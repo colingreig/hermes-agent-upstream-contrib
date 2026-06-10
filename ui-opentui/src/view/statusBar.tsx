@@ -1,20 +1,32 @@
 /**
- * StatusBar — Variant A dense single status bar (v6 Epic 1.3; signed-off design).
- * The header stays the minimal brand line; EVERYTHING else lives here, one
- * themed row pinned above the composer:
+ * StatusBar — the session chrome above the composer, RESPONSIVE across a
+ * width ladder (`chromeMode`, design pass piece 3):
+ *
+ * WIDE (≥140 cols) — the chrome breathes: TWO lines of justified zones.
+ *   line 1 (session vitals):   ● model ·effort   ███░░ 42% 84k/200k   $0.41 · 23m · cmp 2
+ *   line 2 (environment):      profile │ 2 mcp │ 1 agent running          …/cwd (branch)
+ *   A pending update renders in line 2's notice SLOT (before the cwd) instead
+ *   of borrowing a line.
+ *
+ * MEDIUM — today's Variant A dense single row (v6 Epic 1.3; signed-off):
  *
  *   ● model ·effort │ ███░░ 42% 84k │ $0.41 · 23m · cmp 2 │ profile │ 2 mcp │ …/cwd (branch)
  *
- * Progressive disclosure (Ink's `statusRuleWidths` idiom): the dot+model and
- * the context % are PINNED; the tail segments drop whole as columns shrink, in
- * reverse priority — mcp → bg → profile → cost → duration/cmp → token/bar
- * detail — and the cwd left-truncates into whatever remains. `statusSegments`
- * is the pure width→visibility table (table-tested); nothing truncates
- * mid-segment, so the row NEVER wraps or clips.
+ * NARROW (<72) — pinned essentials only, via the same progressive-disclosure
+ * ladder (Ink's `statusRuleWidths` idiom): the dot+model and the context %
+ * are PINNED; tail segments drop whole as columns shrink, in reverse priority
+ * — mcp → bg → profile → cost → duration/cmp → token/bar detail — and the cwd
+ * left-truncates into whatever remains. `statusSegments` is the pure
+ * width→visibility table (table-tested); nothing truncates mid-segment, so a
+ * row NEVER wraps or clips.
  *
- * A pending update (`info.update_behind > 0`) BORROWS the whole line as a
- * transient notice (Variant A decision — no permanent transcript row); it
- * dismisses on Esc or after NOTICE_TTL_MS.
+ * In medium/narrow a pending update (`info.update_behind > 0`) BORROWS the
+ * whole line as a transient notice (Variant A decision — no permanent
+ * transcript row); it dismisses on Esc or after NOTICE_TTL_MS (the Esc/TTL
+ * dismiss also clears the wide notice slot).
+ *
+ * Colors respect the Appendix C roles: the navy `statusBg` fill (the one
+ * correct blue surface), `statusFg` primary text, muted metrics, ok/warn dot.
  *
  * Parity notes (data that does not reach this TUI yet — reported, not faked):
  *   - `N bg` (background tasks): the OpenTUI store has no background-task
@@ -30,6 +42,7 @@ import { useKeyboard } from '@opentui/solid'
 import { createEffect, createMemo, createSignal, onCleanup, Show } from 'solid-js'
 
 import type { SessionStore } from '../logic/store.ts'
+import { isTrayAgent } from './agentsTray.tsx'
 import { useDimensions } from './dimensions.tsx'
 import { elapsedSeconds, useElapsedTick } from './elapsed.ts'
 import { useTheme } from './theme.tsx'
@@ -42,6 +55,19 @@ const DOT_SEP = ' · '
 const NOTICE_TTL_MS = 30_000
 
 // ── pure, table-tested width/threshold logic ────────────────────────────
+
+/** The responsive chrome ladder (design pass piece 3). WIDE spreads the
+ *  chrome over TWO justified lines; MEDIUM is the dense single row; NARROW is
+ *  the pinned-essentials end of the `statusSegments` drop ladder (where the
+ *  ctx read-out has collapsed to a bare `42%`). */
+export type ChromeMode = 'wide' | 'medium' | 'narrow'
+
+export function chromeMode(cols: number): ChromeMode {
+  const w = Math.max(1, Math.floor(cols || 1))
+  if (w >= 140) return 'wide'
+  if (w >= 72) return 'medium'
+  return 'narrow'
+}
 
 /** Which tail segments are visible at a given column count. Drop order as the
  *  terminal narrows (reverse priority, spec Epic 1.3): mcp → bg → profile →
@@ -171,6 +197,7 @@ export function StatusBar(props: { store: SessionStore }) {
     info().running ? theme().color.statusWarn : props.store.state.ready ? theme().color.statusGood : theme().color.muted
 
   const segs = createMemo(() => statusSegments(dims().width))
+  const mode = createMemo(() => chromeMode(dims().width))
 
   // ── transient update notice (borrows the whole line; Esc / TTL dismisses) ──
   const [dismissed, setDismissed] = createSignal(false)
@@ -256,88 +283,215 @@ export function StatusBar(props: { store: SessionStore }) {
     return budget > 4 ? truncLeft(cwdFull(), budget) : ''
   })
 
+  // ── wide-mode extras (the two-line spread) ──────────────────────────────
+  /** Full context read-out with used/max tokens — the wide line-1 center zone. */
+  const wideCtx = createMemo(() => {
+    const p = pct()
+    if (p === undefined) return ''
+    const used = info().contextUsed
+    const max = info().contextMax
+    const tokens = used !== undefined ? ` ${fmtTokens(used)}${max ? `/${fmtTokens(max)}` : ''}` : ''
+    return `${ctxBar(p, CTX_BAR_CELLS)} ${p}%${tokens}`
+  })
+  /** Live delegated-agents count (same predicate as the agents tray). */
+  const agentsText = createMemo(() => {
+    const n = props.store.state.subagents.filter(isTrayAgent).length
+    return n > 0 ? `${n} agent${n === 1 ? '' : 's'} running` : ''
+  })
+  /** Wide line 2's left zone: profile │ N mcp │ agents-running. */
+  const envLeft = createMemo(() => [profileText(), mcpText(), agentsText()].filter(Boolean))
+  /** Wide line 2's right zone trims the cwd around the update-notice slot. */
+  const wideCwd = createMemo(() => {
+    let len = 0
+    for (const seg of envLeft()) len += (len ? SEP.length : 0) + seg.length
+    const notice = noticeText()
+    if (notice) len += (len ? SEP.length : 0) + notice.length
+    const budget = dims().width - 4 - len - 2
+    return budget > 4 ? truncLeft(cwdFull(), budget) : ''
+  })
+
+  /** cost · duration · cmp spans — shared by the medium row and wide line 1. */
+  const Meter = () => (
+    <>
+      <Show when={costText()}>
+        <span style={{ fg: theme().color.muted }}>{costText()}</span>
+      </Show>
+      <Show when={costText() && durationText()}>
+        <span style={{ fg: theme().color.muted }}>{DOT_SEP}</span>
+      </Show>
+      <Show when={durationText()}>
+        <span style={{ fg: theme().color.muted }}>{durationText()}</span>
+      </Show>
+      <Show when={(costText() || durationText()) && cmpText()}>
+        <span style={{ fg: theme().color.muted }}>{DOT_SEP}</span>
+      </Show>
+      <Show when={cmpText()}>
+        <span style={{ fg: cmpColorOf(cmpCount()) }}>{cmpText()}</span>
+      </Show>
+    </>
+  )
+
   return (
     <box
       style={{
         flexShrink: 0,
-        flexDirection: 'row',
+        flexDirection: 'column',
         backgroundColor: theme().color.statusBg,
         paddingLeft: 1,
         paddingRight: 1
       }}
     >
       <Show
-        when={!noticeText()}
+        when={mode() === 'wide'}
         fallback={
-          // the update notice borrows the WHOLE line (Variant A) — warn-tinted,
-          // head-truncated so the Esc hint clips last only on absurd widths.
-          <text selectable={false}>
-            <span style={{ fg: theme().color.warn }}>{truncRight(noticeText(), Math.max(1, dims().width - 4))}</span>
-          </text>
+          /* MEDIUM/NARROW — the dense single row (statusSegments drop ladder). */
+          <box style={{ flexShrink: 0, flexDirection: 'row' }}>
+            <Show
+              when={!noticeText()}
+              fallback={
+                // the update notice borrows the WHOLE line (Variant A) — warn-tinted,
+                // head-truncated so the Esc hint clips last only on absurd widths.
+                <text selectable={false}>
+                  <span style={{ fg: theme().color.warn }}>
+                    {truncRight(noticeText(), Math.max(1, dims().width - 4))}
+                  </span>
+                </text>
+              }
+            >
+              {/* left: pinned dot+model, then the priority-ordered tail segments */}
+              <box style={{ flexShrink: 0, flexDirection: 'row' }}>
+                <text selectable={false}>
+                  <span style={{ fg: dotColor() }}>{dot()}</span>
+                  <Show when={model()}>
+                    <span style={{ fg: theme().color.statusFg }}>{` ${model()}`}</span>
+                    <span style={{ fg: theme().color.muted }}>{effort()}</span>
+                  </Show>
+                  <Show when={ctxText()}>
+                    <span style={{ fg: theme().color.border }}>{SEP}</span>
+                    {/* ctxText() truthy guarantees pct() is defined; `?? 0` only satisfies the type. */}
+                    <Show
+                      when={segs().ctxDetail}
+                      fallback={<span style={{ fg: ctxColorOf(pct() ?? 0) }}>{ctxText()}</span>}
+                    >
+                      <span style={{ fg: ctxColorOf(pct() ?? 0) }}>{ctxBar(pct() ?? 0, CTX_BAR_CELLS)}</span>
+                      <span style={{ fg: theme().color.statusFg }}>{` ${pct()}%`}</span>
+                      <Show when={info().contextUsed !== undefined}>
+                        <span style={{ fg: theme().color.muted }}>{` ${fmtTokens(info().contextUsed ?? 0)}`}</span>
+                      </Show>
+                    </Show>
+                  </Show>
+                  <Show when={meterText()}>
+                    <span style={{ fg: theme().color.border }}>{SEP}</span>
+                    <Meter />
+                  </Show>
+                  <Show when={profileText()}>
+                    <span style={{ fg: theme().color.border }}>{SEP}</span>
+                    {/* statusFg, not accent — persistent chrome spends no warm ink
+                        (design pass); the navy fill is the bar's one blue surface. */}
+                    <span style={{ fg: theme().color.statusFg }}>{profileText()}</span>
+                  </Show>
+                  {/* `N bg` would slot here (segs().bg) — no store data feeds it yet (see header). */}
+                  <Show when={mcpText()}>
+                    <span style={{ fg: theme().color.border }}>{SEP}</span>
+                    <span style={{ fg: theme().color.muted }}>{mcpText()}</span>
+                  </Show>
+                </text>
+              </box>
+
+              {/* spacer pushes the cwd to the right edge */}
+              <box style={{ flexGrow: 1, minWidth: 0 }} />
+
+              {/* right: cwd (branch), pre-truncated so the row never wraps */}
+              <Show when={rightText()}>
+                <box style={{ flexShrink: 0, flexDirection: 'row' }}>
+                  <text selectable={false}>
+                    <span style={{ fg: theme().color.muted }}>{rightText()}</span>
+                  </text>
+                </box>
+              </Show>
+            </Show>
+          </box>
         }
       >
-        {/* left: pinned dot+model, then the priority-ordered tail segments */}
+        {/* WIDE line 1 — session vitals in justified zones:
+            model·effort │ ctx bar + tokens │ cost·duration·cmp */}
         <box style={{ flexShrink: 0, flexDirection: 'row' }}>
-          <text selectable={false}>
-            <span style={{ fg: dotColor() }}>{dot()}</span>
-            <Show when={model()}>
-              <span style={{ fg: theme().color.statusFg }}>{` ${model()}`}</span>
-              <span style={{ fg: theme().color.muted }}>{effort()}</span>
-            </Show>
-            <Show when={ctxText()}>
-              <span style={{ fg: theme().color.border }}>{SEP}</span>
-              {/* ctxText() truthy guarantees pct() is defined; `?? 0` only satisfies the type. */}
-              <Show when={segs().ctxDetail} fallback={<span style={{ fg: ctxColorOf(pct() ?? 0) }}>{ctxText()}</span>}>
+          <box style={{ flexShrink: 0 }}>
+            <text selectable={false}>
+              <span style={{ fg: dotColor() }}>{dot()}</span>
+              <Show when={model()}>
+                <span style={{ fg: theme().color.statusFg }}>{` ${model()}`}</span>
+                <span style={{ fg: theme().color.muted }}>{effort()}</span>
+              </Show>
+            </text>
+          </box>
+          <box style={{ flexGrow: 1, minWidth: 0 }} />
+          <Show when={wideCtx()}>
+            <box style={{ flexShrink: 0 }}>
+              <text selectable={false}>
                 <span style={{ fg: ctxColorOf(pct() ?? 0) }}>{ctxBar(pct() ?? 0, CTX_BAR_CELLS)}</span>
                 <span style={{ fg: theme().color.statusFg }}>{` ${pct()}%`}</span>
                 <Show when={info().contextUsed !== undefined}>
-                  <span style={{ fg: theme().color.muted }}>{` ${fmtTokens(info().contextUsed ?? 0)}`}</span>
+                  <span style={{ fg: theme().color.muted }}>
+                    {` ${fmtTokens(info().contextUsed ?? 0)}${
+                      info().contextMax ? `/${fmtTokens(info().contextMax ?? 0)}` : ''
+                    }`}
+                  </span>
                 </Show>
-              </Show>
-            </Show>
-            <Show when={meterText()}>
-              <span style={{ fg: theme().color.border }}>{SEP}</span>
-              <Show when={costText()}>
-                <span style={{ fg: theme().color.muted }}>{costText()}</span>
-              </Show>
-              <Show when={costText() && durationText()}>
-                <span style={{ fg: theme().color.muted }}>{DOT_SEP}</span>
-              </Show>
-              <Show when={durationText()}>
-                <span style={{ fg: theme().color.muted }}>{durationText()}</span>
-              </Show>
-              <Show when={(costText() || durationText()) && cmpText()}>
-                <span style={{ fg: theme().color.muted }}>{DOT_SEP}</span>
-              </Show>
-              <Show when={cmpText()}>
-                <span style={{ fg: cmpColorOf(cmpCount()) }}>{cmpText()}</span>
-              </Show>
-            </Show>
-            <Show when={profileText()}>
-              <span style={{ fg: theme().color.border }}>{SEP}</span>
-              {/* statusFg, not accent — persistent chrome spends no warm ink
-                  (design pass); the navy fill is the bar's one blue surface. */}
-              <span style={{ fg: theme().color.statusFg }}>{profileText()}</span>
-            </Show>
-            {/* `N bg` would slot here (segs().bg) — no store data feeds it yet (see header). */}
-            <Show when={mcpText()}>
-              <span style={{ fg: theme().color.border }}>{SEP}</span>
-              <span style={{ fg: theme().color.muted }}>{mcpText()}</span>
-            </Show>
-          </text>
+              </text>
+            </box>
+          </Show>
+          <box style={{ flexGrow: 1, minWidth: 0 }} />
+          <Show when={meterText()}>
+            <box style={{ flexShrink: 0 }}>
+              <text selectable={false}>
+                <Meter />
+              </text>
+            </box>
+          </Show>
         </box>
 
-        {/* spacer pushes the cwd to the right edge */}
-        <box style={{ flexGrow: 1, minWidth: 0 }} />
-
-        {/* right: cwd (branch), pre-truncated so the row never wraps */}
-        <Show when={rightText()}>
-          <box style={{ flexShrink: 0, flexDirection: 'row' }}>
+        {/* WIDE line 2 — environment:
+            profile │ N mcp │ agents-running … update-notice slot │ cwd (branch) */}
+        <box style={{ flexShrink: 0, flexDirection: 'row' }}>
+          <box style={{ flexShrink: 0 }}>
             <text selectable={false}>
-              <span style={{ fg: theme().color.muted }}>{rightText()}</span>
+              <Show when={profileText()}>
+                <span style={{ fg: theme().color.statusFg }}>{profileText()}</span>
+              </Show>
+              <Show when={profileText() && (mcpText() || agentsText())}>
+                <span style={{ fg: theme().color.border }}>{SEP}</span>
+              </Show>
+              <Show when={mcpText()}>
+                <span style={{ fg: theme().color.muted }}>{mcpText()}</span>
+              </Show>
+              <Show when={mcpText() && agentsText()}>
+                <span style={{ fg: theme().color.border }}>{SEP}</span>
+              </Show>
+              <Show when={agentsText()}>
+                <span style={{ fg: theme().color.muted }}>{agentsText()}</span>
+              </Show>
             </text>
           </box>
-        </Show>
+          <box style={{ flexGrow: 1, minWidth: 0 }} />
+          <Show when={noticeText() || wideCwd()}>
+            <box style={{ flexShrink: 0 }}>
+              <text selectable={false}>
+                {/* the update notice rides line 2's slot in wide mode — no line
+                    borrowing; Esc/TTL dismisses it exactly as in medium. */}
+                <Show when={noticeText()}>
+                  <span style={{ fg: theme().color.warn }}>{noticeText()}</span>
+                </Show>
+                <Show when={noticeText() && wideCwd()}>
+                  <span style={{ fg: theme().color.border }}>{SEP}</span>
+                </Show>
+                <Show when={wideCwd()}>
+                  <span style={{ fg: theme().color.muted }}>{wideCwd()}</span>
+                </Show>
+              </text>
+            </box>
+          </Show>
+        </box>
       </Show>
     </box>
   )

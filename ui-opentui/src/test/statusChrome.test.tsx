@@ -13,7 +13,15 @@ import { describe, expect, test } from 'vitest'
 
 import { decodeSessionInfoPatch } from '../boundary/schema/SessionInfo.ts'
 import { createSessionStore, type SessionStore } from '../logic/store.ts'
-import { cmpLevel, ctxLevel, fmtShortDuration, fmtTokens, StatusBar, statusSegments } from '../view/statusBar.tsx'
+import {
+  chromeMode,
+  cmpLevel,
+  ctxLevel,
+  fmtShortDuration,
+  fmtTokens,
+  StatusBar,
+  statusSegments
+} from '../view/statusBar.tsx'
 import { ThemeProvider } from '../view/theme.tsx'
 import { captureFrame, renderProbe } from './lib/render.ts'
 
@@ -95,6 +103,19 @@ describe('store.applyInfo — Epic 1.3 chrome merge', () => {
 })
 
 // ── 3. pure logic ────────────────────────────────────────────────────────
+
+describe('chromeMode — the responsive width ladder (design pass piece 3)', () => {
+  test('wide ≥140, medium in between, narrow <72 (where ctx detail collapses)', () => {
+    expect(chromeMode(220)).toBe('wide')
+    expect(chromeMode(140)).toBe('wide')
+    expect(chromeMode(139)).toBe('medium')
+    expect(chromeMode(120)).toBe('medium')
+    expect(chromeMode(72)).toBe('medium')
+    expect(chromeMode(71)).toBe('narrow')
+    expect(chromeMode(40)).toBe('narrow')
+    expect(chromeMode(0)).toBe('narrow') // degenerate input stays well-formed
+  })
+})
 
 describe('statusSegments — progressive disclosure table', () => {
   test('full width shows everything', () => {
@@ -192,13 +213,14 @@ function bar(store: SessionStore) {
   )
 }
 
-describe('StatusBar frames (Variant A)', () => {
-  test('full width renders every segment with │ separators', async () => {
-    const frame = await captureFrame(bar(seededStore()), { width: 160, height: 3 })
+describe('StatusBar frames (responsive chrome)', () => {
+  test('WIDE (160) spreads into the two-line layout: vitals line + environment line', async () => {
+    const frame = await captureFrame(bar(seededStore()), { width: 160, height: 4 })
+    // every segment present…
     expect(frame).toContain('claude-opus-4-8')
     expect(frame).toContain('·high') // effort suffix
     expect(frame).toContain('42%')
-    expect(frame).toContain('84k') // token-count detail
+    expect(frame).toContain('84k/200k') // wide ctx zone shows used/max tokens
     expect(frame).toContain('░') // the meter is partially filled at 42%
     expect(frame).toContain('$0.41')
     expect(frame).toContain('cmp 2')
@@ -206,6 +228,45 @@ describe('StatusBar frames (Variant A)', () => {
     expect(frame).toContain('2 mcp')
     expect(frame).toContain('/tmp/proj (main)')
     expect(frame).toContain('│')
+    // …split across TWO lines: vitals (model + cost) up, environment (profile +
+    // cwd) below.
+    const rows = frame.split('\n')
+    const vitals = rows.findIndex(r => r.includes('claude-opus-4-8'))
+    const env = rows.findIndex(r => r.includes('researcher'))
+    expect(vitals).toBeGreaterThanOrEqual(0)
+    expect(env).toBe(vitals + 1)
+    expect(rows[vitals]).toContain('$0.41')
+    expect(rows[vitals]).toContain('42%')
+    expect(rows[env]).toContain('2 mcp')
+    expect(rows[env]).toContain('/tmp/proj (main)')
+  })
+
+  test('MEDIUM (120) keeps the dense single line (model and cwd share a row)', async () => {
+    const frame = await captureFrame(bar(seededStore()), { width: 120, height: 3 })
+    const rows = frame.split('\n')
+    const row = rows.find(r => r.includes('claude-opus-4-8')) ?? ''
+    expect(row).toContain('42%')
+    expect(row).toContain('$0.41')
+    expect(row).toContain('/tmp/proj (main)')
+  })
+
+  test('WIDE line 2 carries the agents-running count when subagents are live', async () => {
+    const store = seededStore()
+    store.apply({ payload: { goal: 'crunch data', subagent_id: 'sa1' }, type: 'subagent.start' })
+    const frame = await captureFrame(bar(store), { width: 160, height: 4 })
+    expect(frame).toContain('1 agent running')
+    const rows = frame.split('\n')
+    const env = rows.find(r => r.includes('researcher')) ?? ''
+    expect(env).toContain('1 agent running')
+  })
+
+  test('WIDE update notice rides line 2 (no line borrowing — segments stay)', async () => {
+    const store = seededStore()
+    store.applyInfo({ update_behind: 3, update_command: 'hermes update' })
+    const frame = await captureFrame(bar(store), { width: 200, height: 4 })
+    expect(frame).toContain('3 commits behind')
+    expect(frame).toContain('$0.41') // vitals NOT replaced in wide mode
+    expect(frame).toContain('claude-opus-4-8')
   })
 
   test('narrow width drops the tail (no mcp/profile/cost) and compacts the context read-out', async () => {
