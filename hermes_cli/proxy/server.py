@@ -129,6 +129,12 @@ def create_app(adapter: UpstreamAdapter) -> "web.Application":
         # need to forward large multipart uploads we'll switch to streaming
         # the request body too.
         body = await request.read()
+        # Adapters may rewrite the body (default no-op) to drop fields the
+        # upstream rejects — e.g. Codex rejects ``max_output_tokens``.
+        try:
+            body = adapter.transform_request_body(rel_path, body)
+        except Exception as exc:  # pragma: no cover - defensive; keep forwarding
+            logger.warning("proxy: request body transform failed (forwarding as-is): %s", exc)
 
         timeout = aiohttp.ClientTimeout(total=None, sock_connect=15, sock_read=300)
 
@@ -140,6 +146,14 @@ def create_app(adapter: UpstreamAdapter) -> "web.Application":
 
             fwd_headers = _filter_request_headers(request.headers)
             fwd_headers["Authorization"] = f"{active_cred.token_type} {active_cred.bearer}"
+            # HERMES-PATCH 26: codex-proxy-writer — adapter-supplied upstream
+            # headers (e.g. Codex Cloudflare headers: originator /
+            # ChatGPT-Account-ID / User-Agent). Merged after auth so they cannot
+            # clobber the bearer.
+            for _hk, _hv in (active_cred.extra_headers or {}).items():
+                if _hk.lower() == "authorization":
+                    continue
+                fwd_headers[_hk] = _hv
 
             logger.debug(
                 "proxy: forwarding %s %s -> %s (body=%d bytes)",
