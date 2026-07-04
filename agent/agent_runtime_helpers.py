@@ -1672,6 +1672,22 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
                 k: v for k, v in client_kwargs.items()
                 if k in {"api_key", "base_url", "default_headers", "timeout", "http_client"}
             }
+            # HERMES-PATCH 24: re-resolve the Gemini key from the live env on
+            # every client rebuild. restore_primary_runtime rebuilds this client
+            # from a _primary_runtime snapshot whose api_key can be stale/empty
+            # (the snapshot is captured at init; the fallback-activation path in
+            # chat_completion_helpers reads GEMINI_API_KEY directly, so fallback
+            # calls succeed while restore_primary fails with HTTP 400 "API key
+            # not valid"). Prefer GEMINI_API_KEY over GOOGLE_API_KEY (the
+            # provider's api_key_env_vars checks GOOGLE_API_KEY first, which can
+            # be empty/stale). Only override when the env actually has a key.
+            import os as _os
+            _fresh_gemini_key = (
+                _os.getenv("GEMINI_API_KEY", "").strip()
+                or _os.getenv("GOOGLE_API_KEY", "").strip()
+            )
+            if _fresh_gemini_key:
+                safe_kwargs["api_key"] = _fresh_gemini_key
             if "http_client" not in safe_kwargs:
                 keepalive_http = agent._build_keepalive_http_client(
                     base_url, verify=httpx_verify,

@@ -4372,6 +4372,31 @@ class AIAgent:
         if "azure.com" in _base:
             return False
 
+        # Credential-pool guard (subscription→api-key overflow failover).
+        # This per-create refresh resolves the *default* Anthropic token via
+        # resolve_anthropic_token(), which is the OAuth subscription token —
+        # it has no awareness of the credential pool. When the pool has rotated
+        # to the static ``sk-ant-api*`` fallback (added for the "out of extra
+        # usage" overflow path), rebuilding the client with the default OAuth
+        # token here silently REVERTS the rotation back to the exhausted
+        # subscription. Every retry then re-hits "out of extra usage" and the
+        # pool mis-marks the *good* api-key as exhausted, poisoning the whole
+        # pool until nothing is left ("no available entries" → hard 400). Static
+        # api-keys never need OAuth refresh, so when the active pool credential
+        # is non-OAuth, leave the swapped client untouched. OAuth-current
+        # entries fall through to the normal refresh below (token rotation
+        # still works for the subscription path).
+        pool = getattr(self, "_credential_pool", None)
+        if pool is not None:
+            try:
+                from agent.credential_pool import AUTH_TYPE_OAUTH
+                _current = pool.current()
+            except Exception:
+                _current = None
+                AUTH_TYPE_OAUTH = "oauth"
+            if _current is not None and getattr(_current, "auth_type", None) != AUTH_TYPE_OAUTH:
+                return False
+
         try:
             from agent.anthropic_adapter import resolve_anthropic_token, build_anthropic_client
 

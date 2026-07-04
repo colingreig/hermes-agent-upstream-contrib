@@ -38,6 +38,16 @@ logger = logging.getLogger(__name__)
 # every time. Cleared automatically when the file changes (different mtime).
 _CONFIG_PARSE_WARNED: set = set()
 
+# HERMES-PATCH: reload_env boot-env protection (2026-06-25)
+# Keys present in the process environment at import time. Doppler (or any
+# parent-process secret injector) populates os.environ BEFORE this module is
+# imported and BEFORE any .env file is applied, so this snapshot is exactly the
+# set of externally-injected env vars. reload_env() must NEVER delete these:
+# they are not sourced from ~/.hermes/.env, and deleting them silently poisons
+# provider resolution (e.g. zai/glm keyless) for the rest of the process
+# lifetime — the root cause of the 2026-06-25 gateway keyless-resolution stall.
+_PROCESS_BOOT_ENV_KEYS = frozenset(os.environ.keys())
+
 
 def _backup_corrupt_config(config_path: Path) -> Optional[Path]:
     """Preserve a corrupted ``config.yaml`` by copying it to a timestamped ``.bak``.
@@ -7647,11 +7657,30 @@ def reload_env() -> int:
     known_keys = set(OPTIONAL_ENV_VARS.keys()) | _EXTRA_ENV_KEYS
     count = 0
     for key, value in env_vars.items():
+        # HERMES-PATCH: never write an UNINTERPOLATED ${VAR} reference into the
+        # live env. load_env() is a literal parser — it does NOT expand ${...},
+        # unlike the boot-time python-dotenv loader (load_dotenv override=True)
+        # that resolves e.g. `GOOGLE_API_KEY=${GEMINI_API_KEY}` against the
+        # Doppler-injected env. Writing the literal "${GEMINI_API_KEY}" here
+        # clobbered the correctly-expanded boot value and silently broke gemini
+        # key resolution after the first /reload — email-triage then hit the
+        # PATCH-06 "NO API key" refusal every cron tick despite Doppler holding
+        # the key. Skipping uninterpolated refs preserves the good boot value.
+        # See learnings 2026-06-29 (reload_env ${VAR} clobber).
+        if "${" in value:
+            continue
         if os.environ.get(key) != value:
             os.environ[key] = value
             count += 1
-    # Remove known Hermes vars that are no longer in .env
+    # HERMES-PATCH: reload_env boot-env protection (2026-06-25)
+    # Remove known Hermes vars that .env previously owned but were deleted from
+    # it. Crucially, NEVER delete a key that was injected by the parent process
+    # environment (e.g. Doppler) at boot — those are absent from .env by design,
+    # and deleting them silently poisons provider key resolution for the rest of
+    # the process lifetime. See learnings 2026-06-25 (gateway keyless stall).
     for key in known_keys:
+        if key in _PROCESS_BOOT_ENV_KEYS:
+            continue
         if key not in env_vars and key in os.environ:
             del os.environ[key]
             count += 1

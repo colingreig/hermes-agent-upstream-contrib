@@ -14,8 +14,8 @@ The proxy server is otherwise provider-agnostic.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from typing import FrozenSet, Optional
+from dataclasses import dataclass, field
+from typing import FrozenSet, Mapping, Optional
 
 
 @dataclass(frozen=True)
@@ -33,6 +33,15 @@ class UpstreamCredential:
 
     expires_at: Optional[str] = None
     """ISO-8601 expiry timestamp for the bearer, when known. Informational."""
+
+    extra_headers: Mapping[str, str] = field(default_factory=dict)
+    """Additional upstream request headers the adapter wants attached.
+
+    The forwarder merges these onto the outbound request AFTER setting
+    ``Authorization`` (they cannot override the bearer). Default empty —
+    only providers that need non-standard headers (e.g. the Codex backend's
+    ``originator`` / ``ChatGPT-Account-ID`` Cloudflare headers) populate it.
+    """
 
 
 class UpstreamAdapter(ABC):
@@ -94,6 +103,21 @@ class UpstreamAdapter(ABC):
         """
         _ = failed_credential, status_code
         return None
+
+    def transform_request_body(self, rel_path: str, body: bytes) -> bytes:
+        """Optionally rewrite the outbound request body before forwarding.
+
+        HERMES-PATCH 26: codex-proxy-writer (body-transform hook; pairs with the
+        ``extra_headers`` field above used by the Codex Cloudflare headers).
+
+        Default is identity — the proxy is a verbatim forwarder. Providers
+        whose backend rejects a field the client unavoidably sends can override
+        this to drop it (e.g. the Codex backend rejects ``max_output_tokens``,
+        which OpenCode's Responses provider always emits). Must be cheap and
+        tolerant: return ``body`` unchanged on any parse error.
+        """
+        _ = rel_path
+        return body
 
     def describe(self) -> str:
         """One-line status summary for ``proxy status``."""

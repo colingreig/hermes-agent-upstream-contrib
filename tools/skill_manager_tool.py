@@ -867,6 +867,28 @@ def _edit_skill(name: str, content: str) -> Dict[str, Any]:
 
     # Back up original content for rollback
     original_content = skill_md.read_text(encoding="utf-8") if skill_md.exists() else None
+
+    # Stub-corruption guard (added 2026-06-15): refuse replacing a substantial
+    # SKILL.md body with a near-empty stub. An over-eager skill-update step
+    # (agent/background_review "update the skill library, be ACTIVE") once
+    # clobbered a 100K body with a stub, taking the executor's instructions
+    # offline. A full `edit` is meant to evolve content, not destroy it; legit
+    # slim-downs that move detail into references/ keep a meaningful body, so
+    # this only trips on an extreme shrink-to-stub — not on normal refactors.
+    if original_content is not None:
+        def _skill_body_len(c: str) -> int:
+            m = re.search(r'\n---\s*\n', c[3:]) if c.startswith("---") else None
+            return len((c[m.end() + 3:] if m else c).strip())
+        _old_len, _new_len = _skill_body_len(original_content), _skill_body_len(content)
+        if _old_len > 5000 and _new_len < 800:
+            return {"success": False, "error": (
+                f"Refusing to replace SKILL.md body ({_old_len:,} chars) with a stub "
+                f"({_new_len:,} chars) — this looks like accidental corruption, not an "
+                f"intentional edit. If you mean to slim it, keep a meaningful body and move "
+                f"detail into references/ via write_file; use action='patch' for targeted "
+                f"changes. (skill_manage stub-guard)"
+            )}
+
     _atomic_write_text(skill_md, content)
 
     # Security scan — roll back on block
