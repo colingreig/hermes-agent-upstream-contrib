@@ -714,6 +714,48 @@ def _validate_remote_mcp_url(server_name: str, url: Any) -> str:
     return stripped
 
 
+def _warn_unresolved_header_placeholders(server_name: str, headers: Any) -> None:
+    """Log an actionable warning when a header still has an unresolved ``${VAR}``.
+
+    ``_interpolate_env_vars`` (in ``_load_mcp_config``) resolves ``${VAR}`` /
+    ``${env:VAR}`` placeholders from ``~/.hermes/.env`` (or the active profile's
+    secret scope), but leaves the literal placeholder text in place when the
+    referenced variable isn't set. Sending that literal string — e.g.
+    ``Authorization: Bearer ${MCP_AGENCY_OS_API_KEY}`` — produces a bare 401
+    Unauthorized from the server with no indication of *why*, and because HTTP
+    MCP servers reconnect in a loop on failure, the same unexplained 401 repeats
+    in errors.log forever.
+
+    This is exactly the failure shape that shows up when one MCP endpoint is
+    split into several (e.g. a combined endpoint becoming ``/api/mcp/cms`` +
+    ``/api/mcp/agency-os``): each split server typically needs its own auth
+    token, and it's easy to add the new server-name entry to ``mcp_servers`` in
+    config.yaml but forget to also add its corresponding secret to
+    ``~/.hermes/.env``. Surfacing this at connect time turns a mystery 401 into
+    a one-line fix.
+
+    Only logs — never raises — since this must never block an otherwise-working
+    connection (a literal ``${...}`` could in principle be an intentional value
+    for some other server).
+    """
+    if not isinstance(headers, dict):
+        return
+    for header_name, value in headers.items():
+        if not isinstance(value, str):
+            continue
+        for m in _ENV_VAR_PATTERN.finditer(value):
+            var_name = _env_ref_name(m.group(1))
+            logger.warning(
+                "MCP server '%s': header '%s' still contains the unresolved "
+                "placeholder '${%s}' after env interpolation — that literal "
+                "text will be sent to the server instead of a real credential "
+                "and will typically look like a bare, repeating 401 "
+                "Unauthorized. Set %s in ~/.hermes/.env (or the active "
+                "profile's secret scope) and reconnect this server.",
+                server_name, header_name, var_name, var_name,
+            )
+
+
 def _resolve_client_cert(server_name: str, config: dict):
     """Resolve the ``client_cert`` / ``client_key`` config for mTLS.
 
@@ -2320,6 +2362,11 @@ class MCPServerTask:
                 self._error = exc
                 self._ready.set()
                 return
+
+            # Surface a clear diagnostic (never fatal) when a header still
+            # contains an unresolved ${VAR} placeholder — see docstring for
+            # why this matters most right after an endpoint split.
+            _warn_unresolved_header_placeholders(self.name, config.get("headers"))
 
             # Pre-flight content-type probe (Streamable HTTP only; SSE is
             # exercised by its own client and legitimately serves
