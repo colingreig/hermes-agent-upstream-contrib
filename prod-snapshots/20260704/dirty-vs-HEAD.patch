@@ -1,0 +1,907 @@
+diff --git a/agent/agent_runtime_helpers.py b/agent/agent_runtime_helpers.py
+index 18ed3102c2..00451deddd 100644
+--- a/agent/agent_runtime_helpers.py
++++ b/agent/agent_runtime_helpers.py
+@@ -1583,6 +1583,22 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
+                 k: v for k, v in client_kwargs.items()
+                 if k in {"api_key", "base_url", "default_headers", "timeout", "http_client"}
+             }
++            # HERMES-PATCH 24: re-resolve the Gemini key from the live env on
++            # every client rebuild. restore_primary_runtime rebuilds this client
++            # from a _primary_runtime snapshot whose api_key can be stale/empty
++            # (the snapshot is captured at init; the fallback-activation path in
++            # chat_completion_helpers reads GEMINI_API_KEY directly, so fallback
++            # calls succeed while restore_primary fails with HTTP 400 "API key
++            # not valid"). Prefer GEMINI_API_KEY over GOOGLE_API_KEY (the
++            # provider's api_key_env_vars checks GOOGLE_API_KEY first, which can
++            # be empty/stale). Only override when the env actually has a key.
++            import os as _os
++            _fresh_gemini_key = (
++                _os.getenv("GEMINI_API_KEY", "").strip()
++                or _os.getenv("GOOGLE_API_KEY", "").strip()
++            )
++            if _fresh_gemini_key:
++                safe_kwargs["api_key"] = _fresh_gemini_key
+             if "http_client" not in safe_kwargs:
+                 keepalive_http = agent._build_keepalive_http_client(
+                     base_url, verify=httpx_verify,
+diff --git a/agent/background_review.py b/agent/background_review.py
+index 985888693b..133abd929c 100644
+--- a/agent/background_review.py
++++ b/agent/background_review.py
+@@ -169,10 +169,20 @@ _MEMORY_REVIEW_PROMPT = (
+ )
+ 
+ _SKILL_REVIEW_PROMPT = (
+-    "Review the conversation above and update the skill library. Be "
+-    "ACTIVE — most sessions produce at least one skill update, even if "
+-    "small. A pass that does nothing is a missed learning opportunity, "
+-    "not a neutral outcome.\n\n"
++    "Review the conversation above and update the skill library ONLY "
++    "when a genuinely novel, transferable, cross-session lesson emerged. "
++    "Most routine cron ticks produce NOTHING worth saving — 'Nothing to "
++    "save.' is the correct and common outcome. Do not manufacture an "
++    "update to feel productive.\n\n"
++    "⚠️ SIZE DISCIPLINE (hard rule): a SKILL.md body has a 100,000-char "
++    "HARD LIMIT — saves past it are REJECTED and waste the whole pass. "
++    "NEVER append to a SKILL.md body that is already large (>50KB): put "
++    "any genuinely new detail in `references/<topic>.md` and add at most "
++    "a one-line pointer. NEVER write dated per-tick status, confirmation, "
++    "or 'tick NN observed' notes into SKILL.md OR into references/ — that "
++    "is operational state and belongs in memory or the brain, never the "
++    "skill library. If your only candidate is such a note, say 'Nothing "
++    "to save.' and stop.\n\n"
+     "Target shape of the library: CLASS-LEVEL skills, each with a rich "
+     "SKILL.md and a `references/` directory for session-specific detail. "
+     "Not a long flat list of narrow one-session-one-skill entries. This "
+@@ -267,10 +277,10 @@ _SKILL_REVIEW_PROMPT = (
+     "command, config step, env var to set) under an existing setup or "
+     "troubleshooting skill — never 'this tool does not work' as a "
+     "standalone constraint.\n\n"
+-    "'Nothing to save.' is a real option but should NOT be the "
+-    "default. If the session ran smoothly with no corrections and "
+-    "produced no new technique, just say 'Nothing to save.' and stop. "
+-    "Otherwise, act."
++    "'Nothing to save.' is the right default for routine ticks. If the "
++    "session ran smoothly with no corrections and produced no new "
++    "transferable technique, say 'Nothing to save.' and stop. Only act "
++    "when a real, durable, cross-session lesson emerged."
+ )
+ 
+ _COMBINED_REVIEW_PROMPT = (
+@@ -279,9 +289,13 @@ _COMBINED_REVIEW_PROMPT = (
+     "desires, preferences, personal details, or expectations about "
+     "how you should behave? Save facts about the user and durable "
+     "preferences with the memory tool.\n\n"
+-    "**Skills**: how to do this class of task. Be ACTIVE — most "
+-    "sessions produce at least one skill update. A pass that does "
+-    "nothing is a missed learning opportunity, not a neutral outcome.\n\n"
++    "**Skills**: how to do this class of task. Update ONLY on a "
++    "genuinely novel, transferable lesson; most routine ticks save "
++    "nothing and 'Nothing to save.' is correct. ⚠️ SIZE DISCIPLINE: "
++    "SKILL.md bodies have a 100,000-char hard limit (saves rejected past "
++    "it). Never append to a SKILL.md already >50KB — use `references/` + "
++    "a one-line pointer. Never write dated per-tick status/confirmation "
++    "notes to the skill library; those go to memory or the brain.\n\n"
+     "Target shape of the skill library: CLASS-LEVEL skills with a rich "
+     "SKILL.md and a `references/` directory for session-specific detail. "
+     "Not a long flat list of narrow one-session-one-skill entries.\n\n"
+diff --git a/agent/error_classifier.py b/agent/error_classifier.py
+index 3489c66c94..5c773e42d0 100644
+--- a/agent/error_classifier.py
++++ b/agent/error_classifier.py
+@@ -650,6 +650,24 @@ def classify_api_error(
+             should_compress=False,
+         )
+ 
++    # Anthropic Pro/Max OAuth subscription depletion. Native Anthropic returns
++    # HTTP 400 invalid_request_error with "You're out of extra usage. Add more
++    # at claude.ai/settings/usage and keep going." when the subscription's usage
++    # allowance is spent. Without this, _classify_by_status (step 2) downgrades
++    # the bare 400 to format_error (non-retryable, no rotation) and the credential
++    # pool never rotates to the paid ANTHROPIC_API_KEY_HERMES fallback, so the
++    # plan's "subscription-first, capped key overflow" silently fails. Classify
++    # as billing so recover_with_credential_pool rotates to the next pool entry.
++    # Narrow phrase ("out of extra usage") won't collide with the 429 long-context
++    # tier gate (different status) or the 400 long-context-beta rule (different text).
++    if status_code == 400 and "out of extra usage" in error_msg:
++        return _result(
++            FailoverReason.billing,
++            retryable=False,
++            should_rotate_credential=True,
++            should_fallback=True,
++        )
++
+     # llama.cpp's ``json-schema-to-grammar`` converter (used by its OAI
+     # server to build GBNF tool-call parsers) rejects regex escape classes
+     # like ``\d``/``\w``/``\s`` and most ``format`` values. MCP servers
+diff --git a/cron/scheduler.py b/cron/scheduler.py
+index e072fce7fd..6ec53d8f6f 100644
+--- a/cron/scheduler.py
++++ b/cron/scheduler.py
+@@ -2651,8 +2651,23 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
+                     logger.warning("Job '%s': failed to parse prefill messages file '%s': %s", job_id, pfpath, e)
+                     prefill_messages = None
+ 
+-        # Max iterations
+-        max_iterations = _cfg.get("agent", {}).get("max_turns") or _cfg.get("max_turns") or 90
++        # Max iterations (a job-record "max_turns" overrides the global config —
++        # long-form worker jobs like the clickup-executor need a bigger budget
++        # than interactive turns). `bool` is a subclass of `int`, so exclude it
++        # explicitly: `max_turns: true` must fall back to the default, not
++        # silently set a 1-turn budget. (HERMES-PATCH 03)
++        _job_max_turns = job.get("max_turns")
++        _job_max_turns_valid = (
++            isinstance(_job_max_turns, int)
++            and not isinstance(_job_max_turns, bool)
++            and _job_max_turns > 0
++        )
++        max_iterations = (
++            (_job_max_turns if _job_max_turns_valid else None)
++            or _cfg.get("agent", {}).get("max_turns")
++            or _cfg.get("max_turns")
++            or 90
++        )
+ 
+         # Provider routing
+         pr = _cfg.get("provider_routing") or {}
+@@ -2760,6 +2775,57 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
+                 f"(or pin the original values to keep them). See #44585."
+             )
+ 
++        # HERMES-PATCH 06 — pinned-provider credential preflight.
++        # When a job PINS a provider (job["provider"]) but the resolved runtime
++        # has NO usable API key, refuse to run rather than sliding into
++        # agent_init's #17929 init-time fallback. That fallback promotes the
++        # config fallback (e.g. anthropic/claude-haiku-4-5) to PRIMARY and builds
++        # it as an OpenAI-compat client pointed at api.anthropic.com, which hits
++        # /v1/chat/completions (404 — Anthropic only serves /v1/messages) on every
++        # call and 404-loops SILENTLY for hours. Root cause of the 2026-06-24
++        # outage: the gateway booted (post `hermes update`) before doppler had
++        # exported OPENAI_API_KEY, so openai-api resolved keyless. Fail LOUD with
++        # an actionable alert instead. Scoped to HTTP key-based providers: skips
++        # bedrock (boto3, no key), acp-command providers (carry a command), and
++        # the auto/openrouter/custom routers. See learnings/2026-06-24 …404 outage.
++        _pinned_provider = (job.get("provider") or "").strip().lower()
++        _rt_api_mode = str(runtime.get("api_mode") or "").strip().lower()
++        if (
++            _pinned_provider
++            and _pinned_provider not in {"auto", "openrouter", "custom"}
++            and _rt_api_mode != "bedrock_converse"
++            and not runtime.get("command")
++        ):
++            _rt_key = runtime.get("api_key")
++            # A callable key (Azure Entra ID mints a JWT per request) counts as
++            # present; otherwise require a non-blank string.
++            _has_key = callable(_rt_key) or bool(isinstance(_rt_key, str) and _rt_key.strip())
++            if not _has_key:
++                _env_hint = f"{_pinned_provider.upper().replace('-', '_')}_API_KEY"
++                try:
++                    from hermes_cli.auth import PROVIDER_REGISTRY
++                    _pcfg = PROVIDER_REGISTRY.get(_pinned_provider)
++                    if _pcfg and _pcfg.api_key_env_vars:
++                        _env_hint = _pcfg.api_key_env_vars[0]
++                except Exception:
++                    pass
++                logger.error(
++                    "Job '%s': pinned provider '%s' resolved with NO API key — "
++                    "refusing to run on the silent anthropic fallback (HERMES-PATCH 06). "
++                    "Gateway likely booted before doppler exported %s. "
++                    "Contact the operator to restart the Hermes gateway service.",
++                    job_name, _pinned_provider, _env_hint,
++                )
++                raise RuntimeError(
++                    f"Job '{job_name}' pins provider '{_pinned_provider}' but the "
++                    f"resolved runtime has NO API key. Refusing to run: the init-time "
++                    f"fallback would route to api.anthropic.com as an OpenAI-compat "
++                    f"client and 404-loop silently. Likely the gateway booted before "
++                    f"doppler exported {_env_hint}. "
++                    f"The gateway needs to be restarted by the operator — do not run "
++                    f"launchctl commands directly. No inference call was made."
++                )
++
+         fallback_model = get_fallback_chain(_cfg) or None
+         credential_pool = None
+         runtime_provider = str(runtime.get("provider") or "").strip().lower()
+@@ -2935,11 +3001,19 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
+         # builds the proper failure tuple. (issue #17855)
+         turn_exit_reason = str(result.get("turn_exit_reason") or "")
+         final_response_text = (result.get("final_response") or "").strip()
++        # HERMES-PATCH 03: an iteration/budget stop that still produced a
++        # substantive report is PARTIAL work, not a failure. Upstream already
++        # spares "max_iterations_reached" stops with any non-empty response; this
++        # also covers a directly-surfaced "budget_exhausted" exit (finalize_turn
++        # normally rewrites it to max_iterations_reached first) and applies a
++        # >=300-char floor so the short turn-completion explainer boilerplate
++        # finalize_turn injects when the post-budget summary call itself fails is
++        # still treated as a real failure (no work record), not a partial.
+         max_iteration_summary = (
+             result.get("failed") is not True
+             and result.get("completed") is False
+-            and turn_exit_reason.startswith("max_iterations_reached(")
+-            and bool(final_response_text)
++            and turn_exit_reason.startswith(("max_iterations_reached(", "budget_exhausted"))
++            and len(final_response_text) >= 300
+         )
+         if result.get("failed") is True or (result.get("completed") is False and not max_iteration_summary):
+             _err_text = (
+@@ -2950,9 +3024,16 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
+             raise RuntimeError(_err_text)
+         if max_iteration_summary:
+             logger.warning(
+-                "Job '%s' reached the iteration limit but produced a final fallback response; "
+-                "delivering the response instead of failing the cron run",
+-                job_name,
++                "Job '%s' hit the iteration/budget limit (%s) but produced a substantive "
++                "report — recording as PARTIAL success (handoff brief)",
++                job_name, turn_exit_reason,
++            )
++            # Mark the delivered text so a budget-stopped run isn't mistaken for a
++            # completed one in the dashboard / downstream consumers.
++            result["final_response"] = (
++                f"⚠️ PARTIAL — iteration budget hit ({turn_exit_reason}). "
++                "Work may be incomplete; treat the report below as a handoff brief.\n\n"
++                + final_response_text
+             )
+ 
+         final_response = result.get("final_response", "") or ""
+diff --git a/hermes_cli/config.py b/hermes_cli/config.py
+index 35ad381722..fc85020a8e 100644
+--- a/hermes_cli/config.py
++++ b/hermes_cli/config.py
+@@ -38,6 +38,16 @@ logger = logging.getLogger(__name__)
+ # every time. Cleared automatically when the file changes (different mtime).
+ _CONFIG_PARSE_WARNED: set = set()
+ 
++# HERMES-PATCH: reload_env boot-env protection (2026-06-25)
++# Keys present in the process environment at import time. Doppler (or any
++# parent-process secret injector) populates os.environ BEFORE this module is
++# imported and BEFORE any .env file is applied, so this snapshot is exactly the
++# set of externally-injected env vars. reload_env() must NEVER delete these:
++# they are not sourced from ~/.hermes/.env, and deleting them silently poisons
++# provider resolution (e.g. zai/glm keyless) for the rest of the process
++# lifetime — the root cause of the 2026-06-25 gateway keyless-resolution stall.
++_PROCESS_BOOT_ENV_KEYS = frozenset(os.environ.keys())
++
+ 
+ def _backup_corrupt_config(config_path: Path) -> Optional[Path]:
+     """Preserve a corrupted ``config.yaml`` by copying it to a timestamped ``.bak``.
+@@ -7370,11 +7380,30 @@ def reload_env() -> int:
+     known_keys = set(OPTIONAL_ENV_VARS.keys()) | _EXTRA_ENV_KEYS
+     count = 0
+     for key, value in env_vars.items():
++        # HERMES-PATCH: never write an UNINTERPOLATED ${VAR} reference into the
++        # live env. load_env() is a literal parser — it does NOT expand ${...},
++        # unlike the boot-time python-dotenv loader (load_dotenv override=True)
++        # that resolves e.g. `GOOGLE_API_KEY=${GEMINI_API_KEY}` against the
++        # Doppler-injected env. Writing the literal "${GEMINI_API_KEY}" here
++        # clobbered the correctly-expanded boot value and silently broke gemini
++        # key resolution after the first /reload — email-triage then hit the
++        # PATCH-06 "NO API key" refusal every cron tick despite Doppler holding
++        # the key. Skipping uninterpolated refs preserves the good boot value.
++        # See learnings 2026-06-29 (reload_env ${VAR} clobber).
++        if "${" in value:
++            continue
+         if os.environ.get(key) != value:
+             os.environ[key] = value
+             count += 1
+-    # Remove known Hermes vars that are no longer in .env
++    # HERMES-PATCH: reload_env boot-env protection (2026-06-25)
++    # Remove known Hermes vars that .env previously owned but were deleted from
++    # it. Crucially, NEVER delete a key that was injected by the parent process
++    # environment (e.g. Doppler) at boot — those are absent from .env by design,
++    # and deleting them silently poisons provider key resolution for the rest of
++    # the process lifetime. See learnings 2026-06-25 (gateway keyless stall).
+     for key in known_keys:
++        if key in _PROCESS_BOOT_ENV_KEYS:
++            continue
+         if key not in env_vars and key in os.environ:
+             del os.environ[key]
+             count += 1
+diff --git a/hermes_cli/proxy/adapters/__init__.py b/hermes_cli/proxy/adapters/__init__.py
+index 7aa0c5c09a..7869615b26 100644
+--- a/hermes_cli/proxy/adapters/__init__.py
++++ b/hermes_cli/proxy/adapters/__init__.py
+@@ -9,6 +9,7 @@ from typing import Dict, Type
+ 
+ from hermes_cli.proxy.adapters.base import UpstreamAdapter
+ from hermes_cli.proxy.adapters.nous_portal import NousPortalAdapter
++from hermes_cli.proxy.adapters.openai_codex import OpenAICodexAdapter
+ from hermes_cli.proxy.adapters.xai import XAIGrokAdapter
+ 
+ # Registry of available adapter classes keyed by provider name as used on
+@@ -16,6 +17,7 @@ from hermes_cli.proxy.adapters.xai import XAIGrokAdapter
+ ADAPTERS: Dict[str, Type[UpstreamAdapter]] = {
+     "nous": NousPortalAdapter,
+     "xai": XAIGrokAdapter,
++    "openai-codex": OpenAICodexAdapter,
+ }
+ 
+ 
+diff --git a/hermes_cli/proxy/adapters/base.py b/hermes_cli/proxy/adapters/base.py
+index 65107b6f18..4312f7a9df 100644
+--- a/hermes_cli/proxy/adapters/base.py
++++ b/hermes_cli/proxy/adapters/base.py
+@@ -14,8 +14,8 @@ The proxy server is otherwise provider-agnostic.
+ from __future__ import annotations
+ 
+ from abc import ABC, abstractmethod
+-from dataclasses import dataclass
+-from typing import FrozenSet, Optional
++from dataclasses import dataclass, field
++from typing import FrozenSet, Mapping, Optional
+ 
+ 
+ @dataclass(frozen=True)
+@@ -34,6 +34,15 @@ class UpstreamCredential:
+     expires_at: Optional[str] = None
+     """ISO-8601 expiry timestamp for the bearer, when known. Informational."""
+ 
++    extra_headers: Mapping[str, str] = field(default_factory=dict)
++    """Additional upstream request headers the adapter wants attached.
++
++    The forwarder merges these onto the outbound request AFTER setting
++    ``Authorization`` (they cannot override the bearer). Default empty —
++    only providers that need non-standard headers (e.g. the Codex backend's
++    ``originator`` / ``ChatGPT-Account-ID`` Cloudflare headers) populate it.
++    """
++
+ 
+ class UpstreamAdapter(ABC):
+     """Contract for an upstream provider the proxy can forward to."""
+@@ -95,6 +104,21 @@ class UpstreamAdapter(ABC):
+         _ = failed_credential, status_code
+         return None
+ 
++    def transform_request_body(self, rel_path: str, body: bytes) -> bytes:
++        """Optionally rewrite the outbound request body before forwarding.
++
++        HERMES-PATCH 26: codex-proxy-writer (body-transform hook; pairs with the
++        ``extra_headers`` field above used by the Codex Cloudflare headers).
++
++        Default is identity — the proxy is a verbatim forwarder. Providers
++        whose backend rejects a field the client unavoidably sends can override
++        this to drop it (e.g. the Codex backend rejects ``max_output_tokens``,
++        which OpenCode's Responses provider always emits). Must be cheap and
++        tolerant: return ``body`` unchanged on any parse error.
++        """
++        _ = rel_path
++        return body
++
+     def describe(self) -> str:
+         """One-line status summary for ``proxy status``."""
+         try:
+diff --git a/hermes_cli/proxy/adapters/openai_codex.py b/hermes_cli/proxy/adapters/openai_codex.py
+new file mode 100644
+index 0000000000..004b01ce53
+--- /dev/null
++++ b/hermes_cli/proxy/adapters/openai_codex.py
+@@ -0,0 +1,188 @@
++"""OpenAI Codex (ChatGPT) OAuth upstream adapter.
++
++Forwards OpenAI **Responses API** requests to the ChatGPT-backed Codex endpoint
++(``https://chatgpt.com/backend-api/codex``) using Hermes' own OAuth credential
++store. This lets any local OpenAI-compatible client that speaks the Responses
++shape (``/v1/responses``) write through the subscription-flat Codex backend.
++
++Unlike the nous/xai adapters, the Codex backend sits behind Cloudflare and
++rejects requests that don't advertise a first-party originator. We therefore
++attach three non-standard upstream headers via ``UpstreamCredential.extra_headers``:
++
++  - ``originator: codex_cli_rs``         (Cloudflare all-list)
++  - ``User-Agent: codex_cli_rs/...``     (SDK-fingerprint evasion)
++  - ``ChatGPT-Account-ID: <jwt claim>``  (account routing, from the OAuth JWT)
++
++Token resolution + refresh (including the cross-process refresh lock that
++prevents a single-use refresh_token from being double-spent) is delegated to
++``hermes_cli.auth.resolve_codex_runtime_credentials`` — the same function
++Hermes' native chat path uses. The proxy server forwards the request/response
++body verbatim, so no chat<->responses translation happens here: the client is
++expected to send the Responses shape directly (e.g. gpt-5.4 via the OpenAI
++Responses API). gpt-5.4 is the silent-hang-safe Codex model; gpt-5.5 on the
++Codex backend has a documented silent-hang risk — prefer gpt-5.4.
++"""
++
++# HERMES-PATCH 26: codex-proxy-writer — local OpenAI-compatible upstream adapter
++# exposing the ChatGPT Codex OAuth backend (gpt-5.4) so OpenCode can WRITE code
++# through the subscription-flat Codex endpoint. Re-applied by
++# ~/.hermes/scripts/verify-hermes-patches.sh after `hermes update`.
++from __future__ import annotations
++
++import base64
++import json
++import logging
++import threading
++from typing import Dict, FrozenSet, Optional
++
++from hermes_cli.auth import resolve_codex_runtime_credentials
++from hermes_cli.proxy.adapters.base import UpstreamAdapter, UpstreamCredential
++
++logger = logging.getLogger(__name__)
++
++# Codex is a Responses-API backend. ``/responses`` is the live path; the others
++# are advertised so a misrouted ``/models`` probe gets a clean upstream answer
++# rather than a 404 from the proxy. The Codex backend itself decides what it
++# serves — the proxy just allows the path through.
++_ALLOWED_PATHS: FrozenSet[str] = frozenset(
++    {
++        "/responses",
++        "/models",
++    }
++)
++
++# Fields the Codex backend rejects ("Unsupported parameter") that clients
++# (notably OpenCode's Responses provider) emit unavoidably. Stripped in
++# ``transform_request_body``.
++_CODEX_REJECTED_FIELDS: FrozenSet[str] = frozenset({"max_output_tokens"})
++
++
++def _codex_cloudflare_headers(access_token: str) -> Dict[str, str]:
++    """Headers required to avoid Cloudflare 403s on chatgpt.com/backend-api/codex.
++
++    Inlined from ``agent.auxiliary_client._codex_cloudflare_headers`` (kept in
++    sync deliberately) so the proxy adapter stays self-contained and doesn't
++    pull the heavy auxiliary_client module into the proxy process. Malformed
++    tokens are tolerated — we drop the account-ID header rather than raise, so a
++    bad token surfaces as an upstream 401 instead of crashing the forwarder.
++    """
++    headers = {
++        "User-Agent": "codex_cli_rs/0.0.0 (Hermes Agent)",
++        "originator": "codex_cli_rs",
++    }
++    if not isinstance(access_token, str) or not access_token.strip():
++        return headers
++    try:
++        parts = access_token.split(".")
++        if len(parts) < 2:
++            return headers
++        payload_b64 = parts[1] + "=" * (-len(parts[1]) % 4)
++        claims = json.loads(base64.urlsafe_b64decode(payload_b64))
++        acct_id = claims.get("https://api.openai.com/auth", {}).get("chatgpt_account_id")
++        if isinstance(acct_id, str) and acct_id:
++            headers["ChatGPT-Account-ID"] = acct_id
++    except Exception:
++        pass
++    return headers
++
++
++class OpenAICodexAdapter(UpstreamAdapter):
++    """Proxy upstream for the ChatGPT Codex backend via Hermes-managed OAuth."""
++
++    auth_hint = "hermes auth add openai-codex --type oauth"
++
++    def __init__(self) -> None:
++        self._lock = threading.Lock()
++
++    @property
++    def name(self) -> str:
++        return "openai-codex"
++
++    @property
++    def display_name(self) -> str:
++        return "OpenAI Codex OAuth"
++
++    @property
++    def allowed_paths(self) -> FrozenSet[str]:
++        return _ALLOWED_PATHS
++
++    def is_authenticated(self) -> bool:
++        # Cheap, no network: resolve WITHOUT triggering a refresh and report
++        # whether a usable access token exists in the store/pool.
++        try:
++            creds = resolve_codex_runtime_credentials(refresh_if_expiring=False)
++        except Exception:
++            return False
++        return bool((creds or {}).get("api_key"))
++
++    def get_credential(self) -> UpstreamCredential:
++        with self._lock:
++            return self._resolve(force_refresh=False)
++
++    def get_retry_credential(
++        self,
++        *,
++        failed_credential: UpstreamCredential,
++        status_code: int,
++    ) -> Optional[UpstreamCredential]:
++        # On a 401 the access token is likely stale — force a refresh once and
++        # retry. (429 = quota, not auth; let it flow back to the client.)
++        if status_code != 401:
++            return None
++        with self._lock:
++            try:
++                retry = self._resolve(force_refresh=True)
++            except Exception as exc:
++                logger.warning("proxy: codex forced refresh failed: %s", exc)
++                return None
++            if retry.bearer == failed_credential.bearer:
++                return None
++            logger.info("proxy: codex upstream returned 401; retrying with refreshed token")
++            return retry
++
++    def transform_request_body(self, rel_path: str, body: bytes) -> bytes:
++        """Drop request fields the Codex backend rejects.
++
++        OpenCode's built-in OpenAI Responses provider hardcodes a
++        ``max_output_tokens`` fallback (8192) on every request — there's no
++        client-side knob to suppress it — and the Codex backend rejects it with
++        ``Unsupported parameter: max_output_tokens``. We strip exactly that
++        field (and nothing else); the body is otherwise forwarded verbatim.
++        Tolerant: returns the body unchanged on non-JSON or any parse error.
++        """
++        if not body or rel_path != "/responses":
++            return body
++        try:
++            payload = json.loads(body)
++        except Exception:
++            return body
++        if not isinstance(payload, dict):
++            return body
++        removed = False
++        for key in _CODEX_REJECTED_FIELDS:
++            if key in payload:
++                payload.pop(key, None)
++                removed = True
++        if not removed:
++            return body
++        return json.dumps(payload).encode("utf-8")
++
++    def _resolve(self, *, force_refresh: bool) -> UpstreamCredential:
++        creds = resolve_codex_runtime_credentials(force_refresh=force_refresh)
++        access_token = str((creds or {}).get("api_key", "") or "").strip()
++        if not access_token:
++            raise RuntimeError(
++                "No usable OpenAI Codex OAuth credential. Run "
++                "`hermes auth add openai-codex --type oauth` first."
++            )
++        base_url = str((creds or {}).get("base_url", "") or "").strip().rstrip("/")
++        if not base_url:
++            raise RuntimeError("Codex credential resolved without a base_url.")
++        return UpstreamCredential(
++            bearer=access_token,
++            base_url=base_url,
++            extra_headers=_codex_cloudflare_headers(access_token),
++        )
++
++
++__all__ = ["OpenAICodexAdapter"]
+diff --git a/hermes_cli/proxy/server.py b/hermes_cli/proxy/server.py
+index 17e8615fcb..ce5794c241 100644
+--- a/hermes_cli/proxy/server.py
++++ b/hermes_cli/proxy/server.py
+@@ -129,6 +129,12 @@ def create_app(adapter: UpstreamAdapter) -> "web.Application":
+         # need to forward large multipart uploads we'll switch to streaming
+         # the request body too.
+         body = await request.read()
++        # Adapters may rewrite the body (default no-op) to drop fields the
++        # upstream rejects — e.g. Codex rejects ``max_output_tokens``.
++        try:
++            body = adapter.transform_request_body(rel_path, body)
++        except Exception as exc:  # pragma: no cover - defensive; keep forwarding
++            logger.warning("proxy: request body transform failed (forwarding as-is): %s", exc)
+ 
+         timeout = aiohttp.ClientTimeout(total=None, sock_connect=15, sock_read=300)
+ 
+@@ -140,6 +146,14 @@ def create_app(adapter: UpstreamAdapter) -> "web.Application":
+ 
+             fwd_headers = _filter_request_headers(request.headers)
+             fwd_headers["Authorization"] = f"{active_cred.token_type} {active_cred.bearer}"
++            # HERMES-PATCH 26: codex-proxy-writer — adapter-supplied upstream
++            # headers (e.g. Codex Cloudflare headers: originator /
++            # ChatGPT-Account-ID / User-Agent). Merged after auth so they cannot
++            # clobber the bearer.
++            for _hk, _hv in (active_cred.extra_headers or {}).items():
++                if _hk.lower() == "authorization":
++                    continue
++                fwd_headers[_hk] = _hv
+ 
+             logger.debug(
+                 "proxy: forwarding %s %s -> %s (body=%d bytes)",
+diff --git a/plugins/platforms/slack/adapter.py b/plugins/platforms/slack/adapter.py
+index f3eb4f50a5..8de5204af8 100644
+--- a/plugins/platforms/slack/adapter.py
++++ b/plugins/platforms/slack/adapter.py
+@@ -112,6 +112,80 @@ def check_slack_requirements() -> bool:
+     return ensure_and_bind("platform.slack", _import, globals(), prompt=False)
+ 
+ 
++# HERMES-PATCH 05: slack-decision-thread-hook
++# Slack-thread-per-decision round-trip (file B, 2026-06-19). The SLA sweep
++# (clickup_review_sla.py::_post_decision_threads) posts a rich threaded decision
++# message to Colin's DM and records {decision_thread_ts, decision_channel} in its
++# state file, keyed by ClickUp task id. When Colin replies IN that thread, this
++# hook deterministically converts the reply into the SAME operator ClickUp comment
++# the existing resume loop consumes (a non-agent comment newer than the 🟡 park),
++# and suppresses the generic agent wake for that thread. State file is the single
++# source of truth shared with the SLA script.
++_REVIEW_SLA_STATE_PATH = os.path.join(
++    os.path.expanduser("~"), ".hermes", "scripts", ".review_sla_state.json"
++)
++# Mirror clickup_review_sla.py::AGENT_COMMENT_MARKERS — the operator comment we
++# post MUST contain none of these so the SLA resume logic classifies it as an
++# operator reply (not an agent comment).
++_AGENT_COMMENT_MARKERS = ("🤖", "✅", "🔧", "🟡 hermes-decision", "🚨 hermes-hardstop",
++                          "⏳ hermes-review-sla")
++
++
++def _match_decision_thread(channel: str, thread_ts: str) -> Optional[str]:
++    """Best-effort: return the ClickUp task id whose recorded decision thread
++    matches (channel, thread_ts), else None. Reads the SLA script's state file;
++    any error (missing file, bad json) returns None so normal handling proceeds."""
++    if not thread_ts:
++        return None
++    try:
++        with open(_REVIEW_SLA_STATE_PATH) as f:
++            state = json.load(f)
++    except Exception:
++        return None
++    for tid, rec in (state.items() if isinstance(state, dict) else []):
++        if not isinstance(rec, dict):
++            continue
++        if rec.get("decision_thread_ts") != thread_ts:
++            continue
++        rec_chan = rec.get("decision_channel")
++        if rec_chan and channel and rec_chan != channel:
++            continue
++        return tid
++    return None
++
++
++async def _post_clickup_operator_comment(task_id: str, reply_text: str) -> bool:
++    """POST the operator's Slack reply as a ClickUp comment, prefixed with a plain
++    (marker-free) operator tag so the SLA resume logic treats it as an operator
++    reply. Replicates clickup_review_sla.py::_post_comment's auth/endpoint:
++    Authorization: <CLICKUP_API_TOKEN>, POST /api/v2/task/<id>/comment with
++    {"comment_text": ...}. Async (aiohttp) so it doesn't block the event loop.
++    Returns True on success. Never raises."""
++    token = (os.environ.get("CLICKUP_API_TOKEN") or "").strip()
++    if not token:
++        logger.warning("[Slack][decision-hook] CLICKUP_API_TOKEN unset — cannot record reply")
++        return False
++    # Plain operator tag; intentionally contains NO agent markers (🤖/✅/🔧/🟡/🚨/⏳).
++    body = "Operator (via Slack): " + (reply_text or "").strip()
++    url = f"https://api.clickup.com/api/v2/task/{task_id}/comment"
++    headers = {"Authorization": token, "Content-Type": "application/json"}
++    try:
++        import aiohttp  # local import: aiohttp may be lazily available
++        async with aiohttp.ClientSession() as sess:
++            async with sess.post(
++                url, headers=headers, json={"comment_text": body},
++                timeout=aiohttp.ClientTimeout(total=30),
++            ) as resp:
++                data = await resp.json(content_type=None)
++                ok = bool(isinstance(data, dict) and data.get("id"))
++                if not ok:
++                    logger.warning("[Slack][decision-hook] ClickUp comment POST returned no id (status=%s)", resp.status)
++                return ok
++    except Exception as e:
++        logger.warning("[Slack][decision-hook] ClickUp comment POST failed for %s: %s", task_id, e)
++        return False
++
++
+ def _extract_text_from_slack_blocks(blocks: list) -> str:
+     """Extract readable text from Slack Block Kit blocks, including quoted/forwarded content.
+ 
+@@ -497,6 +571,26 @@ class SlackAdapter(BasePlatformAdapter):
+         )
+         _apply_slack_proxy(self._handler.client, self._proxy_url)
+ 
++        # HERMES-PATCH 22: slack-watchdog-owns-reconnect (2026-06-24)
++        # Disable slack_sdk's internal auto-reconnect. AsyncSocketModeHandler does
++        # not forward auto_reconnect_enabled, so it defaults to True and slack_sdk
++        # retries a dead aiohttp session forever ("Session is closed"). That loop
++        # both (a) floods the logs and (b) makes close_async() hang — which on
++        # 2026-06-24 was awaited inside _socket_reconnect_lock, deadlocking the
++        # lock and blinding this adapter's watchdog for 3.5h. With it off, a
++        # dropped socket surfaces deterministically (is_connected()->False) and
++        # the watchdog owns reconnection by building a fresh handler/session.
++        _client = getattr(self._handler, "client", None)
++        if _client is not None:
++            try:
++                _client.auto_reconnect_enabled = False
++                _client.default_auto_reconnect_enabled = False
++            except Exception:  # pragma: no cover - defensive
++                logger.debug(
++                    "[Slack] Could not disable internal auto-reconnect",
++                    exc_info=True,
++                )
++
+         task = asyncio.create_task(self._handler.start_async())
+         self._socket_mode_task = task
+         task.add_done_callback(self._on_socket_mode_task_done)
+@@ -510,7 +604,16 @@ class SlackAdapter(BasePlatformAdapter):
+ 
+         if handler is not None:
+             try:
+-                await handler.close_async()
++                # HERMES-PATCH 22: slack-close-timeout (2026-06-24) — close_async()
++                # can hang on a broken/closed session. Because this runs inside
++                # _socket_reconnect_lock, an unbounded hang holds the lock forever
++                # and permanently blinds the watchdog (observed 2026-06-24). Bound
++                # it so a hang can never freeze self-healing again.
++                await asyncio.wait_for(handler.close_async(), timeout=10)
++            except asyncio.TimeoutError:
++                logger.warning(
++                    "[Slack] close_async() timed out after 10s; abandoning handler"
++                )
+             except Exception as e:  # pragma: no cover - defensive logging
+                 logger.warning(
+                     "[Slack] Error while closing Socket Mode handler: %s",
+@@ -521,8 +624,8 @@ class SlackAdapter(BasePlatformAdapter):
+         if task is not None and not task.done():
+             task.cancel()
+             try:
+-                await task
+-            except asyncio.CancelledError:
++                await asyncio.wait_for(task, timeout=10)
++            except (asyncio.CancelledError, asyncio.TimeoutError):
+                 pass
+             except Exception:  # pragma: no cover - defensive logging
+                 logger.debug(
+@@ -2823,6 +2926,55 @@ class SlackAdapter(BasePlatformAdapter):
+         event_thread_ts = event.get("thread_ts")
+         is_thread_reply = bool(event_thread_ts and event_thread_ts != ts)
+ 
++        # HERMES-PATCH 05: slack-decision-thread-hook
++        # Slack-thread-per-decision round-trip. If this is a reply in a thread that
++        # the SLA sweep anchored as a decision thread for a ClickUp task, convert
++        # the reply into an OPERATOR ClickUp comment (the signal the existing resume
++        # loop consumes) and SUPPRESS the generic agent wake for this message.
++        # Wrapped so any failure falls through to normal handling — never breaks the
++        # gateway. Runs BEFORE channel gating / agent dispatch.
++        if is_thread_reply:
++            try:
++                # Skip our own / bot posts (don't act on Hermes's own thread
++                # messages — the top-of-handler bot filter covers bot_id/subtype;
++                # this also guards the bot's own user id).
++                _is_own = bool(
++                    (event.get("bot_id"))
++                    or (event.get("subtype") == "bot_message")
++                    or (user_id and bot_uid and user_id == bot_uid)
++                )
++                if not _is_own:
++                    _dtid = _match_decision_thread(channel_id, event_thread_ts)
++                    if _dtid:
++                        _reply = (text or original_text or "").strip()
++                        if _reply:
++                            _ok = await _post_clickup_operator_comment(_dtid, _reply)
++                            if _ok:
++                                try:
++                                    await self.send(
++                                        chat_id=channel_id,
++                                        content=(
++                                            "Got it — recorded your decision on the "
++                                            "task; Hermes will apply it on the next poll."
++                                        ),
++                                        metadata={"thread_ts": event_thread_ts},
++                                    )
++                                except Exception:  # ack is best-effort
++                                    pass
++                                logger.info(
++                                    "[Slack][decision-hook] recorded operator reply on task %s "
++                                    "(thread %s); suppressing agent wake", _dtid, event_thread_ts,
++                                )
++                                # Suppress the generic agent run for this message.
++                                return
++                            else:
++                                logger.warning(
++                                    "[Slack][decision-hook] failed to record reply on task %s; "
++                                    "falling through to normal handling", _dtid,
++                                )
++            except Exception as e:  # pragma: no cover - defensive
++                logger.warning("[Slack][decision-hook] error (falling through): %s", e)
++
+         if not is_dm and bot_uid:
+             # Check allowed channels — if set, only respond in these channels (whitelist)
+             allowed_channels = self._slack_allowed_channels()
+diff --git a/run_agent.py b/run_agent.py
+index aaafd469a8..547badd087 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -4301,6 +4301,31 @@ class AIAgent:
+         if "azure.com" in _base:
+             return False
+ 
++        # Credential-pool guard (subscription→api-key overflow failover).
++        # This per-create refresh resolves the *default* Anthropic token via
++        # resolve_anthropic_token(), which is the OAuth subscription token —
++        # it has no awareness of the credential pool. When the pool has rotated
++        # to the static ``sk-ant-api*`` fallback (added for the "out of extra
++        # usage" overflow path), rebuilding the client with the default OAuth
++        # token here silently REVERTS the rotation back to the exhausted
++        # subscription. Every retry then re-hits "out of extra usage" and the
++        # pool mis-marks the *good* api-key as exhausted, poisoning the whole
++        # pool until nothing is left ("no available entries" → hard 400). Static
++        # api-keys never need OAuth refresh, so when the active pool credential
++        # is non-OAuth, leave the swapped client untouched. OAuth-current
++        # entries fall through to the normal refresh below (token rotation
++        # still works for the subscription path).
++        pool = getattr(self, "_credential_pool", None)
++        if pool is not None:
++            try:
++                from agent.credential_pool import AUTH_TYPE_OAUTH
++                _current = pool.current()
++            except Exception:
++                _current = None
++                AUTH_TYPE_OAUTH = "oauth"
++            if _current is not None and getattr(_current, "auth_type", None) != AUTH_TYPE_OAUTH:
++                return False
++
+         try:
+             from agent.anthropic_adapter import resolve_anthropic_token, build_anthropic_client
+ 
+diff --git a/tools/skill_manager_tool.py b/tools/skill_manager_tool.py
+index 2d7d9fa9ab..83913b3a47 100644
+--- a/tools/skill_manager_tool.py
++++ b/tools/skill_manager_tool.py
+@@ -867,6 +867,28 @@ def _edit_skill(name: str, content: str) -> Dict[str, Any]:
+ 
+     # Back up original content for rollback
+     original_content = skill_md.read_text(encoding="utf-8") if skill_md.exists() else None
++
++    # Stub-corruption guard (added 2026-06-15): refuse replacing a substantial
++    # SKILL.md body with a near-empty stub. An over-eager skill-update step
++    # (agent/background_review "update the skill library, be ACTIVE") once
++    # clobbered a 100K body with a stub, taking the executor's instructions
++    # offline. A full `edit` is meant to evolve content, not destroy it; legit
++    # slim-downs that move detail into references/ keep a meaningful body, so
++    # this only trips on an extreme shrink-to-stub — not on normal refactors.
++    if original_content is not None:
++        def _skill_body_len(c: str) -> int:
++            m = re.search(r'\n---\s*\n', c[3:]) if c.startswith("---") else None
++            return len((c[m.end() + 3:] if m else c).strip())
++        _old_len, _new_len = _skill_body_len(original_content), _skill_body_len(content)
++        if _old_len > 5000 and _new_len < 800:
++            return {"success": False, "error": (
++                f"Refusing to replace SKILL.md body ({_old_len:,} chars) with a stub "
++                f"({_new_len:,} chars) — this looks like accidental corruption, not an "
++                f"intentional edit. If you mean to slim it, keep a meaningful body and move "
++                f"detail into references/ via write_file; use action='patch' for targeted "
++                f"changes. (skill_manage stub-guard)"
++            )}
++
+     _atomic_write_text(skill_md, content)
+ 
+     # Security scan — roll back on block
+diff --git a/tools/tirith_security.py b/tools/tirith_security.py
+index 9350960413..46ae384574 100644
+--- a/tools/tirith_security.py
++++ b/tools/tirith_security.py
+@@ -793,6 +793,37 @@ def check_command_security(command: str) -> dict:
+         if fail_open:
+             return {"action": "allow", "findings": [], "summary": f"tirith unavailable: {exc}"}
+         return {"action": "block", "findings": [], "summary": f"tirith spawn failed (fail-closed): {exc}"}
++    except ValueError as exc:
++        # HERMES-PATCH: tirith-nul-byte-block (2026-06-24)
++        # subprocess.run raises ValueError("embedded null byte") at argv
++        # construction when ``command`` contains a NUL — *before* spawning,
++        # so neither OSError nor TimeoutExpired catches it and the exception
++        # propagates out of the guard (observed 17x in gateway.error.log).
++        # A NUL byte in a command is a scanner-evasion signal AND the command
++        # is non-executable by any shell anyway, so we ALWAYS block it,
++        # independent of fail_open — allowing it would let an un-scanned,
++        # malformed command reach execution.
++        _warn_once(
++            f"tirith_argv_valueerror:{type(exc).__name__}",
++            "tirith could not scan command (argv error, blocking): %s",
++            exc,
++        )
++        return {
++            "action": "block",
++            "findings": [{
++                "rule_id": "malformed_command_unscannable",
++                "severity": "HIGH",
++                "title": "Command contains a NUL/control byte and cannot be scanned",
++                "description": (
++                    "The command string contains an embedded null byte (or "
++                    "similar argv-invalid content) that prevents the security "
++                    "scanner from inspecting it. Such commands are non-executable "
++                    "and may indicate scanner-evasion; blocking unconditionally."
++                ),
++                "evidence": [],
++            }],
++            "summary": f"command unscannable, blocked ({exc})",
++        }
+     except subprocess.TimeoutExpired:
+         _warn_once(
+             f"tirith_timeout:{timeout}",

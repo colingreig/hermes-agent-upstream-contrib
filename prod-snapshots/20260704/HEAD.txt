@@ -1,0 +1,1 @@
+42bc07d107cf9f932acc5a00c20aafc003737241 2026-07-03 01:32:27 -0500 fix(desktop): cancel downloads triggered by link-title fetch window

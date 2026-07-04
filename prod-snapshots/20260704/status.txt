@@ -1,0 +1,21 @@
+M  agent/agent_runtime_helpers.py
+ M agent/background_review.py
+ M agent/error_classifier.py
+UU cron/scheduler.py
+ M hermes_cli/config.py
+M  hermes_cli/proxy/adapters/__init__.py
+M  hermes_cli/proxy/adapters/base.py
+A  hermes_cli/proxy/adapters/openai_codex.py
+M  hermes_cli/proxy/server.py
+ M plugins/platforms/slack/adapter.py
+ M run_agent.py
+M  tools/skill_manager_tool.py
+ M tools/tirith_security.py
+?? agent/agent_runtime_helpers.py.bak-gemini-key-20260625
+?? agent/background_review.py.bak-s4-20260623-215121
+?? agent/error_classifier.py.bak-overflowpatch
+?? cron/scheduler.py.bak-partialstatus-jobmaxturns
+?? gateway/platforms/slack.py.bak-20260619
+?? run_agent.py.bak-failover-clobberfix
+?? tools/skill_manager_tool.py.bak-s4-20260623-215121
+?? tools/tirith_security.py.bak-tirith-nulbyte-20260624
