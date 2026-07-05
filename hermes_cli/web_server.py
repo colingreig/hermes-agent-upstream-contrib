@@ -737,6 +737,10 @@ _CATEGORY_MERGE: Dict[str, str] = {
     # field — fold it into the agent tab rather than spawning a one-field
     # orphan category.
     "computer_use": "agent",
+    # `spend_caps.anthropic` is the only schema-surfaced spend_caps field —
+    # fold it into the agent tab rather than spawning a one-field orphan
+    # category.
+    "spend_caps": "agent",
 }
 
 # Display order for tabs — unlisted categories sort alphabetically after these.
