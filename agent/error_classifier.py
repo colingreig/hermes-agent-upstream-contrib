@@ -380,6 +380,12 @@ _AUTH_PATTERNS = [
     "token expired",
     "token revoked",
     "access denied",
+    # Gemini's native wording for a bad key: {"error":{"code":400,"status":
+    # "INVALID_ARGUMENT","message":"API key not valid. Please pass a valid
+    # API key."}} — reversed word order vs "invalid api key" above, so it
+    # needs its own pattern (see 86e261t1y: this 400 was falling through to
+    # a hard format_error and never rotating the credential pool).
+    "api key not valid",
 ]
 
 # Anthropic thinking block signature patterns
@@ -1153,6 +1159,20 @@ def _classify_400(
     if any(p in error_msg for p in _BILLING_PATTERNS):
         return result_fn(
             FailoverReason.billing,
+            retryable=False,
+            should_rotate_credential=True,
+            should_fallback=True,
+        )
+
+    # Some providers (notably Gemini's "API key not valid") return an
+    # invalid-credential error as a 400 instead of 401 — this dedicated 400
+    # handler never checked _AUTH_PATTERNS, so it fell all the way through
+    # to the generic format_error below, which never rotates the pool.
+    # Result: a dead key gets retried forever instead of failing over to
+    # the next pool entry / fallback chain link (see 86e261t1y).
+    if any(p in error_msg for p in _AUTH_PATTERNS):
+        return result_fn(
+            FailoverReason.auth,
             retryable=False,
             should_rotate_credential=True,
             should_fallback=True,

@@ -698,6 +698,30 @@ class TestClassifyApiError:
         result = classify_api_error(e, approx_tokens=1000, context_length=200000)
         assert result.reason == FailoverReason.format_error
 
+    def test_400_gemini_api_key_not_valid_is_auth_and_rotates(self):
+        """Gemini's invalid-key 400 (INVALID_ARGUMENT) must rotate the pool.
+
+        Regression for 86e261t1y: this 400 previously fell through
+        _classify_400's dedicated handler (which never checked
+        _AUTH_PATTERNS) all the way to a hard format_error with no
+        credential rotation, so a dead Gemini key was retried forever
+        instead of failing over to the next pool entry.
+        """
+        e = MockAPIError(
+            "API key not valid. Please pass a valid API key.",
+            status_code=400,
+            body={"error": {
+                "code": 400,
+                "status": "INVALID_ARGUMENT",
+                "message": "API key not valid. Please pass a valid API key.",
+            }},
+        )
+        result = classify_api_error(e)
+        assert result.reason == FailoverReason.auth
+        assert result.should_rotate_credential is True
+        assert result.should_fallback is True
+        assert result.retryable is False
+
     def test_400_generic_many_messages_below_large_context_pressure_is_format_error(self):
         """Large-context sessions should not overflow solely due to message count."""
         e = MockAPIError(
