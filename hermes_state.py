@@ -2698,6 +2698,45 @@ class SessionDB:
             for r in rows
         ]
 
+    def get_daily_provider_spend(self, day: str) -> Dict[str, float]:
+        """Sum session cost by billing_provider for a given UTC calendar day.
+
+        ``day`` is a ``'YYYY-MM-DD'`` string. Falls back to estimated_cost_usd
+        when actual_cost_usd hasn't landed yet (matches update_token_counts'
+        own COALESCE convention). Used by check_daily_spend_alerts to catch
+        quota-driven fallback burn (see 86e260vnu — a GLM quota exhaustion
+        silently pushed spend onto the most expensive Gemini fallback tail
+        for days before anyone noticed).
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT billing_provider, SUM(COALESCE(actual_cost_usd, estimated_cost_usd, 0)) AS spend "
+                "FROM sessions WHERE date(started_at, 'unixepoch') = ? "
+                "GROUP BY billing_provider",
+                (day,),
+            ).fetchall()
+        return {
+            (r["billing_provider"] or "unknown"): float(r["spend"] or 0)
+            for r in rows
+        }
+
+    def check_daily_spend_alerts(
+        self, day: str, threshold_usd: float = 10.0
+    ) -> List[Dict[str, Any]]:
+        """Return providers whose spend on ``day`` exceeds ``threshold_usd``.
+
+        Each entry is ``{"provider": str, "spend_usd": float, "threshold_usd": float}``.
+        Callers (cron/dashboard) decide how to surface this — email, Slack,
+        ClickUp comment. Passing a lower threshold_usd is the "forced test
+        threshold" path for verifying the alert actually fires.
+        """
+        spend = self.get_daily_provider_spend(day)
+        return [
+            {"provider": provider, "spend_usd": total, "threshold_usd": threshold_usd}
+            for provider, total in spend.items()
+            if total > threshold_usd
+        ]
+
     def list_sessions_rich(
         self,
         source: str = None,

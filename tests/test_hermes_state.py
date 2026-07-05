@@ -2,6 +2,7 @@
 
 import sqlite3
 import time
+from datetime import datetime, timezone
 import pytest
 
 import hermes_state
@@ -1757,6 +1758,65 @@ class TestCounts:
         db.append_message("s2", role="user", content="C")
         assert db.message_count(session_id="s1") == 1
         assert db.message_count(session_id="s2") == 2
+
+
+# =========================================================================
+# Per-provider daily spend (86e260vnu)
+# =========================================================================
+
+class TestProviderSpend:
+    def _seed_session(self, db, session_id, provider, day, cost, use_actual=True):
+        db.create_session(session_id=session_id, source="cli")
+        kwargs = {"absolute": True}
+        if use_actual:
+            kwargs["actual_cost_usd"] = cost
+        else:
+            kwargs["estimated_cost_usd"] = cost
+        db.update_token_counts(session_id, **kwargs)
+        db.update_session_billing_route(session_id, provider=provider, base_url="https://example.test")
+        epoch = datetime.fromisoformat(day).replace(tzinfo=timezone.utc).timestamp()
+        with db._lock:
+            db._conn.execute(
+                "UPDATE sessions SET started_at = ? WHERE id = ?", (epoch, session_id)
+            )
+            db._conn.commit()
+
+    def test_get_daily_provider_spend_groups_and_sums(self, db):
+        self._seed_session(db, "s1", "gemini-3.1-pro", "2026-07-04", 3.5)
+        self._seed_session(db, "s2", "gemini-3.1-pro", "2026-07-04", 2.5)
+        self._seed_session(db, "s3", "glm", "2026-07-04", 1.0)
+        self._seed_session(db, "s4", "gemini-3.1-pro", "2026-07-03", 100.0)  # different day, excluded
+
+        spend = db.get_daily_provider_spend("2026-07-04")
+        assert spend["gemini-3.1-pro"] == pytest.approx(6.0)
+        assert spend["glm"] == pytest.approx(1.0)
+        assert "2026-07-03" not in spend
+
+    def test_get_daily_provider_spend_falls_back_to_estimated(self, db):
+        self._seed_session(db, "s1", "gemini-3.5-flash", "2026-07-04", 4.2, use_actual=False)
+        spend = db.get_daily_provider_spend("2026-07-04")
+        assert spend["gemini-3.5-flash"] == pytest.approx(4.2)
+
+    def test_check_daily_spend_alerts_fires_over_threshold(self, db):
+        self._seed_session(db, "s1", "gemini-3.1-pro", "2026-07-04", 12.0)
+        self._seed_session(db, "s2", "glm", "2026-07-04", 3.0)
+
+        alerts = db.check_daily_spend_alerts("2026-07-04", threshold_usd=10.0)
+        assert len(alerts) == 1
+        assert alerts[0]["provider"] == "gemini-3.1-pro"
+        assert alerts[0]["spend_usd"] == pytest.approx(12.0)
+        assert alerts[0]["threshold_usd"] == 10.0
+
+    def test_check_daily_spend_alerts_forced_low_threshold(self, db):
+        """A forced low threshold is the mechanism for proving the alert fires."""
+        self._seed_session(db, "s1", "minimax-m3", "2026-07-04", 0.50)
+        assert db.check_daily_spend_alerts("2026-07-04", threshold_usd=10.0) == []
+        alerts = db.check_daily_spend_alerts("2026-07-04", threshold_usd=0.10)
+        assert len(alerts) == 1
+        assert alerts[0]["provider"] == "minimax-m3"
+
+    def test_check_daily_spend_alerts_empty_day(self, db):
+        assert db.check_daily_spend_alerts("2026-07-04") == []
 
 
 # =========================================================================
