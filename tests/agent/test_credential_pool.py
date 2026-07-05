@@ -379,6 +379,63 @@ def test_mark_exhausted_and_rotate_persists_status(tmp_path, monkeypatch):
     assert persisted["last_error_code"] == 402
 
 
+def test_zai_weekly_quota_429_parses_absolute_reset_timestamp(tmp_path, monkeypatch):
+    """Z.AI's weekly/monthly quota 429 states an exact reset time as free
+    text (code 1310) rather than a structured field: "Weekly/Monthly Limit
+    Exhausted. Your limit will reset at 2026-07-09 12:37:24". Regression
+    for 86e261t21: this format wasn't recognized by any existing pattern,
+    so last_error_reset_at stayed null and _exhausted_ttl() fell back to a
+    flat 1h TTL — every fresh cron process re-probed the dead primary for
+    the whole multi-day exhaustion window instead of waiting for the real
+    reset time.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "zai": [
+                    {
+                        "id": "cred-glm",
+                        "label": "GLM_API_KEY",
+                        "auth_type": "api_key",
+                        "priority": 0,
+                        "source": "manual",
+                        "access_token": "zai-key",
+                    },
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("zai")
+    pool.mark_exhausted_and_rotate(
+        status_code=429,
+        error_context={
+            "reason": "1310",
+            "message": (
+                "Weekly/Monthly Limit Exhausted. Your limit will reset at "
+                "2026-07-09 12:37:24"
+            ),
+        },
+    )
+
+    auth_payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    persisted = auth_payload["credential_pool"]["zai"][0]
+    assert persisted["last_status"] == "exhausted"
+    expected = datetime(2026, 7, 9, 12, 37, 24, tzinfo=timezone.utc).timestamp()
+    assert persisted["last_error_reset_at"] == pytest.approx(expected)
+
+    # The pool must stay exhausted at "now" even though a flat 1h TTL would
+    # have already expired — this is the actual behavioral fix, not just
+    # the parsed value.
+    reloaded = load_pool("zai")
+    assert reloaded.select() is None
+
+
 def test_token_invalidated_marks_credential_dead(tmp_path, monkeypatch):
     """OpenAI Codex token_invalidated must mark the credential DEAD, not exhausted.
 

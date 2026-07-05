@@ -1147,6 +1147,31 @@ def restore_primary_runtime(agent) -> bool:
     if getattr(agent, "_rate_limited_until", 0) > time.monotonic():
         return False  # primary still in rate-limit cooldown, stay on fallback
 
+    # Respect the credential pool's exhaustion state (last_error_reset_at)
+    # instead of blindly restoring + live-probing the primary every turn.
+    # _rate_limited_until above is per-AIAgent-instance and resets to 0 on
+    # every fresh process — but a cron tick spins up a brand-new instance
+    # each run, so without this check a primary the pool already knows is
+    # exhausted for days (e.g. a weekly quota window) gets re-probed on
+    # every single tick, burning a wasted API call + retry latency each
+    # time until the quota naturally resets (86e261t21).
+    primary_provider = ((agent._primary_runtime or {}).get("provider") or "").strip().lower()
+    if primary_provider:
+        try:
+            from agent.credential_pool import load_pool, _exhausted_until
+
+            pool = load_pool(primary_provider)
+            entry = (pool.current() or pool.peek()) if pool else None
+            if entry is not None and entry.last_status == STATUS_EXHAUSTED:
+                exhausted_until = _exhausted_until(entry)
+                if exhausted_until is not None and time.time() < exhausted_until:
+                    return False  # pool says primary is still exhausted — stay on fallback
+        except Exception as _pool_exc:  # noqa: BLE001
+            logger.debug(
+                "restore_primary_runtime: pool exhaustion check failed for %s (%s); "
+                "proceeding with restore", primary_provider, _pool_exc,
+            )
+
     rt = agent._primary_runtime
     try:
         # ── Core runtime state ──

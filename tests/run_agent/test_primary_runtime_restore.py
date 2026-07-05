@@ -699,3 +699,105 @@ class TestRateLimitCooldown:
 
         # second call should not have extended the cooldown
         assert second_cooldown == first_cooldown
+
+
+# =============================================================================
+# Credential-pool exhaustion gate (86e261t21)
+# =============================================================================
+
+class TestPoolExhaustionGate:
+    """Verify _restore_primary_runtime() respects credential-pool exhaustion
+    (last_error_reset_at) instead of blindly rebuilding the primary client
+    and re-probing it live every turn.
+
+    Regression: _rate_limited_until (TestRateLimitCooldown above) is a
+    per-AIAgent-instance in-memory cooldown that resets to 0 on every fresh
+    process. A cron tick spins up a brand-new AIAgent each run, so without
+    this gate a primary the pool already knows is exhausted for days (e.g.
+    a weekly quota window) gets restored + probed on every single tick.
+    """
+
+    def test_restore_blocked_while_pool_reports_primary_exhausted(self):
+        from agent.credential_pool import STATUS_EXHAUSTED
+
+        agent = _make_agent(
+            provider="zai",
+            fallback_model={"provider": "openrouter", "model": "anthropic/claude-sonnet-4"},
+        )
+        mock_client = _mock_resolve()
+        with patch("agent.auxiliary_client.resolve_provider_client", return_value=(mock_client, None)):
+            agent._try_activate_fallback()
+        assert agent._fallback_activated is True
+
+        class _ExhaustedEntry:
+            last_status = STATUS_EXHAUSTED
+            last_error_reset_at = time.time() + 3600  # far in the future
+            last_status_at = time.time()
+            last_error_code = 429
+
+        class _Pool:
+            def current(self):
+                return None
+
+            def peek(self):
+                return _ExhaustedEntry()
+
+        with patch("agent.credential_pool.load_pool", return_value=_Pool()):
+            result = agent._restore_primary_runtime()
+
+        assert result is False
+        assert agent._fallback_activated is True  # stayed on fallback, no live re-probe
+
+    def test_restore_allowed_once_pool_reset_at_has_passed(self):
+        from agent.credential_pool import STATUS_EXHAUSTED
+
+        agent = _make_agent(
+            provider="zai",
+            fallback_model={"provider": "openrouter", "model": "anthropic/claude-sonnet-4"},
+        )
+        mock_client = _mock_resolve()
+        with patch("agent.auxiliary_client.resolve_provider_client", return_value=(mock_client, None)):
+            agent._try_activate_fallback()
+        assert agent._fallback_activated is True
+
+        class _RecoveredEntry:
+            last_status = STATUS_EXHAUSTED
+            last_error_reset_at = time.time() - 10  # already passed
+            last_status_at = time.time() - 3600
+            last_error_code = 429
+
+        class _Pool:
+            def current(self):
+                return None
+
+            def peek(self):
+                return _RecoveredEntry()
+
+        with (
+            patch("agent.credential_pool.load_pool", return_value=_Pool()),
+            patch("run_agent.OpenAI", return_value=MagicMock()),
+        ):
+            result = agent._restore_primary_runtime()
+
+        assert result is True
+        assert agent._fallback_activated is False
+
+    def test_restore_proceeds_when_pool_lookup_raises(self):
+        """A pool-lookup failure must not wedge the session on fallback forever."""
+        agent = _make_agent(
+            provider="zai",
+            fallback_model={"provider": "openrouter", "model": "anthropic/claude-sonnet-4"},
+        )
+        mock_client = _mock_resolve()
+        with patch("agent.auxiliary_client.resolve_provider_client", return_value=(mock_client, None)):
+            agent._try_activate_fallback()
+        assert agent._fallback_activated is True
+
+        with (
+            patch("agent.credential_pool.load_pool", side_effect=RuntimeError("boom")),
+            patch("run_agent.OpenAI", return_value=MagicMock()),
+        ):
+            result = agent._restore_primary_runtime()
+
+        assert result is True
+        assert agent._fallback_activated is False

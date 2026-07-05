@@ -310,6 +310,33 @@ def _extract_retry_delay_seconds(message: str) -> Optional[float]:
     return None
 
 
+def _extract_absolute_reset_at(message: str) -> Optional[float]:
+    """Parse an absolute reset timestamp embedded in a provider error message.
+
+    Z.AI's weekly/monthly quota 429 (code 1310) states the exact reset time
+    as free text instead of a structured field: "Weekly/Monthly Limit
+    Exhausted. Your limit will reset at 2026-07-09 12:37:24" — no timezone
+    marker.  Treated as UTC: even if the account's actual reset time is a
+    few hours off from that assumption, it is a large improvement over the
+    prior behavior (a flat 1h TTL that re-probed the dead primary on every
+    fresh cron process for the full multi-day exhaustion window — 86e261t21).
+    """
+    if not message:
+        return None
+    match = re.search(
+        r"reset\s+at\s+(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2})",
+        message,
+        re.IGNORECASE,
+    )
+    if not match:
+        return None
+    try:
+        naive = datetime.fromisoformat(match.group(1).replace(" ", "T"))
+        return naive.replace(tzinfo=timezone.utc).timestamp()
+    except ValueError:
+        return None
+
+
 def _normalize_error_context(error_context: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     if not isinstance(error_context, dict):
         return {}
@@ -326,6 +353,8 @@ def _normalize_error_context(error_context: Optional[Dict[str, Any]]) -> Dict[st
         or error_context.get("retry_until")
     )
     parsed_reset_at = _parse_absolute_timestamp(reset_at)
+    if parsed_reset_at is None and isinstance(message, str):
+        parsed_reset_at = _extract_absolute_reset_at(message)
     if parsed_reset_at is None and isinstance(message, str):
         retry_delay_seconds = _extract_retry_delay_seconds(message)
         if retry_delay_seconds is not None:

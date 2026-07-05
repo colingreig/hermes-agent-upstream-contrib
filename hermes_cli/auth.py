@@ -588,18 +588,45 @@ def _resolve_api_key_provider_secret(
             return val, env_var
 
     # Fallback: try credential pool (e.g. zai key stored via auth.json)
+    #
+    # Instrumented per 86e261t1y: this provider's env vars were empty and
+    # the pool fallback ALSO intermittently came back empty (~50% of
+    # resolve_provider_client calls for minimax), with no trace of why —
+    # the bare `except Exception: pass` below silently ate whatever error
+    # explained it. Every non-success branch now logs its specific reason
+    # so the next occurrence is diagnosable instead of a silent "provider
+    # not configured".
     try:
         from agent.credential_pool import load_pool
         pool = load_pool(provider_id)
-        if pool and pool.has_credentials():
-            entry = pool.peek()
-            if entry:
-                key = getattr(entry, "access_token", "") or getattr(entry, "runtime_api_key", "")
-                key = str(key).strip()
-                if has_usable_secret(key):
-                    return key, f"credential_pool:{provider_id}"
-    except Exception:
-        pass
+        if not pool:
+            logger.debug(
+                "resolve_api_key_provider_secret: %s has no credential pool", provider_id)
+            return "", ""
+        if not pool.has_credentials():
+            logger.debug(
+                "resolve_api_key_provider_secret: %s pool loaded but has zero entries",
+                provider_id)
+            return "", ""
+        entry = pool.peek()
+        if not entry:
+            logger.warning(
+                "resolve_api_key_provider_secret: %s pool has credentials but "
+                "peek() returned none (all entries exhausted/dead?)", provider_id)
+            return "", ""
+        key = getattr(entry, "access_token", "") or getattr(entry, "runtime_api_key", "")
+        key = str(key).strip()
+        if not has_usable_secret(key):
+            logger.warning(
+                "resolve_api_key_provider_secret: %s pool entry %s has no usable "
+                "secret (empty/placeholder access_token and runtime_api_key)",
+                provider_id, getattr(entry, "id", "?"))
+            return "", ""
+        return key, f"credential_pool:{provider_id}"
+    except Exception as exc:
+        logger.warning(
+            "resolve_api_key_provider_secret: %s credential pool lookup raised "
+            "%s: %s", provider_id, type(exc).__name__, exc)
 
     return "", ""
 
