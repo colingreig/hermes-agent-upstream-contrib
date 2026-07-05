@@ -5,8 +5,10 @@ the new list-based ``fallback_providers`` config format and chain
 advancement through multiple providers.
 """
 
+import logging
 from unittest.mock import MagicMock, patch
 
+from agent.error_classifier import FailoverReason
 from run_agent import AIAgent, _pool_may_recover_from_rate_limit
 
 
@@ -102,6 +104,38 @@ class TestFallbackChainAdvancement:
             assert agent._fallback_index == 1
             assert agent.model == "gpt-4o"
             assert agent._fallback_activated is True
+
+    def test_rate_limit_advance_emits_quota_receipt(self, caplog):
+        """86e260vnu: a quota-driven advance must log a visible 'fallback: X
+        quota exhausted, serving via Y' receipt so spend-driving fallthroughs
+        aren't only noticed later as an unexplained cost spike."""
+        fbs = [{"provider": "zai", "model": "glm-4.7"}]
+        agent = _make_agent(fallback_model=fbs)
+        agent.provider = "zai"
+        agent.model = "glm-5.2"
+        with (
+            caplog.at_level(logging.INFO, logger="agent.chat_completion_helpers"),
+            patch("agent.auxiliary_client.resolve_provider_client",
+                  return_value=(_mock_client(), "glm-4.7")),
+        ):
+            assert agent._try_activate_fallback(reason=FailoverReason.rate_limit) is True
+        assert any(
+            "quota exhausted, serving via zai/glm-4.7" in r.message
+            for r in caplog.records
+        )
+
+    def test_non_quota_advance_does_not_emit_receipt(self, caplog):
+        """A non-quota failure (e.g. transport error) shouldn't log a quota
+        receipt — only rate_limit/billing/upstream_rate_limit advances should."""
+        fbs = [{"provider": "zai", "model": "glm-4.7"}]
+        agent = _make_agent(fallback_model=fbs)
+        with (
+            caplog.at_level(logging.INFO, logger="agent.chat_completion_helpers"),
+            patch("agent.auxiliary_client.resolve_provider_client",
+                  return_value=(_mock_client(), "glm-4.7")),
+        ):
+            assert agent._try_activate_fallback(reason=None) is True
+        assert not any("quota exhausted" in r.message for r in caplog.records)
 
     def test_second_fallback_works(self):
         fbs = [

@@ -1219,6 +1219,18 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         return agent._try_activate_fallback(reason)
     fb_provider = (fb.get("provider") or "").strip().lower()
     fb_model = (fb.get("model") or "").strip()
+    if reason in {FailoverReason.rate_limit, FailoverReason.billing, FailoverReason.upstream_rate_limit}:
+        # Visible receipt for quota-driven spend: makes it obvious in real time
+        # when a cascade falls through to a more expensive fallback tail
+        # because the primary is quota-exhausted, rather than only surfacing
+        # as an unexplained cost spike later (see 86e260vnu).
+        logger.info(
+            "fallback: %s/%s quota exhausted, serving via %s/%s",
+            (getattr(agent, "provider", "") or "").strip().lower(),
+            getattr(agent, "model", "") or "",
+            fb_provider,
+            fb_model,
+        )
     if not fb_provider or not fb_model:
         return agent._try_activate_fallback(reason)  # skip invalid, try next
 
