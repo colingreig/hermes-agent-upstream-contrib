@@ -5,13 +5,21 @@ from __future__ import annotations
 import logging
 import os
 import re
+import time
 from urllib.parse import urlparse
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
 from hermes_cli import auth as auth_mod
-from agent.credential_pool import CredentialPool, PooledCredential, get_custom_provider_pool_key, load_pool
+from agent.credential_pool import (
+    STATUS_EXHAUSTED,
+    CredentialPool,
+    PooledCredential,
+    _exhausted_until,
+    get_custom_provider_pool_key,
+    load_pool,
+)
 from agent.secret_scope import get_secret as _get_secret
 from hermes_cli.auth import (
     AuthError,
@@ -1740,6 +1748,33 @@ def resolve_runtime_provider(
                 pool=pool,
                 target_model=target_model,
             )
+
+        # pool.select() gave nothing usable (entry is None, or a Nous
+        # agent_key never became usable). Before falling through to the
+        # generic per-provider resolution below — which for api_key
+        # providers reads straight from env/dotenv/secret storage with zero
+        # awareness of pool exhaustion state — check whether the reason
+        # select() came up empty is that the pool's only/current entry is
+        # still inside its exhaustion cooldown. If so, this provider truly
+        # has no usable credentials right now; raise the same signal a
+        # legitimately-exhausted pool already produces elsewhere in this
+        # function (AuthError), so the caller's fallback-chain logic
+        # engages instead of live-probing the exhausted key on every fresh
+        # process (86e261t21 — restore_primary_runtime() only guards the
+        # mid-session re-restore path, which is a no-op on turn 1 of a
+        # fresh process).
+        if entry is None:
+            peeked = pool.current() or pool.peek()
+            if peeked is not None and peeked.last_status == STATUS_EXHAUSTED:
+                exhausted_until = _exhausted_until(peeked)
+                if exhausted_until is not None and time.time() < exhausted_until:
+                    raise AuthError(
+                        f"Credential pool for '{provider}' has no usable "
+                        "entries right now (exhausted, cooling down until "
+                        f"{exhausted_until}).",
+                        provider=provider,
+                        code="pool_exhausted",
+                    )
 
     if provider == "nous":
         try:

@@ -230,6 +230,66 @@ def test_resolve_runtime_provider_falls_back_when_pool_empty(monkeypatch):
     assert resolved.get("credential_pool") is None
 
 
+def test_resolve_runtime_provider_zai_pool_exhausted_does_not_hammer_env_key(monkeypatch):
+    """Regression for 86e261t21: a fresh process's FIRST request for an
+    api_key-type provider (e.g. zai) whose only pool entry is currently
+    exhausted must not fall through to resolve_api_key_provider_credentials()
+    and fire a live probe against the still-cooling-down key.
+
+    restore_primary_runtime() only guards the mid-session re-restore path
+    (gated on agent._fallback_activated, which starts False on turn 1), so
+    it's a no-op here — this is the fix that actually closes the gap for a
+    brand-new process's first attempt.
+    """
+    from agent.credential_pool import STATUS_EXHAUSTED, PooledCredential
+
+    exhausted_entry = PooledCredential(
+        provider="zai",
+        id="cred-glm",
+        label="GLM_API_KEY",
+        auth_type="api_key",
+        priority=0,
+        source="manual",
+        access_token="zai-key",
+        last_status=STATUS_EXHAUSTED,
+        last_status_at=time.time(),
+        last_error_code=429,
+        # Reset far in the future — mirrors the Z.AI weekly-quota absolute
+        # reset timestamp parsed in test_credential_pool.py.
+        last_error_reset_at=time.time() + 6 * 24 * 3600,
+    )
+
+    class _ExhaustedPool:
+        def has_credentials(self):
+            return True
+
+        def select(self):
+            # A real CredentialPool.select() returns None here: the only
+            # entry is still inside its exhaustion cooldown.
+            return None
+
+        def current(self):
+            return None
+
+        def peek(self):
+            return exhausted_entry
+
+    def _unexpected_api_key_resolution(provider):
+        raise AssertionError(
+            f"resolve_api_key_provider_credentials should not be called for "
+            f"{provider} while its only pool entry is exhausted"
+        )
+
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "zai")
+    monkeypatch.setattr(rp, "load_pool", lambda provider: _ExhaustedPool())
+    monkeypatch.setattr(
+        rp, "resolve_api_key_provider_credentials", _unexpected_api_key_resolution
+    )
+
+    with pytest.raises(rp.AuthError):
+        rp.resolve_runtime_provider(requested="zai")
+
+
 def test_resolve_runtime_provider_codex(monkeypatch):
     monkeypatch.setattr(
         rp,
