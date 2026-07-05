@@ -1087,6 +1087,9 @@ DEFAULT_CONFIG = {
         "image_input_mode": "auto",
         "disabled_toolsets": [],
     },
+    "spend_caps": {
+        "anthropic": 5.0,
+    },
     
     "terminal": {
         "backend": "local",
