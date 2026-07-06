@@ -3331,3 +3331,93 @@ class TestDoubleCompactionSummaryRole:
             "summary of earlier turns" in (m.get("content") or "")
             for m in result
         )
+
+
+class TestOversizedSingleMessageCap:
+    """A single pathologically large tool result can, by itself, exceed the
+    context window while sitting inside the protected head/tail — neither
+    ``_prune_old_tool_results`` nor ``_find_tail_cut_by_tokens`` have a
+    per-message size limit (protect_last_n / _MAX_TAIL_MESSAGE_FLOOR only
+    bound message *count*). Without a cap, compression permanently reports
+    "no progress" no matter how aggressively the rest of the transcript is
+    summarized — the observed "Context length exceeded ... Cannot compress
+    further" failure. ``_cap_oversized_messages`` closes that gap."""
+
+    def test_cap_oversized_messages_truncates_single_giant_tool_result(self):
+        from agent.context_compressor import (
+            _cap_oversized_tool_result,
+            _MAX_SINGLE_TOOL_RESULT_CHARS,
+        )
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=200_000):
+            c = ContextCompressor(model="test/model", quiet_mode=True)
+
+        giant = "x" * (_MAX_SINGLE_TOOL_RESULT_CHARS * 3)
+        messages = [
+            {"role": "user", "content": "list all tasks"},
+            {"role": "assistant", "content": None, "tool_calls": [
+                {"id": "call_1", "function": {"name": "clickup_search", "arguments": "{}"}},
+            ]},
+            {"role": "tool", "content": giant, "tool_call_id": "call_1"},
+        ]
+
+        capped, count = c._cap_oversized_messages(messages)
+
+        assert count == 1
+        assert len(capped[2]["content"]) < len(giant)
+        assert len(capped[2]["content"]) <= _MAX_SINGLE_TOOL_RESULT_CHARS + 200
+        # Original list must not be mutated in place — callers rely on
+        # identity to cheaply detect the no-op case.
+        assert messages[2]["content"] == giant
+        assert capped[2]["content"] == _cap_oversized_tool_result(giant)
+
+    def test_cap_oversized_messages_noop_when_nothing_oversized(self):
+        with patch("agent.context_compressor.get_model_context_length", return_value=200_000):
+            c = ContextCompressor(model="test/model", quiet_mode=True)
+
+        messages = [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi"},
+            {"role": "tool", "content": "small result", "tool_call_id": "call_1"},
+        ]
+
+        capped, count = c._cap_oversized_messages(messages)
+
+        assert count == 0
+        assert capped is messages
+
+    def test_compress_makes_progress_on_short_conversation_with_giant_tool_result(self):
+        """The motivating incident scenario: a SHORT conversation (below
+        ``_min_for_compress``, so the normal head/tail summarization path
+        never runs at all) whose only tool result is pathologically large.
+        Before the fix, ``compress()`` returned the messages completely
+        unchanged here — the caller's "did compression make progress?"
+        check (``len`` down OR tokens down >5%) then saw a hard no-op and
+        gave up with "Cannot compress further" even though the fix is a
+        single truncation away.
+        """
+        from agent.context_compressor import _MAX_SINGLE_TOOL_RESULT_CHARS
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=200_000):
+            c = ContextCompressor(
+                model="test/model", protect_first_n=1, protect_last_n=8, quiet_mode=True,
+            )
+
+        giant = "x" * (_MAX_SINGLE_TOOL_RESULT_CHARS * 4)
+        messages = [
+            {"role": "user", "content": "list all tasks"},
+            {"role": "assistant", "content": None, "tool_calls": [
+                {"id": "call_1", "function": {"name": "clickup_search", "arguments": "{}"}},
+            ]},
+            {"role": "tool", "content": giant, "tool_call_id": "call_1"},
+        ]
+        original_chars = sum(len(m.get("content") or "") for m in messages)
+
+        result = c.compress(messages)
+
+        result_chars = sum(len(m.get("content") or "") for m in result)
+        assert result_chars < original_chars * 0.5, (
+            "a pathologically oversized tool result must be capped even when "
+            "the conversation is too short to reach the normal head/tail "
+            "summarization path"
+        )
