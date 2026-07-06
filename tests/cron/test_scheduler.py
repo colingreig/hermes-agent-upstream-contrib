@@ -1955,6 +1955,50 @@ class TestRunJobConfigEnvVarExpansion:
         models = [e.get("model") for e in fb if isinstance(e, dict)]
         assert models == ["gpt-4o-mini", "claude-sonnet-4-6"]
 
+    def test_auth_error_fallback_updates_model_to_match_fallback_provider(self, tmp_path, monkeypatch):
+        """86e26474a: when the job's own pinned provider fails auth entirely
+        and the code falls through to the global fallback_providers chain,
+        `model` must switch to the fallback entry's own model — not stay
+        pinned to the primary provider's model, which the fallback provider
+        doesn't serve. Before this fix, the agent was constructed with the
+        fallback's PROVIDER but the primary's MODEL (e.g. openai-codex +
+        glm-4.7), an invalid combination that also mislabels billing."""
+        (tmp_path / "config.yaml").write_text(
+            "fallback_providers:\n"
+            "  - provider: openai-codex\n"
+            "    model: gpt-5.4-mini\n"
+        )
+
+        job = {
+            "id": "auth-fallback-job", "name": "auth fallback test", "prompt": "hi",
+            "provider": "zai", "model": "glm-4.7",
+        }
+        fake_db = MagicMock()
+        from hermes_cli.auth import AuthError
+
+        fallback_runtime = {
+            "api_key": "fb-key",
+            "base_url": "https://api.openai.com/v1",
+            "provider": "openai-codex",
+            "api_mode": "codex_responses",
+        }
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("dotenv.load_dotenv"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch("hermes_cli.runtime_provider.resolve_runtime_provider",
+                   side_effect=[AuthError("zai auth failed", provider="zai"), fallback_runtime]), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent_cls.return_value = mock_agent
+            run_job(job)
+
+        kwargs = mock_agent_cls.call_args.kwargs
+        assert kwargs["provider"] == "openai-codex"
+        assert kwargs["model"] == "gpt-5.4-mini"
+
     def test_unexpanded_ref_passthrough_when_var_unset(self, tmp_path, monkeypatch):
         """When the env var is not set, the literal ${VAR} is kept verbatim (not crashed)."""
         (tmp_path / "config.yaml").write_text("model: ${_HERMES_TEST_CRON_UNSET_VAR}\n")
