@@ -348,6 +348,62 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         source_url="https://openai.com/api/pricing/",
         pricing_version="openai-pricing-2026-03-16",
     ),
+    # ── GPT-5 family (openai-api billed surface — see 86e26474a) ────────────
+    (
+        "openai",
+        "gpt-5-mini",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("0.25"),
+        output_cost_per_million=Decimal("2.00"),
+        cache_read_cost_per_million=Decimal("0.025"),
+        source="official_docs_snapshot",
+        source_url="https://developers.openai.com/api/docs/pricing",
+        pricing_version="openai-pricing-2026-07",
+    ),
+    (
+        "openai",
+        "gpt-5.5",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("5.00"),
+        output_cost_per_million=Decimal("30.00"),
+        cache_read_cost_per_million=Decimal("0.50"),
+        source="official_docs_snapshot",
+        source_url="https://developers.openai.com/api/docs/pricing",
+        pricing_version="openai-pricing-2026-07",
+    ),
+    (
+        "openai",
+        "gpt-5.4",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("2.50"),
+        output_cost_per_million=Decimal("15.00"),
+        cache_read_cost_per_million=Decimal("0.25"),
+        source="official_docs_snapshot",
+        source_url="https://developers.openai.com/api/docs/pricing",
+        pricing_version="openai-pricing-2026-07",
+    ),
+    (
+        "openai",
+        "gpt-5.4-mini",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("0.75"),
+        output_cost_per_million=Decimal("4.50"),
+        cache_read_cost_per_million=Decimal("0.075"),
+        source="official_docs_snapshot",
+        source_url="https://developers.openai.com/api/docs/pricing",
+        pricing_version="openai-pricing-2026-07",
+    ),
+    (
+        "openai",
+        "gpt-5.4-nano",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("0.20"),
+        output_cost_per_million=Decimal("1.25"),
+        cache_read_cost_per_million=Decimal("0.02"),
+        source="official_docs_snapshot",
+        source_url="https://developers.openai.com/api/docs/pricing",
+        pricing_version="openai-pricing-2026-07",
+    ),
     # ── Anthropic older models (pre-4.5 generation) ────────────────────────
     (
         "anthropic",
@@ -430,8 +486,12 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         pricing_version="deepseek-pricing-2026-05-12",
     ),
     # Google Gemini
+    # NOTE: keyed "gemini" (not "google") to match resolve_billing_route()'s
+    # actual route provider for both the direct gemini provider and vertex —
+    # a "google"/"gemini" key mismatch here previously made every lookup miss
+    # regardless of model, fleet-wide dark cost tracking (86e26474a).
     (
-        "google",
+        "gemini",
         "gemini-2.5-pro",
     ): PricingEntry(
         input_cost_per_million=Decimal("1.25"),
@@ -441,7 +501,7 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         pricing_version="google-pricing-2026-03-16",
     ),
     (
-        "google",
+        "gemini",
         "gemini-2.5-flash",
     ): PricingEntry(
         input_cost_per_million=Decimal("0.15"),
@@ -451,7 +511,7 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         pricing_version="google-pricing-2026-03-16",
     ),
     (
-        "google",
+        "gemini",
         "gemini-2.0-flash",
     ): PricingEntry(
         input_cost_per_million=Decimal("0.10"),
@@ -459,6 +519,28 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         source="official_docs_snapshot",
         source_url="https://ai.google.dev/pricing",
         pricing_version="google-pricing-2026-03-16",
+    ),
+    (
+        "gemini",
+        "gemini-3.5-flash",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("1.50"),
+        output_cost_per_million=Decimal("9.00"),
+        cache_read_cost_per_million=Decimal("0.15"),
+        source="official_docs_snapshot",
+        source_url="https://ai.google.dev/gemini-api/docs/pricing",
+        pricing_version="google-pricing-2026-07",
+    ),
+    (
+        "gemini",
+        "gemini-3.1-pro-preview",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("2.00"),
+        output_cost_per_million=Decimal("12.00"),
+        cache_read_cost_per_million=Decimal("0.20"),
+        source="official_docs_snapshot",
+        source_url="https://ai.google.dev/gemini-api/docs/pricing",
+        pricing_version="google-pricing-2026-07",
     ),
     # AWS Bedrock — pricing per the Bedrock pricing page.
     # Bedrock charges the same per-token rates as the model provider but
@@ -602,14 +684,22 @@ def resolve_billing_route(
         return BillingRoute(provider="nous", model=model, base_url=base_url or _NOUS_DEFAULT_BASE_URL, billing_mode="official_models_api")
     if provider_name == "anthropic":
         return BillingRoute(provider="anthropic", model=model.split("/")[-1], base_url=base_url or "", billing_mode="official_docs_snapshot")
-    if provider_name == "openai":
+    if provider_name in {"openai", "openai-api"}:
+        # "openai-api" is the billed API-key surface (distinct from the
+        # flat-rate openai-codex OAuth route above); it prices off the same
+        # official-docs snapshot as "openai" — see 86e26474a (this was
+        # previously falling through to the unmapped/"unknown" branch below,
+        # so every openai-api session priced as $0/dark regardless of usage).
         return BillingRoute(provider="openai", model=model.split("/")[-1], base_url=base_url or "", billing_mode="official_docs_snapshot")
     if provider_name in {"minimax", "minimax-cn"}:
         return BillingRoute(provider=provider_name, model=model.split("/")[-1], base_url=base_url or "", billing_mode="official_docs_snapshot")
     # Vertex AI hosts the same Gemini models as Google AI Studio; price them
     # off the gemini official-docs snapshot. Strip the "google/" vendor prefix
-    # the OpenAI-compat endpoint requires so the pricing key matches.
-    if provider_name == "vertex" or base_url_host_matches(base_url or "", "aiplatform.googleapis.com"):
+    # the OpenAI-compat endpoint requires so the pricing key matches. The bare
+    # "gemini" provider (Google AI Studio direct, not via Vertex) needs the
+    # identical route — it was previously unmapped and fell to "unknown"
+    # below, same dark-cost bug as openai-api above (86e26474a).
+    if provider_name in {"vertex", "gemini"} or base_url_host_matches(base_url or "", "aiplatform.googleapis.com"):
         return BillingRoute(provider="gemini", model=model.split("/")[-1], base_url=base_url or "", billing_mode="official_docs_snapshot")
     if provider_name in {"custom", "local"} or (base and "localhost" in base):
         return BillingRoute(provider=provider_name or "custom", model=model, base_url=base_url or "", billing_mode="unknown")
