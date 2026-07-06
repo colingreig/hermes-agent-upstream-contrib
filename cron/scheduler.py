@@ -2768,7 +2768,22 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
                     if entry.get("api_key"):
                         fb_kwargs["explicit_api_key"] = entry["api_key"]
                     runtime = resolve_runtime_provider(**fb_kwargs)
-                    logger.info("Job '%s': fallback resolved to %s", job_id, runtime.get("provider"))
+                    # The job's own `model` (set above from job.get("model"),
+                    # scoped to the PRIMARY provider that just failed auth
+                    # entirely) does not exist on this fallback provider —
+                    # e.g. a job pinned to zai/glm-4.7 falling back to
+                    # openai-codex must not still request "glm-4.7" from
+                    # Codex. Without this, the agent gets constructed with a
+                    # provider/model pair that never matches, which both
+                    # breaks the call and mislabels billing_provider against
+                    # whatever the fallback's real serving model turns out
+                    # to be (86e26474a).
+                    if entry.get("model"):
+                        model = entry["model"]
+                    logger.info(
+                        "Job '%s': fallback resolved to %s/%s",
+                        job_id, runtime.get("provider"), model,
+                    )
                     break
                 except Exception as fb_exc:
                     logger.debug("Job '%s': fallback %s failed: %s", job_id, entry.get("provider"), fb_exc)
