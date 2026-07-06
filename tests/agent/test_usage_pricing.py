@@ -299,6 +299,54 @@ def test_bedrock_cross_region_profile_prefix_resolves_to_pricing():
         assert scoped.cache_read_cost_per_million == bare.cache_read_cost_per_million
 
 
+def test_openai_api_provider_routes_to_openai_pricing():
+    """Regression test for 86e26474a: the billed "openai-api" surface (distinct
+    from the flat-rate "openai-codex" OAuth route) was never mapped in
+    resolve_billing_route(), so every openai-api session fell through to the
+    unmapped/"unknown" branch and priced as cost_source='none' regardless of
+    real usage — fleet-wide dark cost tracking for the most heavily-used
+    billed provider.
+    """
+    entry = get_pricing_entry("gpt-5-mini", provider="openai-api")
+    assert entry is not None
+    assert float(entry.input_cost_per_million) == 0.25
+    assert float(entry.output_cost_per_million) == 2.00
+
+    result = estimate_usage_cost(
+        "gpt-5-mini",
+        CanonicalUsage(input_tokens=1_000_000, output_tokens=500_000),
+        provider="openai-api",
+    )
+    assert result.status == "estimated"
+    assert result.amount_usd is not None
+    # 1M input × $0.25/M + 500K output × $2.00/M = $0.25 + $1.00 = $1.25
+    assert float(result.amount_usd) == 1.25
+
+
+def test_gemini_provider_routes_to_pricing_not_stale_google_key():
+    """Regression test for 86e26474a: the bare "gemini" provider (Google AI
+    Studio direct, as opposed to "vertex") was never mapped in
+    resolve_billing_route(), so it fell through to "unknown" the same way
+    openai-api did. Also covers the "google"->"gemini" pricing-table key
+    rename — vertex already routed to provider="gemini" but the table was
+    keyed "google", so even the vertex path silently missed every lookup.
+    """
+    entry = get_pricing_entry("gemini-3.5-flash", provider="gemini")
+    assert entry is not None
+    assert float(entry.input_cost_per_million) == 1.50
+    assert float(entry.output_cost_per_million) == 9.00
+
+    result = estimate_usage_cost(
+        "gemini-3.1-pro-preview",
+        CanonicalUsage(input_tokens=1_000_000, output_tokens=500_000),
+        provider="gemini",
+    )
+    assert result.status == "estimated"
+    assert result.amount_usd is not None
+    # 1M input × $2.00/M + 500K output × $12.00/M = $2.00 + $6.00 = $8.00
+    assert float(result.amount_usd) == 8.00
+
+
 def test_bedrock_claude_cached_session_estimates_cost_not_unknown():
     """A Bedrock Claude session with cache hits must produce a dollar estimate,
     not ``unknown`` — the user-visible symptom in #50295.
