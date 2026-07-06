@@ -105,6 +105,40 @@ class TestFallbackChainAdvancement:
             assert agent.model == "gpt-4o"
             assert agent._fallback_activated is True
 
+    def test_advance_persists_billing_route_to_session_db(self):
+        """86e26474a: update_token_counts() uses COALESCE(billing_provider, ?)
+        — it only fills a NULL, never overwrites — so once a session's first
+        call records a billing_provider, every later per-call write in that
+        SAME session keeps recording the pre-fallback provider even after
+        agent.provider switches. A fallback activation must immediately push
+        the new route via update_session_billing_route() (the same
+        unconditional-overwrite path the manual /model switch already uses),
+        or SessionDB mislabels the fallback's real spend under the old
+        provider's billing_mode (e.g. reporting real GLM consumption spend
+        as openai-codex's $0 subscription_included)."""
+        fbs = [{"provider": "zai-coding", "model": "glm-4.7"}]
+        agent = _make_agent(fallback_model=fbs)
+        agent._session_db = MagicMock()
+        agent.session_id = "cron_test_session"
+        with patch("agent.auxiliary_client.resolve_provider_client",
+                    return_value=(_mock_client(base_url="https://api.zai.com/v1"), "glm-4.7")):
+            assert agent._try_activate_fallback() is True
+        agent._session_db.update_session_billing_route.assert_called_once_with(
+            "cron_test_session",
+            provider="zai-coding",
+            base_url="https://api.zai.com/v1",
+            billing_mode=agent.api_mode,
+        )
+
+    def test_advance_without_session_db_does_not_raise(self):
+        """No _session_db (bare/test agent) must not break fallback activation."""
+        fbs = [{"provider": "zai", "model": "glm-4.7"}]
+        agent = _make_agent(fallback_model=fbs)
+        assert getattr(agent, "_session_db", None) is None
+        with patch("agent.auxiliary_client.resolve_provider_client",
+                    return_value=(_mock_client(), "glm-4.7")):
+            assert agent._try_activate_fallback() is True
+
     def test_rate_limit_advance_emits_quota_receipt(self, caplog):
         """86e260vnu: a quota-driven advance must log a visible 'fallback: X
         quota exhausted, serving via Y' receipt so spend-driving fallthroughs

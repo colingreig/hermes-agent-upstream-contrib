@@ -657,6 +657,29 @@ def run_conversation(
                 agent._safe_print(f"\n⚠️  Iteration budget exhausted ({agent.iteration_budget.used}/{agent.iteration_budget.max_total} iterations used)")
             break
 
+        _spend_cap_block = agent._get_provider_daily_spend_cap_block()
+        if _spend_cap_block is not None:
+            _turn_exit_reason = "provider_daily_spend_cap"
+            _cap_message = agent._format_provider_daily_spend_cap_message(_spend_cap_block)
+            logger.info(
+                "provider daily spend cap blocked %s on %s: spend=%0.2f cap=%0.2f",
+                _spend_cap_block["provider"],
+                _spend_cap_block["day"],
+                _spend_cap_block["spend_usd"],
+                _spend_cap_block["cap_usd"],
+            )
+            agent._vprint(f"{agent.log_prefix}💸 {_cap_message}", force=True)
+            if agent._try_activate_fallback(reason=FailoverReason.billing):
+                continue
+            return {
+                "final_response": _cap_message,
+                "messages": messages,
+                "api_calls": api_call_count,
+                "completed": False,
+                "failed": True,
+                "error": _cap_message,
+            }
+
         # Fire step_callback for gateway hooks (agent:step event)
         if agent.step_callback is not None:
             try:

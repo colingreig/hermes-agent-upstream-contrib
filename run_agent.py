@@ -3219,6 +3219,77 @@ class AIAgent:
         self._credits_notices_enabled_cache = enabled
         return enabled
 
+    def _get_provider_daily_spend_cap_usd(self, provider: Optional[str] = None) -> Optional[float]:
+        """Return the configured per-provider daily spend cap in USD.
+
+        Caps live in ``config.yaml`` at top-level ``spend_caps.<provider>`` and
+        are resolved through ``load_config()`` so CLI, gateway, and subagents
+        share the same persisted configuration.
+        """
+        provider_key = (provider or getattr(self, "provider", "") or "").strip().lower()
+        if not provider_key:
+            return None
+        cached = getattr(self, "_provider_daily_spend_caps_cache", None)
+        if cached is None:
+            cached = {}
+            try:
+                from hermes_cli.config import load_config as _load_config
+
+                _cfg = _load_config() or {}
+                _raw_caps = _cfg.get("spend_caps") if isinstance(_cfg, dict) else None
+                if isinstance(_raw_caps, dict):
+                    for _name, _value in _raw_caps.items():
+                        try:
+                            _cap = float(_value)
+                        except (TypeError, ValueError):
+                            continue
+                        if _cap > 0:
+                            cached[str(_name).strip().lower()] = _cap
+            except Exception:
+                cached = {}
+            self._provider_daily_spend_caps_cache = cached
+        return cached.get(provider_key)
+
+    def _get_provider_daily_spend_cap_block(self) -> Optional[Dict[str, Any]]:
+        """Return a block payload when today's provider spend reached its cap."""
+        cap_usd = self._get_provider_daily_spend_cap_usd()
+        if cap_usd is None:
+            return None
+        provider_key = (getattr(self, "provider", "") or "").strip().lower()
+        if not provider_key:
+            return None
+        session_db = getattr(self, "_session_db", None)
+        if session_db is None:
+            try:
+                from hermes_state import SessionDB
+
+                session_db = SessionDB()
+            except Exception:
+                return None
+        day = datetime.utcnow().strftime("%Y-%m-%d")
+        try:
+            spend_usd = float((session_db.get_daily_provider_spend(day) or {}).get(provider_key, 0.0) or 0.0)
+        except Exception:
+            return None
+        if spend_usd < cap_usd:
+            return None
+        return {
+            "provider": provider_key,
+            "day": day,
+            "spend_usd": spend_usd,
+            "cap_usd": cap_usd,
+        }
+
+    @staticmethod
+    def _format_provider_daily_spend_cap_message(block: Dict[str, Any]) -> str:
+        provider_label = str(block.get("provider") or "the selected provider")
+        return (
+            f"Hermes daily spend cap reached for {provider_label}: "
+            f"${float(block.get('spend_usd') or 0.0):.2f} spent on {block.get('day')} "
+            f"against a configured ${float(block.get('cap_usd') or 0.0):.2f}/day cap. "
+            "Switch providers, raise spend_caps for that provider in config.yaml, or wait for the next UTC day."
+        )
+
     def get_credits_state(self):
         """Return the last captured CreditsState, or None."""
         return self._credits_state

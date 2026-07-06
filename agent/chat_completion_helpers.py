@@ -1500,6 +1500,34 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             "Fallback activated: %s → %s (%s)",
             old_model, fb_model, fb_provider,
         )
+
+        # Persist the new billing route immediately. update_token_counts()
+        # uses COALESCE(billing_provider, ?) — it only fills in a NULL, it
+        # never overwrites — so without this, every subsequent per-call
+        # write in this session keeps recording the PRE-fallback provider
+        # (e.g. "openai-codex") even though agent.model/agent.provider have
+        # already switched to the fallback (e.g. glm-4.7 via zai-coding).
+        # That mislabels the session's cost route, which for providers with
+        # a subscription_included billing_mode makes estimate_usage_cost()
+        # report the fallback's real consumption spend as $0/"included" —
+        # the root cause behind SessionDB cost tracking going fleet-wide
+        # dark (see task 86e26474a). Mirrors the mid-session /model-switch
+        # persistence in agent_runtime_helpers.py's update_session_billing_route call.
+        _session_db = getattr(agent, "_session_db", None)
+        _session_id = getattr(agent, "session_id", None)
+        if _session_db is not None and _session_id:
+            try:
+                _session_db.update_session_billing_route(
+                    _session_id,
+                    provider=fb_provider,
+                    base_url=fb_base_url,
+                    billing_mode=fb_api_mode,
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to persist billing route after fallback activation",
+                    exc_info=True,
+                )
         return True
     except Exception as e:
         if fb_provider == "nous":
