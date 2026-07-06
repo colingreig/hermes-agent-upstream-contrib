@@ -2425,6 +2425,89 @@ def test_complete_task_dependency_override_succeeds_and_emits_event(kanban_home,
 
 
 # ---------------------------------------------------------------------------
+# Human sign-off gate on complete_task
+# ---------------------------------------------------------------------------
+
+def test_complete_task_no_signoff_language_completes_normally(kanban_home):
+    """(a) A task with no sign-off-required language completes normally."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="routine task", body="Just fix the bug and ship it.")
+        ok = kb.complete_task(conn, t, result="fixed")
+        assert ok is True
+        task = kb.get_task(conn, t)
+        assert task is not None
+        assert task.status == "done"
+
+
+def test_complete_task_signoff_required_with_only_bot_comments_raises(kanban_home):
+    """(b) A task requiring sign-off with only bot-prefixed comments raises."""
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn, title="ship the pricing page",
+            body="Acceptance criteria: ... This requires Colin sign-off before closing.",
+        )
+        kb.add_comment(conn, t, author="hermes-worker", body="ignite- claiming: starting work now")
+        kb.add_comment(conn, t, author="hermes-worker", body="ignite- done: shipped and tested")
+
+        with pytest.raises(kb.MissingHumanSignOffError):
+            kb.complete_task(conn, t, result="shipped")
+
+        task = kb.get_task(conn, t)
+        assert task is not None
+        assert task.status != "done"
+        events = kb.list_events(conn, t)
+        assert any(e.kind == "completion_blocked_signoff" for e in events)
+
+
+def test_complete_task_signoff_required_with_non_bot_comment_succeeds(kanban_home):
+    """(c) Same task WITH one non-bot-prefixed comment present completes successfully."""
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn, title="ship the pricing page",
+            body="Acceptance criteria: ... This requires Colin sign-off before closing.",
+        )
+        kb.add_comment(conn, t, author="hermes-worker", body="ignite- claiming: starting work now")
+        kb.add_comment(conn, t, author="colin", body="Looks good, approved to ship.")
+
+        ok = kb.complete_task(conn, t, result="shipped")
+        assert ok is True
+        task = kb.get_task(conn, t)
+        assert task is not None
+        assert task.status == "done"
+
+
+def test_complete_task_signoff_override_bypasses_check_and_emits_event(kanban_home):
+    """(d) The override flag bypasses the check but emits the audit event."""
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn, title="ship the pricing page",
+            body="This requires Colin sign-off before closing.",
+        )
+        kb.add_comment(conn, t, author="hermes-worker", body="ignite- claiming: starting work now")
+
+        ok = kb.complete_task(conn, t, result="shipped", override_signoff_check=True)
+        assert ok is True
+        task = kb.get_task(conn, t)
+        assert task is not None
+        assert task.status == "done"
+        events = kb.list_events(conn, t)
+        assert any(e.kind == "signoff_override" for e in events)
+
+
+def test_complete_task_signoff_gate_applies_without_workspace_path(kanban_home):
+    """The sign-off gate is not scoped to workspace-bearing tasks (unlike
+    the dependency/placeholder gates) — sign-off is about closeout, not a
+    diff, so a plain scratch task must still be gated."""
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn, title="content task", body="Needs Colin's approval before publishing.",
+        )
+        assert kb.get_task(conn, t).workspace_path is None
+        with pytest.raises(kb.MissingHumanSignOffError):
+            kb.complete_task(conn, t, result="done")
+
+
+# ---------------------------------------------------------------------------
 # Scratch cleanup containment (#28818)
 # ---------------------------------------------------------------------------
 

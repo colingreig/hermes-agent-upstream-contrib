@@ -8,7 +8,7 @@ generated content for placeholder markers before merge, and a sibling task
 providing the real dataset was still open when the task shipped — no
 dependency gate caught it.
 
-This module provides the two checks wired into
+This module provides the checks wired into
 :func:`hermes_cli.kanban_db.complete_task` and
 :func:`plugins.kanban.dashboard.plugin_api._set_status_direct` (the review
 transition):
@@ -17,9 +17,13 @@ transition):
   :func:`diff_changed_files` — Check 1, pre-publish placeholder/stub content
   scan.
 * :func:`open_parent_summaries` — Check 2, open-dependency gate.
+* :func:`requires_human_signoff` / :func:`has_non_bot_comment` — Check 4,
+  human sign-off enforcement (see :func:`hermes_cli.kanban_db.complete_task`
+  for how these combine into the actual gate).
 
 It also provides :func:`flag_recovery_pr_mismatch` (Check 3), a pure
-heuristic used by human/review-agent workflows (see
+heuristic used by :mod:`hermes_cli.pr_safety_gate` (the automated CI gate)
+and human/review-agent workflows (see
 ``skills/github/github-code-review/SKILL.md``) to catch stranded-worktree
 recovery PRs whose description doesn't match their actual diff.
 """
@@ -283,3 +287,63 @@ def flag_recovery_pr_mismatch(pr_description: str, diff_stat_text: str) -> Optio
         )
 
     return None
+
+
+# ---------------------------------------------------------------------------
+# Check 4: human sign-off enforcement
+# ---------------------------------------------------------------------------
+
+# Grew out of the same incident: the task's acceptance criteria explicitly
+# required Colin's sign-off, but the task was marked complete off the back
+# of AI-authored comments alone — no real human ever looked at it. Anchored
+# on the specific phrases that show up in ClickUp/kanban acceptance-criteria
+# text when a task genuinely needs a human in the loop; kept tight for the
+# same false-positive-avoidance reason as PLACEHOLDER_MARKERS above.
+HUMAN_SIGNOFF_MARKERS: list[re.Pattern[str]] = [
+    re.compile(r"\bcolin sign[- ]?off\b", re.IGNORECASE),
+    re.compile(r"\brequires colin\b", re.IGNORECASE),
+    re.compile(r"\bhuman sign[- ]?off\b", re.IGNORECASE),
+    re.compile(r"\bexplicit sign[- ]?off\b", re.IGNORECASE),
+    re.compile(r"\bneeds colin'?s? approval\b", re.IGNORECASE),
+    re.compile(r"\bcolin'?s? (?:explicit )?approval\b", re.IGNORECASE),
+]
+
+# Bot-authored comments in this repo's convention are prefixed "ignite-"
+# (e.g. "ignite- claiming:", "ignite- done:") — see the ClickUp comment
+# threads referenced in the task that added this gate. Matched
+# case-insensitively against the comment body after stripping leading
+# whitespace.
+_BOT_COMMENT_PREFIX = "ignite-"
+
+
+def requires_human_signoff(text: str) -> bool:
+    """Return True if ``text`` (a task's body/acceptance-criteria text)
+    contains an explicit human-sign-off requirement.
+
+    Empty list means the text is clean. See :data:`HUMAN_SIGNOFF_MARKERS`
+    for the exact phrases matched.
+    """
+    if not text:
+        return False
+    return any(pattern.search(text) for pattern in HUMAN_SIGNOFF_MARKERS)
+
+
+def is_bot_comment(comment_body: str) -> bool:
+    """Return True if ``comment_body`` is bot-authored by this repo's
+    convention (starts with the ``ignite-`` marker prefix, e.g.
+    ``"ignite- claiming: ..."`` / ``"ignite- done: ..."``).
+    """
+    if not comment_body:
+        return False
+    return comment_body.strip().lower().startswith(_BOT_COMMENT_PREFIX)
+
+
+def has_non_bot_comment(comment_bodies: Iterable[str]) -> bool:
+    """Return True if at least one comment in ``comment_bodies`` is NOT
+    bot-authored (see :func:`is_bot_comment`).
+
+    Used by the human-sign-off gate to distinguish a real human comment
+    from an agent narrating its own progress — a task requiring explicit
+    sign-off must not be satisfiable by bot comments alone.
+    """
+    return any(not is_bot_comment(body) for body in comment_bodies)

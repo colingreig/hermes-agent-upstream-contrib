@@ -590,6 +590,7 @@ def _handle_complete(args: dict, **kw) -> str:
     metadata = _stamp_worker_session_metadata(tid, metadata)
     override_dependency_check = bool(args.get("override_dependency_check", False))
     override_placeholder_check = bool(args.get("override_placeholder_check", False))
+    override_signoff_check = bool(args.get("override_signoff_check", False))
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
@@ -633,6 +634,7 @@ def _handle_complete(args: dict, **kw) -> str:
                     expected_run_id=_worker_run_id(tid),
                     override_dependency_check=override_dependency_check,
                     override_placeholder_check=override_placeholder_check,
+                    override_signoff_check=override_signoff_check,
                 )
             except kb.HallucinatedCardsError as hall_err:
                 # Structured rejection — surface the phantom ids so the
@@ -691,6 +693,27 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"override_placeholder_check=true (use sparingly — "
                     f"this is for a human-confirmed exception, not routine "
                     f"use)."
+                )
+            except kb.MissingHumanSignOffError:
+                # Structured rejection — this task's acceptance criteria
+                # require an explicit human sign-off and no non-bot comment
+                # exists yet. Audit event already landed in the DB; the
+                # task itself was NOT mutated (the gate runs before the
+                # write txn). Deliberately vague about *why* a bot comment
+                # doesn't count — a worker should not be coached into
+                # crafting a comment that merely dodges the "ignite-"
+                # prefix; the fix is to get a real human to actually look
+                # at the task and comment.
+                return tool_error(
+                    "kanban_complete blocked: this task's acceptance "
+                    "criteria require an explicit human sign-off, and no "
+                    "non-bot comment exists on the task yet. Your task is "
+                    "still in-flight (no state change). Wait for a human "
+                    "to review and comment, or if a human has confirmed "
+                    "out-of-band that sign-off is satisfied, retry "
+                    "kanban_complete with override_signoff_check=true (use "
+                    "sparingly — this is for a human-confirmed exception, "
+                    "not routine use)."
                 )
             if not ok:
                 return tool_error(
@@ -1345,6 +1368,20 @@ KANBAN_COMPLETE_SCHEMA = {
                     "the flagged text is a false positive — it is meant "
                     "for a human-confirmed exception, not routine use. "
                     "The bypass is still recorded as an audit event."
+                ),
+            },
+            "override_signoff_check": {
+                "type": "boolean",
+                "description": (
+                    "Bypass the human sign-off gate, which normally "
+                    "blocks completion when the task's acceptance "
+                    "criteria explicitly require a human sign-off (e.g. "
+                    "'Colin sign-off', 'requires Colin') and no non-bot "
+                    "comment exists on the task yet. Only set this after "
+                    "a human has confirmed out-of-band that sign-off is "
+                    "satisfied — it is meant for a human-confirmed "
+                    "exception, not routine use. The bypass is still "
+                    "recorded as an audit event."
                 ),
             },
             "board": _board_schema_prop(),

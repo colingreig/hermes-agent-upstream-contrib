@@ -95,6 +95,25 @@ each bypass still emits a ``dependency_override`` / ``placeholder_override``
 event so the exception is auditable. These overrides exist for
 human-confirmed exceptions; routine workers should fix the underlying
 issue (close the open parent, replace the placeholder text) instead.
+
+A third gate runs against EVERY task (no ``workspace_path`` requirement,
+since sign-off is about the task's own closeout, not its diff):
+
+* **Human sign-off gate** — when the task's ``body`` (acceptance criteria
+  text) contains an explicit human-sign-off requirement (see
+  ``content_gate.HUMAN_SIGNOFF_MARKERS`` — phrases like "Colin sign-off",
+  "requires Colin", "human sign-off"), completion is blocked with
+  ``MissingHumanSignOffError`` unless at least one comment on the task is
+  NOT bot-authored (bot comments are identified by the ``ignite-`` prefix
+  convention — see ``content_gate.is_bot_comment``). This catches a task
+  whose acceptance criteria explicitly require a human sign-off being
+  marked complete off the back of AI-authored comments alone, with no
+  real human ever having looked at it — exactly how the placeholder
+  content incident's recovery PR slipped through.
+
+Same bypass pattern as the other two gates: ``override_signoff_check=True``
+skips the check and emits a ``signoff_override`` event instead of the
+``completion_blocked_signoff`` block event.
 """
 
 from __future__ import annotations
@@ -4050,6 +4069,27 @@ class PlaceholderContentError(ValueError):
         )
 
 
+class MissingHumanSignOffError(ValueError):
+    """Raised by ``complete_task`` when the task's acceptance criteria
+    require an explicit human sign-off (see
+    :data:`hermes_cli.content_gate.HUMAN_SIGNOFF_MARKERS`) but no comment
+    on the task is non-bot-authored (see
+    :func:`hermes_cli.content_gate.is_bot_comment`).
+
+    This is exactly how the placeholder-content incident's recovery PR
+    slipped through: the task's acceptance criteria explicitly required
+    Colin's sign-off, but the task was marked complete off the back of
+    AI-authored comments alone — no real human ever looked at it.
+    """
+
+    def __init__(self, completing_task_id: str):
+        self.completing_task_id = completing_task_id
+        super().__init__(
+            "completion blocked: task requires explicit human sign-off "
+            "but has no non-bot-authored comment"
+        )
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4061,6 +4101,7 @@ def complete_task(
     expected_run_id: Optional[int] = None,
     override_dependency_check: bool = False,
     override_placeholder_check: bool = False,
+    override_signoff_check: bool = False,
 ) -> bool:
     """Transition ``running|ready -> done`` and record ``result``.
 
@@ -4106,6 +4147,18 @@ def complete_task(
     human-confirmed exceptions — routine workers should fix the underlying
     issue (close the open parent, replace the placeholder text) rather
     than reach for them.
+
+    A third gate runs regardless of ``workspace_path`` (sign-off is about
+    the task's closeout, not its diff):
+
+    * **Human sign-off gate** — if the task's ``body`` contains an explicit
+      human-sign-off requirement (see
+      ``content_gate.HUMAN_SIGNOFF_MARKERS``) and every comment on the task
+      is bot-authored (the ``ignite-`` prefix convention — see
+      ``content_gate.is_bot_comment``), completion is blocked with
+      ``MissingHumanSignOffError`` unless ``override_signoff_check=True``.
+      Same auditable block/override event pattern as the other two gates
+      (``completion_blocked_signoff`` / ``signoff_override``).
 
     After a successful completion, ``summary`` and ``result`` are scanned
     for prose references like ``t_deadbeefcafe`` that do not resolve.
@@ -4179,6 +4232,32 @@ def complete_task(
                 _append_event(
                     conn, task_id, "placeholder_override",
                     {"overridden": True, "hits": placeholder_hits},
+                )
+
+    # Gate: human sign-off enforcement, BEFORE the main write txn (same
+    # style as the gates above). Unlike the two gates above, this one
+    # applies to every task regardless of workspace_path — sign-off is
+    # about the task's acceptance criteria and closeout comments, not its
+    # diff, so a workspace-less task (e.g. a content/ops task) still needs
+    # to satisfy an explicit sign-off requirement in its body text.
+    if _completing_task is None:
+        _completing_task = get_task(conn, task_id)
+    if _completing_task is not None and content_gate.requires_human_signoff(
+        _completing_task.body or ""
+    ):
+        comment_bodies = [c.body for c in list_comments(conn, task_id)]
+        if not content_gate.has_non_bot_comment(comment_bodies) and not override_signoff_check:
+            with write_txn(conn):
+                _append_event(
+                    conn, task_id, "completion_blocked_signoff",
+                    {"comment_count": len(comment_bodies)},
+                )
+            raise MissingHumanSignOffError(task_id)
+        elif not content_gate.has_non_bot_comment(comment_bodies):
+            with write_txn(conn):
+                _append_event(
+                    conn, task_id, "signoff_override",
+                    {"overridden": True, "comment_count": len(comment_bodies)},
                 )
 
     with write_txn(conn):

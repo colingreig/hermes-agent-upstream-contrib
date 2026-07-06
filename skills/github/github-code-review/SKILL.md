@@ -482,19 +482,32 @@ git branch -D pr-$PR_NUMBER
 
 ---
 
-## 6. Recovery / Stranded-Worktree PR Integrity Check
+## 6. Recovery / Stranded-Worktree PR Integrity Check — AUTOMATED, ENFORCED
 
-A stranded-worktree recovery PR (a branch/description that reads as "recovering" work from a
-worktree that got orphaned mid-task) is a special case: its description was written from memory
-about what got lost, not from a live diff, so it's the PR type most likely to under- or
-mis-describe its own scope. Run this check on any PR whose branch name or description uses
-recovery language before approving or merging it.
+**This is no longer just a manual checklist item — it is an automated, required CI gate that
+structurally blocks merge.** The `pr-safety-gate` job (`.github/workflows/pr-safety-gate.yml`,
+wired into `.github/workflows/ci.yml`'s `all-checks-pass` required check) runs on every PR and
+fails the check when it detects a recovery/stranded-worktree PR whose description doesn't match
+its actual diff. A failing required check blocks merge via branch protection — a mismatched
+recovery PR cannot sail through unnoticed the way the original incident's PR did.
+
+The gate's logic lives in `hermes_cli/pr_safety_gate.py` (`check_recovery_pr` /
+`is_recovery_pr`), which wraps the same `flag_recovery_pr_mismatch` heuristic
+(`hermes_cli/content_gate.py`) described below, plus branch-name (`recover/*`, `recovery/*`,
+`salvage/*`) and PR-title signal detection so recovery PRs are caught even when the description
+itself doesn't use recovery wording. Unit tests: `tests/hermes_cli/test_pr_safety_gate.py`.
+
+**What this means for you as a reviewer:** you no longer need to manually run this check to
+prevent a merge — CI already will. This section is still useful for understanding *why* a PR got
+blocked, for triaging a red `pr-safety-gate` check, and for the (now purely informational) manual
+walkthrough below if you want to look at a recovery PR proactively before CI runs.
 
 ### Step 1: Detect recovery language
 
 Read the PR description. If it contains phrases like "recovery", "stranded worktree",
 "stranded-worktree", or "recovered branch" (case-insensitive), this check applies. Otherwise skip
-straight to the normal review workflow above.
+straight to the normal review workflow above. (CI additionally checks the branch name and title —
+see `is_recovery_pr` — so a PR can be in-scope even if the description itself is silent on it.)
 
 ### Step 2: Gather the claimed vs actual scope
 
@@ -521,18 +534,23 @@ quoted paths, or bare `dir/file.ext`-shaped tokens), and check each one actually
 `--stat` output. Also compare file counts — if the description names only 1-2 files but the diff
 touches 3x or more, the description understates the scope.
 
-### Step 4: Treat a mismatch as a hold, not an auto-block
+This is exactly what the `pr-safety-gate` CI job already does automatically on every PR — manual
+review here is a proactive double-check, not the only line of defense.
 
-`flag_recovery_pr_mismatch` (and the manual check) is a **signal to pause and get explicit human
-confirmation**, not an automatic rejection. A legitimate recovery can still touch more files than
-the description mentions (e.g. a lockfile regenerated as a side effect). When the check flags a
-mismatch:
+### Step 4: If CI flags a mismatch, resolve it — do not bypass
 
-1. Do **not** approve or merge the PR yet.
-2. Post the mismatch details as a review comment (named files missing from the diff, or the
-   file-count discrepancy) so the reviewer (human or the next agent) sees it immediately.
-3. Explicitly ask a human to confirm the extra/missing scope is expected before merging.
-4. Only proceed with Approve / Request Changes once that confirmation is in hand.
+A failing `pr-safety-gate` check is a **hard block**, not a suggestion. A legitimate recovery can
+still touch more files than the description mentions (e.g. a lockfile regenerated as a side
+effect) — that's a real mismatch by design, and it should be resolved by fixing the PR, not by
+disabling or skipping the check:
 
-When the check finds nothing (returns `None` — no recovery language detected, or the named files
-and diff line up), continue with the normal PR Review Workflow (Section 5) as usual.
+1. Do **not** approve, merge, or bypass branch protection to force the merge through.
+2. Read the failing check's log (`::error::` line) for the specific missing/extra files or the
+   scope-understatement detail.
+3. Update the PR description to accurately reflect the diff (or, if the diff itself is wrong,
+   fix the diff) so the description and the actual changes line up.
+4. Push the fix — CI re-runs automatically and the check should go green once they match.
+5. If you genuinely believe the mismatch is a false positive (e.g. a regenerated lockfile), get
+   explicit human confirmation before considering any manual override of branch protection —
+   this should be rare, and the default path is always "fix the description or diff," not
+   "override the gate."

@@ -214,3 +214,49 @@ def test_flag_recovery_pr_mismatch_none_when_everything_lines_up():
         "2 files changed, 6 insertions(+), 2 deletions(-)"
     )
     assert cg.flag_recovery_pr_mismatch(description, diff_stat) is None
+
+
+# ---------------------------------------------------------------------------
+# requires_human_signoff / is_bot_comment / has_non_bot_comment
+# ---------------------------------------------------------------------------
+
+def test_requires_human_signoff_detects_marker_phrases():
+    assert cg.requires_human_signoff("This task requires Colin sign-off before closing.")
+    assert cg.requires_human_signoff("Needs Colin's approval before shipping.")
+    assert cg.requires_human_signoff("Explicit sign-off required from a human.")
+    assert cg.requires_human_signoff("This requires Colin to review.")
+
+
+def test_requires_human_signoff_false_for_ordinary_ac_text():
+    text = "Acceptance criteria: all tests pass and the endpoint returns 200."
+    assert cg.requires_human_signoff(text) is False
+
+
+def test_requires_human_signoff_empty_string():
+    assert cg.requires_human_signoff("") is False
+
+
+def test_is_bot_comment_detects_ignite_prefix():
+    assert cg.is_bot_comment("ignite- claiming: starting work on this now")
+    assert cg.is_bot_comment("ignite- done: shipped and tested")
+    assert cg.is_bot_comment("  ignite- claiming: leading whitespace")
+    assert cg.is_bot_comment("IGNITE- DONE: case insensitive")
+
+
+def test_is_bot_comment_false_for_human_comment():
+    assert cg.is_bot_comment("Looks good, approved.") is False
+    assert cg.is_bot_comment("") is False
+
+
+def test_has_non_bot_comment_true_when_at_least_one_human_comment():
+    comments = ["ignite- claiming: starting", "Looks good, approved.", "ignite- done: shipped"]
+    assert cg.has_non_bot_comment(comments) is True
+
+
+def test_has_non_bot_comment_false_when_all_bot():
+    comments = ["ignite- claiming: starting", "ignite- done: shipped"]
+    assert cg.has_non_bot_comment(comments) is False
+
+
+def test_has_non_bot_comment_false_for_empty_list():
+    assert cg.has_non_bot_comment([]) is False
