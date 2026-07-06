@@ -130,6 +130,26 @@ class TestFallbackChainAdvancement:
             billing_mode=agent.api_mode,
         )
 
+    def test_advance_persists_model_to_session_db(self):
+        """86e26474a: a session row created before the fallback fires keeps
+        its ORIGINAL model forever (_insert_session_row's
+        COALESCE(sessions.model, excluded.model)), even though the only
+        successful call in the session actually ran the fallback's model.
+        update_session_model() already exists for this exact
+        unconditional-overwrite need — the fallback activation must call it
+        too, or the dashboard's model column goes stale the moment a session
+        falls over."""
+        fbs = [{"provider": "zai-coding", "model": "glm-4.7"}]
+        agent = _make_agent(fallback_model=fbs)
+        agent._session_db = MagicMock()
+        agent.session_id = "cron_test_session"
+        with patch("agent.auxiliary_client.resolve_provider_client",
+                    return_value=(_mock_client(), "glm-4.7")):
+            assert agent._try_activate_fallback() is True
+        agent._session_db.update_session_model.assert_called_once_with(
+            "cron_test_session", "glm-4.7",
+        )
+
     def test_advance_without_session_db_does_not_raise(self):
         """No _session_db (bare/test agent) must not break fallback activation."""
         fbs = [{"provider": "zai", "model": "glm-4.7"}]

@@ -1523,6 +1523,19 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                     base_url=fb_base_url,
                     billing_mode=fb_api_mode,
                 )
+                # _insert_session_row() (called from the first
+                # update_token_counts()) uses
+                # COALESCE(sessions.model, excluded.model) — a session row
+                # created (e.g. by _ensure_db_session()) before this
+                # fallback fires keeps its ORIGINAL model forever. Confirmed
+                # live: a real fallback session recorded model="glm-4.7"
+                # (the pre-fallback model) even though the only successful
+                # call in that session actually ran gpt-5.4-mini via
+                # openai-codex. update_session_model() already exists for
+                # exactly this unconditional-overwrite need (the manual
+                # /model-switch path uses it) — call it here too so the
+                # dashboard's model column matches what's actually serving.
+                _session_db.update_session_model(_session_id, fb_model)
             except Exception:
                 logger.warning(
                     "Failed to persist billing route after fallback activation",
