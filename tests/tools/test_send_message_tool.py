@@ -544,6 +544,115 @@ class TestSendMessageTool:
         assert "access_token=***" in result["error"]
 
 
+class TestSendMessagePlatformConfiguredCheck:
+    """Regression coverage for ClickUp 86e275mbp.
+
+    ``config.platforms`` is only populated from the yaml ``platforms:`` list
+    (or a handful of hardcoded env-var auto-adds in
+    ``gateway/config.py::_apply_env_overrides``). A platform can be fully
+    configured -- real Slack bot credentials present -- and still be missing
+    from ``config.platforms`` merely because it isn't listed under
+    ``platforms:``. Before the fix, ``send_message_tool`` trusted only
+    ``config.platforms.get(platform)`` and returned "not configured" in that
+    case, even though the gateway's own connect logic (which consults the
+    plugin registry's ``is_connected`` hook) would have connected fine.
+    """
+
+    def test_slack_configured_via_credentials_not_listed_in_platforms(self, monkeypatch):
+        # Simulate config.yaml's `platforms:` key listing only telegram and
+        # api_server -- Slack is entirely absent, exactly as described in the
+        # bug report -- while real Slack credentials exist (SLACK_BOT_TOKEN),
+        # which is the same signal the Slack plugin's own `is_connected` hook
+        # (and therefore the gateway's connect loop) checks.
+        config = SimpleNamespace(
+            platforms={Platform.TELEGRAM: SimpleNamespace(enabled=True, token="***", extra={})},
+            get_home_channel=lambda _platform: None,
+        )
+
+        monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-real-cred")
+
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("gateway.mirror.mirror_to_session", return_value=True):
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "target": "slack:C0123456789",
+                        "message": "hello",
+                    }
+                )
+            )
+
+        assert result.get("success") is True, result
+        assert "not configured" not in json.dumps(result)
+        send_mock.assert_awaited_once()
+        called_platform = send_mock.await_args.args[0]
+        assert called_platform == Platform.SLACK
+
+    def test_slack_still_reports_not_configured_without_credentials(self, monkeypatch):
+        """No SLACK_BOT_TOKEN anywhere -- the fallback must not fabricate one."""
+        config = SimpleNamespace(
+            platforms={Platform.TELEGRAM: SimpleNamespace(enabled=True, token="***", extra={})},
+            get_home_channel=lambda _platform: None,
+        )
+
+        monkeypatch.delenv("SLACK_BOT_TOKEN", raising=False)
+
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock:
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "target": "slack:C0123456789",
+                        "message": "hello",
+                    }
+                )
+            )
+
+        assert "error" in result
+        assert "not configured" in result["error"]
+        send_mock.assert_not_awaited()
+
+    def test_explicit_disable_is_not_overridden_by_fallback(self, monkeypatch):
+        """An explicit `enabled: false` (platforms.slack.enabled: false) must
+        still win even when SLACK_BOT_TOKEN is present -- the fallback should
+        only rescue platforms that are *absent*, not ones the user opted out
+        of."""
+        slack_cfg = SimpleNamespace(
+            enabled=False, token=None, extra={"_enabled_explicit": True}
+        )
+        config = SimpleNamespace(
+            platforms={Platform.SLACK: slack_cfg},
+            get_home_channel=lambda _platform: None,
+        )
+
+        monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-real-cred")
+
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock:
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "target": "slack:C0123456789",
+                        "message": "hello",
+                    }
+                )
+            )
+
+        assert "error" in result
+        assert "not configured" in result["error"]
+        send_mock.assert_not_awaited()
+
+
 class TestSendTelegramMediaDelivery:
     def test_sends_text_then_photo_for_media_tag(self, tmp_path, monkeypatch):
         image_path = tmp_path / "photo.png"

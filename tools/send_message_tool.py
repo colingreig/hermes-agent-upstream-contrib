@@ -369,7 +369,47 @@ def _handle_send(args):
             else:
                 return tool_error(f"Platform '{platform_name}' is not configured. Set up credentials in ~/.hermes/config.yaml or environment variables.")
         else:
-            return tool_error(f"Platform '{platform_name}' is not configured. Set up credentials in ~/.hermes/config.yaml or environment variables.")
+            # `config.platforms` is only populated from the yaml `platforms:`
+            # list (or a handful of hardcoded env-var auto-adds in
+            # gateway/config.py::_apply_env_overrides). A platform can be
+            # fully configured -- e.g. real Slack credentials sitting in
+            # config.yaml/.env -- and still be absent here because it isn't
+            # listed under `platforms:`. That's a stricter check than the one
+            # the gateway itself uses to decide what to connect: plugin
+            # platforms register an `is_connected` hook (see
+            # gateway/platform_registry.PlatformEntry.is_connected, e.g. the
+            # Slack plugin's check for SLACK_BOT_TOKEN) which is exactly the
+            # signal GatewayConfig._is_platform_connected()/
+            # get_connected_platforms() fall back to. Reuse that same hook
+            # here so `hermes send` agrees with the gateway's own connect
+            # logic instead of only trusting `platforms:` membership.
+            # Respect an explicit `enabled: false` (user opt-out) -- don't let
+            # the is_connected fallback below resurrect a platform the user
+            # deliberately turned off.
+            explicitly_disabled = bool(
+                pconfig and pconfig.extra.get("_enabled_explicit") and not pconfig.enabled
+            )
+            fallback_pconfig = None
+            if not explicitly_disabled:
+                try:
+                    from hermes_cli.plugins import discover_plugins
+                    from gateway.platform_registry import platform_registry
+
+                    discover_plugins()
+                    entry = platform_registry.get(platform_name)
+                    if entry is not None and entry.is_connected is not None:
+                        from gateway.config import PlatformConfig
+
+                        probe_cfg = pconfig if pconfig is not None else PlatformConfig()
+                        if entry.is_connected(probe_cfg):
+                            fallback_pconfig = pconfig if pconfig is not None else PlatformConfig()
+                            fallback_pconfig.enabled = True
+                except Exception:
+                    fallback_pconfig = None
+
+            if fallback_pconfig is None:
+                return tool_error(f"Platform '{platform_name}' is not configured. Set up credentials in ~/.hermes/config.yaml or environment variables.")
+            pconfig = fallback_pconfig
 
     from gateway.platforms.base import BasePlatformAdapter
 
