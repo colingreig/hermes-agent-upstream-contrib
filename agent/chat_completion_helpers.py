@@ -1206,6 +1206,23 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 _existing_cooldown,
                 time.monotonic() + _FALLBACK_EXHAUSTED_COOLDOWN_S,
             )
+        if len(agent._fallback_chain) > 0:
+            # Non-debug on purpose: hermes_usage_alert.py greps agent.log for
+            # this exact phrase ("fallback chain exhausted") to fire a
+            # same-tick outage alert. The prior candidate signature (a
+            # logger.debug in the unrelated auxiliary_client.py chain) was
+            # both the wrong client and filtered out under the default INFO
+            # root level, so the 07-04 chain-dead-for-13h outage went
+            # completely unalerted (86e261t28, validator FAIL).
+            logger.warning(
+                "Fallback chain exhausted: all %d fallback(s) tried and "
+                "failed for primary provider %s (reason=%s) -- zero work "
+                "happening until a provider recovers or the primary is "
+                "restored.",
+                len(agent._fallback_chain),
+                ((agent._primary_runtime or {}).get("provider") or "unknown"),
+                getattr(reason, "value", reason),
+            )
         return False
     fb = agent._fallback_chain[agent._fallback_index]
     agent._fallback_index += 1

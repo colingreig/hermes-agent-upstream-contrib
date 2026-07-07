@@ -111,6 +111,52 @@ class TestExhaustionArmsCooldown:
         # ~60s past the frozen clock, far past the short exhaustion window.
         assert cooldown == frozen + 60
 
+    def test_exhaustion_emits_non_debug_alert_signature(self, caplog):
+        """Regression for 86e261t28: hermes_usage_alert.py greps agent.log
+        for the literal phrase "fallback chain exhausted" at WARNING+ (the
+        default root log level is INFO, so a logger.debug emission — the
+        prior candidate signature, in the unrelated auxiliary_client.py
+        chain — never reached the log file and the 07-04 chain-dead outage
+        went completely unalerted). This asserts the real primary-chain
+        exhaustion point in try_activate_fallback logs the exact phrase at
+        WARNING or above.
+        """
+        import logging
+
+        fbs = [{"provider": "openai", "model": "gpt-4o"}]
+        agent = _make_agent(fallback_model=fbs)
+        agent._rate_limited_until = 0
+        with (
+            patch("agent.chat_completion_helpers.time.monotonic", return_value=1_000.0),
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(_mock_client(), "resolved"),
+            ),
+            caplog.at_level(logging.WARNING, logger="agent.chat_completion_helpers"),
+        ):
+            assert agent._try_activate_fallback() is True   # -> entry 0
+            assert agent._try_activate_fallback() is False  # chain exhausted
+        assert any(
+            "fallback chain exhausted" in record.message.lower()
+            and record.levelno >= logging.WARNING
+            for record in caplog.records
+        )
+
+    def test_no_chain_does_not_emit_alert_signature(self, caplog):
+        """An empty chain has nothing to exhaust — must not fire the alert
+        signature (would be a false positive on every no-fallback-configured
+        agent's first failure)."""
+        import logging
+
+        agent = _make_agent(fallback_model=None)
+        agent._rate_limited_until = 0
+        with caplog.at_level(logging.WARNING, logger="agent.chat_completion_helpers"):
+            assert agent._try_activate_fallback() is False
+        assert not any(
+            "fallback chain exhausted" in record.message.lower()
+            for record in caplog.records
+        )
+
     def test_cooldown_never_shrinks_existing_window(self):
         """If a longer cooldown is already armed, exhaustion must not reduce
         it (we take the max)."""
