@@ -479,3 +479,78 @@ git branch -D pr-$PR_NUMBER
 - **Approve** — no critical or warning-level issues, only minor suggestions or all clear
 - **Request Changes** — any critical or warning-level issue that should be fixed before merge
 - **Comment** — observations and suggestions, but nothing blocking (use when you're unsure or the PR is a draft)
+
+---
+
+## 6. Recovery / Stranded-Worktree PR Integrity Check — AUTOMATED, ENFORCED
+
+**This is no longer just a manual checklist item — it is an automated, required CI gate that
+structurally blocks merge.** The `pr-safety-gate` job (`.github/workflows/pr-safety-gate.yml`,
+wired into `.github/workflows/ci.yml`'s `all-checks-pass` required check) runs on every PR and
+fails the check when it detects a recovery/stranded-worktree PR whose description doesn't match
+its actual diff. A failing required check blocks merge via branch protection — a mismatched
+recovery PR cannot sail through unnoticed the way the original incident's PR did.
+
+The gate's logic lives in `hermes_cli/pr_safety_gate.py` (`check_recovery_pr` /
+`is_recovery_pr`), which wraps the same `flag_recovery_pr_mismatch` heuristic
+(`hermes_cli/content_gate.py`) described below, plus branch-name (`recover/*`, `recovery/*`,
+`salvage/*`) and PR-title signal detection so recovery PRs are caught even when the description
+itself doesn't use recovery wording. Unit tests: `tests/hermes_cli/test_pr_safety_gate.py`.
+
+**What this means for you as a reviewer:** you no longer need to manually run this check to
+prevent a merge — CI already will. This section is still useful for understanding *why* a PR got
+blocked, for triaging a red `pr-safety-gate` check, and for the (now purely informational) manual
+walkthrough below if you want to look at a recovery PR proactively before CI runs.
+
+### Step 1: Detect recovery language
+
+Read the PR description. If it contains phrases like "recovery", "stranded worktree",
+"stranded-worktree", or "recovered branch" (case-insensitive), this check applies. Otherwise skip
+straight to the normal review workflow above. (CI additionally checks the branch name and title —
+see `is_recovery_pr` — so a PR can be in-scope even if the description itself is silent on it.)
+
+### Step 2: Gather the claimed vs actual scope
+
+```bash
+# What the description claims (read it yourself — no command for this)
+gh pr view $PR_NUMBER --json body --jq '.body'
+
+# What actually changed
+gh pr diff $PR_NUMBER --stat
+```
+
+### Step 3: Compare
+
+Either call the helper directly:
+
+```python
+from hermes_cli.content_gate import flag_recovery_pr_mismatch
+
+warning = flag_recovery_pr_mismatch(pr_description, diff_stat_text)
+```
+
+or do the manual equivalent: list every file-path-looking token the description names (backtick-
+quoted paths, or bare `dir/file.ext`-shaped tokens), and check each one actually appears in the
+`--stat` output. Also compare file counts — if the description names only 1-2 files but the diff
+touches 3x or more, the description understates the scope.
+
+This is exactly what the `pr-safety-gate` CI job already does automatically on every PR — manual
+review here is a proactive double-check, not the only line of defense.
+
+### Step 4: If CI flags a mismatch, resolve it — do not bypass
+
+A failing `pr-safety-gate` check is a **hard block**, not a suggestion. A legitimate recovery can
+still touch more files than the description mentions (e.g. a lockfile regenerated as a side
+effect) — that's a real mismatch by design, and it should be resolved by fixing the PR, not by
+disabling or skipping the check:
+
+1. Do **not** approve, merge, or bypass branch protection to force the merge through.
+2. Read the failing check's log (`::error::` line) for the specific missing/extra files or the
+   scope-understatement detail.
+3. Update the PR description to accurately reflect the diff (or, if the diff itself is wrong,
+   fix the diff) so the description and the actual changes line up.
+4. Push the fix — CI re-runs automatically and the check should go green once they match.
+5. If you genuinely believe the mismatch is a false positive (e.g. a regenerated lockfile), get
+   explicit human confirmation before considering any manual override of branch protection —
+   this should be rare, and the default path is always "fix the description or diff," not
+   "override the gate."

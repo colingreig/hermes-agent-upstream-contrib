@@ -1,0 +1,57 @@
+name: PR Safety Gate
+
+# Automated pre-merge gate for recovery/stranded-worktree PRs.
+#
+# A prior incident shipped a blog post live with literal unfilled
+# placeholder copy ("Placeholder model" / "TBC") because the content had
+# been merged via a "recovery PR" (a PR created to rescue work from a
+# stranded/abandoned git worktree) whose description didn't match its
+# actual diff. The only check that existed at the time was a manual,
+# reviewer-invoked checklist item — nothing structurally blocked the
+# merge, and nobody caught the mismatch.
+#
+# This workflow is the automated replacement: it detects recovery-PR
+# signals (branch name pattern, title, description text) and, when
+# present, cross-checks the PR description against the actual diff via
+# hermes_cli/pr_safety_gate.py. A real mismatch fails this check, and
+# since it's a required status in the `all-checks-pass` gate, a mismatched
+# recovery PR cannot merge without a human updating the description (or
+# diff) to resolve it.
+#
+# Runs on every PR — the job is cheap and the recovery-PR detection itself
+# short-circuits to a no-op pass for the overwhelming majority of ordinary
+# PRs.
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  check-recovery-pr:
+    name: Recovery PR description/diff check
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0 # need full history for merge-base diff
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v5
+        with:
+          python-version: "3.11"
+
+      - name: Run recovery PR safety gate
+        env:
+          PR_BRANCH: ${{ github.event.pull_request.head.ref }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          python -m hermes_cli.pr_safety_gate \
+            --branch "$PR_BRANCH" \
+            --title "$PR_TITLE" \
+            --body "$PR_BODY" \
+            --base-ref "origin/${{ github.event.pull_request.base.ref || 'main' }}"

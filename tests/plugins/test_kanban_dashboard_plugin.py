@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -18,6 +19,16 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from hermes_cli import kanban_db as kb
+
+
+def _init_git_repo(repo: Path) -> None:
+    repo.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True, text=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "kanban@example.com"], check=True, capture_output=True, text=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Kanban Test"], check=True, capture_output=True, text=True)
+    (repo / "README.md").write_text("hello\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True, capture_output=True, text=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-m", "init"], check=True, capture_output=True, text=True)
 
 
 # ---------------------------------------------------------------------------
@@ -398,6 +409,130 @@ def test_patch_drag_drop_move_todo_to_ready(client):
     # Now child auto-promoted by recompute_ready — already ready.
     child_after = client.get(f"/api/plugins/kanban/tasks/{child['id']}").json()["task"]
     assert child_after["status"] == "ready"
+
+
+def test_patch_status_review_blocked_by_open_parent(client, tmp_path):
+    """Content safety gate: promoting to 'review' with an open parent is
+    rejected (409) with structured blocking_parents detail, mirroring the
+    'ready'-transition parent gate. See hermes_cli/content_gate.py."""
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+
+    parent = client.post("/api/plugins/kanban/tasks", json={"title": "dataset task"}).json()["task"]
+    child = client.post(
+        "/api/plugins/kanban/tasks",
+        json={
+            "title": "ship blog post",
+            "parents": [parent["id"]],
+            "workspace_kind": "dir",
+            "workspace_path": str(repo),
+        },
+    ).json()["task"]
+
+    r = client.patch(
+        f"/api/plugins/kanban/tasks/{child['id']}",
+        json={"status": "review"},
+    )
+    assert r.status_code == 409
+    detail = r.json()["detail"]
+    assert "review" in detail["error"]
+    assert detail["blocking_parents"][0]["id"] == parent["id"]
+
+    child_after = client.get(f"/api/plugins/kanban/tasks/{child['id']}").json()["task"]
+    assert child_after["status"] != "review"
+
+
+def test_patch_status_review_blocked_by_placeholder_content(client, tmp_path):
+    """Content safety gate: promoting to 'review' with a placeholder marker
+    in a changed file is rejected (409) with structured placeholder_hits."""
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    (repo / "post.md").write_text("Author: Placeholder model\nTBC\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "post.md"], check=True, capture_output=True, text=True)
+
+    t = client.post(
+        "/api/plugins/kanban/tasks",
+        json={
+            "title": "ship blog post",
+            "workspace_kind": "dir",
+            "workspace_path": str(repo),
+        },
+    ).json()["task"]
+
+    r = client.patch(f"/api/plugins/kanban/tasks/{t['id']}", json={"status": "review"})
+    assert r.status_code == 409
+    detail = r.json()["detail"]
+    assert detail["placeholder_hits"]
+
+    t_after = client.get(f"/api/plugins/kanban/tasks/{t['id']}").json()["task"]
+    assert t_after["status"] != "review"
+
+
+def test_patch_status_review_blocked_by_both_gates_reports_both(client, tmp_path):
+    """Regression: an open parent must not short-circuit the placeholder
+    scan. Both gates run independently, so a task tripping both reports
+    both in the 409 detail (previously the placeholder scan was nested
+    inside `if not blocking_parents`, silently skipping detection —
+    and letting an override that only cleared the dependency block ship
+    placeholder content to review with zero detection or audit trail)."""
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    (repo / "post.md").write_text("Author: Placeholder model\nTBC\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "post.md"], check=True, capture_output=True, text=True)
+
+    parent = client.post("/api/plugins/kanban/tasks", json={"title": "dataset task"}).json()["task"]
+    child = client.post(
+        "/api/plugins/kanban/tasks",
+        json={
+            "title": "ship blog post",
+            "parents": [parent["id"]],
+            "workspace_kind": "dir",
+            "workspace_path": str(repo),
+        },
+    ).json()["task"]
+
+    r = client.patch(
+        f"/api/plugins/kanban/tasks/{child['id']}",
+        json={"status": "review"},
+    )
+    assert r.status_code == 409
+    detail = r.json()["detail"]
+    assert detail["blocking_parents"][0]["id"] == parent["id"]
+    assert detail["placeholder_hits"]
+
+    # override=True must bypass BOTH gates — not just the one that fired
+    # first — and still land the transition.
+    r = client.patch(
+        f"/api/plugins/kanban/tasks/{child['id']}",
+        json={"status": "review", "override": True},
+    )
+    assert r.status_code == 200
+    assert r.json()["task"]["status"] == "review"
+
+
+def test_patch_status_review_override_bypasses_gates(client, tmp_path):
+    """override=True bypasses both content safety gates on the 'review'
+    transition — meant for a human-confirmed exception."""
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    (repo / "post.md").write_text("Author: Placeholder model\nTBC\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "post.md"], check=True, capture_output=True, text=True)
+
+    t = client.post(
+        "/api/plugins/kanban/tasks",
+        json={
+            "title": "ship blog post",
+            "workspace_kind": "dir",
+            "workspace_path": str(repo),
+        },
+    ).json()["task"]
+
+    r = client.patch(
+        f"/api/plugins/kanban/tasks/{t['id']}",
+        json={"status": "review", "override": True},
+    )
+    assert r.status_code == 200
+    assert r.json()["task"]["status"] == "review"
 
 
 def test_reopening_parent_demotes_ready_child(client):
