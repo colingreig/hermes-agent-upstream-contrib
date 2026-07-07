@@ -1765,6 +1765,25 @@ def resolve_runtime_provider(
         # fresh process).
         if entry is None:
             peeked = pool.current() or pool.peek()
+            if peeked is None:
+                # current()/peek() are defined to only ever surface a
+                # non-exhausted candidate — _available_entries() excludes
+                # exhausted ones by design. So when EVERY entry in the pool
+                # is exhausted, both legitimately return None and the check
+                # below never fires, silently falling through to a live
+                # probe of the dead credential (86e261t21, round 4: the
+                # single-zai-key case, not just the multi-entry one this
+                # block was originally written for). Fall back to the raw
+                # entries directly, picking whichever clears soonest so the
+                # AuthError reports an accurate cooldown.
+                exhausted_entries = [
+                    e for e in pool.entries() if e.last_status == STATUS_EXHAUSTED
+                ]
+                if exhausted_entries:
+                    peeked = min(
+                        exhausted_entries,
+                        key=lambda e: _exhausted_until(e) or float("inf"),
+                    )
             if peeked is not None and peeked.last_status == STATUS_EXHAUSTED:
                 exhausted_until = _exhausted_until(peeked)
                 if exhausted_until is not None and time.time() < exhausted_until:

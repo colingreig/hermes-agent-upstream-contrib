@@ -227,6 +227,20 @@ _AUTO_FOCUS_MAX_CHARS = 700
 # back the old large-tool-output case where nothing can be compacted.
 _MAX_TAIL_MESSAGE_FLOOR = 8
 
+# Absolute per-message safety cap, applied regardless of head/tail protection.
+# protect_last_n / _MAX_TAIL_MESSAGE_FLOOR intentionally keep recent tool
+# output verbatim, but that protection has no size limit — a single
+# pathologically large tool result (an uncapped bulk API fetch, a huge file
+# dump) sitting in the protected tail can by itself exceed the model's entire
+# context window. When that happens, no amount of summarizing the
+# compressible middle region reduces total tokens below the limit, and
+# compression permanently reports "made no progress" even though the rest of
+# the transcript is tiny. Capping any single tool result to this many chars
+# (~37.5K tokens) via a head+tail preview guarantees compression always has
+# somewhere to go, without touching the vast majority of real tool results
+# which fall well under this ceiling.
+_MAX_SINGLE_TOOL_RESULT_CHARS = 150_000
+
 
 _PATH_MENTION_RE = re.compile(r"(?:/|~/?|[A-Za-z]:\\)[^\s`'\")\]}<>]+")
 
@@ -315,6 +329,28 @@ def _estimate_msg_budget_tokens(msg: dict) -> int:
         if isinstance(tc, dict):
             tokens += len(str(tc)) // _CHARS_PER_TOKEN
     return tokens
+
+
+def _cap_oversized_tool_result(content: str, cap_chars: int = _MAX_SINGLE_TOOL_RESULT_CHARS) -> str:
+    """Head+tail preview of a single tool result that alone exceeds ``cap_chars``.
+
+    Keeps 70% of the budget from the start (where results usually front-load
+    the useful summary/schema) and 30% from the end, with an explicit marker
+    in between so the model knows content was elided rather than silently
+    truncated mid-thought.
+    """
+    if not isinstance(content, str) or len(content) <= cap_chars:
+        return content
+    head = int(cap_chars * 0.7)
+    tail = cap_chars - head
+    omitted = len(content) - head - tail
+    return (
+        f"{content[:head]}\n"
+        f"[... {omitted:,} chars omitted — this tool result was capped because "
+        f"it alone exceeded {cap_chars:,} chars and would otherwise permanently "
+        f"block context compression ...]\n"
+        f"{content[-tail:]}"
+    )
 
 
 def _content_text_for_contains(content: Any) -> str:
@@ -1175,6 +1211,36 @@ class ContextCompressor(ContextEngine):
     # ------------------------------------------------------------------
     # Tool output pruning (cheap pre-pass, no LLM call)
     # ------------------------------------------------------------------
+
+    def _cap_oversized_messages(
+        self, messages: List[Dict[str, Any]],
+    ) -> tuple[List[Dict[str, Any]], int]:
+        """Cap any single tool-result message that alone exceeds
+        ``_MAX_SINGLE_TOOL_RESULT_CHARS``, regardless of head/tail protection.
+
+        This runs BEFORE the normal head/tail split so it also fires on the
+        small-conversation early-return path in ``compress()`` — the exact
+        shape of the failure this guards against: a handful of messages, one
+        of which is pathologically large, that never reaches the "protect
+        first + last N" pruning logic at all.
+
+        Returns ``(messages, capped_count)``.  Returns the same list object
+        untouched when nothing needed capping, so callers can cheaply detect
+        no-op via identity.
+        """
+        capped = 0
+        result = messages
+        for i, msg in enumerate(messages):
+            if msg.get("role") != "tool":
+                continue
+            content = msg.get("content")
+            if not isinstance(content, str) or len(content) <= _MAX_SINGLE_TOOL_RESULT_CHARS:
+                continue
+            if result is messages:
+                result = list(messages)
+            result[i] = {**msg, "content": _cap_oversized_tool_result(content)}
+            capped += 1
+        return result, capped
 
     def _prune_old_tool_results(
         self, messages: List[Dict[str, Any]], protect_tail_count: int,
@@ -2713,6 +2779,23 @@ This compaction should PRIORITISE preserving all information related to the focu
         # this, /compress would silently no-op for 30-60s after a failure.
         if force:
             self._clear_compression_failure_cooldown()
+
+        # Absolute safety net, run before anything else (including the
+        # small-conversation early-return below): cap any single tool result
+        # that alone exceeds _MAX_SINGLE_TOOL_RESULT_CHARS. Head/tail
+        # protection has no per-message size limit, so a single oversized
+        # tool result can otherwise make every subsequent compression attempt
+        # a permanent no-op regardless of how many messages exist. See
+        # _MAX_SINGLE_TOOL_RESULT_CHARS for rationale.
+        messages, _oversized_capped = self._cap_oversized_messages(messages)
+        if _oversized_capped and not self.quiet_mode:
+            logger.warning(
+                "Capped %d oversized tool result(s) that individually exceeded "
+                "%d chars — would otherwise block compression regardless of "
+                "tail protection",
+                _oversized_capped, _MAX_SINGLE_TOOL_RESULT_CHARS,
+            )
+
         n_messages = len(messages)
         # Only need head + 3 tail messages minimum (token budget decides the real tail size)
         _min_for_compress = self._protect_head_size(messages) + 3 + 1

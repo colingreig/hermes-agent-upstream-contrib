@@ -240,6 +240,15 @@ def test_resolve_runtime_provider_zai_pool_exhausted_does_not_hammer_env_key(mon
     (gated on agent._fallback_activated, which starts False on turn 1), so
     it's a no-op here — this is the fix that actually closes the gap for a
     brand-new process's first attempt.
+
+    The fake pool's peek()/current() return None here — matching the REAL
+    CredentialPool: _available_entries() (which both peek() and current()
+    delegate to for a fresh process with no _current_id) excludes exhausted
+    entries by design, so with the pool's only entry exhausted, peek() also
+    legitimately returns None. This is round 4's bug (validator FAIL on
+    86e261t21): the original version of this fake had peek() return
+    exhausted_entry directly, which isn't how the real pool behaves and
+    masked the gap entries()-fallback below exists to close.
     """
     from agent.credential_pool import STATUS_EXHAUSTED, PooledCredential
 
@@ -272,7 +281,12 @@ def test_resolve_runtime_provider_zai_pool_exhausted_does_not_hammer_env_key(mon
             return None
 
         def peek(self):
-            return exhausted_entry
+            # Real CredentialPool.peek() only ever surfaces a non-exhausted
+            # candidate; with the sole entry exhausted, it returns None.
+            return None
+
+        def entries(self):
+            return [exhausted_entry]
 
     def _unexpected_api_key_resolution(provider):
         raise AssertionError(
