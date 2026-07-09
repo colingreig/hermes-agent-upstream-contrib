@@ -588,6 +588,9 @@ def _handle_complete(args: dict, **kw) -> str:
             f"metadata must be an object/dict, got {type(metadata).__name__}"
         )
     metadata = _stamp_worker_session_metadata(tid, metadata)
+    override_dependency_check = bool(args.get("override_dependency_check", False))
+    override_placeholder_check = bool(args.get("override_placeholder_check", False))
+    override_signoff_check = bool(args.get("override_signoff_check", False))
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
@@ -629,6 +632,9 @@ def _handle_complete(args: dict, **kw) -> str:
                     result=result, summary=summary, metadata=metadata,
                     created_cards=created_cards,
                     expected_run_id=_worker_run_id(tid),
+                    override_dependency_check=override_dependency_check,
+                    override_placeholder_check=override_placeholder_check,
+                    override_signoff_check=override_signoff_check,
                 )
             except kb.HallucinatedCardsError as hall_err:
                 # Structured rejection — surface the phantom ids so the
@@ -649,6 +655,65 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"Retry kanban_complete with the same summary/metadata "
                     f"and either drop these ids from created_cards, or pass "
                     f"created_cards=[] to skip the card-claim check entirely."
+                )
+            except kb.OpenDependencyError as dep_err:
+                # Structured rejection — name the still-open parent(s) so
+                # the worker understands why completion is blocked. Audit
+                # event already landed in the DB; the task itself was NOT
+                # mutated (the gate runs before the write txn).
+                names = ", ".join(
+                    f"{p['title']!r} ({p['id']}, status={p['status']})"
+                    for p in dep_err.blocking_parents
+                )
+                return tool_error(
+                    f"kanban_complete blocked: this task has open parent(s) "
+                    f"not yet done — {names}. Your task is still in-flight "
+                    f"(no state change). Wait for the parent(s) to complete, "
+                    f"or if you have confirmed with a human that completing "
+                    f"anyway is correct, retry kanban_complete with "
+                    f"override_dependency_check=true (use sparingly — this "
+                    f"is for a human-confirmed exception, not routine use)."
+                )
+            except kb.PlaceholderContentError as ph_err:
+                # Structured rejection — list file -> markers so the worker
+                # can find and fix the placeholder/stub content. Audit
+                # event already landed in the DB; the task itself was NOT
+                # mutated (the gate runs before the write txn).
+                details = "; ".join(
+                    f"{path}: {', '.join(markers)}"
+                    for path, markers in ph_err.hits.items()
+                )
+                return tool_error(
+                    f"kanban_complete blocked: placeholder/stub content "
+                    f"detected in changed files — {details}. Your task is "
+                    f"still in-flight (no state change). Replace the "
+                    f"placeholder content and retry, or if you have "
+                    f"confirmed with a human that this is a false positive, "
+                    f"retry kanban_complete with "
+                    f"override_placeholder_check=true (use sparingly — "
+                    f"this is for a human-confirmed exception, not routine "
+                    f"use)."
+                )
+            except kb.MissingHumanSignOffError:
+                # Structured rejection — this task's acceptance criteria
+                # require an explicit human sign-off and no non-bot comment
+                # exists yet. Audit event already landed in the DB; the
+                # task itself was NOT mutated (the gate runs before the
+                # write txn). Deliberately vague about *why* a bot comment
+                # doesn't count — a worker should not be coached into
+                # crafting a comment that merely dodges the "ignite-"
+                # prefix; the fix is to get a real human to actually look
+                # at the task and comment.
+                return tool_error(
+                    "kanban_complete blocked: this task's acceptance "
+                    "criteria require an explicit human sign-off, and no "
+                    "non-bot comment exists on the task yet. Your task is "
+                    "still in-flight (no state change). Wait for a human "
+                    "to review and comment, or if a human has confirmed "
+                    "out-of-band that sign-off is satisfied, retry "
+                    "kanban_complete with override_signoff_check=true (use "
+                    "sparingly — this is for a human-confirmed exception, "
+                    "not routine use)."
                 )
             if not ok:
                 return tool_error(
@@ -1279,6 +1344,44 @@ KANBAN_COMPLETE_SCHEMA = {
                     "are not the deliverable. The path must exist "
                     "on disk when the notifier runs; missing files "
                     "are silently skipped."
+                ),
+            },
+            "override_dependency_check": {
+                "type": "boolean",
+                "description": (
+                    "Bypass the open-dependency gate, which normally "
+                    "blocks completion when a parent task is still open "
+                    "(not done/archived). Only set this after a human has "
+                    "confirmed completing anyway is correct — it is meant "
+                    "for a human-confirmed exception, not routine use. "
+                    "The bypass is still recorded as an audit event."
+                ),
+            },
+            "override_placeholder_check": {
+                "type": "boolean",
+                "description": (
+                    "Bypass the placeholder/stub content scan, which "
+                    "normally blocks completion when changed files "
+                    "contain markers like literal 'TBC', 'lorem ipsum', "
+                    "leaked internal notes, or unrendered template "
+                    "tokens. Only set this after a human has confirmed "
+                    "the flagged text is a false positive — it is meant "
+                    "for a human-confirmed exception, not routine use. "
+                    "The bypass is still recorded as an audit event."
+                ),
+            },
+            "override_signoff_check": {
+                "type": "boolean",
+                "description": (
+                    "Bypass the human sign-off gate, which normally "
+                    "blocks completion when the task's acceptance "
+                    "criteria explicitly require a human sign-off (e.g. "
+                    "'Colin sign-off', 'requires Colin') and no non-bot "
+                    "comment exists on the task yet. Only set this after "
+                    "a human has confirmed out-of-band that sign-off is "
+                    "satisfied — it is meant for a human-confirmed "
+                    "exception, not routine use. The bypass is still "
+                    "recorded as an audit event."
                 ),
             },
             "board": _board_schema_prop(),

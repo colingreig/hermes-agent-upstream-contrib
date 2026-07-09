@@ -5079,3 +5079,144 @@ class TestCompressionFallbackContextFilter:
         # Empty / unknown tasks have no minimum
         assert _task_minimum_context_length("") is None
         assert _task_minimum_context_length(None) is None
+
+
+class _GeminiInvalidKeyError(Exception):
+    """Mirrors Gemini's real wire error for a dead/invalid API key.
+
+    Gemini returns this as HTTP 400 (not 401), with a message shaped like
+    ``{"error":{"code":400,"status":"INVALID_ARGUMENT","message":"API key
+    not valid. Please pass a valid API key."}}``. Observed in prod as
+    "Compression aborted: Gemini HTTP 400 API key not valid" — the bug this
+    opt-in per-task fallback exists to fix.
+    """
+
+    status_code = 400
+
+    def __init__(self, message="API key not valid. Please pass a valid API key."):
+        super().__init__(message)
+
+
+class TestAuxiliaryTaskFallback:
+    """auxiliary.<task>.fallback: opt-in, config-driven, single-shot failover.
+
+    Covers agent/auxiliary_client.py::_try_task_fallback_once and the
+    _is_hard_aux_error gate in call_llm(). This is deliberately separate from
+    the always-on should_fallback/is_capacity_error machinery exercised by
+    TestAuxiliaryFallbackLayering and TestCallLlmPaymentFallback above — it
+    only ever activates for a task that explicitly configures
+    ``auxiliary.<task>.fallback``, and only for a hard, unrecoverable error
+    class (auth/invalid-key, connection failure, or payment/credit
+    exhaustion).
+    """
+
+    _FALLBACK_ENTRY = {
+        "provider": "zai",
+        "model": "glm-4.7",
+        "base_url": "https://api.z.ai/api/coding/paas/v4",
+    }
+
+    def _configure_fallback_for(self, monkeypatch, *tasks_with_fallback):
+        """Patch _get_auxiliary_task_config so only the named tasks carry a
+        fallback block — mirrors DEFAULT_CONFIG's compression/skills_hub
+        defaults without depending on the real config file."""
+        monkeypatch.setattr(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            lambda task: (
+                {"fallback": dict(self._FALLBACK_ENTRY)}
+                if task in tasks_with_fallback else {}
+            ),
+        )
+
+    def test_hard_auth_error_falls_back_to_configured_fallback(self, monkeypatch):
+        """A Gemini 400 'API key not valid' on the explicit primary provider
+        for `compression` transparently succeeds via the configured fallback
+        instead of aborting the auxiliary task."""
+        self._configure_fallback_for(monkeypatch, "compression")
+
+        primary_client = MagicMock()
+        primary_client.base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
+        primary_client.chat.completions.create.side_effect = _GeminiInvalidKeyError()
+
+        fallback_client = MagicMock()
+        fallback_client.base_url = "https://api.z.ai/api/coding/paas/v4"
+        fallback_client.chat.completions.create.return_value = _DummyResponse("fallback summary")
+
+        with patch("agent.auxiliary_client._get_cached_client",
+                   return_value=(primary_client, "gemini-3.5-flash")), \
+             patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("gemini", "gemini-3.5-flash", None, None, None)), \
+             patch("agent.auxiliary_client.resolve_provider_client",
+                   return_value=(fallback_client, "glm-4.7")) as mock_resolve:
+            result = call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "hello"}],
+            )
+
+        assert result.choices[0].message.content == "fallback summary"
+        assert fallback_client.chat.completions.create.called
+        # Resolved through the central provider router with the configured
+        # zai/glm-4.7/z.ai coordinates — not a hardcoded special case.
+        mock_resolve.assert_called_once()
+        assert mock_resolve.call_args.args[0] == "zai"
+        assert mock_resolve.call_args.kwargs.get("model") == "glm-4.7"
+        assert mock_resolve.call_args.kwargs.get("explicit_base_url") == "https://api.z.ai/api/coding/paas/v4"
+
+    def test_task_without_fallback_still_aborts_unchanged(self, monkeypatch):
+        """A task with NO auxiliary.<task>.fallback configured must raise
+        exactly as before — zero behavior change for the other ~10 aux
+        tasks that don't opt in."""
+        self._configure_fallback_for(monkeypatch)  # no task gets a fallback
+
+        primary_client = MagicMock()
+        primary_client.base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
+        primary_client.chat.completions.create.side_effect = _GeminiInvalidKeyError()
+
+        with patch("agent.auxiliary_client._get_cached_client",
+                   return_value=(primary_client, "gemini-3.5-flash")), \
+             patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("gemini", "gemini-3.5-flash", None, None, None)), \
+             patch("agent.auxiliary_client.resolve_provider_client") as mock_resolve:
+            with pytest.raises(_GeminiInvalidKeyError):
+                call_llm(
+                    task="web_extract",
+                    messages=[{"role": "user", "content": "hello"}],
+                )
+
+        # No fallback configured for web_extract — the central provider
+        # router must never even be consulted for a fallback candidate.
+        mock_resolve.assert_not_called()
+
+    def test_soft_rate_limit_error_does_not_trigger_task_fallback(self, monkeypatch):
+        """An ordinary 429 rate-limit (with retry-after semantics) must NOT
+        route through the opt-in task fallback, even when one is configured
+        — that would silently broaden retry semantics beyond what this
+        feature is meant to cover. Existing rate-limit handling (same-provider
+        retry / the always-on capacity fallback) is untouched by this test;
+        it only asserts our new narrow mechanism stays out of the way."""
+        self._configure_fallback_for(monkeypatch, "compression")
+
+        primary_client = MagicMock()
+        primary_client.base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
+        rate_limit_err = Exception("Rate limit exceeded, please retry after 30 seconds")
+        rate_limit_err.status_code = 429
+        primary_client.chat.completions.create.side_effect = rate_limit_err
+
+        with patch("agent.auxiliary_client._get_cached_client",
+                   return_value=(primary_client, "gemini-3.5-flash")), \
+             patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("gemini", "gemini-3.5-flash", None, None, None)), \
+             patch("agent.auxiliary_client._try_configured_fallback_chain",
+                   return_value=(None, None, "")), \
+             patch("agent.auxiliary_client._try_main_agent_model_fallback",
+                   return_value=(None, None, "")), \
+             patch("agent.auxiliary_client._try_task_fallback_once") as mock_task_fb:
+            with pytest.raises(Exception, match="Rate limit exceeded"):
+                call_llm(
+                    task="compression",
+                    messages=[{"role": "user", "content": "hello"}],
+                )
+
+        # The hard-error gate (_is_hard_aux_error) must exclude rate limits,
+        # so the new helper is never even called for this error class.
+        mock_task_fb.assert_not_called()

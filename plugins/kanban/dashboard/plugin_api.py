@@ -48,6 +48,7 @@ from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile, Web
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
+from hermes_cli import content_gate
 from hermes_cli import kanban_db
 from hermes_cli import kanban_diagnostics as kd
 
@@ -816,6 +817,11 @@ class UpdateTaskBody(BaseModel):
     # complete --summary ... --metadata ...``.
     summary: Optional[str] = None
     metadata: Optional[dict] = None
+    # Bypasses the open-dependency / placeholder-content gates on the
+    # 'review' transition (see _set_status_direct). Intended for a
+    # human-confirmed exception, not routine use — the dashboard should
+    # only send this after the user explicitly acknowledges the block.
+    override: bool = False
 
 
 @router.patch("/tasks/{task_id}")
@@ -868,10 +874,34 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                     status_code=400,
                     detail="Cannot set status to 'running' directly; use the dispatcher/claim path",
                 )
+            elif s == "review":
+                ok = _set_status_direct(conn, task_id, "review", override=payload.override)
             elif s in ("todo", "triage", "scheduled"):
                 ok = _set_status_direct(conn, task_id, s)
             else:
                 raise HTTPException(status_code=400, detail=f"unknown status: {s}")
+            if isinstance(ok, dict):
+                # Structured content-safety-gate block from _set_status_direct
+                # (review transition). Surface enough detail for the
+                # dashboard to render a specific toast rather than a
+                # generic "transition refused" message.
+                detail: dict[str, Any] = {"error": "content safety gate blocked review transition"}
+                if ok.get("blocking_parents"):
+                    names = ", ".join(
+                        f"{p['title']!r} ({p['id']}, status={p['status']})"
+                        for p in ok["blocking_parents"]
+                    )
+                    detail["error"] = f"Cannot move to 'review': blocked by parent(s) not done — {names}"
+                    detail["blocking_parents"] = ok["blocking_parents"]
+                if ok.get("placeholder_hits"):
+                    detail["placeholder_hits"] = ok["placeholder_hits"]
+                    if "blocking_parents" not in detail:
+                        hit_desc = "; ".join(
+                            f"{path}: {', '.join(markers)}"
+                            for path, markers in ok["placeholder_hits"].items()
+                        )
+                        detail["error"] = f"Cannot move to 'review': placeholder content detected — {hit_desc}"
+                raise HTTPException(status_code=409, detail=detail)
             if not ok:
                 # For ``ready``, name the blocking parent(s) so the dashboard
                 # can render an actionable toast instead of a silent no-op.
@@ -978,22 +1008,36 @@ def _parents_blocking_ready(
 
 
 def _set_status_direct(
-    conn: sqlite3.Connection, task_id: str, new_status: str,
-) -> bool:
+    conn: sqlite3.Connection, task_id: str, new_status: str, *, override: bool = False,
+) -> Any:
     """Direct status write for drag-drop moves that aren't covered by the
     structured complete/block/unblock/archive verbs (e.g. todo<->ready,
-    running<->ready). Appends a ``status`` event row for the live feed.
+    running<->ready, ->review). Appends a ``status`` event row for the live
+    feed.
 
     When this transitions OFF ``running`` to anything other than the
     terminal verbs above (which own their own run closing), we close the
     active run with outcome='reclaimed' so attempt history isn't
     orphaned. ``running -> ready`` via drag-drop is the common case
     (user yanking a stuck worker back to the queue).
+
+    Returns ``True`` on success, ``False`` on a plain not-found/CAS-miss
+    failure, or a ``dict`` describing a *content-safety-gate* block when
+    ``new_status == "review"`` hits the open-dependency or placeholder
+    checks (mirrors the shape ``update_task`` already builds for the
+    ``ready``-transition 409, extended with a ``placeholder_hits`` field
+    when relevant) — callers should check ``isinstance(result, dict)``
+    before treating a falsy return as a generic failure.
+
+    ``override=True`` bypasses both content-safety gates for the
+    ``review`` transition (mirrors ``complete_task``'s
+    ``override_dependency_check`` / ``override_placeholder_check``) and
+    still emits the corresponding ``*_override`` audit event.
     """
     with kanban_db.write_txn(conn):
         # Snapshot current state so we know whether to close a run.
         prev = conn.execute(
-            "SELECT status, current_run_id FROM tasks WHERE id = ?",
+            "SELECT status, current_run_id, workspace_path FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if prev is None:
@@ -1013,6 +1057,45 @@ def _set_status_direct(
                 p["status"] == "done" for p in parent_statuses
             ):
                 return False
+
+        # Content safety gates — additive to (not a replacement for) the
+        # 'ready' parent gate above. Applied on the transition INTO
+        # 'review', since _set_status_direct is the only code path that
+        # sets status='review' (dashboard drag-drop and any programmatic
+        # direct-status-change caller). See hermes_cli/content_gate.py and
+        # the incident writeup in kanban_db.complete_task's docstring.
+        if new_status == "review" and prev["workspace_path"]:
+            blocking_parents = content_gate.open_parent_summaries(conn, task_id)
+            changed_files = content_gate.diff_changed_files(prev["workspace_path"])
+            placeholder_hits = content_gate.scan_paths_for_placeholders(changed_files)
+
+            if (blocking_parents or placeholder_hits) and not override:
+                if blocking_parents:
+                    kanban_db._append_event(
+                        conn, task_id, "completion_blocked_dependency",
+                        {"blocking_parents": blocking_parents},
+                    )
+                if placeholder_hits:
+                    kanban_db._append_event(
+                        conn, task_id, "completion_blocked_placeholder",
+                        {"hits": placeholder_hits},
+                    )
+                return {
+                    "blocked": True,
+                    "blocking_parents": blocking_parents,
+                    "placeholder_hits": placeholder_hits,
+                }
+            elif blocking_parents or placeholder_hits:
+                if blocking_parents:
+                    kanban_db._append_event(
+                        conn, task_id, "dependency_override",
+                        {"overridden": True, "blocking_parents": blocking_parents},
+                    )
+                if placeholder_hits:
+                    kanban_db._append_event(
+                        conn, task_id, "placeholder_override",
+                        {"overridden": True, "hits": placeholder_hits},
+                    )
 
         was_running = prev["status"] == "running"
         reopening_satisfied_parent = (

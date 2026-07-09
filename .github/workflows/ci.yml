@@ -88,6 +88,12 @@ jobs:
     if: needs.detect.outputs.event_name == 'pull_request'
     uses: ./.github/workflows/history-check.yml
 
+  pr-safety-gate:
+    name: PR safety gate
+    needs: detect
+    if: needs.detect.outputs.event_name == 'pull_request'
+    uses: ./.github/workflows/pr-safety-gate.yml
+
   contributor-check:
     name: Check contributors
     needs: detect
@@ -142,6 +148,7 @@ jobs:
       - typecheck
       - docs-site
       - history-check
+      - pr-safety-gate
       - contributor-check
       - uv-lockfile
       - docker-lint

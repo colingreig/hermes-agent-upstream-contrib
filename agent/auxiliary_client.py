@@ -2816,6 +2816,15 @@ def _is_auth_error(exc: Exception) -> bool:
         return True
     if "unauthenticated" in err_lower and "bad-credentials" in err_lower:
         return True
+    # Gemini's native wording for a bad/revoked key is a 400, not a 401:
+    # {"error":{"code":400,"status":"INVALID_ARGUMENT","message":"API key not
+    # valid. Please pass a valid API key."}}. Without this, a dead Gemini key
+    # never matches the auth-error branches above and every auxiliary call
+    # (compression, skills_hub, ...) aborts hard with no recovery attempted.
+    # Mirrors the identical fix already applied to the main-chain classifier
+    # in agent/error_classifier.py (_AUTH_PATTERNS, see 86e261t1y).
+    if status == 400 and "api key not valid" in err_lower:
+        return True
     return False
 
 
@@ -3576,6 +3585,85 @@ def _try_configured_fallback_chain(
             task, ", ".join(tried),
         )
     return None, None, ""
+
+
+def _is_hard_aux_error(exc: Exception) -> bool:
+    """Narrow "unrecoverable primary" classifier for the opt-in task fallback.
+
+    Deliberately tighter than ``should_fallback`` in :func:`call_llm`: only
+    the error classes that mean *this specific provider/credential cannot
+    serve the request at all* qualify —
+
+      * auth / invalid-credential (401, or Gemini's 400 "API key not valid")
+      * endpoint unreachable (DNS/connection/TLS failure)
+      * 402 / credit-exhaustion
+
+    Ordinary 429 rate-limiting (which already has its own retry-after
+    handling) and plain transient timeouts are excluded on purpose — those
+    are expected to self-resolve or are already covered by
+    ``_is_transient_transport_error`` same-provider retries, and routing
+    them through a second provider on every blip would broaden retry
+    semantics well beyond what auxiliary.<task>.fallback is meant to cover.
+    """
+    return (
+        _is_auth_error(exc)
+        or _is_connection_error(exc)
+        or _is_payment_error(exc)
+    )
+
+
+def _try_task_fallback_once(task: Optional[str], exc: Exception) -> Tuple[Optional[Any], Optional[str], str]:
+    """Try the opt-in ``auxiliary.<task>.fallback`` provider exactly once.
+
+    This is the single-entry counterpart to :func:`_try_configured_fallback_chain`
+    (which reads a *list* under ``fallback_chain``): it reads the singular
+    ``auxiliary.<task>.fallback: {provider, model, base_url}`` block and, when
+    present, resolves it through the same central provider router used by the
+    rest of this module. Absence of the key (the default for every task except
+    ``compression`` and ``skills_hub``) means this is a pure no-op — existing
+    tasks see zero behavior change.
+
+    Callers are expected to have already verified ``_is_hard_aux_error(exc)``;
+    this function does not re-classify the error, it only resolves and returns
+    a client. It never recurses — a failure of the fallback client itself
+    simply propagates to the caller like any other exception, it is not
+    retried again through this same path.
+
+    Returns:
+        (client, model, provider_label) or (None, None, "") when no fallback
+        is configured for this task, or the configured fallback provider
+        itself has no usable credentials.
+    """
+    if not task:
+        return None, None, ""
+    task_config = _get_auxiliary_task_config(task)
+    entry = task_config.get("fallback")
+    if not isinstance(entry, dict) or not entry.get("provider"):
+        return None, None, ""
+
+    label = f"fallback({entry.get('provider')})"
+    try:
+        fb_client, resolved_model = _resolve_fallback_entry(entry)
+    except Exception:
+        logger.debug(
+            "Auxiliary %s: configured hard-error fallback %s failed to resolve",
+            task, label, exc_info=True,
+        )
+        return None, None, ""
+
+    if fb_client is None:
+        logger.debug(
+            "Auxiliary %s: configured hard-error fallback %s has no usable credentials",
+            task, label,
+        )
+        return None, None, ""
+
+    logger.info(
+        "Auxiliary %s: hard error on primary provider (%s) — using configured "
+        "fallback %s (%s)",
+        task, exc, label, resolved_model or entry.get("model") or "default",
+    )
+    return fb_client, resolved_model or str(entry.get("model") or "").strip() or None, label
 
 
 def _try_configured_fallback_for_unavailable_client(
@@ -6480,6 +6568,32 @@ def call_llm(
                 "(fallback_chain + main agent model). Raising original error.",
                 task or "call", reason, resolved_provider,
             )
+        # ── Opt-in per-task hard-error fallback (config-driven, last resort) ──
+        # Everything above is the shared, always-on recovery machinery (pool
+        # rotation, fallback_chain, main-agent safety net) and only fires for
+        # specific error/provider combinations by design (e.g. auth errors on
+        # an explicitly-configured provider deliberately skip it — see
+        # test_401_auth_error_no_fallback_with_explicit_provider). This is a
+        # separate, narrower escape hatch: when the task has
+        # ``auxiliary.<task>.fallback`` configured (default: compression,
+        # skills_hub — see hermes_cli/config.py DEFAULT_CONFIG) AND the
+        # primary call failed with a hard, unrecoverable error (invalid/expired
+        # key, unreachable endpoint, or credit exhaustion — see
+        # ``_is_hard_aux_error``), try the configured fallback exactly once
+        # before giving up. Tasks with no ``fallback`` configured hit a no-op
+        # here and fall straight through to ``raise`` unchanged.
+        if _is_hard_aux_error(first_err):
+            fb_client, fb_model, fb_label = _try_task_fallback_once(task, first_err)
+            if fb_client is not None:
+                fb_kwargs = _build_call_kwargs(
+                    fb_label, fb_model, messages,
+                    temperature=temperature, max_tokens=max_tokens,
+                    tools=tools, timeout=effective_timeout,
+                    extra_body=effective_extra_body,
+                    base_url=str(getattr(fb_client, "base_url", "") or ""))
+                return _validate_llm_response(
+                    fb_client.chat.completions.create(**fb_kwargs), task)
+
         # Connection/timeout errors leave the cached client poisoned (closed
         # httpx transport, half-read stream, dead async loop).  Drop it from
         # the cache regardless of whether we found a fallback above so the
@@ -6969,6 +7083,29 @@ async def async_call_llm(
                 "(fallback_chain + main agent model). Raising original error.",
                 task or "call", reason, resolved_provider,
             )
+
+        # ── Opt-in per-task hard-error fallback (config-driven, last resort) ──
+        # Mirrors the sync call_llm() path — see its comment for the full
+        # rationale. Only fires when auxiliary.<task>.fallback is configured
+        # (default: compression, skills_hub) and the failure is a hard,
+        # unrecoverable error on the primary provider.
+        if _is_hard_aux_error(first_err):
+            fb_client, fb_model, fb_label = _try_task_fallback_once(task, first_err)
+            if fb_client is not None:
+                fb_kwargs = _build_call_kwargs(
+                    fb_label, fb_model, messages,
+                    temperature=temperature, max_tokens=max_tokens,
+                    tools=tools, timeout=effective_timeout,
+                    extra_body=effective_extra_body,
+                    base_url=str(getattr(fb_client, "base_url", "") or ""))
+                async_fb, async_fb_model = _to_async_client(
+                    fb_client, fb_model or "", is_vision=(task == "vision")
+                )
+                if async_fb_model and async_fb_model != fb_kwargs.get("model"):
+                    fb_kwargs["model"] = async_fb_model
+                return _validate_llm_response(
+                    await async_fb.chat.completions.create(**fb_kwargs), task)
+
         # Mirror the sync path: drop poisoned clients on connection/timeout
         # so the next aux call rebuilds.  See issue #23432.
         if _is_connection_error(first_err):
