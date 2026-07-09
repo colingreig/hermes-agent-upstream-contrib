@@ -210,22 +210,10 @@ def describe_profile(
         model, provider = None, None
 
     try:
-        from agent.auxiliary_client import (  # type: ignore
-            get_auxiliary_extra_body,
-            get_text_auxiliary_client,
-        )
+        from agent.auxiliary_client import call_llm  # type: ignore
     except Exception as exc:
         logger.debug("describe: auxiliary client import failed: %s", exc)
         return DescribeOutcome(canon, False, "auxiliary client unavailable")
-
-    try:
-        client, aux_model = get_text_auxiliary_client("profile_describer")
-    except Exception as exc:
-        logger.debug("describe: get_text_auxiliary_client failed: %s", exc)
-        return DescribeOutcome(canon, False, "auxiliary client unavailable")
-
-    if client is None or not aux_model:
-        return DescribeOutcome(canon, False, "no auxiliary client configured")
 
     user_msg = _USER_TEMPLATE.format(
         name=canon,
@@ -237,8 +225,14 @@ def describe_profile(
     )
 
     try:
-        resp = client.chat.completions.create(
-            model=aux_model,
+        # Route through call_llm (not a raw get_text_auxiliary_client +
+        # chat.completions.create) so the shared auxiliary recovery machinery
+        # applies — provider/model/extra_body come from
+        # ``auxiliary.profile_describer.*`` and a HARD primary-provider error
+        # (invalid key / unreachable endpoint / credit exhaustion) transparently
+        # retries the configured ``auxiliary.profile_describer.fallback``.
+        resp = call_llm(
+            task="profile_describer",
             messages=[
                 {"role": "system", "content": _SYSTEM_PROMPT},
                 {"role": "user", "content": user_msg},
@@ -246,8 +240,12 @@ def describe_profile(
             temperature=0.3,
             max_tokens=400,
             timeout=timeout or 60,
-            extra_body=get_auxiliary_extra_body() or None,
         )
+    except RuntimeError as exc:
+        # call_llm raises RuntimeError only when no provider/credentials
+        # resolve for the task — the old "no auxiliary client configured" case.
+        logger.debug("describe: no auxiliary client configured: %s", exc)
+        return DescribeOutcome(canon, False, "no auxiliary client configured")
     except Exception as exc:
         logger.info("describe: API call failed for %s (%s)", canon, exc)
         return DescribeOutcome(canon, False, f"LLM error: {type(exc).__name__}")

@@ -41,22 +41,19 @@ def _fake_aux_response(content: str):
     return resp
 
 
-def _mock_client_returning(content: str):
-    client = MagicMock()
-    client.chat.completions.create = MagicMock(return_value=_fake_aux_response(content))
-    return client
-
-
 def _patch_aux_client(content: str, *, model: str = "test-model"):
-    """Patch get_text_auxiliary_client at its source + at the module that
-    imported it lazily inside specify_task. Both patches are needed
-    because kanban_specify imports the function inside the function body.
+    """Patch call_llm (which specify_task now routes through) to return a
+    fake OpenAI-shaped response. specify_task imports call_llm lazily inside
+    the function body, so patching it at its source module is sufficient.
+
+    Returns (patch_ctx, mock_call_llm) so callers can assert on whether the
+    auxiliary LLM was invoked (mock.call_count).
     """
-    client = _mock_client_returning(content)
+    mock_call_llm = MagicMock(return_value=_fake_aux_response(content))
     return patch(
-        "agent.auxiliary_client.get_text_auxiliary_client",
-        return_value=(client, model),
-    ), client
+        "agent.auxiliary_client.call_llm",
+        mock_call_llm,
+    ), mock_call_llm
 
 
 # ---------------------------------------------------------------------------
@@ -135,32 +132,35 @@ def test_specify_task_rejects_non_triage_task(kanban_home):
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="ready task")
 
-    p, client = _patch_aux_client("unused")
+    p, mock_call_llm = _patch_aux_client("unused")
     with p:
         outcome = spec.specify_task(tid)
 
     assert outcome.ok is False
     assert "not in triage" in outcome.reason
     # LLM must not be invoked for a non-triage task — fail cheap.
-    assert client.chat.completions.create.call_count == 0
+    assert mock_call_llm.call_count == 0
 
 
 def test_specify_task_unknown_id(kanban_home):
-    p, client = _patch_aux_client("unused")
+    p, mock_call_llm = _patch_aux_client("unused")
     with p:
         outcome = spec.specify_task("t_nope")
     assert outcome.ok is False
     assert "unknown task" in outcome.reason
-    assert client.chat.completions.create.call_count == 0
+    assert mock_call_llm.call_count == 0
 
 
 def test_specify_task_no_aux_client_configured(kanban_home):
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="rough", triage=True)
 
+    # call_llm raises RuntimeError when no provider/credentials resolve.
     with patch(
-        "agent.auxiliary_client.get_text_auxiliary_client",
-        return_value=(None, ""),
+        "agent.auxiliary_client.call_llm",
+        side_effect=RuntimeError(
+            "No LLM provider configured for task=triage_specifier"
+        ),
     ):
         outcome = spec.specify_task(tid)
 
@@ -171,15 +171,18 @@ def test_specify_task_no_aux_client_configured(kanban_home):
         assert kb.get_task(conn, tid).status == "triage"
 
 
+class _FakeAPIError(Exception):
+    """Stand-in for a provider SDK API error (non-RuntimeError), which is
+    what call_llm raises for an upstream failure it couldn't recover from."""
+
+
 def test_specify_task_llm_api_error_keeps_task_in_triage(kanban_home):
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="rough", triage=True)
 
-    client = MagicMock()
-    client.chat.completions.create = MagicMock(side_effect=RuntimeError("429 rate limited"))
     with patch(
-        "agent.auxiliary_client.get_text_auxiliary_client",
-        return_value=(client, "test-model"),
+        "agent.auxiliary_client.call_llm",
+        side_effect=_FakeAPIError("upstream 500"),
     ):
         outcome = spec.specify_task(tid)
 
@@ -288,8 +291,10 @@ def test_cli_specify_all_returns_1_when_every_task_fails(kanban_home, capsys):
         kb.create_task(conn, title="b", triage=True)
 
     with patch(
-        "agent.auxiliary_client.get_text_auxiliary_client",
-        return_value=(None, ""),  # no aux client → every task fails
+        "agent.auxiliary_client.call_llm",
+        side_effect=RuntimeError(  # no aux client → every task fails
+            "No LLM provider configured for task=triage_specifier"
+        ),
     ):
         rc = _run_cli("specify", "--all")
 
