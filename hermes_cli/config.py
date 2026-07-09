@@ -1512,6 +1512,20 @@ DEFAULT_CONFIG = {
             "api_key": "",
             "timeout": 120,        # seconds — compression summarises large contexts; increase for local models
             "extra_body": {},
+            # Opt-in, single-shot failover for a HARD primary-provider error
+            # (invalid/expired API key, unreachable endpoint, or 402 credit
+            # exhaustion — see agent/auxiliary_client.py::_try_task_fallback_once).
+            # Ordinary rate limits and transient timeouts are unaffected; those
+            # already have their own retry/fallback handling. Compression is a
+            # highest-value aux task (a stuck compression blocks the whole
+            # session), so it ships with a working default: zai/glm-4.7 is the
+            # same provider already proven in prod for kanban_decomposer. Clear
+            # this block (or set provider: "") to disable.
+            "fallback": {
+                "provider": "zai",
+                "model": "glm-4.7",
+                "base_url": "https://api.z.ai/api/coding/paas/v4",
+            },
         },
         # Note: session_search no longer uses an auxiliary LLM (PR #27590 —
         # single-shape tool returns DB content directly). The old
@@ -1524,6 +1538,15 @@ DEFAULT_CONFIG = {
             "api_key": "",
             "timeout": 30,
             "extra_body": {},
+            # See auxiliary.compression.fallback above — same opt-in hard-error
+            # failover, applied here because skill selection is the other
+            # highest-value aux task (a stuck skills_hub call silently drops
+            # skill routing for the turn).
+            "fallback": {
+                "provider": "zai",
+                "model": "glm-4.7",
+                "base_url": "https://api.z.ai/api/coding/paas/v4",
+            },
         },
         "approval": {
             "provider": "auto",
