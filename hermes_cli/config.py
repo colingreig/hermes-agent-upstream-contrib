@@ -1496,6 +1496,19 @@ DEFAULT_CONFIG = {
             "timeout": 120,        # seconds — LLM API call timeout; vision payloads need generous timeout
             "extra_body": {},      # OpenAI-compatible provider-specific request fields
             "download_timeout": 30,  # seconds — image HTTP download timeout; increase for slow connections
+            # Opt-in hard-error failover (see auxiliary.compression.fallback).
+            # Vision is multimodal, so the fallback MUST be a vision-capable
+            # backend — a text-only model (e.g. glm-4.7) would reject image
+            # blocks. z.ai's glm-5v-turbo is the OpenAI-wire multimodal model
+            # in _PROVIDER_VISION_MODELS; it must use the /api/paas/v4 endpoint
+            # (the Anthropic-wire /coding endpoint rejects max_tokens on
+            # multimodal calls with error 1210 — see resolve_vision_provider_client).
+            # Only fires when ZAI credentials exist; otherwise a graceful no-op.
+            "fallback": {
+                "provider": "zai",
+                "model": "glm-5v-turbo",
+                "base_url": "https://api.z.ai/api/paas/v4",
+            },
         },
         "web_extract": {
             "provider": "auto",
@@ -1504,6 +1517,15 @@ DEFAULT_CONFIG = {
             "api_key": "",
             "timeout": 360,        # seconds (6min) — per-attempt LLM summarization timeout; increase for slow local models
             "extra_body": {},
+            # Vision-capable failover, matching auxiliary.vision.fallback:
+            # web_extract can be pointed at pages/PDFs whose content is
+            # rendered as images, so a multimodal fallback is a strict superset
+            # of a text one. See auxiliary.vision.fallback for the endpoint note.
+            "fallback": {
+                "provider": "zai",
+                "model": "glm-5v-turbo",
+                "base_url": "https://api.z.ai/api/paas/v4",
+            },
         },
         "compression": {
             "provider": "auto",
@@ -1580,6 +1602,19 @@ DEFAULT_CONFIG = {
             "api_key": "",
             "timeout": 30,
             "extra_body": {},
+            # NOTE: this task is the TEXT tag-rewrite that inserts Gemini audio
+            # tags ([whispers], [excitedly], …) into a transcript before TTS —
+            # NOT the TTS synthesis itself (that is gemini-only, handled by
+            # tools/tts_tool.py::_generate_gemini_tts against Gemini's
+            # generateContent endpoint and has no auxiliary fallback). The
+            # rewrite is a plain text transformation routed through call_llm, so
+            # a text fallback restores it after a hard primary-provider error.
+            # See auxiliary.compression.fallback for the mechanism.
+            "fallback": {
+                "provider": "zai",
+                "model": "glm-4.7",
+                "base_url": "https://api.z.ai/api/coding/paas/v4",
+            },
         },
         # Triage specifier — flesh out a rough one-liner in the Kanban
         # Triage column into a concrete spec, then promote it to ``todo``.
@@ -1593,6 +1628,15 @@ DEFAULT_CONFIG = {
             "api_key": "",
             "timeout": 120,
             "extra_body": {},
+            # Opt-in hard-error failover (see auxiliary.compression.fallback).
+            # The spec expansion is a plain text task routed through call_llm
+            # (hermes_cli/kanban_specify.py), so a text fallback keeps a triage
+            # task from stranding when the primary aux provider dies hard.
+            "fallback": {
+                "provider": "zai",
+                "model": "glm-4.7",
+                "base_url": "https://api.z.ai/api/coding/paas/v4",
+            },
         },
         # Kanban decomposer — decomposes a triage task into a graph of
         # child tasks routed to specialist profiles by description.
@@ -1618,12 +1662,30 @@ DEFAULT_CONFIG = {
             "api_key": "",
             "timeout": 60,
             "extra_body": {},
+            # Opt-in hard-error failover (see auxiliary.compression.fallback).
+            # Short text description generation routed through call_llm
+            # (hermes_cli/profile_describer.py); a text fallback restores it
+            # after a hard primary-provider error.
+            "fallback": {
+                "provider": "zai",
+                "model": "glm-4.7",
+                "base_url": "https://api.z.ai/api/coding/paas/v4",
+            },
         },
         # Curator — skill-usage review fork. Timeout is generous because the
         # review pass can take several minutes on reasoning models (umbrella
         # building over hundreds of candidate skills). "auto" = use main chat
         # model; override via `hermes model` → auxiliary → Curator to route
         # to a cheaper aux model (e.g. openrouter google/gemini-3-flash-preview).
+        #
+        # No ``fallback`` block here BY DESIGN: unlike the other auxiliary
+        # tasks, curator does NOT call call_llm(). It forks a full AIAgent
+        # (agent/curator.py::_run_llm_review) which already carries the main
+        # agent's provider fallback (top-level ``fallback_providers`` chain).
+        # An ``auxiliary.curator.fallback`` block would be a silent no-op —
+        # _try_task_fallback_once() is never on curator's call path — so it is
+        # intentionally omitted. Provider failover for the curator fork is
+        # configured via ``fallback_providers`` at the top level, not here.
         "curator": {
             "provider": "auto",
             "model": "",
