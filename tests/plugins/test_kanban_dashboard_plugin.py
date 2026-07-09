@@ -2213,20 +2213,18 @@ def test_board_exposes_diagnostics_list_and_summary(client):
 
 
 def _patch_specifier_response(monkeypatch, *, content, model="test-model"):
-    """Helper: install a fake auxiliary client so the specifier endpoint
-    can run without hitting any real provider."""
+    """Helper: install a fake call_llm so the specifier endpoint can run
+    without hitting any real provider (specify_task routes through call_llm)."""
     from unittest.mock import MagicMock
 
     resp = MagicMock()
     resp.choices = [MagicMock()]
     resp.choices[0].message.content = content
-    fake_client = MagicMock()
-    fake_client.chat.completions.create = MagicMock(return_value=resp)
     monkeypatch.setattr(
-        "agent.auxiliary_client.get_text_auxiliary_client",
-        lambda *a, **kw: (fake_client, model),
+        "agent.auxiliary_client.call_llm",
+        lambda *a, **kw: resp,
     )
-    return fake_client
+    return resp
 
 
 def test_specify_happy_path(client, monkeypatch):
@@ -2288,11 +2286,12 @@ def test_specify_no_aux_client_surfaces_reason(client, monkeypatch):
         json={"title": "rough", "triage": True},
     ).json()["task"]
 
-    # Simulate "no auxiliary client configured".
-    monkeypatch.setattr(
-        "agent.auxiliary_client.get_text_auxiliary_client",
-        lambda *a, **kw: (None, ""),
-    )
+    # Simulate "no auxiliary client configured" — call_llm raises RuntimeError
+    # when no provider/credentials resolve.
+    def _no_provider(*a, **kw):
+        raise RuntimeError("No LLM provider configured for task=triage_specifier")
+
+    monkeypatch.setattr("agent.auxiliary_client.call_llm", _no_provider)
 
     r = client.post(
         f"/api/plugins/kanban/tasks/{t['id']}/specify",

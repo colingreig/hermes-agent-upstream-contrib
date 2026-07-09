@@ -5228,35 +5228,45 @@ class TestAuxiliaryTaskFallback:
                 f"auxiliary.{task}.fallback missing or wrong in DEFAULT_CONFIG"
             )
 
-    def test_default_config_no_fallback_for_multimodal_or_unwired_tasks(self):
-        """Tasks deliberately left without a fallback default must stay that
-        way: vision/web_extract (multimodal — glm-4.7 is text-only on the
-        zai coding endpoint) and tts_audio_tags (Gemini-TTS-specific
-        feature). triage_specifier/profile_describer/curator are also
-        excluded because their call sites bypass call_llm()'s
-        _try_task_fallback_once() path entirely (they call
-        client.chat.completions.create() directly, or — for curator — run
-        through hermes_cli.runtime_provider instead of the auxiliary client),
-        so a fallback block there would silently do nothing."""
+    def test_default_config_fallback_now_wired_for_previously_uncovered_tasks(self):
+        """The tasks previously left out are now covered: vision/web_extract get
+        a MULTIMODAL fallback (glm-5v-turbo on the OpenAI-wire /paas/v4 vision
+        endpoint — a text-only glm-4.7 would reject image blocks), and
+        tts_audio_tags/triage_specifier/profile_describer (all routed through
+        call_llm) get the text glm-4.7 fallback. curator remains excluded on
+        purpose — it forks a full AIAgent instead of calling call_llm(), so a
+        block there would be a silent no-op."""
         from hermes_cli.config import DEFAULT_CONFIG
 
         aux = DEFAULT_CONFIG["auxiliary"]
-        for task in (
-            "vision",
-            "web_extract",
-            "tts_audio_tags",
-            "triage_specifier",
-            "profile_describer",
-            "curator",
-        ):
-            assert "fallback" not in aux[task], (
-                f"auxiliary.{task}.fallback unexpectedly present"
+
+        for task in ("vision", "web_extract"):
+            fb = aux[task].get("fallback")
+            assert fb, f"auxiliary.{task}.fallback missing"
+            assert fb.get("model") == "glm-5v-turbo", (
+                f"auxiliary.{task}.fallback must be multimodal, got {fb.get('model')!r}"
             )
+            assert fb.get("base_url") == "https://api.z.ai/api/paas/v4"
+
+        text_fb = {
+            "provider": "zai",
+            "model": "glm-4.7",
+            "base_url": "https://api.z.ai/api/coding/paas/v4",
+        }
+        for task in ("tts_audio_tags", "triage_specifier", "profile_describer"):
+            assert aux[task].get("fallback") == text_fb, (
+                f"auxiliary.{task}.fallback missing or wrong in DEFAULT_CONFIG"
+            )
+
+        assert "fallback" not in aux["curator"], (
+            "auxiliary.curator.fallback would be a no-op — curator forks an "
+            "AIAgent and never reaches _try_task_fallback_once()"
+        )
 
     def test_task_without_fallback_still_aborts_unchanged(self, monkeypatch):
         """A task with NO auxiliary.<task>.fallback configured must raise
-        exactly as before — zero behavior change for the other ~10 aux
-        tasks that don't opt in."""
+        exactly as before — zero behavior change for the aux tasks that don't
+        opt in (e.g. mcp, approval, title_generation)."""
         self._configure_fallback_for(monkeypatch)  # no task gets a fallback
 
         primary_client = MagicMock()
@@ -5270,12 +5280,12 @@ class TestAuxiliaryTaskFallback:
              patch("agent.auxiliary_client.resolve_provider_client") as mock_resolve:
             with pytest.raises(_GeminiInvalidKeyError):
                 call_llm(
-                    task="web_extract",
+                    task="mcp",
                     messages=[{"role": "user", "content": "hello"}],
                 )
 
-        # No fallback configured for web_extract — the central provider
-        # router must never even be consulted for a fallback candidate.
+        # No fallback configured for mcp — the central provider router must
+        # never even be consulted for a fallback candidate.
         mock_resolve.assert_not_called()
 
     def test_soft_rate_limit_error_does_not_trigger_task_fallback(self, monkeypatch):
@@ -5311,3 +5321,258 @@ class TestAuxiliaryTaskFallback:
         # The hard-error gate (_is_hard_aux_error) must exclude rate limits,
         # so the new helper is never even called for this error class.
         mock_task_fb.assert_not_called()
+
+    # ── Newly-wired per-task fallbacks (this PR) ─────────────────────────
+    # Each test proves the configured fallback for a task that previously had
+    # NO working failover actually fires on a hard primary-provider error and
+    # forwards the configured provider/model/base_url through the central
+    # router. See hermes_cli/config.py DEFAULT_CONFIG.auxiliary.
+
+    _VISION_FALLBACK_ENTRY = {
+        "provider": "zai",
+        "model": "glm-5v-turbo",
+        "base_url": "https://api.z.ai/api/paas/v4",
+    }
+
+    def test_web_extract_hard_error_falls_back_to_vision_capable_model(self, monkeypatch):
+        """web_extract now carries a vision-capable fallback; a hard auth error
+        on the primary routes through the central router with glm-5v-turbo
+        (multimodal), NOT a text-only model."""
+        monkeypatch.setattr(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            lambda task: (
+                {"fallback": dict(self._VISION_FALLBACK_ENTRY)}
+                if task == "web_extract" else {}
+            ),
+        )
+
+        primary_client = MagicMock()
+        primary_client.base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
+        primary_client.chat.completions.create.side_effect = _GeminiInvalidKeyError()
+
+        fallback_client = MagicMock()
+        fallback_client.base_url = "https://api.z.ai/api/paas/v4"
+        fallback_client.chat.completions.create.return_value = _DummyResponse("web-extract-fallback")
+
+        with patch("agent.auxiliary_client._get_cached_client",
+                   return_value=(primary_client, "gemini-3.5-flash")), \
+             patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("gemini", "gemini-3.5-flash", None, None, None)), \
+             patch("agent.auxiliary_client.resolve_provider_client",
+                   return_value=(fallback_client, "glm-5v-turbo")) as mock_resolve:
+            result = call_llm(
+                task="web_extract",
+                messages=[{"role": "user", "content": "summarize this page"}],
+            )
+
+        assert result.choices[0].message.content == "web-extract-fallback"
+        assert fallback_client.chat.completions.create.called
+        mock_resolve.assert_called_once()
+        assert mock_resolve.call_args.args[0] == "zai"
+        assert mock_resolve.call_args.kwargs.get("model") == "glm-5v-turbo"
+        assert mock_resolve.call_args.kwargs.get("explicit_base_url") == "https://api.z.ai/api/paas/v4"
+
+    def test_tts_audio_tags_hard_error_falls_back_to_text_model(self, monkeypatch):
+        """tts_audio_tags (the text tag-rewrite, routed through call_llm) fails
+        over on a hard error to the configured text fallback."""
+        self._configure_fallback_for(monkeypatch, "tts_audio_tags")
+
+        primary_client = MagicMock()
+        primary_client.base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
+        primary_client.chat.completions.create.side_effect = _GeminiInvalidKeyError()
+
+        fallback_client = MagicMock()
+        fallback_client.base_url = "https://api.z.ai/api/coding/paas/v4"
+        fallback_client.chat.completions.create.return_value = _DummyResponse("[whispers] tagged")
+
+        with patch("agent.auxiliary_client._get_cached_client",
+                   return_value=(primary_client, "gemini-3.5-flash")), \
+             patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("gemini", "gemini-3.5-flash", None, None, None)), \
+             patch("agent.auxiliary_client.resolve_provider_client",
+                   return_value=(fallback_client, "glm-4.7")) as mock_resolve:
+            result = call_llm(
+                task="tts_audio_tags",
+                messages=[{"role": "user", "content": "tag this transcript"}],
+            )
+
+        assert result.choices[0].message.content == "[whispers] tagged"
+        mock_resolve.assert_called_once()
+        assert mock_resolve.call_args.args[0] == "zai"
+        assert mock_resolve.call_args.kwargs.get("model") == "glm-4.7"
+
+    def test_triage_specifier_hard_error_falls_back(self, monkeypatch):
+        """triage_specifier (now routed through call_llm) fails over on a hard
+        primary-provider error to the configured fallback."""
+        self._configure_fallback_for(monkeypatch, "triage_specifier")
+
+        primary_client = MagicMock()
+        primary_client.base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
+        primary_client.chat.completions.create.side_effect = _GeminiInvalidKeyError()
+
+        fallback_client = MagicMock()
+        fallback_client.base_url = "https://api.z.ai/api/coding/paas/v4"
+        fallback_client.chat.completions.create.return_value = _DummyResponse('{"title": "t", "body": "b"}')
+
+        with patch("agent.auxiliary_client._get_cached_client",
+                   return_value=(primary_client, "gemini-3.5-flash")), \
+             patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("gemini", "gemini-3.5-flash", None, None, None)), \
+             patch("agent.auxiliary_client.resolve_provider_client",
+                   return_value=(fallback_client, "glm-4.7")) as mock_resolve:
+            result = call_llm(
+                task="triage_specifier",
+                messages=[{"role": "user", "content": "expand this spec"}],
+            )
+
+        assert result.choices[0].message.content == '{"title": "t", "body": "b"}'
+        mock_resolve.assert_called_once()
+        assert mock_resolve.call_args.args[0] == "zai"
+
+    def test_profile_describer_hard_error_falls_back(self, monkeypatch):
+        """profile_describer (now routed through call_llm) fails over on a hard
+        primary-provider error to the configured fallback."""
+        self._configure_fallback_for(monkeypatch, "profile_describer")
+
+        primary_client = MagicMock()
+        primary_client.base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
+        primary_client.chat.completions.create.side_effect = _GeminiInvalidKeyError()
+
+        fallback_client = MagicMock()
+        fallback_client.base_url = "https://api.z.ai/api/coding/paas/v4"
+        fallback_client.chat.completions.create.return_value = _DummyResponse('{"description": "good at X"}')
+
+        with patch("agent.auxiliary_client._get_cached_client",
+                   return_value=(primary_client, "gemini-3.5-flash")), \
+             patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("gemini", "gemini-3.5-flash", None, None, None)), \
+             patch("agent.auxiliary_client.resolve_provider_client",
+                   return_value=(fallback_client, "glm-4.7")) as mock_resolve:
+            result = call_llm(
+                task="profile_describer",
+                messages=[{"role": "user", "content": "describe this profile"}],
+            )
+
+        assert result.choices[0].message.content == '{"description": "good at X"}'
+        mock_resolve.assert_called_once()
+        assert mock_resolve.call_args.args[0] == "zai"
+
+    @pytest.mark.asyncio
+    async def test_vision_hard_error_falls_back_to_vision_capable_model(self, monkeypatch):
+        """Vision runs through async_call_llm and resolves its primary via
+        resolve_vision_provider_client. A hard auth error must route through the
+        opt-in task fallback to a MULTIMODAL model (glm-5v-turbo on the
+        OpenAI-wire /paas/v4 endpoint), converted to an async client with
+        is_vision=True — never a text-only fallback."""
+        monkeypatch.setattr(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            lambda task: (
+                {"fallback": dict(self._VISION_FALLBACK_ENTRY)}
+                if task == "vision" else {}
+            ),
+        )
+
+        failing_client = MagicMock()
+        failing_client.base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
+        failing_client.chat.completions.create = AsyncMock(side_effect=_GeminiInvalidKeyError())
+
+        sync_fallback_client = MagicMock()
+        sync_fallback_client.base_url = "https://api.z.ai/api/paas/v4"
+
+        async_fallback_client = MagicMock()
+        async_fallback_client.base_url = "https://api.z.ai/api/paas/v4"
+        async_fallback_client.chat.completions.create = AsyncMock(
+            return_value=_DummyResponse("vision-fallback"))
+
+        with patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("gemini", "gemini-3-flash", None, None, None)), \
+             patch("agent.auxiliary_client.resolve_vision_provider_client",
+                   return_value=("gemini", failing_client, "gemini-3-flash")), \
+             patch("agent.auxiliary_client.resolve_provider_client",
+                   return_value=(sync_fallback_client, "glm-5v-turbo")) as mock_resolve, \
+             patch("agent.auxiliary_client._to_async_client",
+                   return_value=(async_fallback_client, "glm-5v-turbo")) as mock_to_async:
+            result = await async_call_llm(
+                task="vision",
+                messages=[{"role": "user", "content": "describe this image"}],
+            )
+
+        assert result.choices[0].message.content == "vision-fallback"
+        assert async_fallback_client.chat.completions.create.called
+        # Resolved through the central router with the multimodal coordinates.
+        mock_resolve.assert_called_once()
+        assert mock_resolve.call_args.args[0] == "zai"
+        assert mock_resolve.call_args.kwargs.get("model") == "glm-5v-turbo"
+        assert mock_resolve.call_args.kwargs.get("explicit_base_url") == "https://api.z.ai/api/paas/v4"
+        # The sync fallback client is wrapped for vision (is_vision=True) before use.
+        assert mock_to_async.call_args.kwargs.get("is_vision") is True
+
+
+class TestAuxiliaryFallbackCoverage:
+    """Invariant guard: no auxiliary task carries a dead/no-op fallback block,
+    and multimodal tasks get a multimodal fallback.
+
+    Every ``auxiliary.<task>.fallback`` in DEFAULT_CONFIG must belong to a task
+    whose call path actually reaches _try_task_fallback_once() (i.e. it routes
+    through call_llm/async_call_llm). curator forks a full AIAgent and therefore
+    must NOT carry a task-fallback block (it would be a silent no-op).
+    """
+
+    # Tasks whose runtime call path routes through call_llm()/async_call_llm()
+    # and therefore honor auxiliary.<task>.fallback via _try_task_fallback_once.
+    _CALL_LLM_ROUTED_TASKS = frozenset({
+        "compression",       # agent/context_compressor.py, trajectory_compressor.py
+        "skills_hub",        # agent/plugin_llm.py
+        "vision",            # tools/vision_tools.py (async_call_llm)
+        "web_extract",       # tools/browser_tool.py
+        "tts_audio_tags",    # tools/tts_tool.py (text tag-rewrite)
+        "triage_specifier",  # hermes_cli/kanban_specify.py
+        "profile_describer",  # hermes_cli/profile_describer.py
+        "approval",          # tools/approval.py
+        "mcp",               # tools/mcp_tool.py
+        "title_generation",  # agent/title_generator.py
+        "monitor",           # cron/scripts/classify_items.py
+    })
+
+    # Tasks that make an LLM call but do NOT route through call_llm(), so an
+    # auxiliary.<task>.fallback block would be inert. Must never carry one.
+    _NON_CALL_LLM_TASKS = frozenset({"curator"})
+
+    def _aux(self):
+        from hermes_cli.config import DEFAULT_CONFIG
+        return DEFAULT_CONFIG["auxiliary"]
+
+    def test_every_fallback_block_is_on_a_call_llm_routed_task(self):
+        aux = self._aux()
+        for task, cfg in aux.items():
+            if not isinstance(cfg, dict):
+                continue
+            if "fallback" in cfg:
+                assert task in self._CALL_LLM_ROUTED_TASKS, (
+                    f"auxiliary.{task}.fallback is a silent no-op: {task} does "
+                    f"not route through call_llm()/async_call_llm()"
+                )
+
+    def test_curator_has_no_task_fallback_block(self):
+        aux = self._aux()
+        for task in self._NON_CALL_LLM_TASKS:
+            assert "fallback" not in aux.get(task, {}), (
+                f"auxiliary.{task}.fallback would be a no-op — {task} forks an "
+                f"AIAgent and relies on the top-level fallback_providers chain"
+            )
+
+    def test_vision_tasks_use_a_multimodal_fallback(self):
+        """vision + web_extract fallbacks must be vision-capable — a text-only
+        model (glm-4.7) would reject image blocks."""
+        aux = self._aux()
+        for task in ("vision", "web_extract"):
+            fb = aux[task].get("fallback")
+            assert fb, f"{task} should carry a fallback block"
+            assert fb.get("model") == "glm-5v-turbo", (
+                f"auxiliary.{task}.fallback must use a multimodal model, "
+                f"got {fb.get('model')!r}"
+            )
+            assert "coding/paas" not in fb.get("base_url", ""), (
+                f"auxiliary.{task}.fallback must use the OpenAI-wire /paas/v4 "
+                f"vision endpoint, not the Anthropic-wire /coding endpoint"
+            )
