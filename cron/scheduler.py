@@ -2544,6 +2544,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         platform="",
         chat_id="",
         chat_name="",
+        skill_scope=str(job.get("skill_scope") or ""),
     )
     _cron_delivery_vars = (
         "HERMES_CRON_AUTO_DELIVER_PLATFORM",
