@@ -1496,19 +1496,30 @@ DEFAULT_CONFIG = {
             "timeout": 120,        # seconds — LLM API call timeout; vision payloads need generous timeout
             "extra_body": {},      # OpenAI-compatible provider-specific request fields
             "download_timeout": 30,  # seconds — image HTTP download timeout; increase for slow connections
-            # Opt-in hard-error failover (see auxiliary.compression.fallback).
-            # Vision is multimodal, so the fallback MUST be a vision-capable
-            # backend — a text-only model (e.g. glm-4.7) would reject image
-            # blocks. z.ai's glm-5v-turbo is the OpenAI-wire multimodal model
-            # in _PROVIDER_VISION_MODELS; it must use the /api/paas/v4 endpoint
-            # (the Anthropic-wire /coding endpoint rejects max_tokens on
-            # multimodal calls with error 1210 — see resolve_vision_provider_client).
-            # Only fires when ZAI credentials exist; otherwise a graceful no-op.
-            "fallback": {
-                "provider": "zai",
-                "model": "glm-5v-turbo",
-                "base_url": "https://api.z.ai/api/paas/v4",
-            },
+            # No opt-in ``fallback`` block BY DESIGN. Vision is multimodal, so a
+            # fallback must be a vision-capable backend reachable through the
+            # per-task fallback path — and no config-only option is reliable
+            # here:
+            #   * z.ai's glm-5v-turbo (its OpenAI-wire multimodal model) is NOT
+            #     available on the coding-subscription plan (429 code 1311 "plan
+            #     does not include GLM-5V-Turbo") nor on the pay-as-you-go
+            #     endpoint without API billing (429 code 1113 "insufficient
+            #     balance") — verified against the live account. So a glm-5v
+            #     fallback would just swap one failure for a z.ai billing error.
+            #   * The main vision backend is already ``gemini`` (see the live
+            #     ``auxiliary.vision.provider`` override) — a Gemini fallback
+            #     would duplicate the primary and fail identically if the Gemini
+            #     key/endpoint is what died.
+            #   * An Anthropic fallback can't work through this path: call_llm()
+            #     converts OpenAI image blocks to the Anthropic wire only on the
+            #     PRIMARY request (see _convert_openai_images_to_anthropic call
+            #     sites), not in the fallback branch, so Claude 400s on the
+            #     unconverted image.
+            # Vision resilience therefore comes from the primary provider plus
+            # resolve_vision_provider_client()'s built-in auto-chain
+            # (main → OpenRouter → Nous → Anthropic), NOT a per-task fallback.
+            # Revisit if a vision-capable backend the account can reach becomes
+            # available (or once the fallback branch converts Anthropic images).
         },
         "web_extract": {
             "provider": "auto",
@@ -1517,14 +1528,18 @@ DEFAULT_CONFIG = {
             "api_key": "",
             "timeout": 360,        # seconds (6min) — per-attempt LLM summarization timeout; increase for slow local models
             "extra_body": {},
-            # Vision-capable failover, matching auxiliary.vision.fallback:
-            # web_extract can be pointed at pages/PDFs whose content is
-            # rendered as images, so a multimodal fallback is a strict superset
-            # of a text one. See auxiliary.vision.fallback for the endpoint note.
+            # web_extract's LLM path is TEXT summarisation of a fetched page /
+            # accessibility snapshot (tools/browser_tool.py), not image input,
+            # so a text fallback is correct — and unlike the vision model,
+            # zai/glm-4.7 on the coding endpoint IS reachable on the account's
+            # subscription (verified). See auxiliary.compression.fallback for
+            # the mechanism. (If a future caller feeds web_extract image
+            # payloads, this text fallback only engages on a hard primary error
+            # and at worst fails the same as no fallback — never worse.)
             "fallback": {
                 "provider": "zai",
-                "model": "glm-5v-turbo",
-                "base_url": "https://api.z.ai/api/paas/v4",
+                "model": "glm-4.7",
+                "base_url": "https://api.z.ai/api/coding/paas/v4",
             },
         },
         "compression": {

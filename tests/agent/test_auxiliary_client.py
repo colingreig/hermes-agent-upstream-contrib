@@ -5229,34 +5229,35 @@ class TestAuxiliaryTaskFallback:
             )
 
     def test_default_config_fallback_now_wired_for_previously_uncovered_tasks(self):
-        """The tasks previously left out are now covered: vision/web_extract get
-        a MULTIMODAL fallback (glm-5v-turbo on the OpenAI-wire /paas/v4 vision
-        endpoint — a text-only glm-4.7 would reject image blocks), and
-        tts_audio_tags/triage_specifier/profile_describer (all routed through
-        call_llm) get the text glm-4.7 fallback. curator remains excluded on
-        purpose — it forks a full AIAgent instead of calling call_llm(), so a
-        block there would be a silent no-op."""
+        """The previously-uncovered TEXT tasks are now covered with the
+        glm-4.7 text fallback: web_extract (its LLM path is text page
+        summarisation), tts_audio_tags, triage_specifier, profile_describer —
+        all routed through call_llm. vision deliberately carries NO fallback
+        (no account-reachable, format-safe vision backend exists via config —
+        see the config comment), and curator is excluded because it forks a
+        full AIAgent instead of calling call_llm()."""
         from hermes_cli.config import DEFAULT_CONFIG
 
         aux = DEFAULT_CONFIG["auxiliary"]
-
-        for task in ("vision", "web_extract"):
-            fb = aux[task].get("fallback")
-            assert fb, f"auxiliary.{task}.fallback missing"
-            assert fb.get("model") == "glm-5v-turbo", (
-                f"auxiliary.{task}.fallback must be multimodal, got {fb.get('model')!r}"
-            )
-            assert fb.get("base_url") == "https://api.z.ai/api/paas/v4"
 
         text_fb = {
             "provider": "zai",
             "model": "glm-4.7",
             "base_url": "https://api.z.ai/api/coding/paas/v4",
         }
-        for task in ("tts_audio_tags", "triage_specifier", "profile_describer"):
+        for task in ("web_extract", "tts_audio_tags", "triage_specifier", "profile_describer"):
             assert aux[task].get("fallback") == text_fb, (
                 f"auxiliary.{task}.fallback missing or wrong in DEFAULT_CONFIG"
             )
+
+        # vision must NOT carry a fallback — a glm-4.7 text model would reject
+        # image blocks, and no reachable multimodal fallback is available for
+        # this account (z.ai vision is plan-gated, Gemini is the primary,
+        # Anthropic images aren't converted on the fallback path).
+        assert "fallback" not in aux["vision"], (
+            "auxiliary.vision.fallback would be a dud — no account-reachable, "
+            "format-safe multimodal fallback exists via config"
+        )
 
         assert "fallback" not in aux["curator"], (
             "auxiliary.curator.fallback would be a no-op — curator forks an "
@@ -5334,24 +5335,18 @@ class TestAuxiliaryTaskFallback:
         "base_url": "https://api.z.ai/api/paas/v4",
     }
 
-    def test_web_extract_hard_error_falls_back_to_vision_capable_model(self, monkeypatch):
-        """web_extract now carries a vision-capable fallback; a hard auth error
-        on the primary routes through the central router with glm-5v-turbo
-        (multimodal), NOT a text-only model."""
-        monkeypatch.setattr(
-            "agent.auxiliary_client._get_auxiliary_task_config",
-            lambda task: (
-                {"fallback": dict(self._VISION_FALLBACK_ENTRY)}
-                if task == "web_extract" else {}
-            ),
-        )
+    def test_web_extract_hard_error_falls_back_to_text_model(self, monkeypatch):
+        """web_extract's LLM path is text page summarisation, so a hard auth
+        error on the primary routes through the central router to the text
+        glm-4.7 fallback (reachable on the account's z.ai subscription)."""
+        self._configure_fallback_for(monkeypatch, "web_extract")
 
         primary_client = MagicMock()
         primary_client.base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
         primary_client.chat.completions.create.side_effect = _GeminiInvalidKeyError()
 
         fallback_client = MagicMock()
-        fallback_client.base_url = "https://api.z.ai/api/paas/v4"
+        fallback_client.base_url = "https://api.z.ai/api/coding/paas/v4"
         fallback_client.chat.completions.create.return_value = _DummyResponse("web-extract-fallback")
 
         with patch("agent.auxiliary_client._get_cached_client",
@@ -5359,7 +5354,7 @@ class TestAuxiliaryTaskFallback:
              patch("agent.auxiliary_client._resolve_task_provider_model",
                    return_value=("gemini", "gemini-3.5-flash", None, None, None)), \
              patch("agent.auxiliary_client.resolve_provider_client",
-                   return_value=(fallback_client, "glm-5v-turbo")) as mock_resolve:
+                   return_value=(fallback_client, "glm-4.7")) as mock_resolve:
             result = call_llm(
                 task="web_extract",
                 messages=[{"role": "user", "content": "summarize this page"}],
@@ -5369,8 +5364,7 @@ class TestAuxiliaryTaskFallback:
         assert fallback_client.chat.completions.create.called
         mock_resolve.assert_called_once()
         assert mock_resolve.call_args.args[0] == "zai"
-        assert mock_resolve.call_args.kwargs.get("model") == "glm-5v-turbo"
-        assert mock_resolve.call_args.kwargs.get("explicit_base_url") == "https://api.z.ai/api/paas/v4"
+        assert mock_resolve.call_args.kwargs.get("model") == "glm-4.7"
 
     def test_tts_audio_tags_hard_error_falls_back_to_text_model(self, monkeypatch):
         """tts_audio_tags (the text tag-rewrite, routed through call_llm) fails
@@ -5459,11 +5453,14 @@ class TestAuxiliaryTaskFallback:
 
     @pytest.mark.asyncio
     async def test_vision_hard_error_falls_back_to_vision_capable_model(self, monkeypatch):
-        """Vision runs through async_call_llm and resolves its primary via
-        resolve_vision_provider_client. A hard auth error must route through the
-        opt-in task fallback to a MULTIMODAL model (glm-5v-turbo on the
-        OpenAI-wire /paas/v4 endpoint), converted to an async client with
-        is_vision=True — never a text-only fallback."""
+        """MECHANISM test (config monkeypatched, not shipped defaults): when a
+        vision fallback IS configured, async_call_llm's vision path must route a
+        hard error to that fallback and wrap the resolved client with
+        is_vision=True (converting via _to_async_client) — proving the code path
+        forwards multimodal coordinates correctly. NB: DEFAULT_CONFIG ships NO
+        vision fallback (no account-reachable multimodal backend — see
+        test_default_config_fallback_now_wired_for_previously_uncovered_tasks);
+        this guards the wiring for deployments that DO configure one."""
         monkeypatch.setattr(
             "agent.auxiliary_client._get_auxiliary_task_config",
             lambda task: (
@@ -5561,18 +5558,22 @@ class TestAuxiliaryFallbackCoverage:
                 f"AIAgent and relies on the top-level fallback_providers chain"
             )
 
-    def test_vision_tasks_use_a_multimodal_fallback(self):
-        """vision + web_extract fallbacks must be vision-capable — a text-only
-        model (glm-4.7) would reject image blocks."""
+    def test_no_fallback_uses_a_vision_only_model_on_a_text_task(self):
+        """Guard against the inverse dud: none of the shipped fallbacks may use
+        the multimodal glm-5v-turbo model (which is plan-gated / needs API
+        billing on the account and would 429). Every shipped fallback is the
+        text glm-4.7, and vision — the only task that would need a multimodal
+        fallback — ships none at all (see the config comment)."""
         aux = self._aux()
-        for task in ("vision", "web_extract"):
-            fb = aux[task].get("fallback")
-            assert fb, f"{task} should carry a fallback block"
-            assert fb.get("model") == "glm-5v-turbo", (
-                f"auxiliary.{task}.fallback must use a multimodal model, "
-                f"got {fb.get('model')!r}"
-            )
-            assert "coding/paas" not in fb.get("base_url", ""), (
-                f"auxiliary.{task}.fallback must use the OpenAI-wire /paas/v4 "
-                f"vision endpoint, not the Anthropic-wire /coding endpoint"
-            )
+        for task, cfg in aux.items():
+            if not isinstance(cfg, dict):
+                continue
+            fb = cfg.get("fallback")
+            if fb:
+                assert fb.get("model") != "glm-5v-turbo", (
+                    f"auxiliary.{task}.fallback uses glm-5v-turbo, which is not "
+                    f"reachable on the account's z.ai subscription"
+                )
+        assert "fallback" not in aux["vision"], (
+            "vision must not ship a fallback — no reachable multimodal backend"
+        )
