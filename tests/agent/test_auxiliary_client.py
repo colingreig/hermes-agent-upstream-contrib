@@ -5162,6 +5162,97 @@ class TestAuxiliaryTaskFallback:
         assert mock_resolve.call_args.kwargs.get("model") == "glm-4.7"
         assert mock_resolve.call_args.kwargs.get("explicit_base_url") == "https://api.z.ai/api/coding/paas/v4"
 
+    @pytest.mark.parametrize(
+        "task",
+        [
+            "compression",
+            "skills_hub",
+            "approval",
+            "mcp",
+            "title_generation",
+            "monitor",
+        ],
+    )
+    def test_hard_auth_error_falls_back_for_every_configured_text_task(self, monkeypatch, task):
+        """Same as test_hard_auth_error_falls_back_to_configured_fallback above,
+        parametrized over every task that ships a DEFAULT_CONFIG
+        auxiliary.<task>.fallback block: the two original highest-value tasks
+        (compression, skills_hub) plus the four text-only tasks added
+        alongside this test (approval, mcp, title_generation, monitor) — all
+        of which reach agent/auxiliary_client.py::call_llm() directly via
+        call_llm(task=...), so they all exercise the identical
+        _try_task_fallback_once() path with zero task-specific branching."""
+        self._configure_fallback_for(monkeypatch, task)
+
+        primary_client = MagicMock()
+        primary_client.base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
+        primary_client.chat.completions.create.side_effect = _GeminiInvalidKeyError()
+
+        fallback_client = MagicMock()
+        fallback_client.base_url = "https://api.z.ai/api/coding/paas/v4"
+        fallback_client.chat.completions.create.return_value = _DummyResponse("fallback summary")
+
+        with patch("agent.auxiliary_client._get_cached_client",
+                   return_value=(primary_client, "gemini-3.5-flash")), \
+             patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("gemini", "gemini-3.5-flash", None, None, None)), \
+             patch("agent.auxiliary_client.resolve_provider_client",
+                   return_value=(fallback_client, "glm-4.7")) as mock_resolve:
+            result = call_llm(
+                task=task,
+                messages=[{"role": "user", "content": "hello"}],
+            )
+
+        assert result.choices[0].message.content == "fallback summary"
+        assert fallback_client.chat.completions.create.called
+        mock_resolve.assert_called_once()
+        assert mock_resolve.call_args.args[0] == "zai"
+        assert mock_resolve.call_args.kwargs.get("model") == "glm-4.7"
+        assert mock_resolve.call_args.kwargs.get("explicit_base_url") == "https://api.z.ai/api/coding/paas/v4"
+
+    def test_default_config_fallback_present_for_newly_covered_text_tasks(self):
+        """DEFAULT_CONFIG must actually carry the zai/glm-4.7 fallback block
+        for the newly-covered text-only tasks — this is what makes the
+        parametrized test above true against the real shipped config, not
+        just against a monkeypatched stand-in."""
+        from hermes_cli.config import DEFAULT_CONFIG
+
+        expected = {
+            "provider": "zai",
+            "model": "glm-4.7",
+            "base_url": "https://api.z.ai/api/coding/paas/v4",
+        }
+        aux = DEFAULT_CONFIG["auxiliary"]
+        for task in ("approval", "mcp", "title_generation", "monitor"):
+            assert aux[task].get("fallback") == expected, (
+                f"auxiliary.{task}.fallback missing or wrong in DEFAULT_CONFIG"
+            )
+
+    def test_default_config_no_fallback_for_multimodal_or_unwired_tasks(self):
+        """Tasks deliberately left without a fallback default must stay that
+        way: vision/web_extract (multimodal — glm-4.7 is text-only on the
+        zai coding endpoint) and tts_audio_tags (Gemini-TTS-specific
+        feature). triage_specifier/profile_describer/curator are also
+        excluded because their call sites bypass call_llm()'s
+        _try_task_fallback_once() path entirely (they call
+        client.chat.completions.create() directly, or — for curator — run
+        through hermes_cli.runtime_provider instead of the auxiliary client),
+        so a fallback block there would silently do nothing."""
+        from hermes_cli.config import DEFAULT_CONFIG
+
+        aux = DEFAULT_CONFIG["auxiliary"]
+        for task in (
+            "vision",
+            "web_extract",
+            "tts_audio_tags",
+            "triage_specifier",
+            "profile_describer",
+            "curator",
+        ):
+            assert "fallback" not in aux[task], (
+                f"auxiliary.{task}.fallback unexpectedly present"
+            )
+
     def test_task_without_fallback_still_aborts_unchanged(self, monkeypatch):
         """A task with NO auxiliary.<task>.fallback configured must raise
         exactly as before — zero behavior change for the other ~10 aux
