@@ -5,7 +5,7 @@ from __future__ import annotations
 import base64
 import json
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -382,12 +382,16 @@ def test_mark_exhausted_and_rotate_persists_status(tmp_path, monkeypatch):
 def test_zai_weekly_quota_429_parses_absolute_reset_timestamp(tmp_path, monkeypatch):
     """Z.AI's weekly/monthly quota 429 states an exact reset time as free
     text (code 1310) rather than a structured field: "Weekly/Monthly Limit
-    Exhausted. Your limit will reset at 2026-07-09 12:37:24". Regression
-    for 86e261t21: this format wasn't recognized by any existing pattern,
-    so last_error_reset_at stayed null and _exhausted_ttl() fell back to a
+    Exhausted. Your limit will reset at <timestamp>". Regression for
+    86e261t21: this format wasn't recognized by any existing pattern, so
+    last_error_reset_at stayed null and _exhausted_ttl() fell back to a
     flat 1h TTL — every fresh cron process re-probed the dead primary for
     the whole multi-day exhaustion window instead of waiting for the real
     reset time.
+
+    The reset moment is computed relative to "now" (rather than a
+    hardcoded timestamp) so this test doesn't itself become a time bomb
+    once the hardcoded moment passes.
     """
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     _write_auth_store(
@@ -411,14 +415,16 @@ def test_zai_weekly_quota_429_parses_absolute_reset_timestamp(tmp_path, monkeypa
 
     from agent.credential_pool import load_pool
 
+    future = datetime.now(timezone.utc).replace(microsecond=0) + timedelta(days=7)
+    reset_str = future.strftime("%Y-%m-%d %H:%M:%S")
+
     pool = load_pool("zai")
     pool.mark_exhausted_and_rotate(
         status_code=429,
         error_context={
             "reason": "1310",
             "message": (
-                "Weekly/Monthly Limit Exhausted. Your limit will reset at "
-                "2026-07-09 12:37:24"
+                f"Weekly/Monthly Limit Exhausted. Your limit will reset at {reset_str}"
             ),
         },
     )
@@ -426,7 +432,7 @@ def test_zai_weekly_quota_429_parses_absolute_reset_timestamp(tmp_path, monkeypa
     auth_payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
     persisted = auth_payload["credential_pool"]["zai"][0]
     assert persisted["last_status"] == "exhausted"
-    expected = datetime(2026, 7, 9, 12, 37, 24, tzinfo=timezone.utc).timestamp()
+    expected = future.timestamp()
     assert persisted["last_error_reset_at"] == pytest.approx(expected)
 
     # The pool must stay exhausted at "now" even though a flat 1h TTL would
