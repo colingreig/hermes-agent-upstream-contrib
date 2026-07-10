@@ -1661,14 +1661,27 @@ os.environ["HERMES_EXEC_ASK"] = "1"
 # Set terminal working directory for messaging platforms.
 # config.yaml terminal.cwd is the canonical source (bridged to TERMINAL_CWD
 # by the config bridge above).  When it's unset or a placeholder, default
-# to home directory.  MESSAGING_CWD is accepted as a backward-compat
-# fallback (deprecated — the warning above tells users to migrate).
+# to a dedicated Hermes workspace dir (NOT the home dir) — LLM-written
+# scripts that touch ~/Desktop, ~/Documents, or ~/Downloads trigger macOS
+# TCC privacy-consent prompts that hang the subprocess forever, even past
+# the kill-timeout, when no one is at the console to approve them.
+# MESSAGING_CWD is accepted as a backward-compat fallback (deprecated — the
+# warning above tells users to migrate).
 _configured_cwd = os.environ.get("TERMINAL_CWD", "")
 if not _configured_cwd or _configured_cwd in {".", "auto", "cwd"}:
     if os.environ.get("TERMINAL_ENV", "").strip().lower() == "ssh":
         os.environ.pop("TERMINAL_CWD", None)
     else:
-        _fallback = os.getenv("MESSAGING_CWD") or str(Path.home())
+        _safe_workspace = _hermes_home / "workspace"
+        try:
+            _safe_workspace.mkdir(parents=True, exist_ok=True)
+        except OSError as _workspace_err:
+            print(
+                f"  Warning: could not create default terminal workspace "
+                f"{_safe_workspace}: {_workspace_err}",
+                file=sys.stderr,
+            )
+        _fallback = os.getenv("MESSAGING_CWD") or str(_safe_workspace)
         os.environ["TERMINAL_CWD"] = _fallback
 
 from gateway.config import (
