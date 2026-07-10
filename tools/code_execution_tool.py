@@ -1734,6 +1734,46 @@ def _resolve_child_python(mode: str) -> str:
     return sys.executable
 
 
+# macOS TCC (privacy) protects these folders — a subprocess that merely
+# stats/reads/writes under them triggers a consent prompt, and if no one is
+# at the console to approve it, the process hangs indefinitely (past even
+# the kill-timeout). Never hand one of these to the subprocess as a cwd.
+_TCC_PROTECTED_HOME_SUBDIRS = ("Desktop", "Documents", "Downloads")
+
+
+def _is_tcc_protected_path(path: str) -> str | None:
+    """Return the protected folder name `path` resolves under, or None.
+
+    Compares resolved absolute paths so symlinks / ``..`` segments can't be
+    used to sneak past the guard.
+    """
+    try:
+        resolved = os.path.realpath(os.path.expanduser(path))
+    except OSError:
+        return None
+    home = os.path.realpath(os.path.expanduser("~"))
+    for sub in _TCC_PROTECTED_HOME_SUBDIRS:
+        protected = os.path.join(home, sub)
+        if resolved == protected or resolved.startswith(protected + os.sep):
+            return sub
+    return None
+
+
+def _safe_default_cwd() -> str:
+    """Return (creating if needed) the dedicated Hermes workspace dir.
+
+    Used as the last-resort fallback when no usable, non-TCC-protected cwd
+    is available.
+    """
+    from hermes_constants import get_hermes_home
+    workspace = get_hermes_home() / "workspace"
+    try:
+        workspace.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        logger.warning("execute_code: could not create %s: %s", workspace, exc)
+    return str(workspace)
+
+
 def _resolve_child_cwd(mode: str, staging_dir: str) -> str:
     """Resolve the working directory for the execute_code subprocess.
 
@@ -1742,12 +1782,26 @@ def _resolve_child_cwd(mode: str, staging_dir: str) -> str:
       ``os.getcwd()`` if TERMINAL_CWD is unset or doesn't point at a real dir.
       Falls back to the staging tmpdir as a last resort so we never invoke
       Popen with a nonexistent cwd.
+
+    Defense in depth: even if a user hand-sets ``terminal.cwd`` to a
+    TCC-protected folder (``~/Desktop``, ``~/Documents``, ``~/Downloads``),
+    that path is rejected here and swapped for the safe Hermes workspace
+    dir — see ``_is_tcc_protected_path``.
     """
     if mode != "project":
         return staging_dir
     raw = os.environ.get("TERMINAL_CWD", "").strip()
     if raw:
         expanded = os.path.expanduser(raw)
+        protected_as = _is_tcc_protected_path(expanded)
+        if protected_as:
+            logger.warning(
+                "execute_code: TERMINAL_CWD=%s is under the TCC-protected "
+                "%s folder, which can hang the subprocess on a privacy "
+                "consent prompt. Falling back to the Hermes workspace dir instead.",
+                expanded, protected_as,
+            )
+            return _safe_default_cwd()
         if os.path.isdir(expanded):
             return expanded
     here = os.getcwd()

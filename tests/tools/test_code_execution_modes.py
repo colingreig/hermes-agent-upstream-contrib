@@ -35,6 +35,7 @@ from tools.code_execution_tool import (
     DEFAULT_EXECUTION_MODE,
     EXECUTION_MODES,
     _get_execution_mode,
+    _is_tcc_protected_path,
     _is_usable_python,
     _resolve_child_cwd,
     _resolve_child_python,
@@ -219,6 +220,45 @@ class TestResolveChildCwd(unittest.TestCase):
         home = str(pathlib.Path.home())
         with patch.dict(os.environ, {"TERMINAL_CWD": "~"}):
             self.assertEqual(_resolve_child_cwd("project", "/tmp/staging"), home)
+
+
+# ---------------------------------------------------------------------------
+# TCC-protected folder guard (#gateway hang on privacy consent prompts)
+# ---------------------------------------------------------------------------
+
+class TestIsTccProtectedPath(unittest.TestCase):
+
+    def test_flags_documents(self):
+        self.assertEqual(_is_tcc_protected_path("~/Documents/foo"), "Documents")
+
+    def test_flags_desktop_root(self):
+        self.assertEqual(_is_tcc_protected_path("~/Desktop"), "Desktop")
+
+    def test_flags_downloads_nested(self):
+        self.assertEqual(_is_tcc_protected_path("~/Downloads/a/b/c"), "Downloads")
+
+    def test_does_not_flag_hermes_workspace(self):
+        self.assertIsNone(_is_tcc_protected_path("~/.hermes/workspace"))
+
+    def test_does_not_flag_lookalike_sibling(self):
+        # "DocumentsNotReally" must not match the "Documents" prefix.
+        self.assertIsNone(_is_tcc_protected_path("~/DocumentsNotReally"))
+
+
+class TestResolveChildCwdProtectedFolderGuard(unittest.TestCase):
+
+    def test_protected_terminal_cwd_falls_back_to_safe_workspace(self):
+        import tempfile
+        from hermes_constants import get_hermes_home
+        with tempfile.TemporaryDirectory() as fake_home:
+            documents = os.path.join(fake_home, "Documents")
+            os.makedirs(documents, exist_ok=True)
+            with patch.dict(os.environ, {"HOME": fake_home, "TERMINAL_CWD": documents}):
+                resolved = _resolve_child_cwd("project", "/tmp/staging")
+                expected_workspace = str(get_hermes_home() / "workspace")
+        self.assertNotEqual(resolved, documents)
+        self.assertEqual(resolved, expected_workspace)
+        self.assertTrue(os.path.isdir(resolved))
 
 
 # ---------------------------------------------------------------------------
