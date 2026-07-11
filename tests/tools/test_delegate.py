@@ -1098,10 +1098,14 @@ class TestDelegationCredentialResolution(unittest.TestCase):
 
 
     def test_direct_endpoint_uses_configured_base_url_and_api_key(self):
+        # No delegation.provider configured (or "custom") -> a bare base_url +
+        # api_key is a genuinely unnamed custom endpoint and takes the
+        # "custom" literal path. See test_named_provider_with_base_url_uses_own_credential
+        # (below) for the NAMED-provider + base_url case, which must NOT
+        # collapse to "custom" (that was the credential-leak bug).
         parent = _make_mock_parent(depth=0)
         cfg = {
             "model": "qwen2.5-coder",
-            "provider": "openrouter",
             "base_url": "http://localhost:1234/v1",
             "api_key": "local-key",
         }
@@ -1344,6 +1348,73 @@ class TestDelegationCredentialResolution(unittest.TestCase):
         mock_resolve.assert_called_once()
         self.assertEqual(mock_resolve.call_args.kwargs.get("requested"), "bedrock")
 
+    @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
+    def test_named_provider_with_base_url_uses_own_credential_not_parent(
+        self, mock_resolve
+    ):
+        """Regression for the prod credential-leak incident: a delegation
+        configured as provider='zai' + zai's own base_url + a blank api_key
+        must resolve zai's OWN credential via the runtime provider system,
+        NOT collapse to provider='custom' with api_key=None (which would
+        make _build_child_agent fall back to the PARENT agent's credential
+        and ship it — e.g. an openai-codex OAuth token — as a Bearer token
+        to a completely different third-party endpoint).
+        """
+        mock_resolve.return_value = {
+            "provider": "zai",
+            "base_url": "https://api.z.ai/api/coding/paas/v4",
+            "api_key": "zai-own-resolved-key",
+            "api_mode": "chat_completions",
+        }
+        parent = _make_mock_parent(depth=0)
+        # api_key intentionally blank, mirroring the prod config that leaked
+        # the parent's openai-codex token.
+        cfg = {
+            "model": "glm-4.7",
+            "provider": "zai",
+            "base_url": "https://api.z.ai/api/coding/paas/v4",
+            "api_key": "",
+        }
+        creds = _resolve_delegation_credentials(cfg, parent)
+
+        # Must resolve zai's own credential, never provider='custom'/None api_key.
+        self.assertEqual(creds["provider"], "zai")
+        self.assertEqual(creds["base_url"], "https://api.z.ai/api/coding/paas/v4")
+        self.assertEqual(creds["api_key"], "zai-own-resolved-key")
+        self.assertNotEqual(creds["api_key"], getattr(parent, "api_key", None))
+
+        # The caller's base_url must be forwarded so the resolver can honor a
+        # pinned endpoint for the named provider.
+        mock_resolve.assert_called_once_with(
+            requested="zai",
+            target_model="glm-4.7",
+            explicit_base_url="https://api.z.ai/api/coding/paas/v4",
+        )
+
+    @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
+    def test_named_provider_with_base_url_and_unresolvable_credential_raises(
+        self, mock_resolve
+    ):
+        """Security property: if a named provider is explicitly set alongside
+        a base_url but its own credential can't be resolved (no API key),
+        this must fail loudly (ValueError) rather than silently falling
+        through to the parent agent's inherited credential.
+        """
+        mock_resolve.return_value = {
+            "provider": "zai",
+            "base_url": "https://api.z.ai/api/coding/paas/v4",
+            "api_key": "",
+            "api_mode": "chat_completions",
+        }
+        parent = _make_mock_parent(depth=0)
+        cfg = {
+            "model": "glm-4.7",
+            "provider": "zai",
+            "base_url": "https://api.z.ai/api/coding/paas/v4",
+        }
+        with self.assertRaises(ValueError) as ctx:
+            _resolve_delegation_credentials(cfg, parent)
+        self.assertIn("no API key", str(ctx.exception))
 
 
 class TestDelegationProviderIntegration(unittest.TestCase):

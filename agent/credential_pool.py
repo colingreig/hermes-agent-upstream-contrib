@@ -1722,7 +1722,41 @@ class CredentialPool:
         return entry
 
 
+# Defense-in-depth for the ${GEMINI_API_KEY}-literal incident: even though
+# hermes_cli.config.load_env() now interpolates ``${VAR}``/``$VAR``
+# references (and skips the key entirely when a reference can't be
+# resolved), other seeding paths funnel through here too (custom_providers
+# in config.yaml, which is expanded by a *different*, more permissive
+# helper -- ``_expand_env_vars`` -- that intentionally keeps unresolved
+# refs verbatim so the user can spot them in the YAML). This guard is the
+# single choke point every seeding path (_seed_from_env,
+# _seed_from_singletons, _seed_custom_pool) passes through, so it catches
+# an un-interpolated reference regardless of which upstream path produced
+# it and refuses to ever let it become a live, usable credential.
+_UNRESOLVED_ENV_REF_RE = re.compile(
+    r"^\s*\$\{[^}]*\}\s*$|^\s*\$[A-Za-z_][A-Za-z0-9_]*\s*$"
+)
+
+
+def _looks_like_unresolved_env_ref(value: Any) -> bool:
+    """True when ``value`` is (only) an un-interpolated ``${VAR}``/``$VAR`` reference."""
+    return isinstance(value, str) and bool(_UNRESOLVED_ENV_REF_RE.match(value))
+
+
 def _upsert_entry(entries: List[PooledCredential], provider: str, source: str, payload: Dict[str, Any]) -> bool:
+    candidate_token = payload.get("access_token")
+    if _looks_like_unresolved_env_ref(candidate_token):
+        logger.warning(
+            "Refusing to register credential for %s/%s: access_token %r looks "
+            "like an un-interpolated variable reference, not a real secret. "
+            "This is exactly the shape of the ${GEMINI_API_KEY}-literal "
+            "incident -- skipping instead of poisoning the pool.",
+            provider,
+            source,
+            candidate_token,
+        )
+        return False
+
     existing_idx = None
     for idx, entry in enumerate(entries):
         if entry.source == source:

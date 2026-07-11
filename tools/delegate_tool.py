@@ -2976,18 +2976,39 @@ def _resolve_child_credential_pool(
 def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
     """Resolve credentials for subagent delegation.
 
-    If ``delegation.base_url`` is configured, subagents use that direct
-    OpenAI-compatible endpoint. ``delegation.api_key`` overrides the key; when
-    omitted, ``api_key`` is returned as ``None`` so ``_build_child_agent``
-    inherits the parent agent's key (``effective_api_key = override_api_key or
+    If ``delegation.provider`` is configured to a NAMED/resolvable provider
+    (anything other than blank or the literal ``"custom"`` sentinel — e.g.
+    ``zai``, ``openai-api``, ``anthropic``, ``gemini``, ``minimax``,
+    ``openrouter``, ``bedrock``, ...), that provider's own credential is
+    always resolved via the runtime provider system, even when
+    ``delegation.base_url`` is also set (a caller may legitimately pin the
+    provider's endpoint, e.g. an explicit regional Bedrock URL). The child
+    NEVER inherits the parent agent's credential in this case: if the named
+    provider's own credential can't be resolved, this raises ValueError
+    instead of silently falling back to the parent's token.
+
+    Bug history: this branch used to be gated only on ``base_url`` being
+    set, so ANY configured base_url — including a named provider's own
+    endpoint — short-circuited straight to ``provider="custom"`` and
+    ignored ``delegation.provider`` entirely. Combined with a blank
+    ``delegation.api_key``, that meant the child fell through to
+    ``_build_child_agent``'s parent-credential-inheritance path and shipped
+    the PARENT's token to a third-party endpoint (prod incident: an
+    ``openai-codex`` OAuth token sent as a Bearer to ``api.z.ai`` for a
+    delegation configured as ``provider: zai`` -> HTTP 401 every fire, and
+    a live credential-leak footgun for any other named provider + base_url
+    combination).
+
+    Only when there is NO named/resolvable provider (``delegation.provider``
+    blank or explicitly ``"custom"``) does a configured ``delegation.base_url``
+    fall through to the literal "custom" endpoint path below.
+    ``delegation.api_key`` overrides the key for that path; when omitted,
+    ``api_key`` is returned as ``None`` so ``_build_child_agent`` inherits the
+    parent agent's key (``effective_api_key = override_api_key or
     parent_api_key``). This lets providers that store their key outside
     ``OPENAI_API_KEY`` (e.g. ``MINIMAX_API_KEY``, ``DASHSCOPE_API_KEY``) work
-    without a duplicate config entry.
-
-    Otherwise, if ``delegation.provider`` is configured, the full credential
-    bundle (base_url, api_key, api_mode, provider) is resolved via the runtime
-    provider system — the same path used by CLI/gateway startup. This lets
-    subagents run on a completely different provider:model pair.
+    without a duplicate config entry, and is safe: the endpoint is a genuinely
+    unnamed custom endpoint, not another provider's own base_url.
 
     If neither base_url nor provider is configured, returns None values so the
     child inherits everything from the parent agent.
@@ -3000,17 +3021,27 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
     configured_api_key = str(cfg.get("api_key") or "").strip() or None
     configured_api_mode = str(cfg.get("api_mode") or "").strip().lower() or None
 
+    _provider_lower = (configured_provider or "").strip().lower()
+
+    # A "named" provider is any explicitly-configured provider other than the
+    # literal "custom" sentinel — i.e. one resolvable via the normal
+    # resolve_runtime_provider()/credential-pool path. This must be checked
+    # BEFORE looking at base_url so a named provider's own endpoint doesn't
+    # get misclassified as an anonymous custom target (see docstring above).
+    _is_named_provider = bool(configured_provider) and _provider_lower != "custom"
+
     # Native-SDK providers (Bedrock, Vertex, Google GenAI) speak their own
     # wire protocol — they cannot be reached via OpenAI chat_completions against
     # a base_url. For these, always fall through to resolve_runtime_provider()
     # so the proper SDK path is taken. The configured base_url is still
     # forwarded through runtime-provider resolution when applicable (e.g. a
-    # custom Bedrock regional endpoint).
+    # custom Bedrock regional endpoint). This set is a subset of
+    # ``_is_named_provider`` (kept as its own check for clarity/defense in
+    # depth — a native-SDK provider is always "named", never "custom").
     _NATIVE_SDK_PROVIDERS = {"bedrock", "vertex", "google", "google-genai"}
-    _provider_lower = (configured_provider or "").strip().lower()
     _is_native_sdk_provider = _provider_lower in _NATIVE_SDK_PROVIDERS
 
-    if configured_base_url and not _is_native_sdk_provider:
+    if configured_base_url and not _is_native_sdk_provider and not _is_named_provider:
         # When delegation.api_key is not set, return None so _build_child_agent
         # falls back to the parent agent's API key via the credential inheritance
         # path (effective_api_key = override_api_key or parent_api_key). This
@@ -3066,11 +3097,24 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
             "api_mode": None,
         }
 
-    # Provider is configured — resolve full credentials
+    # Named provider is configured (with or without a pinned base_url) —
+    # resolve its OWN full credential bundle via the runtime provider system.
+    # explicit_base_url/explicit_api_key are forwarded only when actually
+    # configured so a pinned endpoint/key take precedence inside the
+    # resolver without changing the call shape for the common
+    # provider-only case.
     try:
         from hermes_cli.runtime_provider import resolve_runtime_provider
 
-        runtime = resolve_runtime_provider(requested=configured_provider, target_model=configured_model)
+        _resolve_kwargs: Dict[str, Any] = {
+            "requested": configured_provider,
+            "target_model": configured_model,
+        }
+        if configured_base_url:
+            _resolve_kwargs["explicit_base_url"] = configured_base_url
+        if configured_api_key:
+            _resolve_kwargs["explicit_api_key"] = configured_api_key
+        runtime = resolve_runtime_provider(**_resolve_kwargs)
     except Exception as exc:
         raise ValueError(
             f"Cannot resolve delegation provider '{configured_provider}': {exc}. "
@@ -3081,8 +3125,14 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
 
     api_key = runtime.get("api_key", "")
     if not api_key:
+        # Critical: a named provider with no resolvable credential must never
+        # silently fall back to the parent agent's token — that would leak
+        # the parent's credential to this (possibly third-party) base_url.
+        # Fail loudly instead.
         raise ValueError(
             f"Delegation provider '{configured_provider}' resolved but has no API key. "
+            f"Refusing to fall back to the parent agent's credential for a different "
+            f"provider's endpoint (base_url={configured_base_url or runtime.get('base_url')!r}). "
             f"Set the appropriate environment variable or run 'hermes auth'."
         )
 

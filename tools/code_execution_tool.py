@@ -47,6 +47,8 @@ import uuid
 _IS_WINDOWS = platform.system() == "Windows"
 from typing import Any, Dict, List, Optional
 
+from tools.env_secret_patterns import SECRET_SUBSTRINGS as _SECRET_SUBSTRINGS
+from tools.env_secret_patterns import matches_denied_name_pattern as _matches_denied_name_pattern
 from tools.thread_context import propagate_context_to_thread
 
 # Availability gate.  On Windows we fall back to loopback TCP for the
@@ -88,17 +90,11 @@ MAX_STDERR_BYTES = 10_000    # 10 KB
 _SAFE_ENV_PREFIXES = ("PATH", "HOME", "USER", "LANG", "LC_", "TERM",
                       "TMPDIR", "TMP", "TEMP", "SHELL", "LOGNAME",
                       "XDG_", "PYTHONPATH", "VIRTUAL_ENV", "CONDA")
-_SECRET_SUBSTRINGS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL",
-                      "PASSWD", "AUTH", "DSN", "WEBHOOK",
-                      # Abbreviations that appear in real-world credential
-                      # variable names but were previously undetected:
-                      # CREDS (CREDENTIALS abbreviated), BEARER
-                      # (Authorization: Bearer tokens), APIKEY (written
-                      # without an underscore). "PASS" is intentionally NOT
-                      # added — it false-positives on legitimate non-secret
-                      # vars (BYPASS_CACHE, COMPASS_DIR, PASSENGER_HOST) while
-                      # PASSWORD/PASSWD already cover the credential cases.
-                      "CREDS", "BEARER", "APIKEY")
+# _SECRET_SUBSTRINGS now lives in tools/env_secret_patterns.py (imported
+# above) so tools/environments/local.py's terminal backend can share the
+# exact same substring list instead of drifting out of sync with a
+# hand-copied duplicate. See that module's docstring for why it isn't a
+# direct cross-import between this file and local.py.
 
 # Operational HERMES_* vars the child legitimately needs by exact name — these
 # are non-secret runtime-location flags (the same set hermes_cli treats as the
@@ -149,9 +145,11 @@ def _scrub_child_env(source_env, is_passthrough=None, is_windows=None):
     Rules (order matters):
       1. Passthrough vars (skill- or config-declared) always pass.
       2. Secret-substring names (KEY/TOKEN/DSN/WEBHOOK/etc.) are blocked.
-      3. Names matching a safe prefix pass.
-      4. Operational HERMES_* vars (_HERMES_CHILD_ALLOWED) pass by exact name.
-      5. On Windows, a small OS-essential allowlist passes by exact name
+      3. Vendor-integration name patterns with no secret substring at all
+         (e.g. ``WP_*``, ``D365*``) are blocked.
+      4. Names matching a safe prefix pass.
+      5. Operational HERMES_* vars (_HERMES_CHILD_ALLOWED) pass by exact name.
+      6. On Windows, a small OS-essential allowlist passes by exact name
          — without these the child can't even create a socket or spawn a
          subprocess.
 
@@ -181,6 +179,8 @@ def _scrub_child_env(source_env, is_passthrough=None, is_windows=None):
             scrubbed[k] = v
             continue
         if any(s in k.upper() for s in _SECRET_SUBSTRINGS):
+            continue
+        if _matches_denied_name_pattern(k):
             continue
         if any(k.startswith(p) for p in _SAFE_ENV_PREFIXES):
             scrubbed[k] = v
