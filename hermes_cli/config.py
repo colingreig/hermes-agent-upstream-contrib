@@ -2037,7 +2037,7 @@ DEFAULT_CONFIG = {
         # because they look precise enough to compare against the provider.
         # Set this to True to re-enable the surfaces with the understanding
         # that the numbers are a local lower-bound estimate, not billing.
-        "show_token_analytics": False,
+        "show_token_analytics": True,
         # OAuth gate configuration (engaged when ``--host`` is set and
         # ``--insecure`` is not). The bundled Nous Portal plugin reads
         # both keys at startup; they are the canonical surface for these
