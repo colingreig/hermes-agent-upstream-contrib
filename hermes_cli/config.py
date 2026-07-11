@@ -7051,6 +7051,81 @@ def _parse_env_value(raw_value: str) -> str:
     return value
 
 
+# Matches, in priority order: an escaped ``$$`` (-> literal ``$``), a braced
+# ``${VAR}`` reference, or a bare ``$VAR`` reference. Deliberately does not
+# match ``${...}`` bodies containing anything other than a shell-identifier
+# ($NAME) so malformed references (e.g. ``${1+2}``) are left untouched rather
+# than mis-expanded.
+_DOTENV_VAR_REF_RE = re.compile(
+    r"\$\$|\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)"
+)
+
+
+def _interpolate_dotenv_value(value: str, resolved: Dict[str, str], key: str) -> Optional[str]:
+    """Expand ``${VAR}``/``$VAR`` references in a parsed .env value.
+
+    Resolves each reference against ``resolved`` (the values already parsed
+    earlier in the same file, top-to-bottom) and falls back to
+    ``os.environ`` — this makes a line like ``GOOGLE_API_KEY=${GEMINI_API_KEY}``
+    resolve to the real key when ``GEMINI_API_KEY`` appears earlier in the
+    file or is exported in the shell, matching common dotenv behavior.
+
+    ``$$`` is the escape for a literal ``$`` (kept as ``$``, never expanded).
+
+    Runs on the value AFTER ``_parse_env_value()`` quote-stripping so that
+    interpolation composes with quoting instead of fighting it, and never
+    reintroduces quote characters into the returned value.
+
+    Returns ``None`` when one or more referenced variables cannot be
+    resolved anywhere. The caller MUST treat ``None`` as "skip setting this
+    key" rather than substituting any value:
+
+    - Falling back to the unresolved literal ``${VAR}`` string is the exact
+      bug this function exists to fix — a real incident had
+      ``GOOGLE_API_KEY=${GEMINI_API_KEY}`` stored verbatim as a 17-character
+      string that the credential pool then shipped to Google as a real API
+      key, permanently failing every request with HTTP 400 API_KEY_INVALID
+      fleet-wide.
+    - Falling back to "" is also unsafe: an empty string can still read as
+      a "configured" (falsy-but-present) credential to naive downstream
+      truthiness checks, and would silently mask that the reference is
+      broken.
+
+    Skipping the key is the only option that can never manufacture a fake
+    credential, and it leaves the door open for whatever env-var-sourced
+    fallback (or clear absence) the rest of the config pipeline already
+    handles correctly.
+    """
+    if "$" not in value:
+        return value
+
+    unresolved: List[str] = []
+
+    def _replace(match: "re.Match[str]") -> str:
+        if match.group(0) == "$$":
+            return "$"
+        var_name = match.group(1) or match.group(2)
+        if var_name in resolved:
+            return resolved[var_name]
+        if var_name in os.environ:
+            return os.environ[var_name]
+        unresolved.append(var_name)
+        return match.group(0)
+
+    expanded = _DOTENV_VAR_REF_RE.sub(_replace, value)
+    if unresolved:
+        logger.warning(
+            "~/.hermes/.env: %s references undefined variable(s) %s -- skipping "
+            "this key instead of setting it to the unresolved literal (a prior "
+            "incident showed an unresolved ${VAR} literal being ingested as a "
+            "real credential).",
+            key,
+            ", ".join(sorted(set(unresolved))),
+        )
+        return None
+    return expanded
+
+
 def load_env() -> Dict[str, str]:
     """Load environment variables from ~/.hermes/.env.
 
@@ -7105,7 +7180,28 @@ def load_env() -> Dict[str, str]:
                 if line.startswith('export '):
                     line = line[7:]
                 key, _, value = line.partition('=')
-                env_vars[key.strip()] = _parse_env_value(value)
+                key = key.strip()
+                parsed_value = _parse_env_value(value)
+                # Expand ``${VAR}``/``$VAR`` references (interpolation runs
+                # AFTER quote-stripping so a quoted literal like
+                # ``KEY="${LITERAL}"`` still expands, and a value that was
+                # quoted specifically to keep ``$`` literal is unaffected by
+                # this being a separate pass). See #<incident>: a real .env
+                # line ``GOOGLE_API_KEY=${GEMINI_API_KEY}`` used to be stored
+                # verbatim as the 17-char literal string, which the credential
+                # pool then sent to Google as a real API key (permanent
+                # HTTP 400 API_KEY_INVALID, fleet-wide).
+                interpolated = _interpolate_dotenv_value(parsed_value, env_vars, key)
+                if interpolated is None:
+                    # Unresolvable reference — do NOT fall back to the literal
+                    # ``${VAR}`` string (the bug) and do NOT set "" either
+                    # (an empty string can still be treated as "present" by
+                    # naive downstream checks). Skipping the key entirely is
+                    # the only option that can never manufacture a fake
+                    # credential; _interpolate_dotenv_value() already logged
+                    # a warning naming the key and the unresolved reference.
+                    continue
+                env_vars[key] = interpolated
 
     if cache_key is not None:
         _env_cache = (cache_key, dict(env_vars))
