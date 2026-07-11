@@ -699,6 +699,101 @@ class TestSpawnEnvSanitization:
         assert f"{_HERMES_PROVIDER_ENV_FORCE_PREFIX}TELEGRAM_BOT_TOKEN" not in env
         assert env["PYTHONUNBUFFERED"] == "1"
 
+    def test_spawn_local_strips_secret_shaped_vars_absent_from_blocklist(self, registry):
+        """The name-shape gate (WP_*/D365*/generic KEY-TOKEN-SECRET substrings)
+        must also apply to the background/PTY spawn path (process_registry
+        .spawn_local -> _sanitize_subprocess_env), not just the foreground
+        terminal tool. These vars carry no entry in
+        _HERMES_PROVIDER_ENV_BLOCKLIST at all -- the exact-name-only denylist
+        used to let every one of them straight through to a background
+        process. Trusted-shell exemptions (AWS general chain, GIT_AUTHOR_*,
+        SSH_AUTH_SOCK) must still survive.
+        """
+        captured = {}
+
+        def fake_popen(cmd, **kwargs):
+            captured["env"] = kwargs["env"]
+            proc = MagicMock()
+            proc.pid = 4321
+            proc.stdout = iter([])
+            proc.stdin = MagicMock()
+            proc.poll.return_value = None
+            return proc
+
+        fake_thread = MagicMock()
+
+        with patch.dict(os.environ, {
+            "PATH": "/usr/bin:/bin",
+            "HOME": "/home/user",
+            "USER": "tester",
+            # Vendor integration vars with no secret-shaped substring at all.
+            "WP_FIELDSERVICESOFTWARE_IO": "wp-secret",
+            "D365GROUP_DATABASE_URL": "postgres://leak",
+            # A provider key never registered in PROVIDER_REGISTRY /
+            # _HERMES_PROVIDER_ENV_BLOCKLIST but still secret-shaped.
+            "GEMINI_API_KEY": "gm-secret",
+            "RANDOM_CLIENT_SECRET": "shh",
+            # Trusted-shell exemptions that must still survive.
+            "AWS_ACCESS_KEY_ID": "AKIAIOSFODNN7EXAMPLE",
+            "GIT_AUTHOR_NAME": "Cron Bot",
+            "SSH_AUTH_SOCK": "/tmp/ssh-agent.sock",
+            "MY_CUSTOM_VAR": "keep-me",
+        }, clear=True), \
+            patch("tools.process_registry._find_shell", return_value="/bin/bash"), \
+            patch("subprocess.Popen", side_effect=fake_popen), \
+            patch("threading.Thread", return_value=fake_thread), \
+            patch.object(registry, "_write_checkpoint"):
+            registry.spawn_local("echo hello", cwd="/tmp")
+
+        env = captured["env"]
+        assert "WP_FIELDSERVICESOFTWARE_IO" not in env
+        assert "D365GROUP_DATABASE_URL" not in env
+        assert "GEMINI_API_KEY" not in env
+        assert "RANDOM_CLIENT_SECRET" not in env
+        assert env["AWS_ACCESS_KEY_ID"] == "AKIAIOSFODNN7EXAMPLE"
+        assert env["GIT_AUTHOR_NAME"] == "Cron Bot"
+        assert env["SSH_AUTH_SOCK"] == "/tmp/ssh-agent.sock"
+        assert env["MY_CUSTOM_VAR"] == "keep-me"
+
+    def test_spawn_local_pty_path_strips_secret_shaped_vars(self, registry):
+        """Same gate, exercised via the true PTY branch (use_pty=True), not
+        just the pipe-mode fallback -- both call _sanitize_subprocess_env,
+        but this proves the interactive-CLI spawn path (Codex/Claude
+        Code/REPL sessions) isn't left uncovered."""
+        pytest.importorskip("ptyprocess")
+        import ptyprocess
+
+        captured = {}
+
+        def fake_spawn(argv, cwd=None, env=None, dimensions=None):
+            captured["env"] = env
+            proc = MagicMock()
+            proc.pid = 5555
+            return proc
+
+        fake_thread = MagicMock()
+
+        with patch.dict(os.environ, {
+            "PATH": "/usr/bin:/bin",
+            "HOME": "/home/user",
+            "WP_ACADEMY_EXCEL_TV": "wp-secret",
+            "D365GROUP_DATABASE_URL_UNPOOLED": "postgres://leak",
+            "AWS_SESSION_TOKEN": "session-token",
+            "MY_CUSTOM_VAR": "keep-me",
+        }, clear=True), \
+            patch("tools.process_registry._find_shell", return_value="/bin/bash"), \
+            patch.object(ptyprocess.PtyProcess, "spawn", side_effect=fake_spawn), \
+            patch("threading.Thread", return_value=fake_thread), \
+            patch.object(registry, "_write_checkpoint"):
+            registry.spawn_local("echo hello", cwd="/tmp", use_pty=True)
+
+        env = captured["env"]
+        assert "WP_ACADEMY_EXCEL_TV" not in env
+        assert "D365GROUP_DATABASE_URL_UNPOOLED" not in env
+        assert env["AWS_SESSION_TOKEN"] == "session-token"
+        assert env["MY_CUSTOM_VAR"] == "keep-me"
+        assert env["PYTHONUNBUFFERED"] == "1"
+
     def test_spawn_via_env_uses_backend_temp_dir_for_artifacts(self, registry):
         class FakeEnv:
             def __init__(self):

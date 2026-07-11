@@ -761,3 +761,278 @@ class TestHermesInternalDynamicSecrets:
         assert "GATEWAY_RELAY_SECRET" in _HERMES_PROVIDER_ENV_BLOCKLIST
         assert "GATEWAY_RELAY_DELIVERY_KEY" in _HERMES_PROVIDER_ENV_BLOCKLIST
         assert "GATEWAY_RELAY_ID" in _HERMES_PROVIDER_ENV_BLOCKLIST
+
+
+class TestSecretShapeGate:
+    """The terminal backend's name-shape-based deny gate (ported from
+    execute_code's allowlist-first / substring-deny scrubber, shared via
+    tools/env_secret_patterns.py) must catch credential-looking vars that
+    are absent from the exact-name ``_HERMES_PROVIDER_ENV_BLOCKLIST`` —
+    including vendor-integration vars like ``WP_*`` / ``D365*`` that carry
+    no KEY/TOKEN/SECRET-shaped substring at all.
+
+    See ClickUp 86e29q8jm.
+    """
+
+    def test_wp_prefixed_vars_are_stripped(self):
+        """WP_* (WordPress integration) vars have no secret-shaped substring
+        and previously slipped both the exact-name blocklist and any
+        substring check — this is the specific gap the ticket calls out."""
+        result_env = _run_with_env(extra_os_env={
+            "WP_FIELDSERVICESOFTWARE_IO": "wp-secret-value",
+            "WP_HVACSERVICEBELLEVUE_COM": "another-wp-secret",
+        })
+        assert "WP_FIELDSERVICESOFTWARE_IO" not in result_env
+        assert "WP_HVACSERVICEBELLEVUE_COM" not in result_env
+
+    def test_d365_prefixed_vars_are_stripped(self):
+        """D365* (Microsoft Dynamics 365 integration) vars, same gap."""
+        result_env = _run_with_env(extra_os_env={
+            "D365GROUP_DATABASE_URL": "postgres://leak",
+            "D365GROUP_DATABASE_URL_UNPOOLED": "postgres://leak-2",
+        })
+        assert "D365GROUP_DATABASE_URL" not in result_env
+        assert "D365GROUP_DATABASE_URL_UNPOOLED" not in result_env
+
+    def test_wp_d365_case_insensitive(self):
+        """The name-pattern match is case-insensitive, matching
+        matches_denied_name_pattern's re.IGNORECASE."""
+        result_env = _run_with_env(extra_os_env={
+            "wp_lowercase_site": "secret",
+            "d365lowercase_conn": "secret",
+        })
+        assert "wp_lowercase_site" not in result_env
+        assert "d365lowercase_conn" not in result_env
+
+    def test_secret_shaped_vars_absent_from_blocklist_are_stripped(self):
+        """Any KEY/TOKEN/SECRET/PASSWORD/CREDENTIAL-shaped name is blocked
+        even when it was never enumerated in _HERMES_PROVIDER_ENV_BLOCKLIST
+        -- e.g. a provider whose API key var was never registered in
+        PROVIDER_REGISTRY, or an arbitrary client secret sitting in the
+        gateway's process env."""
+        result_env = _run_with_env(extra_os_env={
+            "GEMINI_API_KEY": "gm-secret",  # real gap: present in
+            # OPTIONAL_ENV_VARS but absent from PROVIDER_REGISTRY today.
+            "RANDOM_CLIENT_SECRET": "shh",
+            "SOME_VENDOR_CREDENTIAL": "cred-value",
+            "CRON_SECRET": "cron-secret-value",
+        })
+        for var in ("GEMINI_API_KEY", "RANDOM_CLIENT_SECRET",
+                    "SOME_VENDOR_CREDENTIAL", "CRON_SECRET"):
+            assert var not in result_env, f"{var} leaked into subprocess env"
+
+    def test_general_aws_chain_still_survives_the_new_gate(self):
+        """No-regression guard: the general AWS credential chain contains a
+        secret-shaped substring (KEY/SECRET/TOKEN/CREDENTIAL) but is a
+        documented trusted-shell exemption (#32314) -- the new gate must not
+        re-break what TestProviderEnvBlocklist.
+        test_general_aws_credential_chain_is_preserved already locks in."""
+        result_env = _run_with_env(extra_os_env={
+            "AWS_ACCESS_KEY_ID": "AKIAIOSFODNN7EXAMPLE",
+            "AWS_SECRET_ACCESS_KEY": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            "AWS_SESSION_TOKEN": "session-token",
+            "AWS_SHARED_CREDENTIALS_FILE": "/home/user/.aws/credentials",
+            "AWS_WEB_IDENTITY_TOKEN_FILE": "/var/run/secrets/token",
+        })
+        assert result_env.get("AWS_ACCESS_KEY_ID") == "AKIAIOSFODNN7EXAMPLE"
+        assert result_env.get("AWS_SECRET_ACCESS_KEY") == "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+        assert result_env.get("AWS_SESSION_TOKEN") == "session-token"
+        assert result_env.get("AWS_SHARED_CREDENTIALS_FILE") == "/home/user/.aws/credentials"
+        assert result_env.get("AWS_WEB_IDENTITY_TOKEN_FILE") == "/var/run/secrets/token"
+
+    def test_claude_code_oauth_token_still_survives_the_new_gate(self):
+        result_env = _run_with_env(extra_os_env={
+            "CLAUDE_CODE_OAUTH_TOKEN": "claude-oauth-secret",
+        })
+        assert result_env.get("CLAUDE_CODE_OAUTH_TOKEN") == "claude-oauth-secret"
+
+    def test_ssh_auth_sock_survives_the_new_gate(self):
+        """SSH_AUTH_SOCK trips the AUTH substring but is the ssh-agent socket
+        path, not a credential -- blocking it would break git clone/push/pull
+        over SSH with agent forwarding from the terminal."""
+        result_env = _run_with_env(extra_os_env={
+            "SSH_AUTH_SOCK": "/tmp/ssh-agent.sock",
+        })
+        assert result_env.get("SSH_AUTH_SOCK") == "/tmp/ssh-agent.sock"
+
+    def test_git_author_committer_vars_survive_the_new_gate(self):
+        """GIT_AUTHOR_NAME/EMAIL trip the AUTH substring (AUTHOR contains
+        AUTH) but are plain commit-identity overrides, not secrets. Cron
+        scripts commonly set these before `git commit` -- blocking them is
+        exactly the "git operations" regression this change must avoid."""
+        result_env = _run_with_env(extra_os_env={
+            "GIT_AUTHOR_NAME": "Cron Bot",
+            "GIT_AUTHOR_EMAIL": "cron@example.com",
+            "GIT_COMMITTER_NAME": "Cron Bot",
+            "GIT_COMMITTER_EMAIL": "cron@example.com",
+        })
+        assert result_env.get("GIT_AUTHOR_NAME") == "Cron Bot"
+        assert result_env.get("GIT_AUTHOR_EMAIL") == "cron@example.com"
+        assert result_env.get("GIT_COMMITTER_NAME") == "Cron Bot"
+        assert result_env.get("GIT_COMMITTER_EMAIL") == "cron@example.com"
+
+    def test_ordinary_vars_still_pass_through(self):
+        """Non-secret-shaped custom vars are unaffected by the new gate --
+        the terminal keeps its broader "trusted operator shell" posture for
+        anything that isn't credential-shaped."""
+        result_env = _run_with_env(extra_os_env={
+            "MY_PROJECT_ENVIRONMENT": "staging",
+            "NODE_ENV": "production",
+        })
+        assert result_env.get("MY_PROJECT_ENVIRONMENT") == "staging"
+        assert result_env.get("NODE_ENV") == "production"
+
+    def test_env_passthrough_still_overrides_the_new_gate(self):
+        """A skill/config that explicitly registers a secret-shaped var via
+        env_passthrough can still tunnel it through -- same escape hatch as
+        the exact-name blocklist already had."""
+        with patch(
+            "tools.env_passthrough.is_env_passthrough",
+            side_effect=lambda name: name == "TENOR_API_KEY",
+        ):
+            result_env = _run_with_env(extra_os_env={
+                "TENOR_API_KEY": "tenor-secret",
+                "OTHER_CLIENT_SECRET": "should-be-blocked",
+            })
+        assert result_env.get("TENOR_API_KEY") == "tenor-secret"
+        assert "OTHER_CLIENT_SECRET" not in result_env
+
+    def test_force_prefix_still_overrides_the_new_gate(self):
+        """_HERMES_FORCE_ is a stronger, explicit opt-in than passthrough and
+        must still bypass the new gate too."""
+        result_env = _run_with_env(self_env={
+            f"{_HERMES_PROVIDER_ENV_FORCE_PREFIX}WP_SOME_SITE_KEY": "forced-value",
+        })
+        assert result_env.get("WP_SOME_SITE_KEY") == "forced-value"
+
+
+class TestSecretShapeGateUnit:
+    """Direct unit coverage of the helper predicate and its exemption set,
+    plus the background/PTY spawn path (_sanitize_subprocess_env)."""
+
+    def test_predicate_blocks_wp_and_d365_patterns(self):
+        from tools.environments.local import _is_secret_shaped_and_not_exempt
+        assert _is_secret_shaped_and_not_exempt("WP_FIELDSERVICESOFTWARE_IO")
+        assert _is_secret_shaped_and_not_exempt("D365GROUP_DATABASE_URL")
+        assert _is_secret_shaped_and_not_exempt("wp_lower")
+        assert _is_secret_shaped_and_not_exempt("D365Mixed")
+
+    def test_predicate_blocks_secret_substrings(self):
+        from tools.environments.local import _is_secret_shaped_and_not_exempt
+        for name in ("MY_API_KEY", "SOME_TOKEN", "DB_PASSWORD", "APP_CREDENTIAL",
+                     "MY_PASSWD", "SERVICE_AUTH", "SENTRY_DSN", "SOME_WEBHOOK_URL",
+                     "MY_CREDS", "BEARER_TOKEN_X", "SOME_APIKEY"):
+            assert _is_secret_shaped_and_not_exempt(name), f"{name} should be blocked"
+
+    def test_predicate_allows_exempt_vars(self):
+        from tools.environments.local import (
+            _is_secret_shaped_and_not_exempt,
+            _SECRET_SHAPE_EXEMPT,
+        )
+        for name in _SECRET_SHAPE_EXEMPT:
+            assert not _is_secret_shaped_and_not_exempt(name), f"{name} should be exempt"
+
+    def test_predicate_allows_ordinary_names(self):
+        from tools.environments.local import _is_secret_shaped_and_not_exempt
+        for name in ("PATH", "HOME", "USER", "NODE_ENV", "MY_PROJECT_ENVIRONMENT"):
+            assert not _is_secret_shaped_and_not_exempt(name)
+
+    def test_sanitize_subprocess_env_strips_wp_and_d365(self):
+        """PTY/background spawn path (process_registry.spawn_local ->
+        _sanitize_subprocess_env) gets the same gate as the foreground
+        terminal path."""
+        from tools.environments.local import _sanitize_subprocess_env
+        base = {
+            "PATH": "/usr/bin:/bin",
+            "HOME": "/home/user",
+            "WP_FIELDSERVICESOFTWARE_IO": "wp-secret",
+            "D365GROUP_DATABASE_URL": "postgres://leak",
+            "MY_CUSTOM_VAR": "keep-me",
+        }
+        result = _sanitize_subprocess_env(base)
+        assert "WP_FIELDSERVICESOFTWARE_IO" not in result
+        assert "D365GROUP_DATABASE_URL" not in result
+        assert result.get("HOME") == "/home/user"
+        assert result.get("MY_CUSTOM_VAR") == "keep-me"
+
+    def test_sanitize_subprocess_env_extra_env_also_gated(self):
+        """The extra_env (self.env / env_vars) side of _sanitize_subprocess_env
+        gets the same gate, not just base_env (os.environ)."""
+        from tools.environments.local import _sanitize_subprocess_env
+        result = _sanitize_subprocess_env(
+            {"HOME": "/home/user"},
+            {"WP_INJECTED_SITE": "wp-secret", "MY_CUSTOM_VAR": "keep-me"},
+        )
+        assert "WP_INJECTED_SITE" not in result
+        assert result.get("MY_CUSTOM_VAR") == "keep-me"
+
+    def test_sanitize_subprocess_env_preserves_trusted_shell_exemptions(self):
+        from tools.environments.local import _sanitize_subprocess_env
+        base = {
+            "HOME": "/home/user",
+            "AWS_SESSION_TOKEN": "session-token",
+            "SSH_AUTH_SOCK": "/tmp/ssh-agent.sock",
+            "GIT_AUTHOR_NAME": "Cron Bot",
+        }
+        result = _sanitize_subprocess_env(base)
+        assert result.get("AWS_SESSION_TOKEN") == "session-token"
+        assert result.get("SSH_AUTH_SOCK") == "/tmp/ssh-agent.sock"
+        assert result.get("GIT_AUTHOR_NAME") == "Cron Bot"
+
+    def test_make_run_env_strips_wp_and_d365(self):
+        """Foreground terminal path (_make_run_env) gets the same gate."""
+        from tools.environments.local import _make_run_env
+        with patch.dict(os.environ, {
+            "PATH": "/usr/bin:/bin",
+            "WP_FIELDSERVICESOFTWARE_IO": "wp-secret",
+            "D365GROUP_DATABASE_URL": "postgres://leak",
+            "MY_CUSTOM_VAR": "keep-me",
+        }, clear=True):
+            run_env = _make_run_env({})
+        assert "WP_FIELDSERVICESOFTWARE_IO" not in run_env
+        assert "D365GROUP_DATABASE_URL" not in run_env
+        assert run_env.get("MY_CUSTOM_VAR") == "keep-me"
+
+
+class TestEnvSecretPatternsSharedModule:
+    """tools/env_secret_patterns.py is the single source of truth shared by
+    code_execution_tool.py::_scrub_child_env and
+    tools/environments/local.py's terminal scrub -- both must agree."""
+
+    def test_secret_substrings_match_code_execution_tool(self):
+        from tools.env_secret_patterns import SECRET_SUBSTRINGS
+        from tools.code_execution_tool import _SECRET_SUBSTRINGS
+        assert SECRET_SUBSTRINGS == _SECRET_SUBSTRINGS
+
+    def test_has_secret_substring(self):
+        from tools.env_secret_patterns import has_secret_substring
+        assert has_secret_substring("OPENAI_API_KEY")
+        assert has_secret_substring("db_password")
+        assert not has_secret_substring("PATH")
+        assert not has_secret_substring("BYPASS_CACHE")  # "PASS" excluded
+
+    def test_matches_denied_name_pattern(self):
+        from tools.env_secret_patterns import matches_denied_name_pattern
+        assert matches_denied_name_pattern("WP_SITE_URL")
+        assert matches_denied_name_pattern("D365GROUP_DATABASE_URL")
+        assert matches_denied_name_pattern("wp_lower")
+        assert not matches_denied_name_pattern("MY_WP_VAR")  # not a prefix match
+        assert not matches_denied_name_pattern("PATH")
+
+    def test_code_execution_scrub_also_blocks_wp_and_d365(self):
+        """execute_code's sandbox scrubber gets the same WP_*/D365* pattern
+        gate -- closing the gap the ticket calls out ("these ~8 vars ...
+        slip both today's blocklist AND execute_code's substring scrub")."""
+        from tools.code_execution_tool import _scrub_child_env
+        scrubbed = _scrub_child_env(
+            {
+                "PATH": "/usr/bin:/bin",
+                "WP_FIELDSERVICESOFTWARE_IO": "wp-secret",
+                "D365GROUP_DATABASE_URL": "postgres://leak",
+            },
+            is_passthrough=lambda _: False,
+            is_windows=False,
+        )
+        assert "WP_FIELDSERVICESOFTWARE_IO" not in scrubbed
+        assert "D365GROUP_DATABASE_URL" not in scrubbed
+        assert "PATH" in scrubbed

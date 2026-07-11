@@ -13,6 +13,8 @@ import time
 from pathlib import Path
 
 from tools.environments.base import BaseEnvironment, _pipe_stdin
+from tools.env_secret_patterns import has_secret_substring as _has_secret_substring
+from tools.env_secret_patterns import matches_denied_name_pattern as _matches_denied_name_pattern
 from hermes_cli._subprocess_compat import windows_hide_flags
 
 _IS_WINDOWS = platform.system() == "Windows"
@@ -226,6 +228,87 @@ def _build_provider_env_blocklist() -> frozenset:
 
 _HERMES_PROVIDER_ENV_BLOCKLIST = _build_provider_env_blocklist()
 
+# Name-shape-based deny gate (mirrors execute_code's substring-deny, shared
+# via tools/env_secret_patterns.py) layered on top of the exact-name
+# _HERMES_PROVIDER_ENV_BLOCKLIST above. This catches credential-looking vars
+# whose name never made it into the registry-derived blocklist — a provider
+# added without its API key var being registered (e.g. GEMINI_API_KEY,
+# GLM_API_KEY — present in OPTIONAL_ENV_VARS but absent from
+# PROVIDER_REGISTRY.api_key_env_vars), a skill-declared third-party key that
+# was never passthrough-registered, or an unrelated vendor integration var
+# with no secret-shaped substring at all (WP_*, D365*; see
+# tools.env_secret_patterns.matches_denied_name_pattern).
+#
+# _SECRET_SHAPE_EXEMPT carves out the *specific*, already-documented
+# exceptions to the terminal's "trusted operator shell" posture (SECURITY.md
+# §3.2): the general AWS credential chain and CLAUDE_CODE_OAUTH_TOKEN are
+# deliberately kept inheritable even though their names contain a
+# secret-shaped substring (KEY/TOKEN/CREDENTIAL/AUTH) — see
+# _AWS_SDK_CREDENTIAL_ENV_VARS above and
+# test_general_aws_credential_chain_is_preserved /
+# test_claude_code_oauth_token_is_inheritable. This is not a new carve-out,
+# just extending the existing, tested one to this new gate so it doesn't
+# regress #32314 / #55878.
+#
+# SSH_AUTH_SOCK is a separate, equally load-bearing exemption: it's the path
+# to the user's ssh-agent socket (not a bare credential), and its name trips
+# the "AUTH" substring. Blocking it would break every ``git clone``/``git
+# push``/``git pull`` over SSH with agent forwarding run from the terminal —
+# exactly the "cron scripts, git operations" flows this change must not
+# regress — while granting no new capability beyond what the user's own
+# interactive shell already has (the whole point of the trusted-shell
+# posture).
+#
+# GIT_AUTHOR_NAME / GIT_AUTHOR_EMAIL are a substring false-positive
+# ("AUTHOR" contains "AUTH"), not a real credential — plain commit-identity
+# overrides that cron scripts commonly set before ``git commit``. Blocking
+# them is exactly the "git operations" regression the acceptance bar calls
+# out. GIT_COMMITTER_NAME/EMAIL don't trip the substring check but are
+# listed for symmetry/documentation.
+_SECRET_SHAPE_EXEMPT: frozenset[str] = frozenset({
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_SHARED_CREDENTIALS_FILE",
+    "AWS_WEB_IDENTITY_TOKEN_FILE",
+    "AWS_ROLE_ARN",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "SSH_AUTH_SOCK",
+    "GIT_AUTHOR_NAME",
+    "GIT_AUTHOR_EMAIL",
+    "GIT_COMMITTER_NAME",
+    "GIT_COMMITTER_EMAIL",
+})
+
+# HERMES_SESSION_* (gateway.session_context._VAR_MAP) are operational
+# session-identity vars (platform, chat/thread/user id, session key/id,
+# profile) — not credentials, despite HERMES_SESSION_KEY tripping the "KEY"
+# substring. They already have their own dedicated cross-session leak guard
+# (_inject_session_context_env, ContextVar-authoritative once engaged) that
+# runs *after* this gate; stripping HERMES_SESSION_KEY here would break the
+# unengaged-process os.environ fallback path
+# (test_unengaged_process_preserves_os_environ_fallback /
+# test_sanitize_subprocess_env_unengaged_preserves_fallback) before that
+# guard ever gets a chance to run.
+_SECRET_SHAPE_EXEMPT_PREFIXES: tuple[str, ...] = ("HERMES_SESSION_",)
+
+
+def _is_secret_shaped_and_not_exempt(key: str) -> bool:
+    """True if *key*'s name looks like it carries a credential and it isn't
+    one of the documented "trusted operator shell" exemptions.
+
+    Checked AFTER the exact-name blocklist and env_passthrough opt-in (both
+    of which still take precedence — see call sites in _make_run_env /
+    _sanitize_subprocess_env), so a skill or operator can still explicitly
+    re-allow a specific secret-shaped var via env_passthrough.
+    """
+    if key in _SECRET_SHAPE_EXEMPT:
+        return False
+    if key.startswith(_SECRET_SHAPE_EXEMPT_PREFIXES):
+        return False
+    return _matches_denied_name_pattern(key) or _has_secret_substring(key)
+
+
 # Active-virtualenv markers that must NOT leak into terminal subprocesses.
 # The gateway runs inside its own venv, so its process environment carries
 # VIRTUAL_ENV (and possibly CONDA_PREFIX). If those leak into commands the
@@ -352,13 +435,33 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
 
     sanitized: dict[str, str] = {}
 
+    # Same rule order as _make_run_env's foreground path (kept in sync
+    # deliberately — this is the background/PTY spawn path used by
+    # process_registry.spawn_local, "the same cross-session leak guard" noted
+    # below applies to the whole function, not just the session-var bridge):
+    #   1. _HERMES_FORCE_ prefix — explicit opt-in, still blocks internal
+    #      Hermes-dynamic secrets on the real (unprefixed) name.
+    #   2. _is_hermes_internal_secret — unconditional strip, cannot be
+    #      overridden by passthrough (AUXILIARY_*_API_KEY / GATEWAY_RELAY_*).
+    #   3. env_passthrough opt-in — overrides both the exact-name blocklist
+    #      and the secret-shape gate below.
+    #   4. Exact-name blocklist (_HERMES_PROVIDER_ENV_BLOCKLIST).
+    #   5. Secret-shape gate (_is_secret_shaped_and_not_exempt) — catches
+    #      credential-looking names absent from the blocklist (e.g. WP_*,
+    #      D365*, or a provider key never registered in PROVIDER_REGISTRY).
     for key, value in (base_env or {}).items():
         if key.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
             continue
         if _is_hermes_internal_secret(key):
             continue
-        if key not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough(key):
+        if _is_passthrough(key):
             sanitized[key] = value
+            continue
+        if key in _HERMES_PROVIDER_ENV_BLOCKLIST:
+            continue
+        if _is_secret_shaped_and_not_exempt(key):
+            continue
+        sanitized[key] = value
 
     for key, value in (extra_env or {}).items():
         if key.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
@@ -366,10 +469,17 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
             if _is_hermes_internal_secret(real_key):
                 continue
             sanitized[real_key] = value
-        elif _is_hermes_internal_secret(key):
             continue
-        elif key not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough(key):
+        if _is_hermes_internal_secret(key):
+            continue
+        if _is_passthrough(key):
             sanitized[key] = value
+            continue
+        if key in _HERMES_PROVIDER_ENV_BLOCKLIST:
+            continue
+        if _is_secret_shaped_and_not_exempt(key):
+            continue
+        sanitized[key] = value
 
     _inject_context_hermes_home(sanitized)
 
@@ -800,16 +910,35 @@ def _make_run_env(env: dict) -> dict:
 
     merged = dict(os.environ | env)
     run_env = {}
+    # Same rule order as _sanitize_subprocess_env's background/PTY path (kept
+    # in sync deliberately):
+    #   1. _HERMES_FORCE_ prefix — explicit opt-in, still blocks internal
+    #      Hermes-dynamic secrets on the real (unprefixed) name.
+    #   2. _is_hermes_internal_secret — unconditional strip, cannot be
+    #      overridden by passthrough (AUXILIARY_*_API_KEY / GATEWAY_RELAY_*).
+    #   3. env_passthrough opt-in — overrides both the exact-name blocklist
+    #      and the secret-shape gate below.
+    #   4. Exact-name blocklist (_HERMES_PROVIDER_ENV_BLOCKLIST).
+    #   5. Secret-shape gate (_is_secret_shaped_and_not_exempt) — catches
+    #      credential-looking names absent from the blocklist (e.g. WP_*,
+    #      D365*, or a provider key never registered in PROVIDER_REGISTRY).
     for k, v in merged.items():
         if k.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
             real_key = k[len(_HERMES_PROVIDER_ENV_FORCE_PREFIX):]
             if _is_hermes_internal_secret(real_key):
                 continue
             run_env[real_key] = v
-        elif _is_hermes_internal_secret(k):
             continue
-        elif k not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough(k):
+        if _is_hermes_internal_secret(k):
+            continue
+        if _is_passthrough(k):
             run_env[k] = v
+            continue
+        if k in _HERMES_PROVIDER_ENV_BLOCKLIST:
+            continue
+        if _is_secret_shaped_and_not_exempt(k):
+            continue
+        run_env[k] = v
     path_key = _path_env_key(run_env)
     if path_key is not None:
         new_path = _append_missing_sane_path_entries(run_env.get(path_key, ""))
