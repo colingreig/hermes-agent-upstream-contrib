@@ -426,8 +426,27 @@ def _inject_session_context_env(env: dict) -> None:
             env.pop(var_name, None)
 
 
-def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = None) -> dict:
-    """Filter Hermes-managed secrets from a subprocess environment."""
+def _sanitize_subprocess_env(
+    base_env: dict | None,
+    extra_env: dict | None = None,
+    *,
+    apply_secret_shape_gate: bool = True,
+) -> dict:
+    """Filter Hermes-managed secrets from a subprocess environment.
+
+    ``apply_secret_shape_gate`` (default ``True``) toggles ONLY step 5 below,
+    the name-shape heuristic (``_is_secret_shaped_and_not_exempt``). Steps
+    1-4 — the ``_HERMES_FORCE_`` prefix opt-in, the unconditional
+    Hermes-internal-secret strip, the ``env_passthrough`` opt-in, and the
+    exact-name provider blocklist (``_HERMES_PROVIDER_ENV_BLOCKLIST``) —
+    ALWAYS run regardless of this flag. Trusted first-party callers (the
+    cron scheduler's ``no_agent`` script runner, see
+    ``cron/scheduler.py::_run_job_script``) pass ``apply_secret_shape_gate=
+    False`` so legitimate third-party integration tokens like
+    ``CLICKUP_API_TOKEN`` survive, while LLM-provider credentials are still
+    stripped by the blocklist. The default of ``True`` preserves the
+    model-driven-terminal hardening from PR #24 for every other caller.
+    """
     try:
         from tools.env_passthrough import is_env_passthrough as _is_passthrough
     except Exception:
@@ -459,7 +478,7 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
             continue
         if key in _HERMES_PROVIDER_ENV_BLOCKLIST:
             continue
-        if _is_secret_shaped_and_not_exempt(key):
+        if apply_secret_shape_gate and _is_secret_shaped_and_not_exempt(key):
             continue
         sanitized[key] = value
 
@@ -477,7 +496,7 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
             continue
         if key in _HERMES_PROVIDER_ENV_BLOCKLIST:
             continue
-        if _is_secret_shaped_and_not_exempt(key):
+        if apply_secret_shape_gate and _is_secret_shaped_and_not_exempt(key):
             continue
         sanitized[key] = value
 

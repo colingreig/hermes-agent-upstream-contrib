@@ -1876,9 +1876,15 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
     Shell support lets ``no_agent=True`` jobs ship classic bash watchdogs
     (the `memory-watchdog.sh` pattern) without wrapping them in Python.
 
-    Subprocess environment is passed through ``_sanitize_subprocess_env`` so
-    provider credentials and other Hermes-managed secrets are not inherited
-    (SECURITY.md §2.3), matching terminal and MCP child processes.
+    Subprocess environment is passed through ``_sanitize_subprocess_env``
+    with ``apply_secret_shape_gate=False``: LLM-provider credentials and
+    Hermes-internal secrets are still stripped (the exact-name blocklist and
+    internal-secret checks always run), but the aggressive name-shape
+    heuristic added for the model-driven terminal (SECURITY.md §2.3) is
+    intentionally NOT applied here. Cron scripts are trusted,
+    operator-authored first-party code that legitimately needs its own
+    third-party integration tokens (e.g. ``CLICKUP_API_TOKEN``), which that
+    heuristic would otherwise strip.
 
     Args:
         script_path: Path to the script.  Relative paths are resolved
@@ -1950,7 +1956,7 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
             text=True,
             timeout=script_timeout,
             cwd=str(path.parent),
-            env=_sanitize_subprocess_env(os.environ.copy()),
+            env=_sanitize_subprocess_env(os.environ.copy(), apply_secret_shape_gate=False),
             **popen_kwargs,
         )
         stdout = (result.stdout or "").strip()
