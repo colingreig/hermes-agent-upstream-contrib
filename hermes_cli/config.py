@@ -7645,6 +7645,31 @@ def reload_env() -> int:
     return count
 
 
+def _lazy_secret_resolution_enabled() -> bool:
+    """Whether the lazy, per-task 1Password secret resolver tier is enabled.
+
+    Flag-gated: off by default. See ``agent/lazy_secret_resolver.py``.
+    """
+    return os.getenv("HERMES_LAZY_SECRET_RESOLUTION", "").strip().lower() in ("1", "true", "yes")
+
+
+def _lazy_secret_fallback(key: str) -> Optional[str]:
+    """Flag-gated final-tier lookup via the lazy 1Password resolver.
+
+    Returns None when the flag is off or on any error (fail-open) — this
+    must never be able to raise or take down an existing lookup chain.
+    Never logs the resolved value.
+    """
+    if not _lazy_secret_resolution_enabled():
+        return None
+    try:
+        from agent.lazy_secret_resolver import get as _lazy_get
+
+        return _lazy_get(key)
+    except Exception:
+        return None
+
+
 def get_env_value(key: str) -> Optional[str]:
     """Get a value from ~/.hermes/.env or environment."""
     # Check environment first
@@ -7653,7 +7678,18 @@ def get_env_value(key: str) -> Optional[str]:
 
     # Then check .env file
     env_vars = load_env()
-    return env_vars.get(key)
+    val = env_vars.get(key)
+    if val:
+        return val
+
+    # Final tier: flag-gated lazy 1Password resolution. No-op (returns None)
+    # when HERMES_LAZY_SECRET_RESOLUTION is unset, so when the flag is off
+    # this falls through to `val` exactly as before (None if the key is
+    # absent from .env, or "" if it's present-but-empty).
+    lazy = _lazy_secret_fallback(key)
+    if lazy:
+        return lazy
+    return val
 
 
 def get_env_value_prefer_dotenv(key: str) -> Optional[str]:
@@ -7669,6 +7705,12 @@ def get_env_value_prefer_dotenv(key: str) -> Optional[str]:
     that, under an active profile scope (multiplexed gateway turn), this read
     is scope-checked rather than leaking another profile's raw ``os.environ``
     value — matching the credential-pool seeding path's behaviour.
+
+    When ``HERMES_LAZY_SECRET_RESOLUTION`` is set, a final flag-gated tier
+    resolves the secret lazily via 1Password (``agent.lazy_secret_resolver``)
+    if neither ``.env`` nor the scoped/env lookup produced a value. This tier
+    is a no-op (returns None) when the flag is off, so behavior is unchanged
+    by default.
     """
     env_vars = load_env()
     val = env_vars.get(key)
@@ -7677,9 +7719,15 @@ def get_env_value_prefer_dotenv(key: str) -> Optional[str]:
     try:
         from agent.secret_scope import get_secret as _get_secret
 
-        return _get_secret(key)
+        scoped = _get_secret(key)
     except Exception:
-        return os.environ.get(key)
+        scoped = os.environ.get(key)
+    if scoped:
+        return scoped
+    lazy = _lazy_secret_fallback(key)
+    if lazy:
+        return lazy
+    return scoped
 
 
 # =============================================================================
