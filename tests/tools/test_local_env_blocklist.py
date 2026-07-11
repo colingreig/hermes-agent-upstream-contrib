@@ -979,6 +979,34 @@ class TestSecretShapeGateUnit:
         assert result.get("SSH_AUTH_SOCK") == "/tmp/ssh-agent.sock"
         assert result.get("GIT_AUTHOR_NAME") == "Cron Bot"
 
+    def test_sanitize_subprocess_env_gate_off_keeps_integration_tokens_strips_providers(self):
+        """Trusted first-party callers (cron's no_agent script runner, see
+        cron/scheduler.py::_run_job_script) opt out of the name-shape gate via
+        apply_secret_shape_gate=False so legitimate third-party integration
+        tokens like CLICKUP_API_TOKEN survive, while LLM-provider credentials
+        are still stripped by the always-on exact-name blocklist."""
+        from tools.environments.local import _sanitize_subprocess_env
+        base = {
+            "OPENAI_API_KEY": "sk-provider-secret",
+            "CLICKUP_API_TOKEN": "clickup-secret",
+            "MY_INTEGRATION_TOKEN": "integration-secret",
+            "HOME": "/home/user",
+        }
+        result = _sanitize_subprocess_env(base, apply_secret_shape_gate=False)
+        assert result.get("CLICKUP_API_TOKEN") == "clickup-secret"
+        assert result.get("MY_INTEGRATION_TOKEN") == "integration-secret"
+        assert result.get("HOME") == "/home/user"
+        assert "OPENAI_API_KEY" not in result
+
+    def test_sanitize_subprocess_env_gate_on_still_strips_integration_tokens(self):
+        """Regression guard for the terminal/PTY path: with the default
+        (apply_secret_shape_gate=True), integration tokens that happen to be
+        secret-shaped are still stripped."""
+        from tools.environments.local import _sanitize_subprocess_env
+        result = _sanitize_subprocess_env({"CLICKUP_API_TOKEN": "y", "HOME": "/h"})
+        assert "CLICKUP_API_TOKEN" not in result
+        assert result.get("HOME") == "/h"
+
     def test_make_run_env_strips_wp_and_d365(self):
         """Foreground terminal path (_make_run_env) gets the same gate."""
         from tools.environments.local import _make_run_env
