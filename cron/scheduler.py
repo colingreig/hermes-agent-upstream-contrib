@@ -361,6 +361,45 @@ class _ReadWriteLock:
             self._cond.notify_all()
 
 
+class _DaemonThreadPoolExecutor(concurrent.futures.ThreadPoolExecutor):
+    """ThreadPoolExecutor whose worker threads are marked daemon.
+
+    ignite- 86e27d629: a cron job stuck in a retry loop (e.g. the zai-429
+    re-probe storm 86e261t21 fixed) leaves its worker thread alive after
+    `.shutdown(wait=False, ...)` returns -- shutdown() detaches the pool
+    object but cannot force-kill an in-progress thread. A non-daemon
+    thread like that blocks CPython's normal interpreter finalization
+    (Py_FinalizeEx -> threading._shutdown() joins every non-daemon
+    thread), which is what turned a 0.36s graceful-shutdown sequence into
+    a full restart_drain_timeout (180s) wait before launchd forced a
+    replace. Daemon threads are skipped by that join entirely, so a
+    stuck cron thread can no longer block process exit -- it's simply
+    abandoned when the interpreter shuts down.
+
+    concurrent.futures has no public `daemon=` kwarg, and `_adjust_thread_count`
+    both constructs AND starts the worker thread in one call -- `.daemon` can't
+    be set afterward (`RuntimeError: cannot set daemon status of active thread`).
+    Temporarily swapping `threading.Thread` for a daemon-defaulted subclass for
+    the duration of that one call (module-level `threading.Thread(...)` is an
+    attribute lookup at call time, so this reaches the swap) is the standard
+    workaround; restored in `finally` so nothing else observes the swap.
+    """
+
+    def _adjust_thread_count(self) -> None:
+        _orig_thread = threading.Thread
+
+        class _DaemonThread(_orig_thread):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.daemon = True
+
+        threading.Thread = _DaemonThread
+        try:
+            super()._adjust_thread_count()
+        finally:
+            threading.Thread = _orig_thread
+
+
 # Serializes the per-job TERMINAL_CWD override against every other concurrently
 # running cron job.  See _ReadWriteLock and run_job for the usage contract.
 _terminal_cwd_lock = _ReadWriteLock()
@@ -372,7 +411,7 @@ def _get_parallel_pool(max_workers: Optional[int]) -> concurrent.futures.ThreadP
     if _parallel_pool is None or _parallel_pool_max_workers != max_workers:
         if _parallel_pool is not None:
             _parallel_pool.shutdown(wait=False, cancel_futures=False)
-        _parallel_pool = concurrent.futures.ThreadPoolExecutor(
+        _parallel_pool = _DaemonThreadPoolExecutor(
             max_workers=max_workers,
             thread_name_prefix="cron-parallel",
         )
@@ -390,7 +429,7 @@ def _get_sequential_pool() -> concurrent.futures.ThreadPoolExecutor:
     """
     global _sequential_pool
     if _sequential_pool is None:
-        _sequential_pool = concurrent.futures.ThreadPoolExecutor(
+        _sequential_pool = _DaemonThreadPoolExecutor(
             max_workers=1,
             thread_name_prefix="cron-seq",
         )
@@ -1782,7 +1821,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 # try/except so a per-target failure is logged and the loop
                 # continues to the next target.
                 try:
-                    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+                    pool = _DaemonThreadPoolExecutor(max_workers=1)
                     try:
                         future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files))
                         result = future.result(timeout=30)
@@ -3019,7 +3058,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             _cron_timeout = 600.0
         _cron_inactivity_limit = _cron_timeout if _cron_timeout > 0 else None
         _POLL_INTERVAL = 5.0
-        _cron_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        _cron_pool = _DaemonThreadPoolExecutor(max_workers=1)
         # Preserve scheduler-scoped ContextVar state (for example skill-declared
         # env passthrough registrations) when the cron run hops into the worker
         # thread used for inactivity timeout monitoring.

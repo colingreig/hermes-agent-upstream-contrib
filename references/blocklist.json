@@ -1,0 +1,5 @@
+{
+  "_doc": "Default-ALLOW blocklist for autonomous Hermes work + publishing. Anything NOT listed here — including future sites and projects — is fair game. Additions require an explicit Colin decision (comment on ClickUp task 86e29q8qz or a new task). clickup_project_blocklist blocks autonomous ClickUp board work by project name; publish_domain_blocklist blocks the WordPress publish adapter (86e29q8ru) by target domain. NOTE: the authoritative ClickUp board-loop enforcement lives in the ignite-state skill's board-policy.json (by list ID); this file is the canonical declarative source and the enforcement point for the publisher.",
+  "clickup_project_blocklist": ["oeconnection", "partstech"],
+  "publish_domain_blocklist": ["tofinoelopement"]
+}

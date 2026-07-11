@@ -90,6 +90,66 @@ class TestScopeIsolation:
             ss.reset_secret_scope(t1)
 
 
+class TestLazySecretFallback:
+    """get_secret's last-resort, flag-gated lazy 1Password tier.
+
+    Ordering must be: env/profile ALWAYS win; lazy fires only when a name is
+    absent from every prior tier, and only when
+    ``HERMES_LAZY_SECRET_RESOLUTION`` is truthy.
+    """
+
+    def test_flag_off_never_calls_lazy_resolver(self, monkeypatch):
+        monkeypatch.delenv("HERMES_LAZY_SECRET_RESOLUTION", raising=False)
+        monkeypatch.delenv("LAZY_ONLY_KEY", raising=False)
+
+        calls = []
+
+        def spy(name):
+            calls.append(name)
+            return "should-never-be-returned"
+
+        import agent.lazy_secret_resolver as lsr
+
+        monkeypatch.setattr(lsr, "get", spy)
+
+        assert ss.get_secret("LAZY_ONLY_KEY") is None
+        assert calls == []
+
+    def test_flag_on_and_absent_from_env_uses_lazy_value(self, monkeypatch):
+        monkeypatch.setenv("HERMES_LAZY_SECRET_RESOLUTION", "true")
+        monkeypatch.delenv("LAZY_ONLY_KEY", raising=False)
+
+        calls = []
+
+        def spy(name):
+            calls.append(name)
+            return "resolved-via-1password"
+
+        import agent.lazy_secret_resolver as lsr
+
+        monkeypatch.setattr(lsr, "get", spy)
+
+        assert ss.get_secret("LAZY_ONLY_KEY") == "resolved-via-1password"
+        assert calls == ["LAZY_ONLY_KEY"]
+
+    def test_flag_on_but_present_in_env_never_calls_lazy_resolver(self, monkeypatch):
+        monkeypatch.setenv("HERMES_LAZY_SECRET_RESOLUTION", "true")
+        monkeypatch.setenv("ENV_WINS_KEY", "from-environ")
+
+        calls = []
+
+        def spy(name):
+            calls.append(name)
+            return "should-never-be-returned"
+
+        import agent.lazy_secret_resolver as lsr
+
+        monkeypatch.setattr(lsr, "get", spy)
+
+        assert ss.get_secret("ENV_WINS_KEY") == "from-environ"
+        assert calls == []
+
+
 class TestEnvFileParsing:
     """load_env_file parses without mutating os.environ."""
 

@@ -120,6 +120,45 @@ def _is_global_env(name: str) -> bool:
     return any(name.startswith(p) for p in _GLOBAL_ENV_PREFIXES)
 
 
+def _lazy_secret_resolution_enabled() -> bool:
+    """Whether the lazy, per-task 1Password secret resolver tier is enabled.
+
+    Mirrors ``hermes_cli.config._lazy_secret_resolution_enabled`` exactly
+    (same flag, same truthy set). Imported lazily to avoid any import-cycle
+    risk with ``hermes_cli.config`` (which itself only reaches into
+    ``agent.secret_scope`` from inside a function, never at module scope);
+    any import failure is treated as "flag off".
+    """
+    try:
+        from hermes_cli.config import _lazy_secret_resolution_enabled as _enabled
+
+        return _enabled()
+    except Exception:
+        return os.getenv("HERMES_LAZY_SECRET_RESOLUTION", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+
+
+def _lazy_secret_fallback(name: str) -> Optional[str]:
+    """Flag-gated, last-resort lookup via the lazy 1Password resolver.
+
+    Returns ``None`` when the flag is off or on any error (fail-open) — this
+    must never be able to raise or take down an existing lookup chain. Never
+    logs the resolved value. Mirrors
+    ``hermes_cli.config._lazy_secret_fallback``.
+    """
+    if not _lazy_secret_resolution_enabled():
+        return None
+    try:
+        from agent.lazy_secret_resolver import get as _lazy_get
+
+        return _lazy_get(name)
+    except Exception:
+        return None
+
+
 def get_secret(name: str, default: Optional[str] = None) -> Optional[str]:
     """Resolve a credential by env-var name, honoring the active profile scope.
 
@@ -136,6 +175,13 @@ def get_secret(name: str, default: Optional[str] = None) -> Optional[str]:
          identical to the legacy ``os.getenv`` behavior every caller had before.
        - multiplex ACTIVE: FAIL CLOSED. Raise ``UnscopedSecretError`` so the
          missing scope is caught loudly instead of leaking a cross-profile value.
+    4. LAST RESORT (multiplex-inactive path only, and only when ``os.environ``
+       had nothing): flag-gated lazy 1Password resolution via
+       ``agent.lazy_secret_resolver``. This is a no-op (returns None) when
+       ``HERMES_LAZY_SECRET_RESOLUTION`` is unset, so with the flag off this
+       tier never changes behavior — byte-identical to before. It is also
+       inert whenever ``os.environ`` already has the value, even with the
+       flag on, preserving "env always wins" ordering.
     """
     if _is_global_env(name):
         val = os.environ.get(name)
@@ -157,7 +203,14 @@ def get_secret(name: str, default: Optional[str] = None) -> Optional[str]:
         )
 
     val = os.environ.get(name)
-    return val if val is not None else default
+    if val is not None:
+        return val
+
+    lazy = _lazy_secret_fallback(name)
+    if lazy is not None:
+        return lazy
+
+    return default
 
 
 def load_env_file(env_path: Path) -> Dict[str, str]:

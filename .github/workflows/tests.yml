@@ -113,11 +113,24 @@ jobs:
           OPENAI_API_KEY: ""
           NOUS_API_KEY: ""
 
+      - name: Rename durations file to a per-slice unique name
+        # download-artifact's merge-multiple later downloads every slice's
+        # artifact into one shared directory. Each slice previously uploaded
+        # a file with the IDENTICAL name (test_durations.json) inside its
+        # own uniquely-named artifact; on download that identical-filename
+        # collision caused one slice's content to be appended after
+        # another's instead of overwriting it, leaving a file with two
+        # concatenated JSON documents (json.load's "Extra data" error in
+        # save-durations). Uploading a per-slice-unique filename removes the
+        # collision entirely. Suffix (not prefix) keeps the merge step's
+        # existing `*test_durations.json` glob working unchanged.
+        run: mv test_durations.json slice-${{ matrix.slice.index }}-test_durations.json
+
       - name: Upload per-slice durations
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: test-durations-slice-${{ matrix.slice.index }}
-          path: test_durations.json
+          path: slice-${{ matrix.slice.index }}-test_durations.json
           retention-days: 1
 
   # Merge per-slice duration data into a single cache, so future runs
@@ -137,11 +150,14 @@ jobs:
       - name: Merge into single durations file
         run: |
           python3 -c "
-          import json, glob, os
+          import json, glob
           merged = {}
           for f in glob.glob('durations/*test_durations.json'):
-            with open(f) as fh:
-              merged.update(json.load(fh))
+            try:
+              with open(f) as fh:
+                merged.update(json.load(fh))
+            except json.JSONDecodeError as e:
+              print(f'WARNING: skipping malformed durations file {f}: {e}')
           with open('test_durations.json', 'w') as fh:
             json.dump(merged, fh, indent=2, sort_keys=True)
           print(f'Merged {len(merged)} file durations')
