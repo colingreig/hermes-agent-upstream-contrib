@@ -981,6 +981,25 @@ def _make_run_env(env: dict) -> dict:
 
     _apply_windows_msys_bash_env_defaults(run_env)
 
+    # Flag-gated final tier: resolve external-CLI (C2) secrets lazily at
+    # spawn time and inject them into the CHILD env only — never into this
+    # process's os.environ. This lets spawned vercel/wrangler/git see their
+    # creds without the gateway parent holding them for the whole process
+    # lifetime. No-op (byte-identical run_env) when the flag is off, and
+    # only fills names not already present in run_env (it won't be once
+    # boot stops exporting it).
+    if os.getenv("HERMES_LAZY_SECRET_RESOLUTION", "").strip().lower() in ("1", "true", "yes"):
+        try:
+            from agent.lazy_secret_resolver import C2_EXTERNAL_CLI_SECRETS as _C2_EXTERNAL_CLI_SECRETS
+            from agent.lazy_secret_resolver import get as _lazy_get
+            for _name in _C2_EXTERNAL_CLI_SECRETS:
+                if _name not in run_env:
+                    _v = _lazy_get(_name)
+                    if _v:
+                        run_env[_name] = _v
+        except Exception:
+            pass
+
     return run_env
 
 

@@ -1314,7 +1314,14 @@ def resolve_anthropic_token() -> Optional[str]:
 
     # 5. Regular API key, or a legacy OAuth token saved in ANTHROPIC_API_KEY.
     # This remains as a compatibility fallback for pre-migration Hermes configs.
-    api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+    # Routed through get_env_value_prefer_dotenv() (rather than a raw
+    # os.getenv) so a rotated ~/.hermes/.env value wins over a stale shell
+    # export, matching the rest of this resolver's env-reading conventions,
+    # and so the flag-gated lazy 1Password tier is reachable as a final
+    # fallback when HERMES_LAZY_SECRET_RESOLUTION is enabled.
+    from hermes_cli.config import get_env_value_prefer_dotenv
+
+    api_key = (get_env_value_prefer_dotenv("ANTHROPIC_API_KEY") or "").strip()
     if api_key:
         return api_key
 
