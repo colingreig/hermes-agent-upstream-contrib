@@ -2016,6 +2016,10 @@ class TestCallLlmPaymentFallback:
                    return_value=(primary_client, "minimax/minimax-m2.7")), \
              patch("agent.auxiliary_client._resolve_task_provider_model",
                    return_value=("auto", "minimax/minimax-m2.7", None, None, None)), \
+             patch("agent.auxiliary_client._try_configured_fallback_chain",
+                   return_value=(None, None, "")), \
+             patch("agent.auxiliary_client._try_main_fallback_chain",
+                   return_value=(None, None, "")), \
              patch("agent.auxiliary_client._try_payment_fallback",
                    return_value=(fallback_client, "fallback-model", "openrouter")) as mock_fb:
             result = call_llm(
@@ -4293,6 +4297,12 @@ class TestAuxiliaryClientPoisonedCacheEviction:
                 "agent.auxiliary_client._get_cached_client",
                 return_value=(poisoned, "gpt-5.5"),
             ), patch(
+                "agent.auxiliary_client._try_configured_fallback_chain",
+                return_value=(None, None, ""),
+            ), patch(
+                "agent.auxiliary_client._try_main_agent_model_fallback",
+                return_value=(None, None, ""),
+            ), patch(
                 "agent.auxiliary_client._try_payment_fallback",
                 return_value=(None, None, ""),
             ):
@@ -4328,6 +4338,12 @@ class TestAuxiliaryClientPoisonedCacheEviction:
             ), patch(
                 "agent.auxiliary_client._get_cached_client",
                 return_value=(poisoned, "gpt-5.5"),
+            ), patch(
+                "agent.auxiliary_client._try_configured_fallback_chain",
+                return_value=(None, None, ""),
+            ), patch(
+                "agent.auxiliary_client._try_main_agent_model_fallback",
+                return_value=(None, None, ""),
             ), patch(
                 "agent.auxiliary_client._try_payment_fallback",
                 return_value=(None, None, ""),
@@ -4735,6 +4751,10 @@ class TestAuxUnhealthyCache:
                     return_value=(primary_client, "google/gemini-3-flash-preview")), \
              patch("agent.auxiliary_client._resolve_task_provider_model",
                     return_value=("auto", "google/gemini-3-flash-preview", None, None, None)), \
+             patch("agent.auxiliary_client._try_configured_fallback_chain",
+                    return_value=(None, None, "")), \
+             patch("agent.auxiliary_client._try_main_fallback_chain",
+                    return_value=(None, None, "")), \
              patch("agent.auxiliary_client._try_payment_fallback",
                     return_value=(nous_client, "n-model", "nous")), \
              patch("agent.auxiliary_client._build_call_kwargs",
@@ -5210,56 +5230,64 @@ class TestAuxiliaryTaskFallback:
         assert mock_resolve.call_args.kwargs.get("model") == "glm-4.7"
         assert mock_resolve.call_args.kwargs.get("explicit_base_url") == "https://api.z.ai/api/coding/paas/v4"
 
+    # zai/glm-4.7 (rung 2) — the shape every ``auxiliary.<task>.fallback_chain``
+    # entry[0] must preserve unchanged from the old singular ``fallback`` block.
+    _ZAI_RUNG = {
+        "provider": "zai",
+        "model": "glm-4.7",
+        "base_url": "https://api.z.ai/api/coding/paas/v4",
+    }
+
     def test_default_config_fallback_present_for_newly_covered_text_tasks(self):
-        """DEFAULT_CONFIG must actually carry the zai/glm-4.7 fallback block
-        for the newly-covered text-only tasks — this is what makes the
-        parametrized test above true against the real shipped config, not
-        just against a monkeypatched stand-in."""
+        """DEFAULT_CONFIG must actually carry the zai/glm-4.7 fallback for the
+        newly-covered text-only tasks — this is what makes the parametrized
+        test above true against the real shipped config, not just against a
+        monkeypatched stand-in. ``monitor`` still ships the older singular
+        ``fallback`` shape (out of scope for the 3rd-rung migration — 86e29q8ng
+        covers 9 named tasks only); the rest were migrated to
+        ``fallback_chain`` with zai as rung 2 (see the class below for the
+        rung-3 Anthropic coverage)."""
         from hermes_cli.config import DEFAULT_CONFIG
 
-        expected = {
-            "provider": "zai",
-            "model": "glm-4.7",
-            "base_url": "https://api.z.ai/api/coding/paas/v4",
-        }
         aux = DEFAULT_CONFIG["auxiliary"]
-        for task in ("approval", "mcp", "title_generation", "monitor"):
-            assert aux[task].get("fallback") == expected, (
-                f"auxiliary.{task}.fallback missing or wrong in DEFAULT_CONFIG"
+        for task in ("approval", "mcp", "title_generation"):
+            chain = aux[task].get("fallback_chain")
+            assert chain and chain[0] == self._ZAI_RUNG, (
+                f"auxiliary.{task}.fallback_chain[0] missing or wrong in DEFAULT_CONFIG"
             )
+        assert aux["monitor"].get("fallback") == self._ZAI_RUNG, (
+            "auxiliary.monitor.fallback missing or wrong in DEFAULT_CONFIG"
+        )
 
     def test_default_config_fallback_now_wired_for_previously_uncovered_tasks(self):
         """The previously-uncovered TEXT tasks are now covered with the
-        glm-4.7 text fallback: web_extract (its LLM path is text page
-        summarisation), tts_audio_tags, triage_specifier, profile_describer —
-        all routed through call_llm. vision deliberately carries NO fallback
-        (no account-reachable, format-safe vision backend exists via config —
-        see the config comment), and curator is excluded because it forks a
-        full AIAgent instead of calling call_llm()."""
+        glm-4.7 text fallback as rung 2 of a fallback_chain: web_extract (its
+        LLM path is text page summarisation), tts_audio_tags,
+        triage_specifier, profile_describer — all routed through call_llm.
+        vision deliberately carries NO fallback (no account-reachable,
+        format-safe vision backend exists via config — see the config
+        comment), and curator is excluded because it forks a full AIAgent
+        instead of calling call_llm()."""
         from hermes_cli.config import DEFAULT_CONFIG
 
         aux = DEFAULT_CONFIG["auxiliary"]
 
-        text_fb = {
-            "provider": "zai",
-            "model": "glm-4.7",
-            "base_url": "https://api.z.ai/api/coding/paas/v4",
-        }
         for task in ("web_extract", "tts_audio_tags", "triage_specifier", "profile_describer"):
-            assert aux[task].get("fallback") == text_fb, (
-                f"auxiliary.{task}.fallback missing or wrong in DEFAULT_CONFIG"
+            chain = aux[task].get("fallback_chain")
+            assert chain and chain[0] == self._ZAI_RUNG, (
+                f"auxiliary.{task}.fallback_chain[0] missing or wrong in DEFAULT_CONFIG"
             )
 
         # vision must NOT carry a fallback — a glm-4.7 text model would reject
         # image blocks, and no reachable multimodal fallback is available for
         # this account (z.ai vision is plan-gated, Gemini is the primary,
         # Anthropic images aren't converted on the fallback path).
-        assert "fallback" not in aux["vision"], (
+        assert "fallback" not in aux["vision"] and "fallback_chain" not in aux["vision"], (
             "auxiliary.vision.fallback would be a dud — no account-reachable, "
             "format-safe multimodal fallback exists via config"
         )
 
-        assert "fallback" not in aux["curator"], (
+        assert "fallback" not in aux["curator"] and "fallback_chain" not in aux["curator"], (
             "auxiliary.curator.fallback would be a no-op — curator forks an "
             "AIAgent and never reaches _try_task_fallback_once()"
         )
@@ -5544,10 +5572,10 @@ class TestAuxiliaryFallbackCoverage:
         for task, cfg in aux.items():
             if not isinstance(cfg, dict):
                 continue
-            if "fallback" in cfg:
+            if "fallback" in cfg or "fallback_chain" in cfg:
                 assert task in self._CALL_LLM_ROUTED_TASKS, (
-                    f"auxiliary.{task}.fallback is a silent no-op: {task} does "
-                    f"not route through call_llm()/async_call_llm()"
+                    f"auxiliary.{task}.fallback(_chain) is a silent no-op: "
+                    f"{task} does not route through call_llm()/async_call_llm()"
                 )
 
     def test_curator_has_no_task_fallback_block(self):
@@ -5574,6 +5602,125 @@ class TestAuxiliaryFallbackCoverage:
                     f"auxiliary.{task}.fallback uses glm-5v-turbo, which is not "
                     f"reachable on the account's z.ai subscription"
                 )
-        assert "fallback" not in aux["vision"], (
+            for i, rung in enumerate(cfg.get("fallback_chain") or []):
+                assert rung.get("model") != "glm-5v-turbo", (
+                    f"auxiliary.{task}.fallback_chain[{i}] uses glm-5v-turbo, "
+                    f"which is not reachable on the account's z.ai subscription"
+                )
+        assert "fallback" not in aux["vision"] and "fallback_chain" not in aux["vision"], (
             "vision must not ship a fallback — no reachable multimodal backend"
+        )
+
+
+class TestThirdRungAnthropicFallback:
+    """86e29q8ng: a single-point-of-failure guard. All nine text auxiliary
+    tasks previously had exactly one fallback rung (zai/glm-4.7) behind the
+    primary provider — if primary AND zai were down simultaneously, all nine
+    tasks failed with zero working failover. Each task's ``fallback`` dict
+    was converted to a ``fallback_chain`` list so the existing
+    _try_configured_fallback_chain provider-skip machinery can walk multiple
+    rungs: primary -> zai/glm-4.7 -> anthropic/claude-haiku-4-5.
+    """
+
+    _NINE_TASKS = (
+        "web_extract", "compression", "skills_hub", "approval", "mcp",
+        "title_generation", "tts_audio_tags", "triage_specifier",
+        "profile_describer",
+    )
+
+    @pytest.mark.parametrize("task", _NINE_TASKS)
+    def test_default_config_chain_is_zai_then_anthropic(self, task):
+        """Every one of the nine tasks ships exactly [zai, anthropic], in that
+        order, in the real shipped DEFAULT_CONFIG — not just in a test double."""
+        from hermes_cli.config import DEFAULT_CONFIG
+
+        chain = DEFAULT_CONFIG["auxiliary"][task].get("fallback_chain")
+        assert isinstance(chain, list) and len(chain) == 2, (
+            f"auxiliary.{task}.fallback_chain must be a 2-entry list, got {chain!r}"
+        )
+        assert chain[0]["provider"] == "zai" and chain[0]["model"] == "glm-4.7", (
+            f"auxiliary.{task}.fallback_chain[0] (rung 2 overall) must stay the "
+            f"existing zai/glm-4.7 entry unchanged"
+        )
+        assert chain[1]["provider"] == "anthropic", (
+            f"auxiliary.{task}.fallback_chain[1] (rung 3 overall) must be the "
+            f"new Anthropic entry"
+        )
+        assert chain[1]["model"], (
+            f"auxiliary.{task}.fallback_chain[1] must pin a real model id"
+        )
+
+    @pytest.mark.parametrize("task", _NINE_TASKS)
+    def test_anthropic_rung_engages_when_primary_and_zai_both_fail(self, monkeypatch, task):
+        """Simulate the exact failure mode this task exists to fix: the
+        primary provider is down AND the zai rung (entry[0]) also fails to
+        resolve (e.g. its own 401/unreachable-endpoint). The chain must not
+        give up after zai — it must fall through to the Anthropic rung
+        (entry[1]) and hand back a usable client bound to that rung's model,
+        proving the third rung is what actually keeps the task alive."""
+        from agent.auxiliary_client import _try_configured_fallback_chain
+        from hermes_cli.config import DEFAULT_CONFIG
+
+        chain = DEFAULT_CONFIG["auxiliary"][task]["fallback_chain"]
+        anthropic_model = chain[1]["model"]
+        anthropic_client = MagicMock(name="anthropic_fallback_client")
+
+        def fake_resolve(entry):
+            if entry.get("provider") == "zai":
+                # zai is ALSO unreachable — mirrors _resolve_fallback_entry's
+                # (None, None) return when the candidate can't be resolved.
+                return None, None
+            if entry.get("provider") == "anthropic":
+                return anthropic_client, entry["model"]
+            raise AssertionError(f"unexpected fallback_chain entry: {entry}")
+
+        monkeypatch.setattr(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            lambda t: {"fallback_chain": chain} if t == task else {},
+        )
+        with patch("agent.auxiliary_client._resolve_fallback_entry",
+                   side_effect=fake_resolve):
+            client, model, label = _try_configured_fallback_chain(
+                task=task, failed_provider="gemini", reason="auth error")
+
+        assert client is anthropic_client, (
+            f"auxiliary.{task}: rung 3 (anthropic) must engage once rung 1 "
+            f"(primary) and rung 2 (zai) both fail — the task must not be "
+            f"left without any working fallback."
+        )
+        assert model == anthropic_model
+        assert "anthropic" in label
+
+    def test_zai_rung_still_wins_when_only_primary_fails(self, monkeypatch):
+        """Regression guard for the common case: when zai is healthy, the
+        chain must return zai (rung 2) and never even attempt to resolve the
+        anthropic rung — the third rung is a last resort, not a race."""
+        from agent.auxiliary_client import _try_configured_fallback_chain
+        from hermes_cli.config import DEFAULT_CONFIG
+
+        chain = DEFAULT_CONFIG["auxiliary"]["compression"]["fallback_chain"]
+        zai_client = MagicMock(name="zai_client")
+        resolved_providers = []
+
+        def fake_resolve(entry):
+            resolved_providers.append(entry.get("provider"))
+            if entry.get("provider") == "zai":
+                return zai_client, entry["model"]
+            raise AssertionError(
+                "anthropic rung must not be resolved when zai already succeeded"
+            )
+
+        monkeypatch.setattr(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            lambda t: {"fallback_chain": chain} if t == "compression" else {},
+        )
+        with patch("agent.auxiliary_client._resolve_fallback_entry",
+                   side_effect=fake_resolve):
+            client, model, label = _try_configured_fallback_chain(
+                task="compression", failed_provider="gemini", reason="auth error")
+
+        assert client is zai_client
+        assert model == "glm-4.7"
+        assert resolved_providers == ["zai"], (
+            "anthropic rung must only be tried after zai fails, never in parallel/ahead of it"
         )
