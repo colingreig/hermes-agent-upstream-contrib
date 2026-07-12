@@ -47,7 +47,13 @@ def _get_allowed() -> set[str]:
 # cache made edits to ``terminal.env_passthrough`` in config.yaml a silent
 # no-op until a full gateway restart; keying on the stat signature makes
 # edits take effect on the next call instead.
-_config_passthrough_cache: tuple[tuple[int, int], frozenset[str]] | None = None
+#
+# ``_config_passthrough`` holds the cached value (kept under this name for
+# backward compatibility with external save/restore isolation patterns, e.g.
+# ``tests/gateway/test_raft_adapter.py``). ``_config_passthrough_sig`` holds
+# the (mtime_ns, size) signature the value was computed against.
+_config_passthrough: frozenset[str] | None = None
+_config_passthrough_sig: tuple[int, int] | None = None
 
 
 def _is_hermes_provider_credential(name: str) -> bool:
@@ -136,7 +142,7 @@ def _load_config_passthrough() -> frozenset[str]:
     stat/read failure, empty) result if the config file's stat can't be
     determined.
     """
-    global _config_passthrough_cache
+    global _config_passthrough, _config_passthrough_sig
 
     cache_key: tuple[int, int] | None
     try:
@@ -148,10 +154,10 @@ def _load_config_passthrough() -> frozenset[str]:
 
     if (
         cache_key is not None
-        and _config_passthrough_cache is not None
-        and _config_passthrough_cache[0] == cache_key
+        and _config_passthrough is not None
+        and _config_passthrough_sig == cache_key
     ):
-        return _config_passthrough_cache[1]
+        return _config_passthrough
 
     result: set[str] = set()
     try:
@@ -185,7 +191,8 @@ def _load_config_passthrough() -> frozenset[str]:
 
     computed = frozenset(result)
     if cache_key is not None:
-        _config_passthrough_cache = (cache_key, computed)
+        _config_passthrough = computed
+        _config_passthrough_sig = cache_key
     return computed
 
 
@@ -212,8 +219,9 @@ def clear_env_passthrough() -> None:
     a fresh read of ``terminal.env_passthrough`` from config.yaml on the
     next lookup, rather than serving a possibly-stale cached value.
     """
-    global _config_passthrough_cache
+    global _config_passthrough, _config_passthrough_sig
     _get_allowed().clear()
-    _config_passthrough_cache = None
+    _config_passthrough = None
+    _config_passthrough_sig = None
 
 
