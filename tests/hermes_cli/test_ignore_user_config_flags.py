@@ -60,9 +60,25 @@ class TestIgnoreUserConfigEnvGate:
         (tmp_path / "config.yaml").write_text(config_yaml)
 
     def _reload_cli(self, monkeypatch, tmp_path):
-        """Point cli._hermes_home at tmp_path and return a fresh load_cli_config."""
+        """Point cli._hermes_home at tmp_path and return a fresh load_cli_config.
+
+        ``load_cli_config()`` also has a *second* config source: when the
+        user config is missing or skipped (``--ignore-user-config``), it
+        falls back to a project-level ``./cli-config.yaml`` resolved via
+        ``Path(__file__).parent`` — i.e. the real repo root, not
+        ``_hermes_home``. That path is gitignored but not otherwise
+        isolated, so a real ``cli-config.yaml`` sitting in the checkout
+        (e.g. left behind by a local ``hermes doctor --fix`` run, or
+        written by another process sharing this checkout while tests run
+        in parallel) would leak into ``test_user_config_skipped_when_flag_set``
+        and silently change what "skipped" resolves to. Point ``cli.__file__``
+        at ``tmp_path`` too so the fallback resolves inside the hermetic
+        tmpdir like everything else in this test, regardless of whatever
+        happens to exist at the real repo root.
+        """
         import cli
         monkeypatch.setattr(cli, "_hermes_home", tmp_path)
+        monkeypatch.setattr(cli, "__file__", str(tmp_path / "cli.py"))
         return cli.load_cli_config
 
     def test_user_config_loaded_when_flag_unset(self, tmp_path, monkeypatch):

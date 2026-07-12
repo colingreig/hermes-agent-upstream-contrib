@@ -1,0 +1,7 @@
+name: gemini
+version: 1.0.0
+description: "Google Gemini image generation backend (Nano Banana). Text-to-image & image editing."
+author: Hermes
+kind: backend
+requires_env:
+  - GOOGLE_API_KEY
