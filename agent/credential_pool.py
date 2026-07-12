@@ -1514,7 +1514,10 @@ class CredentialPool:
         available = self._available_entries(clear_expired=True, refresh=True)
         if not available:
             self._current_id = None
-            logger.info("credential pool: no available entries (all exhausted or empty)")
+            logger.info(
+                "credential pool: no available entries (all exhausted or empty) [provider=%s]",
+                self.provider,
+            )
             return None
 
         if self._strategy == STRATEGY_RANDOM:
@@ -1580,20 +1583,20 @@ class CredentialPool:
             )
             if updated_entry.last_status == STATUS_DEAD:
                 logger.warning(
-                    "credential pool: marking %s DEAD (status=%s, reason=%s) — "
+                    "credential pool: marking %s DEAD (status=%s, reason=%s) [provider=%s] — "
                     "permanently failed, will NOT re-enter rotation until re-auth",
-                    _label, status_code, updated_entry.last_error_reason or "unknown",
+                    _label, status_code, updated_entry.last_error_reason or "unknown", self.provider,
                 )
             else:
                 logger.info(
-                    "credential pool: marking %s exhausted (status=%s), rotating",
-                    _label, status_code,
+                    "credential pool: marking %s exhausted (status=%s) [provider=%s], rotating",
+                    _label, status_code, self.provider,
                 )
             self._current_id = None
             next_entry = self._select_unlocked()
             if next_entry:
                 _next_label = next_entry.label or next_entry.id[:8]
-                logger.info("credential pool: rotated to %s", _next_label)
+                logger.info("credential pool: rotated to %s [provider=%s]", _next_label, self.provider)
             return next_entry
 
     def acquire_lease(self, credential_id: Optional[str] = None) -> Optional[str]:
