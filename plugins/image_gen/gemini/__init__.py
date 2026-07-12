@@ -182,6 +182,34 @@ def _guess_mime_type(name: str) -> str:
     return guessed if guessed and guessed.startswith("image/") else "image/png"
 
 
+# Extension inference for the ``inlineData.mimeType`` Gemini hands back on the
+# generation response — mirrors ``_URL_IMAGE_CONTENT_TYPES`` in
+# agent/image_gen_provider.py's save_url_image, kept local since Gemini's own
+# generateContent responses are the only caller here. Gemini's image-output
+# models (Nano Banana / Nano Banana Pro) can return JPEG or WEBP bytes, not
+# just PNG, so a hardcoded ``.png`` extension silently mismatches the actual
+# bytes on disk.
+_INLINE_DATA_EXTENSIONS = {
+    "image/png": "png",
+    "image/jpeg": "jpg",
+    "image/jpg": "jpg",
+    "image/webp": "webp",
+    "image/gif": "gif",
+}
+
+
+def _extension_from_mime_type(mime: Optional[str]) -> str:
+    """Map an ``inlineData`` ``mimeType`` to a bare file extension (no dot).
+
+    Falls back to ``png`` for missing/unrecognized types so a save never
+    fails outright — but the common Gemini output types (png/jpeg/webp) are
+    mapped to their correct extension instead of always assuming PNG.
+    """
+    if not mime:
+        return "png"
+    return _INLINE_DATA_EXTENSIONS.get(mime.strip().lower(), "png")
+
+
 def _load_image_bytes(ref: str) -> Tuple[bytes, str]:
     """Load image bytes + a MIME type from a URL, local path, or data: URI.
 
@@ -477,6 +505,7 @@ class GeminiImageGenProvider(ImageGenProvider):
         cand_parts = ((first_candidate.get("content") or {}).get("parts")) or []
 
         b64_data: Optional[str] = None
+        image_mime_type: Optional[str] = None
         text_response = ""
         for part in cand_parts:
             if not isinstance(part, dict):
@@ -484,6 +513,7 @@ class GeminiImageGenProvider(ImageGenProvider):
             inline = part.get("inlineData")
             if isinstance(inline, dict) and inline.get("data"):
                 b64_data = inline["data"]
+                image_mime_type = inline.get("mimeType")
             elif isinstance(part.get("text"), str):
                 text_response += part["text"]
 
@@ -499,7 +529,11 @@ class GeminiImageGenProvider(ImageGenProvider):
             )
 
         try:
-            saved_path = save_b64_image(b64_data, prefix=f"gemini_{model_id.replace('.', '_').replace('-', '_')}")
+            saved_path = save_b64_image(
+                b64_data,
+                prefix=f"gemini_{model_id.replace('.', '_').replace('-', '_')}",
+                extension=_extension_from_mime_type(image_mime_type),
+            )
         except Exception as exc:
             return error_response(
                 error=f"Could not save image to cache: {exc}",

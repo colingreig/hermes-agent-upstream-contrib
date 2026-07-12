@@ -493,6 +493,75 @@ class TestGenerate:
 
 
 # ---------------------------------------------------------------------------
+# mimeType -> file extension tests (bug: JPEG/WEBP bytes saved with a
+# hardcoded .png extension because save_b64_image's default extension was
+# never overridden from the response's inlineData.mimeType)
+# ---------------------------------------------------------------------------
+
+
+class TestMimeTypeExtension:
+    @pytest.mark.parametrize(
+        "mime,expected",
+        [
+            ("image/png", "png"),
+            ("image/jpeg", "jpg"),
+            ("image/jpg", "jpg"),
+            ("image/webp", "webp"),
+            ("image/gif", "gif"),
+            ("IMAGE/PNG", "png"),
+            ("image/tiff", "png"),  # unrecognized -> safe fallback
+            (None, "png"),
+            ("", "png"),
+        ],
+    )
+    def test_extension_from_mime_type(self, mime, expected):
+        from plugins.image_gen.gemini import _extension_from_mime_type
+
+        assert _extension_from_mime_type(mime) == expected
+
+    @pytest.mark.parametrize(
+        "mime,expected_ext",
+        [
+            ("image/png", "png"),
+            ("image/jpeg", "jpg"),
+            ("image/webp", "webp"),
+        ],
+    )
+    def test_generate_saves_with_extension_matching_response_mime_type(self, mime, expected_ext):
+        """End-to-end: the real save path must derive its extension from the
+        Gemini response's inlineData.mimeType, not assume PNG."""
+        from plugins.image_gen.gemini import GeminiImageGenProvider
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = {
+            "candidates": [
+                {
+                    "content": {
+                        "parts": [
+                            {"inlineData": {"mimeType": mime, "data": _b64(b"fake-bytes")}},
+                        ]
+                    },
+                    "finishReason": "STOP",
+                }
+            ],
+        }
+
+        with patch("plugins.image_gen.gemini.requests.post", return_value=mock_resp), \
+             patch(
+                 "plugins.image_gen.gemini.save_b64_image",
+                 return_value=Path(f"/tmp/gemini_test.{expected_ext}"),
+             ) as mock_save:
+            provider = GeminiImageGenProvider()
+            result = provider.generate(prompt="A cat playing piano")
+
+        assert result["success"] is True
+        assert result["image"].endswith(f".{expected_ext}")
+        assert mock_save.call_args.kwargs["extension"] == expected_ext
+
+
+# ---------------------------------------------------------------------------
 # Registration test
 # ---------------------------------------------------------------------------
 

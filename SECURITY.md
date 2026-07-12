@@ -118,6 +118,13 @@ surfaces, or running a terminal-backend sandbox and expecting it to
 contain code paths that don't go through the shell, are operating
 outside the supported security posture.
 
+A narrow notify-only posture is acceptable when the operator
+intentionally disables inbound text-bearing Slack handlers and keeps
+Slack for outbound alerts, approvals, and lifecycle acknowledgements
+only. In that mode the system is no longer accepting user text from
+Slack as an execution trigger; the remaining local backend trade-off
+is an operator choice, not an implicit trust boundary.
+
 ### 2.3 Credential Scoping
 
 Hermes Agent filters the environment it passes to its lower-trust

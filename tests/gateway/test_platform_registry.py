@@ -661,8 +661,8 @@ class TestPluginPlatformSharedKeyBridge:
 
     Without this, plugin authors using ``apply_yaml_config_fn`` would have to
     re-implement bridging for every common key (``unauthorized_dm_behavior``,
-    ``notice_delivery``, ``reply_prefix``, ``require_mention``, ``dm_policy``,
-    ``allow_from``, etc.) — defeating the hook's whole point of letting
+    ``notice_delivery``, ``reply_prefix``, ``require_mention``, ``inbound_enabled``,
+    ``dm_policy``, ``allow_from``, etc.) — defeating the hook's whole point of letting
     plugins focus on their *platform-specific* keys.
     """
 
@@ -689,6 +689,7 @@ class TestPluginPlatformSharedKeyBridge:
                 tmp_path,
                 "mysharedplat:\n"
                 "  require_mention: true\n"
+                "  inbound_enabled: false\n"
                 "  dm_policy: allow\n"
                 "  reply_prefix: \"→ \"\n"
                 "  allow_from: [\"alice\", \"bob\"]\n",
@@ -702,6 +703,7 @@ class TestPluginPlatformSharedKeyBridge:
             assert plat in cfg.platforms
             extra = cfg.platforms[plat].extra
             assert extra.get("require_mention") is True
+            assert extra.get("inbound_enabled") is False
             assert extra.get("dm_policy") == "allow"
             assert extra.get("reply_prefix") == "→ "
             assert extra.get("allow_from") == ["alice", "bob"]

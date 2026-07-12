@@ -248,9 +248,13 @@ class TestRunAsyncWithRunningLoop:
         async def _never_finishes():
             await asyncio.sleep(999)
 
+        # _run_async builds its worker pool via DaemonThreadPoolExecutor (not
+        # concurrent.futures.ThreadPoolExecutor directly) so a wedged tool
+        # coroutine can't block gateway restart/interpreter exit — patch that
+        # symbol, which is what tools/daemon_pool.py exports and model_tools
+        # imports locally inside _run_async.
         monkeypatch.setattr(
-            concurrent.futures,
-            "ThreadPoolExecutor",
+            "tools.daemon_pool.DaemonThreadPoolExecutor",
             FakeExecutor,
         )
 

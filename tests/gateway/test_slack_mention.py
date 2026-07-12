@@ -57,7 +57,7 @@ OTHER_CHANNEL_ID = "C9999999999"
 
 
 def _make_adapter(require_mention=None, strict_mention=None, free_response_channels=None,
-                  allowed_channels=None, mention_patterns=None):
+                  allowed_channels=None, mention_patterns=None, inbound_enabled=None):
     extra = {}
     if require_mention is not None:
         extra["require_mention"] = require_mention
@@ -69,6 +69,8 @@ def _make_adapter(require_mention=None, strict_mention=None, free_response_chann
         extra["allowed_channels"] = allowed_channels
     if mention_patterns is not None:
         extra["mention_patterns"] = mention_patterns
+    if inbound_enabled is not None:
+        extra["inbound_enabled"] = inbound_enabled
 
     adapter = object.__new__(SlackAdapter)
     adapter.platform = Platform.SLACK
@@ -142,9 +144,29 @@ def test_require_mention_env_var_default_true(monkeypatch):
     assert adapter._slack_require_mention() is True
 
 
-# ---------------------------------------------------------------------------
-# Tests: _slack_strict_mention
-# ---------------------------------------------------------------------------
+def test_inbound_enabled_defaults_to_true(monkeypatch):
+    monkeypatch.delenv("SLACK_INBOUND_ENABLED", raising=False)
+    adapter = _make_adapter()
+    assert adapter._slack_inbound_enabled() is True
+
+
+def test_inbound_enabled_false():
+    adapter = _make_adapter(inbound_enabled=False)
+    assert adapter._slack_inbound_enabled() is False
+
+
+def test_inbound_enabled_string_false():
+    adapter = _make_adapter(inbound_enabled="false")
+    assert adapter._slack_inbound_enabled() is False
+
+
+def test_inbound_enabled_env_var_fallback(monkeypatch):
+    monkeypatch.setenv("SLACK_INBOUND_ENABLED", "no")
+    adapter = _make_adapter()
+    assert adapter._slack_inbound_enabled() is False
+
+
+
 
 def test_strict_mention_defaults_to_false(monkeypatch):
     monkeypatch.delenv("SLACK_STRICT_MENTION", raising=False)
@@ -260,6 +282,9 @@ def _would_process(adapter, *, is_dm=False, channel_id=CHANNEL_ID,
         channel_type = "im" if is_dm else ""
     is_one_to_one_dm = channel_type == "im"
 
+    if not adapter._slack_inbound_enabled():
+        return False
+
     bot_uid = adapter._team_bot_user_ids.get("T1", adapter._bot_user_id)
     if mentioned:
         text = f"<@{bot_uid}> {text}"
@@ -312,6 +337,12 @@ def test_other_channel_not_in_free_response_still_gated():
         free_response_channels=[CHANNEL_ID],
     )
     assert _would_process(adapter, channel_id=OTHER_CHANNEL_ID, text="hello") is False
+
+
+def test_inbound_disabled_blocks_everything():
+    adapter = _make_adapter(inbound_enabled=False)
+    assert _would_process(adapter, text="hello everyone") is False
+    assert _would_process(adapter, is_dm=True, text="hello") is False
 
 
 def test_dm_always_processed_regardless_of_setting():
@@ -466,6 +497,7 @@ def test_config_bridges_slack_free_response_channels(monkeypatch, tmp_path):
     (hermes_home / "config.yaml").write_text(
         "slack:\n"
         "  require_mention: false\n"
+        "  inbound_enabled: false\n"
         "  free_response_channels:\n"
         "    - C0AQWDLHY9M\n"
         "    - C9999999999\n",
@@ -481,10 +513,12 @@ def test_config_bridges_slack_free_response_channels(monkeypatch, tmp_path):
     assert config is not None
     slack_extra = config.platforms[Platform.SLACK].extra
     assert slack_extra.get("require_mention") is False
+    assert slack_extra.get("inbound_enabled") is False
     assert slack_extra.get("free_response_channels") == ["C0AQWDLHY9M", "C9999999999"]
     # Verify env vars were set by config bridging
     import os as _os
     assert _os.environ["SLACK_REQUIRE_MENTION"] == "false"
+    assert _os.environ["SLACK_INBOUND_ENABLED"] == "false"
     assert _os.environ["SLACK_FREE_RESPONSE_CHANNELS"] == "C0AQWDLHY9M,C9999999999"
 
 

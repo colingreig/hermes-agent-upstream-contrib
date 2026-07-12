@@ -14383,7 +14383,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 raise RuntimeError("Gateway is shutting down; executor unavailable")
             executor = getattr(self, "_executor", None)
             if executor is None or getattr(executor, "_shutdown", False):
-                executor = concurrent.futures.ThreadPoolExecutor(
+                # Daemon workers: stdlib ThreadPoolExecutor workers are
+                # non-daemon and registered in concurrent.futures' atexit
+                # hook, which joins them unconditionally — so one wedged
+                # worker (blocking agent turn with no timeout) would block
+                # gateway restart/interpreter exit until the full drain
+                # timeout elapses. See tools/daemon_pool.py.
+                from tools.daemon_pool import DaemonThreadPoolExecutor
+                executor = DaemonThreadPoolExecutor(
                     max_workers=10,
                     thread_name_prefix="hermes-gateway",
                 )
