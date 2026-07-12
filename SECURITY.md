@@ -125,6 +125,10 @@ only. In that mode the system is no longer accepting user text from
 Slack as an execution trigger; the remaining local backend trade-off
 is an operator choice, not an implicit trust boundary.
 
+See the companion compensating controls in tasks 86e29q8jt
+(remove YOLO) and 86e29q8j3 (strip business secrets from the
+gateway env).
+
 ### 2.3 Credential Scoping
 
 Hermes Agent filters the environment it passes to its lower-trust
