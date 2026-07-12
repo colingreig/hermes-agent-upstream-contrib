@@ -143,7 +143,16 @@ def _run_async(coro):
                     pass
                 worker_loop.close()
 
-        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        # Daemon worker: stdlib ThreadPoolExecutor workers are non-daemon and
+        # registered in concurrent.futures' atexit hook, which joins them
+        # unconditionally — so a tool call in flight when the gateway
+        # restarts (whose coroutine ignores/can't observe cancellation)
+        # would block interpreter exit until the full drain timeout elapses,
+        # even though shutdown(wait=False) below tells the pool to stop
+        # accepting new work. See tools/daemon_pool.py.
+        from tools.daemon_pool import DaemonThreadPoolExecutor
+
+        pool = DaemonThreadPoolExecutor(max_workers=1)
         # Carry the active profile + approval/sudo callbacks into the worker so
         # async tools resolve get_hermes_home() under the active profile.
         from tools.thread_context import propagate_context_to_thread

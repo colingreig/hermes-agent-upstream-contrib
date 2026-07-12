@@ -33,6 +33,7 @@ import contextlib
 import asyncio
 import json
 from concurrent.futures import ThreadPoolExecutor
+from tools.daemon_pool import DaemonThreadPoolExecutor
 import logging
 import os
 import uuid
@@ -167,7 +168,13 @@ _VISION_CPU_WORKERS = _resolve_vision_cpu_workers()
 # executor's work queue, leaving cores free for the event loop. The LLM call is
 # deliberately left OUTSIDE this executor so multi-image workflows keep full
 # request concurrency.
-_vision_cpu_executor = ThreadPoolExecutor(
+#
+# Daemon workers: stdlib ThreadPoolExecutor workers are non-daemon and
+# registered in concurrent.futures' atexit hook, which joins them
+# unconditionally — so one wedged encode/resize worker would block gateway
+# restart/interpreter exit until the full drain timeout elapses. See
+# tools/daemon_pool.py.
+_vision_cpu_executor = DaemonThreadPoolExecutor(
     max_workers=_VISION_CPU_WORKERS,
     thread_name_prefix="vision-encode",
 )

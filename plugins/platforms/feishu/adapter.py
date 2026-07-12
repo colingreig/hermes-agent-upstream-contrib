@@ -1669,7 +1669,14 @@ class FeishuAdapter(BasePlatformAdapter):
                 raise RuntimeError("Feishu adapter is shutting down; SDK executor unavailable")
             executor = getattr(self, "_sdk_executor", None)
             if executor is None or getattr(executor, "_shutdown", False):
-                executor = concurrent.futures.ThreadPoolExecutor(
+                # Daemon workers: stdlib ThreadPoolExecutor workers are
+                # non-daemon and registered in concurrent.futures' atexit
+                # hook, which joins them unconditionally — so one wedged
+                # Feishu SDK call would block gateway restart/interpreter
+                # exit until the full drain timeout elapses. See
+                # tools/daemon_pool.py.
+                from tools.daemon_pool import DaemonThreadPoolExecutor
+                executor = DaemonThreadPoolExecutor(
                     max_workers=10,
                     thread_name_prefix="hermes-feishu-sdk",
                 )
