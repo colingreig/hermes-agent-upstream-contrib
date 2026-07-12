@@ -1083,28 +1083,34 @@ class SlackAdapter(BasePlatformAdapter):
                 self._warn_if_not_bot_token(auth_response, team_name)
                 self._warn_if_inchannel_without_flat_reply(team_name)
 
-            # Register message event handler
-            @self._app.event("message")
-            async def handle_message_event(event, say):
-                await self._handle_slack_message(event)
+            inbound_enabled = self._slack_inbound_enabled()
+            if inbound_enabled:
+                # Register message event handler
+                @self._app.event("message")
+                async def handle_message_event(event, say):
+                    await self._handle_slack_message(event)
 
-            # Handle app_mention explicitly. In some Slack app configurations,
-            # channel mentions arrive only as app_mention events rather than the
-            # generic message event. Forward them into the normal message
-            # pipeline so @mentions reliably produce replies.
-            # NOTE: when Slack fires BOTH message and app_mention for the same
-            # @mention, they share the same event ts — the dedup in
-            # _handle_slack_message (MessageDeduplicator) suppresses the second.
-            @self._app.event("app_mention")
-            async def handle_app_mention(event, say):
-                await self._handle_slack_message(event)
+                # Handle app_mention explicitly. In some Slack app configurations,
+                # channel mentions arrive only as app_mention events rather than the
+                # generic message event. Forward them into the normal message
+                # pipeline so @mentions reliably produce replies.
+                # NOTE: when Slack fires BOTH message and app_mention for the same
+                # @mention, they share the same event ts — the dedup in
+                # _handle_slack_message (MessageDeduplicator) suppresses the second.
+                @self._app.event("app_mention")
+                async def handle_app_mention(event, say):
+                    await self._handle_slack_message(event)
 
-            # File lifecycle events can arrive around snippet uploads even when
-            # the actual user message is what we care about. Ack them so Slack
-            # doesn't log noisy 404 "unhandled request" warnings.
-            @self._app.event("file_shared")
-            async def handle_file_shared(event, say):
-                await self._handle_slack_file_shared(event)
+                # File lifecycle events can arrive around snippet uploads even when
+                # the actual user message is what we care about. Ack them so Slack
+                # doesn't log noisy 404 "unhandled request" warnings.
+                @self._app.event("file_shared")
+                async def handle_file_shared(event, say):
+                    await self._handle_slack_file_shared(event)
+            else:
+                logger.info(
+                    "[Slack] inbound_enabled=false; skipping message/app_mention/file_shared handlers"
+                )
 
             @self._app.event("file_created")
             async def handle_file_created(event, say):
@@ -1134,38 +1140,26 @@ class SlackAdapter(BasePlatformAdapter):
             async def handle_assistant_thread_context_changed(event, say):
                 await self._handle_assistant_thread_lifecycle_event(event)
 
-            # Register slash command handler(s)
-            #
-            # Every gateway command from COMMAND_REGISTRY is a native Slack
-            # slash, matching Discord and Telegram's model (e.g. /btw, /stop,
-            # /model work directly without /hermes prefix). A single regex
-            # matcher dispatches all of them to one handler so we don't need
-            # N identical @app.command() decorators.
-            #
-            # The slash commands must ALSO be declared in the Slack app
-            # manifest (see `hermes slack manifest`). In Socket Mode, Slack
-            # routes the command event through the socket regardless of the
-            # manifest's request URL, but it will not deliver an event for
-            # a slash command the manifest doesn't declare.
-            from hermes_cli.commands import slack_native_slashes
-            import re as _re
+            if inbound_enabled:
+                from hermes_cli.commands import slack_native_slashes
+                import re as _re
 
-            _slash_names = [name for name, _d, _h in slack_native_slashes()]
-            if _slash_names:
-                _slash_pattern = _re.compile(
-                    r"^/(?:" + "|".join(_re.escape(n) for n in _slash_names) + r")$"
-                )
-            else:  # pragma: no cover - registry always non-empty
-                _slash_pattern = _re.compile(r"^/hermes$")
+                _slash_names = [name for name, _d, _h in slack_native_slashes()]
+                if _slash_names:
+                    _slash_pattern = _re.compile(
+                        r"^/(?:" + "|".join(_re.escape(n) for n in _slash_names) + r")$"
+                    )
+                else:  # pragma: no cover - registry always non-empty
+                    _slash_pattern = _re.compile(r"^/hermes$")
 
-            @self._app.command(_slash_pattern)
-            async def handle_hermes_command(ack, command):
-                slash = (command.get("command") or "").lstrip("/")
-                await ack(
-                    response_type="ephemeral",
-                    text=f"Running `/{slash}`…",
-                )
-                await self._handle_slash_command(command)
+                @self._app.command(_slash_pattern)
+                async def handle_hermes_command(ack, command):
+                    slash = (command.get("command") or "").lstrip("/")
+                    await ack(
+                        response_type="ephemeral",
+                        text=f"Running `/{slash}`…",
+                    )
+                    await self._handle_slash_command(command)
 
             # Register Block Kit action handlers for approval buttons
             for _action_id in (
@@ -2517,6 +2511,9 @@ class SlackAdapter(BasePlatformAdapter):
         message event, but some video shares have only been observed through
         this lifecycle event.
         """
+        if not self._slack_inbound_enabled():
+            return
+
         channel_id = event.get("channel_id") or event.get("channel") or ""
         file_id = event.get("file_id") or (event.get("file") or {}).get("id") or ""
         if not channel_id or not file_id:
@@ -2588,6 +2585,9 @@ class SlackAdapter(BasePlatformAdapter):
 
     async def _handle_slack_message(self, event: dict) -> None:
         """Handle an incoming Slack message event."""
+        if not self._slack_inbound_enabled():
+            return
+
         # Dedup: Slack Socket Mode can redeliver events after reconnects (#4777)
         event_ts = event.get("ts", "")
         if event_ts and self._dedup.is_duplicate(event_ts):
@@ -3910,6 +3910,9 @@ class SlackAdapter(BasePlatformAdapter):
         what's the weather`` — non-slash text is treated as a regular
         message).
         """
+        if not self._slack_inbound_enabled():
+            return
+
         slash_name = (command.get("command") or "").lstrip("/").strip()
         text = command.get("text", "").strip()
         user_id = command.get("user_id", "")
@@ -4166,6 +4169,25 @@ class SlackAdapter(BasePlatformAdapter):
                 return configured.lower() not in {"false", "0", "no", "off"}
             return bool(configured)
         return os.getenv("SLACK_REQUIRE_MENTION", "true").lower() not in {
+            "false",
+            "0",
+            "no",
+            "off",
+        }
+
+    def _slack_inbound_enabled(self) -> bool:
+        """Return whether Slack inbound text handling is enabled.
+
+        Explicit-false parsing keeps the safe default on. When disabled, the
+        adapter stays notify-only: it keeps approval buttons and lifecycle
+        acks, but skips inbound text-bearing handlers.
+        """
+        configured = self.config.extra.get("inbound_enabled")
+        if configured is not None:
+            if isinstance(configured, str):
+                return configured.lower() not in {"false", "0", "no", "off"}
+            return bool(configured)
+        return os.getenv("SLACK_INBOUND_ENABLED", "true").lower() not in {
             "false",
             "0",
             "no",
@@ -4500,6 +4522,8 @@ def _apply_yaml_config(yaml_cfg: dict, slack_cfg: dict) -> dict | None:
     """
     if "require_mention" in slack_cfg and not os.getenv("SLACK_REQUIRE_MENTION"):
         os.environ["SLACK_REQUIRE_MENTION"] = str(slack_cfg["require_mention"]).lower()
+    if "inbound_enabled" in slack_cfg and not os.getenv("SLACK_INBOUND_ENABLED"):
+        os.environ["SLACK_INBOUND_ENABLED"] = str(slack_cfg["inbound_enabled"]).lower()
     if "strict_mention" in slack_cfg and not os.getenv("SLACK_STRICT_MENTION"):
         os.environ["SLACK_STRICT_MENTION"] = str(slack_cfg["strict_mention"]).lower()
     if "allow_bots" in slack_cfg and not os.getenv("SLACK_ALLOW_BOTS"):
