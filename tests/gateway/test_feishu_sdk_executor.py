@@ -35,6 +35,31 @@ def test_get_executor_creates_pool():
     adapter._shutdown_sdk_executor()
 
 
+def test_get_executor_builds_daemon_pool():
+    """Regression: a wedged Feishu SDK call must not block gateway restart.
+
+    stdlib ThreadPoolExecutor workers are non-daemon and are joined
+    unconditionally by concurrent.futures' atexit hook, so this pool must be
+    the daemon variant (see tools/daemon_pool.py), not the stdlib class.
+    """
+    from concurrent.futures.thread import _threads_queues
+    from tools.daemon_pool import DaemonThreadPoolExecutor
+
+    adapter = _bare_adapter()
+    executor = adapter._get_sdk_executor()
+    try:
+        assert isinstance(executor, DaemonThreadPoolExecutor)
+        import threading
+
+        is_daemon, worker = executor.submit(
+            lambda: (threading.current_thread().daemon, threading.current_thread())
+        ).result(timeout=10)
+        assert is_daemon is True
+        assert worker not in _threads_queues
+    finally:
+        adapter._shutdown_sdk_executor()
+
+
 def test_get_executor_recreates_after_shutdown():
     """A shut-down pool must be transparently replaced — the #10849 recovery."""
     adapter = _bare_adapter()

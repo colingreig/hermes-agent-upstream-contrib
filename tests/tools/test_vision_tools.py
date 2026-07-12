@@ -1198,6 +1198,26 @@ class TestVisionCpuBurstCap:
         assert isinstance(vt._vision_cpu_executor, ThreadPoolExecutor)
         assert vt._vision_cpu_executor._max_workers == vt._VISION_CPU_WORKERS
 
+    def test_cpu_executor_is_daemon_and_does_not_block_exit(self):
+        """A wedged encode/resize worker must not block gateway restart.
+
+        stdlib ThreadPoolExecutor workers are non-daemon and are joined
+        unconditionally by concurrent.futures' atexit hook, so this pool
+        must be the daemon variant (see tools/daemon_pool.py).
+        """
+        import importlib
+        import threading
+        from concurrent.futures.thread import _threads_queues
+        from tools.daemon_pool import DaemonThreadPoolExecutor
+
+        vt = importlib.import_module("tools.vision_tools")
+        assert isinstance(vt._vision_cpu_executor, DaemonThreadPoolExecutor)
+        is_daemon, worker = vt._vision_cpu_executor.submit(
+            lambda: (threading.current_thread().daemon, threading.current_thread())
+        ).result(timeout=10)
+        assert is_daemon is True
+        assert worker not in _threads_queues
+
     @pytest.mark.asyncio
     async def test_encode_runs_on_dedicated_cpu_executor(self):
         """Encode/resize must execute on a ``vision-encode`` thread, off the loop.

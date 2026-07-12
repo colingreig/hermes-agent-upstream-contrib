@@ -575,6 +575,36 @@ async def test_drain_suppress_skips_home_channel_keeps_session_ping(tmp_path, mo
     assert "shutting down" in adapter.sent[0]
 
 
+def test_gateway_executor_is_daemon_and_does_not_block_exit():
+    """The gateway's blocking-work executor must never block process/drain exit.
+
+    Regression for "gateway restart always hits the full drain timeout":
+    stdlib ``ThreadPoolExecutor`` workers are non-daemon and are joined
+    unconditionally by ``concurrent.futures``' own atexit hook (even after
+    ``shutdown(wait=False)``), so a single wedged worker (a blocking agent
+    turn with no timeout) would hold the gateway process open for the
+    entire restart drain window regardless of ``_shutdown_executor``.
+    ``_get_executor`` must build a ``DaemonThreadPoolExecutor`` (see
+    ``tools/daemon_pool.py``), not the stdlib class directly.
+    """
+    import threading as _threading
+    from concurrent.futures.thread import _threads_queues
+    from tools.daemon_pool import DaemonThreadPoolExecutor
+
+    runner, _adapter = make_restart_runner()
+    executor = gateway_run.GatewayRunner._get_executor(runner)
+    try:
+        assert isinstance(executor, DaemonThreadPoolExecutor)
+        is_daemon, worker = executor.submit(
+            lambda: (_threading.current_thread().daemon, _threading.current_thread())
+        ).result(timeout=10)
+        assert is_daemon is True
+        # Not registered with concurrent.futures' own atexit join hook.
+        assert worker not in _threads_queues
+    finally:
+        gateway_run.GatewayRunner._shutdown_executor(runner)
+
+
 @pytest.mark.asyncio
 async def test_drain_without_suppress_flag_still_broadcasts_home_channel(tmp_path, monkeypatch):
     """A drain marker WITHOUT the suppress flag leaves today's behaviour intact.
