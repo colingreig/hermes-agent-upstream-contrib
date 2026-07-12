@@ -30,6 +30,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Set
 
+from agent.ops_alerts import alert_once as _ops_alert_once
 from hermes_constants import get_hermes_home
 from tools import skill_usage
 from utils import atomic_json_write
@@ -1806,6 +1807,28 @@ def _resolve_review_model(cfg: Dict[str, Any]) -> tuple[str, str]:
     return b.provider, b.model
 
 
+def _alert_curator_chain_exhausted(provider: str, error: str) -> None:
+    """Loud-failure alert: the curator review fork's fallback chain is dead.
+
+    The curator fork (``AIAgent`` spawned by ``_run_llm_review``) never calls
+    ``call_llm()``, so it can't use ``auxiliary.curator.fallback`` /
+    ``_try_task_fallback_once()`` — its only degradation path is the main
+    agent's top-level ``fallback_providers`` chain, engaged internally by
+    ``AIAgent.run_conversation()``. If an exception still reaches here, that
+    chain (not just the primary provider) has been exhausted. Historically
+    this failed silently (audit H1). Deduped per provider signature via
+    ``agent.ops_alerts`` so a stuck backend alerts once, not every curator
+    pass.
+    """
+    signature = f"curator:{provider or 'unknown'}"
+    message = (
+        "🔴 Hermes auxiliary.curator: review fork failed and the top-level "
+        f"fallback_providers chain is exhausted (provider={provider or 'unknown'}). "
+        f"Curator passes are hard-failing. {error}"
+    )
+    _ops_alert_once(signature, message)
+
+
 def _run_llm_review(prompt: str) -> Dict[str, Any]:
     """Spawn an AIAgent fork to run the curator review prompt.
 
@@ -1942,6 +1965,12 @@ def _run_llm_review(prompt: str) -> Dict[str, Any]:
     except Exception as e:
         result_meta["error"] = f"error: {e}"
         result_meta["summary"] = result_meta["error"]
+        # The AIAgent fork already tried the main agent's top-level
+        # fallback_providers chain internally (run_conversation()'s own
+        # recovery machinery) before this exception surfaced here, so
+        # reaching this except block means that chain is exhausted, not
+        # just the primary provider. See _alert_curator_chain_exhausted.
+        _alert_curator_chain_exhausted(result_meta.get("provider") or "", result_meta["error"])
     finally:
         if review_agent is not None:
             try:
