@@ -15636,7 +15636,17 @@ def main(
         python cli.py -w                         # Start in isolated git worktree
         python cli.py -w -q "Fix issue #123"     # Single query in worktree
     """
-    global _active_worktree
+    global _active_worktree, CLI_CONFIG
+
+    # CLI_CONFIG is a module-level singleton computed at import time (line ~725),
+    # before these kwargs exist — push them into env and re-resolve so
+    # ignore_user_config/ignore_rules aren't silently dropped on this call.
+    if ignore_user_config:
+        os.environ["HERMES_IGNORE_USER_CONFIG"] = "1"
+    if ignore_rules:
+        os.environ["HERMES_IGNORE_RULES"] = "1"
+    if ignore_user_config or ignore_rules:
+        CLI_CONFIG = load_cli_config()
 
     # Force UTF-8 stdio on Windows before any banner/print() runs — the
     # Rich console prints Unicode box-drawing characters that would
