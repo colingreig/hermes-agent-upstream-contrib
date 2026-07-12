@@ -259,6 +259,97 @@ class TestAppMentionHandler:
             ), f"Slack slash regex does not match {expected}"
 
 
+    @pytest.mark.asyncio
+    async def test_inbound_disabled_skips_text_handlers_but_keeps_lifecycle(self):
+        """inbound_enabled=false should suppress inbound text surfaces only."""
+        config = PlatformConfig(
+            enabled=True,
+            token="xoxb-fake",
+            extra={"inbound_enabled": False},
+        )
+        adapter = SlackAdapter(config)
+
+        registered_events = []
+        registered_commands = []
+        registered_actions = []
+
+        mock_app = MagicMock()
+
+        def mock_event(event_type):
+            def decorator(fn):
+                registered_events.append(event_type)
+                return fn
+
+            return decorator
+
+        def mock_command(cmd):
+            def decorator(fn):
+                registered_commands.append(cmd)
+                return fn
+
+            return decorator
+
+        def mock_action(action_id):
+            def decorator(fn):
+                registered_actions.append(action_id)
+                return fn
+
+            return decorator
+
+        mock_app.event = mock_event
+        mock_app.command = mock_command
+        mock_app.action = mock_action
+        mock_app.client = AsyncMock()
+        mock_app.client.auth_test = AsyncMock(
+            return_value={
+                "user_id": "U_BOT",
+                "user": "testbot",
+            }
+        )
+
+        mock_web_client = AsyncMock()
+        mock_web_client.auth_test = AsyncMock(
+            return_value={
+                "user_id": "U_BOT",
+                "user": "testbot",
+                "team_id": "T_FAKE",
+                "team": "FakeTeam",
+            }
+        )
+
+        socket_mode_handler = MagicMock()
+        socket_mode_handler.start_async = AsyncMock(return_value=None)
+
+        with (
+            patch.object(_slack_mod, "AsyncApp", return_value=mock_app),
+            patch.object(_slack_mod, "AsyncWebClient", return_value=mock_web_client),
+            patch.object(
+                _slack_mod, "AsyncSocketModeHandler", return_value=socket_mode_handler
+            ),
+            patch.dict(os.environ, {"SLACK_APP_TOKEN": "xapp-fake"}),
+            patch("gateway.status.acquire_scoped_lock", return_value=(True, None)),
+            patch("asyncio.create_task", side_effect=_fake_create_task),
+        ):
+            await adapter.connect()
+
+        assert "message" not in registered_events
+        assert "app_mention" not in registered_events
+        assert "file_shared" not in registered_events
+        assert registered_commands == []
+        assert "file_created" in registered_events
+        assert "file_change" in registered_events
+        assert "reaction_added" in registered_events
+        assert "reaction_removed" in registered_events
+        assert "assistant_thread_started" in registered_events
+        assert "assistant_thread_context_changed" in registered_events
+        assert set(registered_actions) >= {
+            "hermes_approve_once",
+            "hermes_approve_session",
+            "hermes_approve_always",
+            "hermes_deny",
+        }
+
+
 class TestSlackConnectCleanup:
     """Regression coverage for failed connect() cleanup."""
 

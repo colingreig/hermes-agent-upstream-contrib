@@ -312,6 +312,8 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     # loader leak these values into later tests in the same process.
     # Force-clear on every test setup so the leak can't happen.
     "SLACK_REQUIRE_MENTION",
+    "SLACK_ALLOWED_CHANNELS",
+    "SLACK_INBOUND_ENABLED",
     "SLACK_STRICT_MENTION",
     "SLACK_FREE_RESPONSE_CHANNELS",
     "SLACK_ALLOW_BOTS",
