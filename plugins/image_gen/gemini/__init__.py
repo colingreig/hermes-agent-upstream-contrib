@@ -28,7 +28,7 @@ Selection precedence (first hit wins), matching the xAI/OpenAI plugins:
 1. ``GEMINI_IMAGE_MODEL`` env var (escape hatch for scripts / tests)
 2. ``image_gen.gemini.model`` in ``config.yaml``
 3. ``image_gen.model`` in ``config.yaml`` (when it's one of our model IDs)
-4. :data:`DEFAULT_MODEL` — ``gemini-3.1-flash-image-preview`` ("Nano Banana 2")
+4. :data:`DEFAULT_MODEL` — ``gemini-3-pro-image`` ("Nano Banana Pro")
 
 Auth: ``GOOGLE_API_KEY``, falling back to ``GEMINI_API_KEY`` then
 ``GOOGLE_AI_API_KEY`` — the same tolerant lookup order used by the Banana
@@ -63,19 +63,24 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _MODELS: Dict[str, Dict[str, Any]] = {
-    "gemini-3.1-flash-image-preview": {
+    "gemini-3-pro-image": {
+        "display": "Gemini 3 Pro Image (Nano Banana Pro)",
+        "speed": "~20-40s",
+        "strengths": "Premium reasoning-driven model; studio-quality 4K, best prompt adherence and text rendering",
+    },
+    "gemini-3.1-flash-image": {
         "display": "Gemini 3.1 Flash Image (Nano Banana 2)",
         "speed": "~10-20s",
-        "strengths": "Latest, highest-fidelity Nano Banana model; best prompt adherence",
+        "strengths": "High-efficiency production-scale tier; faster/cheaper than Pro",
     },
     "gemini-2.5-flash-image": {
         "display": "Gemini 2.5 Flash Image",
         "speed": "~5-10s",
-        "strengths": "Budget / GA fallback — cheaper and generally available",
+        "strengths": "Budget / legacy GA fallback — cheaper and generally available",
     },
 }
 
-DEFAULT_MODEL = "gemini-3.1-flash-image-preview"
+DEFAULT_MODEL = "gemini-3-pro-image"
 
 _API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
 
@@ -260,7 +265,7 @@ class GeminiImageGenProvider(ImageGenProvider):
             "name": "Google Gemini (Nano Banana)",
             "badge": "paid",
             "tag": (
-                "gemini-3.1-flash-image-preview (Nano Banana 2) — "
+                "gemini-3-pro-image (Nano Banana Pro) — "
                 "text-to-image & image editing"
             ),
             "env_vars": [

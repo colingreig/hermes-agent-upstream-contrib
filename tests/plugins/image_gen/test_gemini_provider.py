@@ -75,14 +75,15 @@ class TestGeminiImageGenProvider:
         provider = GeminiImageGenProvider()
         models = provider.list_models()
         ids = [m["id"] for m in models]
-        assert "gemini-3.1-flash-image-preview" in ids
+        assert "gemini-3-pro-image" in ids
+        assert "gemini-3.1-flash-image" in ids
         assert "gemini-2.5-flash-image" in ids
 
     def test_default_model(self):
         from plugins.image_gen.gemini import GeminiImageGenProvider
 
         provider = GeminiImageGenProvider()
-        assert provider.default_model() == "gemini-3.1-flash-image-preview"
+        assert provider.default_model() == "gemini-3-pro-image"
 
     def test_get_setup_schema(self):
         from plugins.image_gen.gemini import GeminiImageGenProvider
@@ -158,7 +159,7 @@ class TestModelResolution:
     def test_default_model(self):
         from plugins.image_gen.gemini import _resolve_model
 
-        assert _resolve_model() == "gemini-3.1-flash-image-preview"
+        assert _resolve_model() == "gemini-3-pro-image"
 
     def test_env_override(self, monkeypatch):
         monkeypatch.setenv("GEMINI_IMAGE_MODEL", "gemini-2.5-flash-image")
@@ -170,7 +171,7 @@ class TestModelResolution:
         monkeypatch.setenv("GEMINI_IMAGE_MODEL", "not-a-real-model")
         from plugins.image_gen.gemini import _resolve_model
 
-        assert _resolve_model() == "gemini-3.1-flash-image-preview"
+        assert _resolve_model() == "gemini-3-pro-image"
 
     def test_scoped_config_model(self, monkeypatch):
         from plugins.image_gen import gemini as gemini_mod
@@ -200,10 +201,10 @@ class TestModelResolution:
             "_load_gemini_config",
             lambda: {
                 "model": "gemini-2.5-flash-image",
-                "gemini": {"model": "gemini-3.1-flash-image-preview"},
+                "gemini": {"model": "gemini-3.1-flash-image"},
             },
         )
-        assert gemini_mod._resolve_model() == "gemini-3.1-flash-image-preview"
+        assert gemini_mod._resolve_model() == "gemini-3.1-flash-image"
 
     def test_default_resolution(self):
         from plugins.image_gen.gemini import _resolve_resolution
@@ -278,7 +279,7 @@ class TestGenerate:
         assert result["success"] is True
         assert result["image"] == "/tmp/gemini_test.png"
         assert result["provider"] == "gemini"
-        assert result["model"] == "gemini-3.1-flash-image-preview"
+        assert result["model"] == "gemini-3-pro-image"
         assert result["modality"] == "text"
 
     def test_request_shape_text_to_image(self):
@@ -303,7 +304,7 @@ class TestGenerate:
         call = mock_post.call_args
         assert call.args[0] == (
             "https://generativelanguage.googleapis.com/v1beta/models/"
-            "gemini-3.1-flash-image-preview:generateContent"
+            "gemini-3-pro-image:generateContent"
         )
         assert call.kwargs["params"] == {"key": "test-key-12345"}
         payload = call.kwargs["json"]
