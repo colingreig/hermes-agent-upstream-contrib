@@ -41,8 +41,19 @@ def _get_allowed() -> set[str]:
         return val
 
 
-# Cache for the config-based allowlist (loaded once per process).
+# Cache for the config-based allowlist, keyed on the config file's
+# (mtime_ns, size) signature — same freshness strategy as
+# ``hermes_cli.config.read_raw_config``. A bare "load once per process"
+# cache made edits to ``terminal.env_passthrough`` in config.yaml a silent
+# no-op until a full gateway restart; keying on the stat signature makes
+# edits take effect on the next call instead.
+#
+# ``_config_passthrough`` holds the cached value (kept under this name for
+# backward compatibility with external save/restore isolation patterns, e.g.
+# ``tests/gateway/test_raft_adapter.py``). ``_config_passthrough_sig`` holds
+# the (mtime_ns, size) signature the value was computed against.
 _config_passthrough: frozenset[str] | None = None
+_config_passthrough_sig: tuple[int, int] | None = None
 
 
 def _is_hermes_provider_credential(name: str) -> bool:
@@ -122,9 +133,30 @@ def register_env_passthrough(var_names: Iterable[str]) -> None:
 
 
 def _load_config_passthrough() -> frozenset[str]:
-    """Load ``tools.env_passthrough`` from config.yaml (cached)."""
-    global _config_passthrough
-    if _config_passthrough is not None:
+    """Load ``tools.env_passthrough`` from config.yaml.
+
+    Cached on the config file's (mtime_ns, size) signature — same freshness
+    strategy as ``hermes_cli.config.read_raw_config`` — so edits to
+    ``terminal.env_passthrough`` take effect on the next call instead of
+    requiring a full process restart. Falls back to an uncached (and, on
+    stat/read failure, empty) result if the config file's stat can't be
+    determined.
+    """
+    global _config_passthrough, _config_passthrough_sig
+
+    cache_key: tuple[int, int] | None
+    try:
+        from hermes_cli.config import get_config_path
+        st = get_config_path().stat()
+        cache_key = (st.st_mtime_ns, st.st_size)
+    except Exception:
+        cache_key = None
+
+    if (
+        cache_key is not None
+        and _config_passthrough is not None
+        and _config_passthrough_sig == cache_key
+    ):
         return _config_passthrough
 
     result: set[str] = set()
@@ -157,8 +189,11 @@ def _load_config_passthrough() -> frozenset[str]:
     except Exception as e:
         logger.debug("Could not read tools.env_passthrough from config: %s", e)
 
-    _config_passthrough = frozenset(result)
-    return _config_passthrough
+    computed = frozenset(result)
+    if cache_key is not None:
+        _config_passthrough = computed
+        _config_passthrough_sig = cache_key
+    return computed
 
 
 def is_env_passthrough(var_name: str) -> bool:
@@ -178,7 +213,15 @@ def get_all_passthrough() -> frozenset[str]:
 
 
 def clear_env_passthrough() -> None:
-    """Reset the skill-scoped allowlist (e.g. on session reset)."""
+    """Reset the skill-scoped allowlist (e.g. on session reset).
+
+    Also drops the config-based allowlist cache so a manual clear forces
+    a fresh read of ``terminal.env_passthrough`` from config.yaml on the
+    next lookup, rather than serving a possibly-stale cached value.
+    """
+    global _config_passthrough, _config_passthrough_sig
     _get_allowed().clear()
+    _config_passthrough = None
+    _config_passthrough_sig = None
 
 
