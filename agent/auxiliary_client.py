@@ -102,6 +102,7 @@ OpenAI = _OpenAIProxy()  # module-level name, resolves lazily on call/isinstance
 
 from agent.credential_pool import load_pool
 from agent.model_metadata import MINIMUM_CONTEXT_LENGTH, get_model_context_length
+from agent.ops_alerts import alert_once as _ops_alert_once
 from agent.process_bootstrap import build_keepalive_http_client
 from hermes_cli.config import get_hermes_home
 from hermes_constants import OPENROUTER_BASE_URL
@@ -126,6 +127,26 @@ _LOGGED_UNHANDLED_AUTHTYPE_KEYS: set = set()
 # with no matching handler. Keyed by provider name.
 _LOGGED_UNSUPPORTED_EXTPROC_KEYS: set = set()
 _LOGGED_UNSUPPORTED_OAUTH_KEYS: set = set()
+
+
+def _alert_vision_chain_exhausted(resolved_provider: Optional[str], detail: str = "") -> None:
+    """Loud-failure alert: the vision auto-chain has no usable backend left.
+
+    Fires when ``resolve_vision_provider_client()``'s built-in auto-chain
+    (main provider → OpenRouter → Nous → Anthropic) is exhausted — i.e. every
+    rung returned no client — right before ``call_llm``/``async_call_llm``
+    raise ``RuntimeError`` for ``task="vision"``. Historically this was a
+    silent hard-failure (audit H1: 2+ days undetected during the 2026-07
+    Gemini outage). Deduped per requested-provider signature via
+    ``agent.ops_alerts`` so a stuck backend alerts once, not every turn.
+    """
+    signature = f"vision:{resolved_provider or 'auto'}"
+    message = (
+        "🔴 Hermes auxiliary.vision: no usable backend left "
+        f"(auto-chain exhausted, requested provider={resolved_provider or 'auto'}). "
+        "Vision calls are hard-failing." + (f" {detail}" if detail else "")
+    )
+    _ops_alert_once(signature, message)
 
 
 def _resolve_aux_verify(base_url: Optional[str]) -> Any:
@@ -6084,6 +6105,7 @@ def call_llm(
                 async_mode=False,
             )
         if client is None:
+            _alert_vision_chain_exhausted(resolved_provider)
             raise RuntimeError(
                 f"No LLM provider configured for task={task} provider={resolved_provider}. "
                 f"Run: hermes setup"
@@ -6707,6 +6729,7 @@ async def async_call_llm(
                 async_mode=True,
             )
         if client is None:
+            _alert_vision_chain_exhausted(resolved_provider)
             raise RuntimeError(
                 f"No LLM provider configured for task={task} provider={resolved_provider}. "
                 f"Run: hermes setup"
