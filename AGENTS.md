@@ -643,6 +643,21 @@ versa), you're on the wrong loader. Check `DEFAULT_CONFIG` coverage.
 
 ---
 
+## 1Password secret access (repository-scoped)
+
+- When a command in this repo needs secrets (deploy CLIs, build steps reading API keys, etc.), run it via `op-run -- <command>`. op-run injects that repo's secrets into the single command's environment only — never a whole-shell export.
+- op-run resolves the repository automatically from its `.op-env` file or `~/.config/op-repo-vault-map.tsv`. Never pass or guess a vault/item yourself.
+- If neither `.op-env` nor the map has an entry for the current repository, STOP and report the missing mapping. Do not guess a vault or item, do not enumerate/list vaults or items to find one, and do not default to `Dev Toolbox/dev`.
+- hermes-agent itself has NO entry in `op-repo-vault-map.tsv` — its secrets live across multiple purpose-specific vault items rather than one `dev` item. op-run correctly fails closed for this repo; that is expected behavior, not a bug to fix by adding a guessed mapping.
+- hermes-agent's own gateway/runtime secrets are resolved separately: at boot by `op_sdk_resolve.py`, and per-task by the lazy resolver in `agent/lazy_secret_resolver.py`. This is infrastructure secret resolution, distinct from repo-scoped op-run — do not replace it with op-run or route it through op-run.
+- Use a direct `op` command only for an explicitly authorized operation neither op-run nor the resolvers above can perform. Never run discovery commands (`op vault list`, `op item list`).
+- Never use a 1Password MCP for secret access.
+- Never probe multiple vaults or items "to check."
+- On a 1Password rate-limit error (HTTP 429), STOP immediately and report it. Never retry a 1Password error in a loop.
+- Never print, echo, log, or persist a resolved secret value.
+
+---
+
 ## Skin/Theme System
 
 The skin engine (`hermes_cli/skin_engine.py`) provides data-driven CLI visual customization. Skins are **pure data** — no code changes needed to add a new skin.
