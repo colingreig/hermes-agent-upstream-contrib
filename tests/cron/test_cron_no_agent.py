@@ -12,6 +12,7 @@ Covers:
 from __future__ import annotations
 
 import json
+import os
 from unittest.mock import patch
 
 import pytest
@@ -329,3 +330,277 @@ def test_run_job_script_path_traversal_still_blocked(hermes_env):
     ok, output = _run_job_script("/etc/passwd")
     assert ok is False
     assert "Blocked" in output or "outside" in output
+
+
+# ---------------------------------------------------------------------------
+# _run_job_script: flag-gated, per-job lazy secret injection
+# ---------------------------------------------------------------------------
+
+
+def _write_secret_probe(hermes_env, filename, variable):
+    script_path = hermes_env / "scripts" / filename
+    script_path.write_text(
+        "import os\n"
+        f"print('PRESENT' if os.environ.get({variable!r}) else 'ABSENT')\n"
+    )
+    return script_path
+
+
+def test_run_job_script_lazy_injects_declared_secret_into_child_only(
+    hermes_env, monkeypatch
+):
+    from cron.scheduler import _run_job_script
+
+    _write_secret_probe(hermes_env, "clickup_probe.py", "CLICKUP_API_TOKEN")
+    monkeypatch.setenv("HERMES_LAZY_SECRET_RESOLUTION", "1")
+    monkeypatch.delenv("CLICKUP_API_TOKEN", raising=False)
+
+    with patch("agent.lazy_secret_resolver.get", return_value="pk_test_clickup") as lazy_get:
+        ok, output = _run_job_script(
+            "clickup_probe.py",
+            required_environment_variables=["CLICKUP_API_TOKEN"],
+        )
+
+    assert ok is True
+    assert output == "PRESENT"
+    assert "CLICKUP_API_TOKEN" not in os.environ
+    lazy_get.assert_called_once_with("CLICKUP_API_TOKEN")
+
+
+def test_run_job_script_injects_declared_secret_from_profile_scope(
+    hermes_env, monkeypatch
+):
+    from agent import secret_scope as ss
+    from cron.scheduler import _run_job_script
+
+    script_path = hermes_env / "scripts" / "profile_scope_probe.py"
+    script_path.write_text(
+        "import os\n"
+        "value = os.environ.get('CLICKUP_API_TOKEN')\n"
+        "print('PROFILE' if value == 'profile-scoped-clickup-token' "
+        "else 'BOOT' if value == 'boot-clickup-token' else 'ABSENT')\n"
+    )
+    monkeypatch.setenv("HERMES_LAZY_SECRET_RESOLUTION", "1")
+    monkeypatch.setenv("CLICKUP_API_TOKEN", "boot-clickup-token")
+
+    prior_multiplex = ss.is_multiplex_active()
+    ss.set_multiplex_active(True)
+    scope_token = ss.set_secret_scope(
+        {"CLICKUP_API_TOKEN": "profile-scoped-clickup-token"}
+    )
+    try:
+        with patch(
+            "agent.lazy_secret_resolver.get", return_value="wrong-global-token"
+        ) as lazy_get:
+            ok, output = _run_job_script(
+                "profile_scope_probe.py",
+                required_environment_variables=["CLICKUP_API_TOKEN"],
+            )
+    finally:
+        ss.reset_secret_scope(scope_token)
+        ss.set_multiplex_active(prior_multiplex)
+
+    assert ok is True
+    assert output == "PROFILE"
+    assert os.environ["CLICKUP_API_TOKEN"] == "boot-clickup-token"
+    lazy_get.assert_not_called()
+
+
+def test_run_job_script_multiplex_scope_miss_never_uses_global_lazy_resolver(
+    hermes_env, monkeypatch
+):
+    from agent import secret_scope as ss
+    from cron.scheduler import _run_job_script
+
+    _write_secret_probe(hermes_env, "multiplex_miss_probe.py", "CLICKUP_API_TOKEN")
+    monkeypatch.setenv("HERMES_LAZY_SECRET_RESOLUTION", "1")
+    monkeypatch.setenv("CLICKUP_API_TOKEN", "default-profile-boot-token")
+
+    prior_multiplex = ss.is_multiplex_active()
+    ss.set_multiplex_active(True)
+    scope_token = ss.set_secret_scope({})
+    try:
+        with patch(
+            "agent.lazy_secret_resolver.get", return_value="must-not-cross-profiles"
+        ) as lazy_get:
+            ok, output = _run_job_script(
+                "multiplex_miss_probe.py",
+                required_environment_variables=["CLICKUP_API_TOKEN"],
+            )
+    finally:
+        ss.reset_secret_scope(scope_token)
+        ss.set_multiplex_active(prior_multiplex)
+
+    assert ok is True
+    assert output == "ABSENT"
+    lazy_get.assert_not_called()
+
+
+def test_run_job_script_unscoped_ambient_secret_keeps_precedence(
+    hermes_env, monkeypatch
+):
+    from agent import secret_scope as ss
+    from cron.scheduler import _run_job_script
+
+    _write_secret_probe(hermes_env, "ambient_precedence.py", "CLICKUP_API_TOKEN")
+    monkeypatch.setenv("HERMES_LAZY_SECRET_RESOLUTION", "1")
+    monkeypatch.setenv("CLICKUP_API_TOKEN", "ambient-clickup-token")
+
+    prior_multiplex = ss.is_multiplex_active()
+    ss.set_multiplex_active(False)
+    scope_token = ss.set_secret_scope(None)
+    try:
+        with patch(
+            "agent.lazy_secret_resolver.get", return_value="unused-lazy-token"
+        ) as lazy_get:
+            ok, output = _run_job_script(
+                "ambient_precedence.py",
+                required_environment_variables=["CLICKUP_API_TOKEN"],
+            )
+    finally:
+        ss.reset_secret_scope(scope_token)
+        ss.set_multiplex_active(prior_multiplex)
+
+    assert ok is True
+    assert output == "PRESENT"
+    lazy_get.assert_not_called()
+
+
+def test_run_job_script_lazy_resolution_is_inert_when_flag_off(
+    hermes_env, monkeypatch
+):
+    from cron.scheduler import _run_job_script
+
+    _write_secret_probe(hermes_env, "flag_off_probe.py", "CLICKUP_API_TOKEN")
+    monkeypatch.delenv("HERMES_LAZY_SECRET_RESOLUTION", raising=False)
+    monkeypatch.delenv("CLICKUP_API_TOKEN", raising=False)
+
+    with patch("agent.lazy_secret_resolver.get", return_value="must-not-resolve") as lazy_get:
+        ok, output = _run_job_script(
+            "flag_off_probe.py",
+            required_environment_variables=["CLICKUP_API_TOKEN"],
+        )
+
+    assert ok is True
+    assert output == "ABSENT"
+    lazy_get.assert_not_called()
+
+
+def test_run_job_script_lazy_resolution_failure_is_fail_open(
+    hermes_env, monkeypatch
+):
+    from cron.scheduler import _run_job_script
+
+    _write_secret_probe(hermes_env, "resolver_failure.py", "CLICKUP_API_TOKEN")
+    monkeypatch.setenv("HERMES_LAZY_SECRET_RESOLUTION", "true")
+    monkeypatch.delenv("CLICKUP_API_TOKEN", raising=False)
+
+    with patch(
+        "agent.lazy_secret_resolver.get",
+        side_effect=RuntimeError("resolver unavailable"),
+    ):
+        ok, output = _run_job_script(
+            "resolver_failure.py",
+            required_environment_variables=["CLICKUP_API_TOKEN"],
+        )
+
+    assert ok is True
+    assert output == "ABSENT"
+
+
+def test_run_job_script_redacts_child_only_lazy_secret(hermes_env, monkeypatch):
+    from cron.scheduler import _run_job_script
+
+    opaque_secret = "opaque-value-with-no-token-shape"
+    script_path = hermes_env / "scripts" / "print_secret.py"
+    script_path.write_text("import os\nprint(os.environ['CLICKUP_API_TOKEN'])\n")
+    monkeypatch.setenv("HERMES_LAZY_SECRET_RESOLUTION", "1")
+    monkeypatch.delenv("CLICKUP_API_TOKEN", raising=False)
+
+    with patch("agent.lazy_secret_resolver.get", return_value=opaque_secret):
+        ok, output = _run_job_script(
+            "print_secret.py",
+            required_environment_variables=["CLICKUP_API_TOKEN"],
+        )
+
+    assert ok is True
+    assert opaque_secret not in output
+    assert "[REDACTED]" in output
+
+
+def test_run_job_script_accepts_skill_style_secret_declarations(
+    hermes_env, monkeypatch
+):
+    from cron.scheduler import _run_job_script
+
+    _write_secret_probe(hermes_env, "mapping_declaration.py", "CLICKUP_API_TOKEN")
+    monkeypatch.setenv("HERMES_LAZY_SECRET_RESOLUTION", "yes")
+    monkeypatch.delenv("CLICKUP_API_TOKEN", raising=False)
+
+    declarations = [
+        {"name": "CLICKUP_API_TOKEN", "help": "ClickUp personal token"},
+        {"name": "not a valid env name"},
+    ]
+    with patch("agent.lazy_secret_resolver.get", return_value="pk_test_clickup") as lazy_get:
+        ok, output = _run_job_script(
+            "mapping_declaration.py",
+            required_environment_variables=declarations,
+        )
+
+    assert ok is True
+    assert output == "PRESENT"
+    lazy_get.assert_called_once_with("CLICKUP_API_TOKEN")
+
+
+def test_run_job_script_declaration_does_not_bypass_provider_blocklist(
+    hermes_env, monkeypatch
+):
+    from cron.scheduler import _run_job_script
+
+    _write_secret_probe(hermes_env, "provider_probe.py", "ANTHROPIC_API_KEY")
+    monkeypatch.setenv("HERMES_LAZY_SECRET_RESOLUTION", "1")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+    with patch("agent.lazy_secret_resolver.get", return_value="provider-secret") as lazy_get:
+        ok, output = _run_job_script(
+            "provider_probe.py",
+            required_environment_variables=["ANTHROPIC_API_KEY"],
+        )
+
+    assert ok is True
+    assert output == "ABSENT"
+    lazy_get.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("job_name", "script_name"),
+    [
+        ("clickup-workspace-refresh", "clickup_workspace_refresh.py"),
+        ("clickup-review-sla", "clickup_review_sla.py"),
+        ("staleness-sweep", "staleness_sweep.py"),
+    ],
+)
+def test_no_agent_clickup_health_jobs_forward_declared_secret(
+    hermes_env, job_name, script_name
+):
+    from cron.scheduler import run_job
+
+    job = {
+        "id": f"test-{job_name}",
+        "name": job_name,
+        "prompt": "",
+        "script": script_name,
+        "no_agent": True,
+        "required_environment_variables": ["CLICKUP_API_TOKEN"],
+    }
+
+    with patch("cron.scheduler._run_job_script", return_value=(True, "ok")) as runner:
+        success, _doc, final_response, error = run_job(job)
+
+    assert success is True
+    assert final_response == "ok"
+    assert error is None
+    runner.assert_called_once_with(
+        script_name,
+        required_environment_variables=["CLICKUP_API_TOKEN"],
+    )

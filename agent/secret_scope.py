@@ -166,22 +166,26 @@ def get_secret(name: str, default: Optional[str] = None) -> Optional[str]:
 
     1. Genuinely-global vars (``_is_global_env``) always read ``os.environ`` —
        they are deployment settings, not profile secrets.
-    2. When a secret scope is installed (multiplexed turn), read from it; an
-       absent key returns ``default``. The scope is authoritative — we do NOT
-       fall through to ``os.environ``, because in a multiplexer ``os.environ``
-       may hold another profile's value.
+    2. When a secret scope is installed (multiplexed turn), read from it. The
+       scope is authoritative — we do NOT fall through to ``os.environ``,
+       because in a multiplexer ``os.environ`` may hold another profile's
+       value. In single-profile mode, when the key is absent, the flag-gated
+       lazy resolver is the only fallback before returning ``default``. In
+       multiplex mode, a miss returns ``default`` because the lazy resolver's
+       process-global manifest/cache cannot preserve profile isolation.
     3. No scope installed:
        - multiplex INACTIVE (default deployment): read ``os.environ`` —
          identical to the legacy ``os.getenv`` behavior every caller had before.
        - multiplex ACTIVE: FAIL CLOSED. Raise ``UnscopedSecretError`` so the
          missing scope is caught loudly instead of leaking a cross-profile value.
-    4. LAST RESORT (multiplex-inactive path only, and only when ``os.environ``
-       had nothing): flag-gated lazy 1Password resolution via
-       ``agent.lazy_secret_resolver``. This is a no-op (returns None) when
-       ``HERMES_LAZY_SECRET_RESOLUTION`` is unset, so with the flag off this
-       tier never changes behavior — byte-identical to before. It is also
-       inert whenever ``os.environ`` already has the value, even with the
-       flag on, preserving "env always wins" ordering.
+    4. LAST RESORT (single-profile mode only, and only when the authoritative
+       scope or ``os.environ`` had nothing): flag-gated lazy 1Password
+       resolution via ``agent.lazy_secret_resolver``. This is a no-op (returns
+       None) when ``HERMES_LAZY_SECRET_RESOLUTION`` is unset, so with the flag
+       off this tier never changes behavior — byte-identical to before. It is
+       also inert whenever the scope or ``os.environ`` already has the value,
+       even with the flag on, preserving existing precedence. Multiplex mode
+       never uses this process-global resolver for a scoped miss.
     """
     if _is_global_env(name):
         val = os.environ.get(name)
@@ -190,7 +194,13 @@ def get_secret(name: str, default: Optional[str] = None) -> Optional[str]:
     scope = _SECRET_SCOPE.get()
     if scope is not None:
         val = scope.get(name)
-        return val if val is not None else default
+        if val is not None:
+            return val
+        if not _MULTIPLEX_ACTIVE:
+            lazy = _lazy_secret_fallback(name)
+            if lazy is not None:
+                return lazy
+        return default
 
     if _MULTIPLEX_ACTIVE:
         raise UnscopedSecretError(
@@ -255,4 +265,3 @@ def build_profile_secret_scope(hermes_home: Path) -> Dict[str, str]:
     from ``os.environ`` directly, so the scope holds only profile secrets.
     """
     return load_env_file(Path(hermes_home) / ".env")
-
