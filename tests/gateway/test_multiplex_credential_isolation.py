@@ -77,6 +77,64 @@ class TestMcpInterpolationUsesScope:
         finally:
             ss.reset_secret_scope(tok)
 
+    def test_single_profile_scope_lazily_resolves_declared_secret(self, monkeypatch):
+        """An agent-scoped MCP variable can resolve after gateway boot.
+
+        Cron installs a secret scope even in single-profile mode. A declared
+        secret absent from both that boot-time ``.env`` snapshot and
+        ``os.environ`` therefore gets one final, flag-gated lazy lookup.
+        """
+        from tools.mcp_tool import _interpolate_env_vars
+        import agent.lazy_secret_resolver as lazy_resolver
+
+        monkeypatch.setenv("HERMES_LAZY_SECRET_RESOLUTION", "true")
+        monkeypatch.delenv("ROTATED_MCP_TOKEN", raising=False)
+        calls = []
+
+        def resolve_declared_secret(name):
+            calls.append(name)
+            return "fresh-rotated-token"
+
+        monkeypatch.setattr(lazy_resolver, "get", resolve_declared_secret)
+        tok = ss.set_secret_scope({})
+        try:
+            cfg = {"env": {"MCP_TOKEN": "${ROTATED_MCP_TOKEN}"}}
+            assert _interpolate_env_vars(cfg) == {
+                "env": {"MCP_TOKEN": "fresh-rotated-token"}
+            }
+        finally:
+            ss.reset_secret_scope(tok)
+
+        assert calls == ["ROTATED_MCP_TOKEN"]
+
+    def test_multiplex_scope_never_uses_process_global_lazy_resolver(self, monkeypatch):
+        """A secondary profile cannot receive the default profile's 1P value."""
+        from tools.mcp_tool import _interpolate_env_vars
+        import agent.lazy_secret_resolver as lazy_resolver
+
+        monkeypatch.setenv("HERMES_LAZY_SECRET_RESOLUTION", "true")
+        monkeypatch.delenv("PROFILE_MCP_TOKEN", raising=False)
+        calls = []
+
+        def resolve_default_profile_secret(name):
+            calls.append(name)
+            return "must-not-cross-profile-boundary"
+
+        monkeypatch.setattr(
+            lazy_resolver, "get", resolve_default_profile_secret
+        )
+        ss.set_multiplex_active(True)
+        tok = ss.set_secret_scope({})
+        try:
+            cfg = {"env": {"MCP_TOKEN": "${PROFILE_MCP_TOKEN}"}}
+            assert _interpolate_env_vars(cfg) == {
+                "env": {"MCP_TOKEN": "${PROFILE_MCP_TOKEN}"}
+            }
+        finally:
+            ss.reset_secret_scope(tok)
+
+        assert calls == []
+
     def test_interpolation_unset_keeps_placeholder(self, monkeypatch):
         from tools.mcp_tool import _interpolate_env_vars
         monkeypatch.delenv("UNSET_MCP_VAR", raising=False)

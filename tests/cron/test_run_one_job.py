@@ -160,3 +160,49 @@ def test_run_one_job_installs_secret_scope_under_multiplex(monkeypatch, tmp_path
     assert scope_during_run["base_url"] == "https://openrouter.ai/api/v1"
     # And it was torn down after run_one_job returned (no leak).
     assert ss.current_secret_scope() is None
+
+
+def test_run_one_job_scope_lazily_resolves_mcp_variable(monkeypatch, tmp_path):
+    """The real cron scope + MCP interpolation path reaches the lazy tier.
+
+    This covers the combined production path: ``run_one_job`` installs an
+    empty single-profile secret scope, then an agent-driven cron job loads an
+    MCP config containing ``${VAR}``. With the rollout flag enabled, a scoped
+    miss resolves without requiring the secret in the gateway boot env.
+    """
+    from agent import lazy_secret_resolver
+    from agent import secret_scope as ss
+    from tools.mcp_tool import _interpolate_env_vars
+
+    (tmp_path / ".env").write_text("")
+    monkeypatch.setattr(s, "_get_hermes_home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_LAZY_SECRET_RESOLUTION", "1")
+    monkeypatch.delenv("MCP_AGENCY_OS_API_KEY", raising=False)
+
+    resolver_calls = []
+
+    def fake_lazy_get(name):
+        resolver_calls.append(name)
+        return "resolved-mcp-token"
+
+    monkeypatch.setattr(lazy_secret_resolver, "get", fake_lazy_get)
+    interpolated_during_run = {}
+
+    def fake_run_job(job):
+        interpolated_during_run["value"] = _interpolate_env_vars(
+            "${MCP_AGENCY_OS_API_KEY}"
+        )
+        return (True, "out", "final", None)
+
+    monkeypatch.setattr(s, "run_job", fake_run_job)
+    monkeypatch.setattr(s, "save_job_output", lambda jid, out: f"/tmp/{jid}.txt")
+    monkeypatch.setattr(s, "_deliver_result", lambda *a, **k: None)
+    monkeypatch.setattr(s, "mark_job_run", lambda *a, **k: None)
+
+    ss.set_multiplex_active(False)
+    ok = s.run_one_job({"id": "mcp-lazy-cron", "name": "mcp lazy cron"})
+
+    assert ok is True
+    assert interpolated_during_run["value"] == "resolved-mcp-token"
+    assert resolver_calls == ["MCP_AGENCY_OS_API_KEY"]
+    assert ss.current_secret_scope() is None
