@@ -91,7 +91,7 @@ def _executor_concurrency():
     Rollback:    echo 1 > ~/.hermes/state/executor_concurrency  (or rm it)."""
     try:
         if os.path.exists(_CONCURRENCY_FILE):
-            with open(_CONCURRENCY_FILE) as f:
+            with open(_CONCURRENCY_FILE, encoding="utf-8") as f:
                 return max(1, int(f.read().strip()))
     except (OSError, ValueError):
         pass
@@ -271,7 +271,7 @@ def _load_localization_deny_ids():
     Format: `{"ids": ["86e1...", "86e1..."]}`. Empty/missing file → defaults.
     """
     try:
-        with open(LOCALIZATION_DENY_IDS_PATH) as f:
+        with open(LOCALIZATION_DENY_IDS_PATH, encoding="utf-8") as f:
             data = json.load(f)
         ids = set(data.get("ids") or [])
         return ids if ids else _LOCALIZATION_DENY_IDS_DEFAULT
@@ -522,7 +522,7 @@ def _recover(last_seen_ids):
 
 def _load_json(path, default):
     try:
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return default
@@ -530,7 +530,7 @@ def _load_json(path, default):
 
 def _save_json(path, obj):
     tmp = path + ".tmp"
-    with open(tmp, "w") as f:
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(obj, f, indent=2)
     os.replace(tmp, path)
 
@@ -643,7 +643,7 @@ def _try_acquire_claim(task_id):
     """
     path = _claim_lock_path(task_id)
     try:
-        lf = open(path, "a")  # create if absent; append keeps mtime stable
+        lf = open(path, "a", encoding="utf-8")  # create if absent; append keeps mtime stable
         # LOCK_EX | LOCK_NB: exclusive, non-blocking. Raises BlockingIOError
         # if any other fd (same or different process) holds LOCK_EX on this
         # inode, making concurrent claims on the same task id impossible.
@@ -663,7 +663,7 @@ def _try_acquire_claim(task_id):
                     file=sys.stderr,
                 )
                 try:
-                    lf2 = open(path, "a")
+                    lf2 = open(path, "a", encoding="utf-8")
                     fcntl.flock(lf2, fcntl.LOCK_EX | fcntl.LOCK_NB)
                     # Update mtime so this holder's TTL window starts fresh.
                     os.utime(path, None)
@@ -779,7 +779,7 @@ def _clear_stale_fire_claim(executor_id):
         except (TypeError, ValueError):
             continue
         try:
-            os.kill(pid, 0)  # liveness probe only — no signal actually sent
+            os.kill(pid, 0)  # windows-footgun: ok — liveness probe only, POSIX-only script (uses fcntl elsewhere)
             continue  # PID alive: genuinely in-flight, not stale. Leave it.
         except ProcessLookupError:
             pass  # dead — fall through and clear
@@ -824,7 +824,7 @@ def _wake(reason, executor_id=EXECUTOR_ID):
         # `hermes cron run` a harmless "already being fired" no-op), and by claim_store (no
         # double-claim of a task) — so a detached fire is safe.
         wake_log = os.path.expanduser("~/.hermes/logs/gate_wake_executor.log")
-        logf = open(wake_log, "a")  # inherited by the child; parent exit closes its own handle
+        logf = open(wake_log, "a", encoding="utf-8")  # inherited by the child; parent exit closes its own handle
         proc = subprocess.Popen(
             [hb, "cron", "run", executor_id],
             stdout=logf, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
