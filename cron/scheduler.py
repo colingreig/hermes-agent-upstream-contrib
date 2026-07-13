@@ -47,6 +47,11 @@ from hermes_time import now as _hermes_now
 logger = logging.getLogger(__name__)
 
 
+def _is_interpreter_shutdown_runtime_error(exc: BaseException) -> bool:
+    """True when a threadpool submit failed because Python is finalizing."""
+    return isinstance(exc, RuntimeError) and "cannot schedule new futures after interpreter shutdown" in str(exc)
+
+
 def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     """Return a compact one-line failure message for chat delivery.
 
@@ -2716,6 +2721,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         platform="",
         chat_id="",
         chat_name="",
+        skill_scope=str(job.get("skill_scope") or ""),
     )
     _cron_delivery_vars = (
         "HERMES_CRON_AUTO_DELIVER_PLATFORM",
@@ -2895,8 +2901,23 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
                     logger.warning("Job '%s': failed to parse prefill messages file '%s': %s", job_id, pfpath, e)
                     prefill_messages = None
 
-        # Max iterations
-        max_iterations = _cfg.get("agent", {}).get("max_turns") or _cfg.get("max_turns") or 90
+        # Max iterations (a job-record "max_turns" overrides the global config —
+        # long-form worker jobs like the clickup-executor need a bigger budget
+        # than interactive turns). `bool` is a subclass of `int`, so exclude it
+        # explicitly: `max_turns: true` must fall back to the default, not
+        # silently set a 1-turn budget. (HERMES-PATCH 03)
+        _job_max_turns = job.get("max_turns")
+        _job_max_turns_valid = (
+            isinstance(_job_max_turns, int)
+            and not isinstance(_job_max_turns, bool)
+            and _job_max_turns > 0
+        )
+        max_iterations = (
+            (_job_max_turns if _job_max_turns_valid else None)
+            or _cfg.get("agent", {}).get("max_turns")
+            or _cfg.get("max_turns")
+            or 90
+        )
 
         # Provider routing
         pr = _cfg.get("provider_routing") or {}
@@ -3019,6 +3040,57 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 f"(or pin the original values to keep them). See #44585."
             )
 
+        # HERMES-PATCH 06 — pinned-provider credential preflight.
+        # When a job PINS a provider (job["provider"]) but the resolved runtime
+        # has NO usable API key, refuse to run rather than sliding into
+        # agent_init's #17929 init-time fallback. That fallback promotes the
+        # config fallback (e.g. anthropic/claude-haiku-4-5) to PRIMARY and builds
+        # it as an OpenAI-compat client pointed at api.anthropic.com, which hits
+        # /v1/chat/completions (404 — Anthropic only serves /v1/messages) on every
+        # call and 404-loops SILENTLY for hours. Root cause of the 2026-06-24
+        # outage: the gateway booted (post `hermes update`) before doppler had
+        # exported OPENAI_API_KEY, so openai-api resolved keyless. Fail LOUD with
+        # an actionable alert instead. Scoped to HTTP key-based providers: skips
+        # bedrock (boto3, no key), acp-command providers (carry a command), and
+        # the auto/openrouter/custom routers. See learnings/2026-06-24 …404 outage.
+        _pinned_provider = (job.get("provider") or "").strip().lower()
+        _rt_api_mode = str(runtime.get("api_mode") or "").strip().lower()
+        if (
+            _pinned_provider
+            and _pinned_provider not in {"auto", "openrouter", "custom"}
+            and _rt_api_mode != "bedrock_converse"
+            and not runtime.get("command")
+        ):
+            _rt_key = runtime.get("api_key")
+            # A callable key (Azure Entra ID mints a JWT per request) counts as
+            # present; otherwise require a non-blank string.
+            _has_key = callable(_rt_key) or bool(isinstance(_rt_key, str) and _rt_key.strip())
+            if not _has_key:
+                _env_hint = f"{_pinned_provider.upper().replace('-', '_')}_API_KEY"
+                try:
+                    from hermes_cli.auth import PROVIDER_REGISTRY
+                    _pcfg = PROVIDER_REGISTRY.get(_pinned_provider)
+                    if _pcfg and _pcfg.api_key_env_vars:
+                        _env_hint = _pcfg.api_key_env_vars[0]
+                except Exception:
+                    pass
+                logger.error(
+                    "Job '%s': pinned provider '%s' resolved with NO API key — "
+                    "refusing to run on the silent anthropic fallback (HERMES-PATCH 06). "
+                    "Gateway likely booted before doppler exported %s. "
+                    "Contact the operator to restart the Hermes gateway service.",
+                    job_name, _pinned_provider, _env_hint,
+                )
+                raise RuntimeError(
+                    f"Job '{job_name}' pins provider '{_pinned_provider}' but the "
+                    f"resolved runtime has NO API key. Refusing to run: the init-time "
+                    f"fallback would route to api.anthropic.com as an OpenAI-compat "
+                    f"client and 404-loop silently. Likely the gateway booted before "
+                    f"doppler exported {_env_hint}. "
+                    f"The gateway needs to be restarted by the operator — do not run "
+                    f"launchctl commands directly. No inference call was made."
+                )
+
         fallback_model = get_fallback_chain(_cfg) or None
         credential_pool = None
         runtime_provider = str(runtime.get("provider") or "").strip().lower()
@@ -3118,8 +3190,35 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         # env passthrough registrations) when the cron run hops into the worker
         # thread used for inactivity timeout monitoring.
         _cron_context = contextvars.copy_context()
-        _cron_future = _cron_pool.submit(_cron_context.run, agent.run_conversation, prompt)
+        _cron_future = None
         _inactivity_timeout = False
+        try:
+            _cron_future = _cron_pool.submit(_cron_context.run, agent.run_conversation, prompt)
+        except RuntimeError as exc:
+            if not _is_interpreter_shutdown_runtime_error(exc):
+                _cron_pool.shutdown(wait=False, cancel_futures=True)
+                raise
+            logger.warning(
+                "Job '%s' skipped before dispatch because Python is shutting down: %s",
+                job_name,
+                exc,
+            )
+            _cron_pool.shutdown(wait=False, cancel_futures=True)
+            output = f"""# Cron Job: {job_name}
+
+**Job ID:** {job_id}
+**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}
+**Schedule:** {job.get('schedule_display', 'N/A')}
+
+## Prompt
+
+{prompt}
+
+## Response
+
+Skipped because Python was already shutting down before the cron worker could be scheduled.
+"""
+            return True, output, SILENT_MARKER, None
         try:
             if _cron_inactivity_limit is None:
                 # Unlimited — just wait for the result.
@@ -3194,11 +3293,23 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         # builds the proper failure tuple. (issue #17855)
         turn_exit_reason = str(result.get("turn_exit_reason") or "")
         final_response_text = (result.get("final_response") or "").strip()
+        explainer_text = ""
+        if turn_exit_reason:
+            try:
+                explainer_text = AIAgent._format_turn_completion_explanation(turn_exit_reason).strip()
+            except Exception:
+                explainer_text = ""
+        # HERMES-PATCH 03: an iteration/budget stop that still produced a
+        # substantive report is PARTIAL work, not a failure. Upstream already
+        # spares "max_iterations_reached" stops with any non-empty response; we
+        # only keep the exact turn-completion explainer out of this path so a
+        # real fallback summary is not rejected just because it is short.
         max_iteration_summary = (
             result.get("failed") is not True
             and result.get("completed") is False
-            and turn_exit_reason.startswith("max_iterations_reached(")
-            and bool(final_response_text)
+            and turn_exit_reason.startswith(("max_iterations_reached(", "budget_exhausted"))
+            and final_response_text
+            and final_response_text != explainer_text
         )
         if result.get("failed") is True or (result.get("completed") is False and not max_iteration_summary):
             _err_text = (
@@ -3209,9 +3320,9 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             raise RuntimeError(_err_text)
         if max_iteration_summary:
             logger.warning(
-                "Job '%s' reached the iteration limit but produced a final fallback response; "
-                "delivering the response instead of failing the cron run",
-                job_name,
+                "Job '%s' hit the iteration/budget limit (%s) but produced a substantive "
+                "report — recording as PARTIAL success (handoff brief)",
+                job_name, turn_exit_reason,
             )
 
         final_response = result.get("final_response", "") or ""

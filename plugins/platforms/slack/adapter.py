@@ -112,6 +112,80 @@ def check_slack_requirements() -> bool:
     return ensure_and_bind("platform.slack", _import, globals(), prompt=False)
 
 
+# HERMES-PATCH 05: slack-decision-thread-hook
+# Slack-thread-per-decision round-trip (file B, 2026-06-19). The SLA sweep
+# (clickup_review_sla.py::_post_decision_threads) posts a rich threaded decision
+# message to Colin's DM and records {decision_thread_ts, decision_channel} in its
+# state file, keyed by ClickUp task id. When Colin replies IN that thread, this
+# hook deterministically converts the reply into the SAME operator ClickUp comment
+# the existing resume loop consumes (a non-agent comment newer than the 🟡 park),
+# and suppresses the generic agent wake for that thread. State file is the single
+# source of truth shared with the SLA script.
+_REVIEW_SLA_STATE_PATH = os.path.join(
+    os.path.expanduser("~"), ".hermes", "scripts", ".review_sla_state.json"
+)
+# Mirror clickup_review_sla.py::AGENT_COMMENT_MARKERS — the operator comment we
+# post MUST contain none of these so the SLA resume logic classifies it as an
+# operator reply (not an agent comment).
+_AGENT_COMMENT_MARKERS = ("🤖", "✅", "🔧", "🟡 hermes-decision", "🚨 hermes-hardstop",
+                          "⏳ hermes-review-sla")
+
+
+def _match_decision_thread(channel: str, thread_ts: str) -> Optional[str]:
+    """Best-effort: return the ClickUp task id whose recorded decision thread
+    matches (channel, thread_ts), else None. Reads the SLA script's state file;
+    any error (missing file, bad json) returns None so normal handling proceeds."""
+    if not thread_ts:
+        return None
+    try:
+        with open(_REVIEW_SLA_STATE_PATH) as f:
+            state = json.load(f)
+    except Exception:
+        return None
+    for tid, rec in (state.items() if isinstance(state, dict) else []):
+        if not isinstance(rec, dict):
+            continue
+        if rec.get("decision_thread_ts") != thread_ts:
+            continue
+        rec_chan = rec.get("decision_channel")
+        if rec_chan and channel and rec_chan != channel:
+            continue
+        return tid
+    return None
+
+
+async def _post_clickup_operator_comment(task_id: str, reply_text: str) -> bool:
+    """POST the operator's Slack reply as a ClickUp comment, prefixed with a plain
+    (marker-free) operator tag so the SLA resume logic treats it as an operator
+    reply. Replicates clickup_review_sla.py::_post_comment's auth/endpoint:
+    Authorization: <CLICKUP_API_TOKEN>, POST /api/v2/task/<id>/comment with
+    {"comment_text": ...}. Async (aiohttp) so it doesn't block the event loop.
+    Returns True on success. Never raises."""
+    token = (os.environ.get("CLICKUP_API_TOKEN") or "").strip()
+    if not token:
+        logger.warning("[Slack][decision-hook] CLICKUP_API_TOKEN unset — cannot record reply")
+        return False
+    # Plain operator tag; intentionally contains NO agent markers (🤖/✅/🔧/🟡/🚨/⏳).
+    body = "Operator (via Slack): " + (reply_text or "").strip()
+    url = f"https://api.clickup.com/api/v2/task/{task_id}/comment"
+    headers = {"Authorization": token, "Content-Type": "application/json"}
+    try:
+        import aiohttp  # local import: aiohttp may be lazily available
+        async with aiohttp.ClientSession() as sess:
+            async with sess.post(
+                url, headers=headers, json={"comment_text": body},
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                data = await resp.json(content_type=None)
+                ok = bool(isinstance(data, dict) and data.get("id"))
+                if not ok:
+                    logger.warning("[Slack][decision-hook] ClickUp comment POST returned no id (status=%s)", resp.status)
+                return ok
+    except Exception as e:
+        logger.warning("[Slack][decision-hook] ClickUp comment POST failed for %s: %s", task_id, e)
+        return False
+
+
 def _extract_text_from_slack_blocks(blocks: list) -> str:
     """Extract readable text from Slack Block Kit blocks, including quoted/forwarded content.
 
@@ -497,6 +571,26 @@ class SlackAdapter(BasePlatformAdapter):
         )
         _apply_slack_proxy(self._handler.client, self._proxy_url)
 
+        # HERMES-PATCH 22: slack-watchdog-owns-reconnect (2026-06-24)
+        # Disable slack_sdk's internal auto-reconnect. AsyncSocketModeHandler does
+        # not forward auto_reconnect_enabled, so it defaults to True and slack_sdk
+        # retries a dead aiohttp session forever ("Session is closed"). That loop
+        # both (a) floods the logs and (b) makes close_async() hang — which on
+        # 2026-06-24 was awaited inside _socket_reconnect_lock, deadlocking the
+        # lock and blinding this adapter's watchdog for 3.5h. With it off, a
+        # dropped socket surfaces deterministically (is_connected()->False) and
+        # the watchdog owns reconnection by building a fresh handler/session.
+        _client = getattr(self._handler, "client", None)
+        if _client is not None:
+            try:
+                _client.auto_reconnect_enabled = False
+                _client.default_auto_reconnect_enabled = False
+            except Exception:  # pragma: no cover - defensive
+                logger.debug(
+                    "[Slack] Could not disable internal auto-reconnect",
+                    exc_info=True,
+                )
+
         task = asyncio.create_task(self._handler.start_async())
         self._socket_mode_task = task
         task.add_done_callback(self._on_socket_mode_task_done)
@@ -510,7 +604,16 @@ class SlackAdapter(BasePlatformAdapter):
 
         if handler is not None:
             try:
-                await handler.close_async()
+                # HERMES-PATCH 22: slack-close-timeout (2026-06-24) — close_async()
+                # can hang on a broken/closed session. Because this runs inside
+                # _socket_reconnect_lock, an unbounded hang holds the lock forever
+                # and permanently blinds the watchdog (observed 2026-06-24). Bound
+                # it so a hang can never freeze self-healing again.
+                await asyncio.wait_for(handler.close_async(), timeout=10)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "[Slack] close_async() timed out after 10s; abandoning handler"
+                )
             except Exception as e:  # pragma: no cover - defensive logging
                 logger.warning(
                     "[Slack] Error while closing Socket Mode handler: %s",
@@ -521,8 +624,8 @@ class SlackAdapter(BasePlatformAdapter):
         if task is not None and not task.done():
             task.cancel()
             try:
-                await task
-            except asyncio.CancelledError:
+                await asyncio.wait_for(task, timeout=10)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
                 pass
             except Exception:  # pragma: no cover - defensive logging
                 logger.debug(
@@ -2831,6 +2934,55 @@ class SlackAdapter(BasePlatformAdapter):
         )
         event_thread_ts = event.get("thread_ts")
         is_thread_reply = bool(event_thread_ts and event_thread_ts != ts)
+
+        # HERMES-PATCH 05: slack-decision-thread-hook
+        # Slack-thread-per-decision round-trip. If this is a reply in a thread that
+        # the SLA sweep anchored as a decision thread for a ClickUp task, convert
+        # the reply into an OPERATOR ClickUp comment (the signal the existing resume
+        # loop consumes) and SUPPRESS the generic agent wake for this message.
+        # Wrapped so any failure falls through to normal handling — never breaks the
+        # gateway. Runs BEFORE channel gating / agent dispatch.
+        if is_thread_reply:
+            try:
+                # Skip our own / bot posts (don't act on Hermes's own thread
+                # messages — the top-of-handler bot filter covers bot_id/subtype;
+                # this also guards the bot's own user id).
+                _is_own = bool(
+                    (event.get("bot_id"))
+                    or (event.get("subtype") == "bot_message")
+                    or (user_id and bot_uid and user_id == bot_uid)
+                )
+                if not _is_own:
+                    _dtid = _match_decision_thread(channel_id, event_thread_ts)
+                    if _dtid:
+                        _reply = (text or original_text or "").strip()
+                        if _reply:
+                            _ok = await _post_clickup_operator_comment(_dtid, _reply)
+                            if _ok:
+                                try:
+                                    await self.send(
+                                        chat_id=channel_id,
+                                        content=(
+                                            "Got it — recorded your decision on the "
+                                            "task; Hermes will apply it on the next poll."
+                                        ),
+                                        metadata={"thread_ts": event_thread_ts},
+                                    )
+                                except Exception:  # ack is best-effort
+                                    pass
+                                logger.info(
+                                    "[Slack][decision-hook] recorded operator reply on task %s "
+                                    "(thread %s); suppressing agent wake", _dtid, event_thread_ts,
+                                )
+                                # Suppress the generic agent run for this message.
+                                return
+                            else:
+                                logger.warning(
+                                    "[Slack][decision-hook] failed to record reply on task %s; "
+                                    "falling through to normal handling", _dtid,
+                                )
+            except Exception as e:  # pragma: no cover - defensive
+                logger.warning("[Slack][decision-hook] error (falling through): %s", e)
 
         if not is_one_to_one_dm and bot_uid:
             # Check allowed channels — if set, only respond in these channels (whitelist)
