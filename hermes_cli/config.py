@@ -2894,6 +2894,19 @@ DEFAULT_CONFIG = {
         # works as a manual override and wins if set explicitly.
         "platform_connect_timeout": 30,
 
+        # Absolute path to a shell script the generated launchd plist should
+        # invoke instead of the bare `python -m hermes_cli.main gateway run
+        # --replace` entrypoint — e.g. a wrapper that resolves secrets (1Password
+        # SDK, etc.) into the environment before exec'ing the real launch
+        # command. Opt-in and config-file-driven (not env-var-driven) so it
+        # survives every `hermes update --gateway` / `hermes gateway install`
+        # plist regeneration regardless of the ambient shell env the CLI runs
+        # under. Empty/unset (default): plist invokes the bare entrypoint,
+        # unchanged from historical behavior. Ignored if the path doesn't
+        # exist at generation time (falls back to the bare entrypoint rather
+        # than installing a plist that points at nothing).
+        "launchd_secrets_wrapper": "",
+
         # Scale-to-zero idle detection (Phase 0). The gateway watches for idle
         # and, when an instance is opted in via the NAS "Labs" toggle (carried as
         # the HERMES_SCALE_TO_ZERO env stamp) AND messaging is relay-only/absent

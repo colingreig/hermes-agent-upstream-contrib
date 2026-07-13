@@ -489,6 +489,44 @@ class TestGeneratedSystemdUnits:
         assert str(local_bin) in plist
         assert str(profile_node_bin) not in plist
 
+    def test_launchd_plist_uses_bare_entrypoint_when_wrapper_unset(self, monkeypatch):
+        monkeypatch.setattr(gateway_cli, "read_raw_config", lambda: {})
+
+        plist = gateway_cli.generate_launchd_plist()
+
+        assert "hermes_cli.main" in plist
+        assert "gateway_secrets_wrap" not in plist
+
+    def test_launchd_plist_uses_configured_wrapper_when_present(self, tmp_path, monkeypatch):
+        wrapper = tmp_path / "gateway_secrets_wrap.sh"
+        wrapper.write_text("#!/bin/bash\nexec true\n")
+        monkeypatch.setattr(
+            gateway_cli,
+            "read_raw_config",
+            lambda: {"gateway": {"launchd_secrets_wrapper": str(wrapper)}},
+        )
+
+        plist = gateway_cli.generate_launchd_plist()
+
+        assert f"<string>{wrapper}</string>" in plist
+        assert "<string>/bin/bash</string>" in plist
+        # The wrapper owns exec'ing the real launch command — plist must not
+        # also pass it `gateway run --replace` args meant for the bare path.
+        assert "hermes_cli.main" not in plist
+
+    def test_launchd_plist_falls_back_when_configured_wrapper_missing(self, tmp_path, monkeypatch):
+        missing_wrapper = tmp_path / "does-not-exist.sh"
+        monkeypatch.setattr(
+            gateway_cli,
+            "read_raw_config",
+            lambda: {"gateway": {"launchd_secrets_wrapper": str(missing_wrapper)}},
+        )
+
+        plist = gateway_cli.generate_launchd_plist()
+
+        assert "hermes_cli.main" in plist
+        assert str(missing_wrapper) not in plist
+
     def test_user_unit_includes_wsl_windows_interop_paths(self, monkeypatch):
         monkeypatch.setattr(gateway_cli, "is_wsl", lambda: True)
         monkeypatch.setenv(
