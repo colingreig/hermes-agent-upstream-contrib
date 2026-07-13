@@ -1897,7 +1897,38 @@ def _get_script_timeout() -> int:
     return _DEFAULT_SCRIPT_TIMEOUT
 
 
-def _run_job_script(script_path: str) -> tuple[bool, str]:
+def _normalize_required_environment_variables(value: Any) -> tuple[str, ...]:
+    """Return valid, unique env names from cron job declaration metadata.
+
+    ``required_environment_variables`` follows the skill-frontmatter shape:
+    callers may provide plain names or mappings with a ``name`` key. Invalid
+    hand-edited job data is ignored so a malformed declaration cannot prevent
+    an otherwise healthy cron script from running.
+    """
+    if isinstance(value, str):
+        entries = [value]
+    elif isinstance(value, (list, tuple)):
+        entries = value
+    else:
+        return ()
+
+    names: list[str] = []
+    for entry in entries:
+        raw_name = entry.get("name") if isinstance(entry, dict) else entry
+        if not isinstance(raw_name, str):
+            continue
+        name = raw_name.strip()
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+            continue
+        if name not in names:
+            names.append(name)
+    return tuple(names)
+
+
+def _run_job_script(
+    script_path: str,
+    required_environment_variables: Any = None,
+) -> tuple[bool, str]:
     """Execute a cron job's data-collection script and capture its output.
 
     Scripts must reside within HERMES_HOME/scripts/.  Both relative and
@@ -1925,10 +1956,22 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
     third-party integration tokens (e.g. ``CLICKUP_API_TOKEN``), which that
     heuristic would otherwise strip.
 
+    When ``HERMES_LAZY_SECRET_RESOLUTION`` is enabled, names explicitly
+    declared by the job in ``required_environment_variables`` are resolved
+    through the active profile secret scope and injected only into this child
+    environment. An active scope is authoritative over inherited boot env; a
+    multiplexed scoped miss therefore stays absent, while a single-profile
+    scoped miss may reach the flag-gated lazy resolver. Resolution is
+    fail-open: an unavailable resolver or individual missing secret leaves the
+    script runnable. With the flag disabled this path is not imported or
+    evaluated, preserving the legacy subprocess environment byte-for-byte.
+
     Args:
         script_path: Path to the script.  Relative paths are resolved
             against HERMES_HOME/scripts/.  Absolute and ~-prefixed paths
             are also validated to ensure they stay within the scripts dir.
+        required_environment_variables: Optional job-declared environment
+            variable names (plain strings or mappings with a ``name`` key).
 
     Returns:
         (success, output) — on failure *output* contains the error message so the
@@ -1986,7 +2029,67 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
         argv = [sys.executable, str(path)]
 
     try:
-        from tools.environments.local import _sanitize_subprocess_env
+        from tools.environments.local import (
+            _HERMES_PROVIDER_ENV_BLOCKLIST,
+            _is_hermes_internal_secret,
+            _sanitize_subprocess_env,
+        )
+
+        subprocess_env = _sanitize_subprocess_env(
+            os.environ.copy(), apply_secret_shape_gate=False
+        )
+        injected_secret_values: list[str] = []
+
+        # Resolve only operator-declared names, only behind the rollout flag,
+        # and only into the child env dict. Ambient values keep precedence.
+        # The unconditional sanitizer blocks remain load-bearing: a job
+        # declaration must not turn into a bypass for model-provider or
+        # Hermes-internal credentials.
+        if os.getenv("HERMES_LAZY_SECRET_RESOLUTION", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        ):
+            try:
+                from agent.secret_scope import (
+                    current_secret_scope as _current_secret_scope,
+                    get_secret as _get_secret,
+                )
+
+                scope_is_active = _current_secret_scope() is not None
+
+                for name in _normalize_required_environment_variables(
+                    required_environment_variables
+                ):
+                    if (
+                        name in _HERMES_PROVIDER_ENV_BLOCKLIST
+                        or _is_hermes_internal_secret(name)
+                    ):
+                        continue
+                    if scope_is_active:
+                        # The profile scope is authoritative. Never let a
+                        # boot-resident default-profile value beat the routed
+                        # profile's value (or survive an authoritative miss).
+                        subprocess_env.pop(name, None)
+                    elif name in subprocess_env:
+                        # Unscoped/single-process legacy path: ambient env
+                        # keeps its historical precedence over lazy lookup.
+                        continue
+                    try:
+                        # Route through the active profile scope. A scoped
+                        # multiplex miss stays absent instead of consulting
+                        # the process-global 1Password manifest; a
+                        # single-profile scoped miss may use the lazy tier.
+                        value = _get_secret(name)
+                    except Exception:
+                        value = None
+                    if isinstance(value, str) and value:
+                        subprocess_env[name] = value
+                        injected_secret_values.append(value)
+            except Exception:
+                # Fail open: resolver import/setup failures must not turn a
+                # previously runnable cron script into a scheduler failure.
+                pass
 
         popen_kwargs = {"creationflags": windows_hide_flags()} if sys.platform == "win32" else {}
         result = subprocess.run(
@@ -1995,11 +2098,20 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
             text=True,
             timeout=script_timeout,
             cwd=str(path.parent),
-            env=_sanitize_subprocess_env(os.environ.copy(), apply_secret_shape_gate=False),
+            env=subprocess_env,
             **popen_kwargs,
         )
         stdout = (result.stdout or "").strip()
         stderr = (result.stderr or "").strip()
+
+        # Scoped/lazy values live only in the child env, so the parent
+        # process's generic redactor may not know their exact values. Remove
+        # every value injected by this call before generic pattern-based
+        # redaction and before any output can reach logs, saved cron output,
+        # or delivery.
+        for secret_value in injected_secret_values:
+            stdout = stdout.replace(secret_value, "[REDACTED]")
+            stderr = stderr.replace(secret_value, "[REDACTED]")
 
         # Redact secrets from both stdout and stderr before any return path.
         try:
@@ -2080,7 +2192,12 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
         if prerun_script is not None:
             success, script_output = prerun_script
         else:
-            success, script_output = _run_job_script(script_path)
+            success, script_output = _run_job_script(
+                script_path,
+                required_environment_variables=job.get(
+                    "required_environment_variables"
+                ),
+            )
         if success:
             if script_output:
                 prompt = (
@@ -2420,7 +2537,12 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 _prior_cwd = None
 
         try:
-            ok, output = _run_job_script(script_path)
+            ok, output = _run_job_script(
+                script_path,
+                required_environment_variables=job.get(
+                    "required_environment_variables"
+                ),
+            )
         finally:
             if _prior_cwd is not None:
                 try:
@@ -2509,7 +2631,12 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     prerun_script = None
     script_path = job.get("script")
     if script_path:
-        prerun_script = _run_job_script(script_path)
+        prerun_script = _run_job_script(
+            script_path,
+            required_environment_variables=job.get(
+                "required_environment_variables"
+            ),
+        )
         _ran_ok, _script_output = prerun_script
         if _ran_ok and not _parse_wake_gate(_script_output):
             logger.info(
