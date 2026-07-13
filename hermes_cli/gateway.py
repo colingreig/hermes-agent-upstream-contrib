@@ -17,6 +17,7 @@ import textwrap
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 
@@ -3792,6 +3793,31 @@ def _launchd_fallback_to_detached(reason: str, *, exit_on_failure: bool = True) 
     return False
 
 
+def _launchd_secrets_wrapper() -> Optional[str]:
+    """Path to the optional secrets-bootstrap wrapper for the launchd plist.
+
+    Config-driven (gateway.launchd_secrets_wrapper in config.yaml), not
+    env-var-driven — a `hermes update --gateway` / `hermes gateway install`
+    plist regen runs in whatever ambient shell happens to invoke it, which is
+    exactly the class of env drift this wrapper exists to route around, so
+    the setting must survive independent of that shell's env. Returns None
+    (falls back to the bare entrypoint) if unset or the path doesn't exist,
+    so a stale/mistyped config value can never install a plist pointing at
+    nothing.
+    """
+    try:
+        raw = read_raw_config()
+    except Exception:
+        return None
+    wrapper = (raw.get("gateway") or {}).get("launchd_secrets_wrapper") or ""
+    wrapper = str(wrapper).strip()
+    if not wrapper:
+        return None
+    if not Path(wrapper).is_file():
+        return None
+    return wrapper
+
+
 def generate_launchd_plist() -> str:
     python_path = get_python_path()
     # Stable cwd anchor — never the volatile source checkout. See
@@ -3831,21 +3857,33 @@ def generate_launchd_plist() -> str:
     )
 
     # Build ProgramArguments array, including --profile when using a named profile
-    prog_args = [
-        f"<string>{python_path}</string>",
-        "<string>-m</string>",
-        "<string>hermes_cli.main</string>",
-    ]
-    if profile_arg:
-        for part in profile_arg.split():
-            prog_args.append(f"<string>{part}</string>")
-    prog_args.extend(
-        [
-            "<string>gateway</string>",
-            "<string>run</string>",
-            "<string>--replace</string>",
+    wrapper = _launchd_secrets_wrapper()
+    if wrapper:
+        # config-driven override (see gateway.launchd_secrets_wrapper): exec the
+        # wrapper instead of the bare python entrypoint. The wrapper is
+        # responsible for resolving secrets into the env and then exec'ing the
+        # real launch command itself — it is NOT passed --profile/gateway/run
+        # args here, since those belong to whatever the wrapper ultimately execs.
+        prog_args = [
+            "<string>/bin/bash</string>",
+            f"<string>{wrapper}</string>",
         ]
-    )
+    else:
+        prog_args = [
+            f"<string>{python_path}</string>",
+            "<string>-m</string>",
+            "<string>hermes_cli.main</string>",
+        ]
+        if profile_arg:
+            for part in profile_arg.split():
+                prog_args.append(f"<string>{part}</string>")
+        prog_args.extend(
+            [
+                "<string>gateway</string>",
+                "<string>run</string>",
+                "<string>--replace</string>",
+            ]
+        )
     prog_args_xml = "\n        ".join(prog_args)
 
     return f"""<?xml version="1.0" encoding="UTF-8"?>
