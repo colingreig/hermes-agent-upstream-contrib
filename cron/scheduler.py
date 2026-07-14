@@ -431,6 +431,12 @@ def _get_sequential_pool() -> concurrent.futures.ThreadPoolExecutor:
     return _sequential_pool
 
 
+def _is_submit_shutdown_error(exc: BaseException) -> bool:
+    """Return True when a thread-pool submit races interpreter / pool shutdown."""
+    text = str(exc)
+    return "cannot schedule new futures after" in text or "interpreter shutdown" in text
+
+
 def _shutdown_parallel_pool() -> None:
     """Shut down the persistent pools on process exit."""
     global _parallel_pool, _parallel_pool_max_workers, _sequential_pool
@@ -3200,7 +3206,31 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         # env passthrough registrations) when the cron run hops into the worker
         # thread used for inactivity timeout monitoring.
         _cron_context = contextvars.copy_context()
-        _cron_future = _cron_pool.submit(_cron_context.run, agent.run_conversation, prompt)
+        try:
+            _cron_future = _cron_pool.submit(_cron_context.run, agent.run_conversation, prompt)
+        except RuntimeError as exc:
+            if _is_submit_shutdown_error(exc):
+                logger.warning(
+                    "Job '%s' skipped because the cron executor was shutting down: %s",
+                    job_name,
+                    exc,
+                )
+                output = f"""# Cron Job: {job_name}
+
+**Job ID:** {job_id}
+**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}
+**Schedule:** {job.get('schedule_display', 'N/A')}
+
+## Prompt
+
+{prompt}
+
+## Note
+
+Interpreter shutting down while scheduling the cron worker; treated as {SILENT_MARKER}.
+"""
+                return True, output, SILENT_MARKER, None
+            raise
         _inactivity_timeout = False
         try:
             if _cron_inactivity_limit is None:
@@ -3276,19 +3306,23 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         # builds the proper failure tuple. (issue #17855)
         turn_exit_reason = str(result.get("turn_exit_reason") or "")
         final_response_text = (result.get("final_response") or "").strip()
+        explainer_text = ""
+        if turn_exit_reason:
+            try:
+                explainer_text = AIAgent._format_turn_completion_explanation(turn_exit_reason).strip()
+            except Exception:
+                explainer_text = ""
         # HERMES-PATCH 03: an iteration/budget stop that still produced a
         # substantive report is PARTIAL work, not a failure. Upstream already
-        # spares "max_iterations_reached" stops with any non-empty response; this
-        # also covers a directly-surfaced "budget_exhausted" exit (finalize_turn
-        # normally rewrites it to max_iterations_reached first) and applies a
-        # >=300-char floor so the short turn-completion explainer boilerplate
-        # finalize_turn injects when the post-budget summary call itself fails is
-        # still treated as a real failure (no work record), not a partial.
+        # spares "max_iterations_reached" stops with any non-empty response; we
+        # only keep the exact turn-completion explainer out of this path so a
+        # real fallback summary is not rejected just because it is short.
         max_iteration_summary = (
             result.get("failed") is not True
             and result.get("completed") is False
             and turn_exit_reason.startswith(("max_iterations_reached(", "budget_exhausted"))
-            and len(final_response_text) >= 300
+            and final_response_text
+            and final_response_text != explainer_text
         )
         if result.get("failed") is True or (result.get("completed") is False and not max_iteration_summary):
             _err_text = (
@@ -3302,13 +3336,6 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 "Job '%s' hit the iteration/budget limit (%s) but produced a substantive "
                 "report — recording as PARTIAL success (handoff brief)",
                 job_name, turn_exit_reason,
-            )
-            # Mark the delivered text so a budget-stopped run isn't mistaken for a
-            # completed one in the dashboard / downstream consumers.
-            result["final_response"] = (
-                f"⚠️ PARTIAL — iteration budget hit ({turn_exit_reason}). "
-                "Work may be incomplete; treat the report below as a handoff brief.\n\n"
-                + final_response_text
             )
 
         final_response = result.get("final_response", "") or ""
@@ -3673,7 +3700,19 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
                     with _running_lock:
                         _running_job_ids.discard(j["id"])
 
-            return pool.submit(_run_and_release)
+            try:
+                return pool.submit(_run_and_release)
+            except RuntimeError as exc:
+                with _running_lock:
+                    _running_job_ids.discard(job_id)
+                if _is_submit_shutdown_error(exc):
+                    logger.debug(
+                        "Cron job '%s' skipped because the executor was shutting down: %s",
+                        job.get("name", job_id),
+                        exc,
+                    )
+                    return None
+                raise
 
         # Sequential pass for env-mutating (workdir) jobs.
         # Queued to a persistent single-thread pool so they run one at a time

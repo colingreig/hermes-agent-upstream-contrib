@@ -1002,6 +1002,56 @@ class TestRunJobSessionPersistence:
         fake_db.close.assert_called_once()
         mock_agent.close.assert_called_once()
 
+    def test_run_job_skips_cleanly_when_python_is_shutting_down(self, tmp_path):
+        """Interpreter-shutdown submit errors should not mark the cron job failed."""
+        job = {
+            "id": "test-job",
+            "name": "test",
+            "prompt": "hello",
+        }
+        fake_db = MagicMock()
+
+        class ShutdownExecutor:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def submit(self, *args, **kwargs):
+                raise RuntimeError("cannot schedule new futures after interpreter shutdown")
+
+            def shutdown(self, *args, **kwargs):
+                pass
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("cron.scheduler._parallel_pool", None), \
+             patch("cron.scheduler._parallel_pool_max_workers", None), \
+             patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+             patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "test-key",
+                     "base_url": "https://example.invalid/v1",
+                     "provider": "openrouter",
+                     "api_mode": "chat_completions",
+                 },
+             ), \
+             patch("run_agent.AIAgent") as mock_agent_cls, \
+             patch("cron.scheduler.concurrent.futures.ThreadPoolExecutor", ShutdownExecutor):
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent_cls.return_value = mock_agent
+            success, output, final_response, error = run_job(job)
+
+        assert success is True
+        assert error is None
+        assert final_response == "[SILENT]"
+        assert "shutting down" in output.lower()
+        fake_db.end_session.assert_called_once()
+        fake_db.close.assert_called_once()
+        mock_agent.close.assert_called_once()
+
     def test_run_job_suppresses_empty_turn_explainer(self, tmp_path):
         """An empty model turn becomes the '⚠️ No reply…' explainer (#34452).
         For cron, that abnormal-empty explainer must be treated as empty so it
@@ -2724,6 +2774,50 @@ class TestOneShotDispatchClaim:
             tick(verbose=False)
         run_mock.assert_not_called()
         deliver_mock.assert_not_called()
+        mark_mock.assert_not_called()
+
+
+class TestTickShutdownRace:
+    """Tick should swallow executor-shutdown submit races instead of failing."""
+
+    def test_tick_skips_cleanly_when_parallel_submit_races_shutdown(self, tmp_path):
+        from cron.scheduler import tick
+
+        job = {
+            "id": "race-job",
+            "name": "race",
+            "prompt": "do the thing",
+            "schedule": "every 1h",
+            "enabled": True,
+            "next_run_at": "2020-01-01T00:00:00",
+            "deliver": "local",
+        }
+
+        class ShutdownExecutor:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def submit(self, *args, **kwargs):
+                raise RuntimeError("cannot schedule new futures after interpreter shutdown")
+
+            def shutdown(self, *args, **kwargs):
+                pass
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler.get_due_jobs", return_value=[job]), \
+             patch("cron.scheduler.advance_next_run") as advance_mock, \
+             patch("cron.scheduler.run_job") as run_mock, \
+             patch("cron.scheduler.save_job_output"), \
+             patch("cron.scheduler._deliver_result"), \
+             patch("cron.scheduler.mark_job_run") as mark_mock, \
+             patch("cron.scheduler._parallel_pool", None), \
+             patch("cron.scheduler._parallel_pool_max_workers", None), \
+             patch("cron.scheduler._get_parallel_pool", return_value=ShutdownExecutor()):
+            result = tick(verbose=False)
+
+        assert result == 0
+        advance_mock.assert_called_once_with("race-job")
+        run_mock.assert_not_called()
         mark_mock.assert_not_called()
 
 

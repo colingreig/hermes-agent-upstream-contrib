@@ -37,6 +37,9 @@ from utils import atomic_json_write
 
 logger = logging.getLogger(__name__)
 
+_CURATOR_LLM_ALERT_KEYS: Set[str] = set()
+_CURATOR_LLM_ALERT_LOCK = threading.Lock()
+
 
 def _strip_aux_credential(value: Any) -> Optional[str]:
     if value is None:
@@ -1662,6 +1665,7 @@ def run_curator_review(
                 else:
                     prompt = f"{CURATOR_REVIEW_PROMPT}{builtins_note}\n\n{candidate_list}"
                 llm_meta = _run_llm_review(prompt)
+                _alert_curator_fallback_exhaustion(llm_meta)
                 final_summary = (
                     f"{prefix}{auto_summary}; llm: {llm_meta.get('summary', 'no change')}"
                 )
@@ -1676,6 +1680,7 @@ def run_curator_review(
                 "tool_calls": [],
                 "error": str(e),
             }
+            _alert_curator_fallback_exhaustion(llm_meta)
 
         # Append the rename map (`old-name → umbrella`) to the user-visible
         # summary so people don't have to dig into REPORT.md to find out where
@@ -1978,6 +1983,51 @@ def _run_llm_review(prompt: str) -> Dict[str, Any]:
             except Exception:
                 pass
     return result_meta
+
+
+def _alert_curator_fallback_exhaustion(llm_meta: Dict[str, Any]) -> None:
+    """Send a single loud alert when the curator's LLM fork is exhausted."""
+    error_text = str(llm_meta.get("error") or "").strip()
+    if not error_text:
+        return
+
+    error_lc = error_text.lower()
+    if not any(
+        needle in error_lc
+        for needle in (
+            "fallback_providers",
+            "all fallbacks exhausted",
+            "fallback chain exhausted",
+            "no llm provider configured",
+            "no api key",
+        )
+    ):
+        return
+
+    provider = str(llm_meta.get("provider") or "").strip() or "unknown"
+    model = str(llm_meta.get("model") or "").strip() or "unknown"
+    dedupe_key = f"{provider}|{model}|{error_text[:240]}"
+    with _CURATOR_LLM_ALERT_LOCK:
+        if dedupe_key in _CURATOR_LLM_ALERT_KEYS:
+            return
+        _CURATOR_LLM_ALERT_KEYS.add(dedupe_key)
+
+    try:
+        from tools.send_message_tool import _sanitize_error_text, send_message_tool
+
+        send_message_tool({
+            "action": "send",
+            "target": "slack:D0BA2PM9CFM",
+            "message": (
+                "⚠️ Hermes curator LLM fork failed after fallback_providers were exhausted\n\n"
+                f"provider: {provider}\n"
+                f"model: {model}\n"
+                f"error: {_sanitize_error_text(error_text)}\n"
+                f"summary: {llm_meta.get('summary') or 'n/a'}"
+            ),
+        })
+    except Exception as exc:
+        logger.debug("Curator exhaustion alert delivery failed: %s", exc, exc_info=True)
 
 
 # ---------------------------------------------------------------------------

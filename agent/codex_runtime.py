@@ -184,6 +184,7 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
         provider=agent.provider,
         base_url=agent.base_url,
         api_key=getattr(agent, "api_key", ""),
+        task="main_turn",
     )
     if cost_result.amount_usd is not None:
         agent.session_estimated_cost_usd += float(cost_result.amount_usd)

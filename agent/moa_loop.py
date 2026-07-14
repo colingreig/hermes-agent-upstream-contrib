@@ -301,6 +301,7 @@ def _run_reference(
                 provider=runtime.get("provider"),
                 base_url=runtime.get("base_url"),
                 api_key=runtime.get("api_key"),
+                task="moa_advisor",
             )
             cost_usd = cost.amount_usd
             cost_status = cost.status

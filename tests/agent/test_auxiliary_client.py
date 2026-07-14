@@ -74,9 +74,11 @@ def _clean_env(monkeypatch):
     import agent.auxiliary_client as _aux_mod
     _aux_mod._aux_unhealthy_until.clear()
     _aux_mod._aux_unhealthy_logged_at.clear()
+    _aux_mod._VISION_EXHAUSTION_ALERT_KEYS.clear()
     yield
     _aux_mod._aux_unhealthy_until.clear()
     _aux_mod._aux_unhealthy_logged_at.clear()
+    _aux_mod._VISION_EXHAUSTION_ALERT_KEYS.clear()
 
 
 @pytest.fixture
@@ -2308,6 +2310,13 @@ class TestAuxiliaryFallbackLayering:
 
         primary_client = MagicMock()
         primary_client.chat.completions.create.side_effect = self._make_payment_err()
+        sent = []
+
+        def fake_send(args, **_kw):
+            sent.append(args)
+            return json.dumps({"success": True})
+
+        monkeypatch.setattr("tools.send_message_tool.send_message_tool", fake_send)
 
         with patch("agent.auxiliary_client._get_cached_client",
                    return_value=(primary_client, "glm-4v-flash")), \
@@ -2327,6 +2336,8 @@ class TestAuxiliaryFallbackLayering:
         assert any(
             "all fallbacks exhausted" in r.message for r in caplog.records
         ), f"Expected exhaustion warning, got: {[r.message for r in caplog.records]}"
+        assert len(sent) == 1
+        assert sent[0]["target"] == "slack:D0BA2PM9CFM"
 
     def test_explicit_provider_no_client_uses_configured_chain_before_error(self, monkeypatch):
         """Missing primary credentials should still honor auxiliary fallback_chain."""
@@ -4638,6 +4649,24 @@ class TestAuxUnhealthyCache:
         )
         _mark_provider_unhealthy("codex")
         assert _is_provider_unhealthy("openai-codex") is True
+
+    def test_resolve_auto_skips_direct_gemini_without_allowlist(self):
+        """Direct Gemini is denied for auxiliary tasks unless explicitly approved."""
+        from agent.auxiliary_client import _resolve_auto
+        nous_client = MagicMock()
+        with patch("agent.auxiliary_client._read_main_provider", return_value="gemini"), \
+             patch("agent.auxiliary_client._read_main_model", return_value="google/gemini-3-flash-preview"), \
+             patch("agent.auxiliary_client._direct_gemini_task_allowlist", return_value=set()), \
+             patch("agent.auxiliary_client.resolve_provider_client") as step1, \
+             patch("agent.auxiliary_client._try_openrouter", return_value=(None, None)) as or_try, \
+             patch("agent.auxiliary_client._try_nous", return_value=(nous_client, "nous-model")), \
+             patch("agent.auxiliary_client._try_custom_endpoint", return_value=(None, None)), \
+             patch("agent.auxiliary_client._resolve_api_key_provider", return_value=(None, None)):
+            client, model = _resolve_auto(task="vision")
+        step1.assert_not_called()
+        or_try.assert_called_once()
+        assert client is nous_client
+        assert model == "nous-model"
 
     def test_resolve_auto_skips_unhealthy_step2(self):
         """_resolve_auto Step-2 chain skips unhealthy providers."""

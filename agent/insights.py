@@ -27,6 +27,7 @@ from agent.usage_pricing import (
     estimate_usage_cost,
     format_duration_compact,
     has_known_pricing,
+    _usage_ledger_config,
 )
 
 
@@ -72,8 +73,123 @@ def _estimate_cost(
 
 
 
+def _read_usage_ledger(days: int) -> List[Dict[str, Any]]:
+    """Read opt-in local usage ledger records within the lookback window."""
+    enabled, path = _usage_ledger_config()
+    if not enabled or not path.exists():
+        return []
+    cutoff = time.time() - (days * 86400)
+    records: List[Dict[str, Any]] = []
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                raw = line.strip()
+                if not raw:
+                    continue
+                try:
+                    record = json.loads(raw)
+                except Exception:
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                ts = record.get("ts")
+                if ts is None:
+                    continue
+                try:
+                    ts_value = float(ts)
+                except (TypeError, ValueError):
+                    continue
+                if ts_value < cutoff:
+                    continue
+                records.append(record)
+    except Exception:
+        return []
+    return records
+
+
+def _compute_usage_ledger(records: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Aggregate the opt-in usage ledger without exposing prompts or creds."""
+    if not records:
+        return {
+            "enabled": False,
+            "summary": {"entries": 0},
+            "by_provider": [],
+            "by_model": [],
+            "by_task": [],
+        }
+
+    total_input = total_output = total_cache_read = total_cache_write = total_reasoning = 0
+    total_cost = 0.0
+    provider_data = defaultdict(lambda: {"entries": 0, "input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0, "cache_write_tokens": 0, "reasoning_tokens": 0, "cost": 0.0})
+    model_data = defaultdict(lambda: {"entries": 0, "input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0, "cache_write_tokens": 0, "reasoning_tokens": 0, "cost": 0.0})
+    task_data = defaultdict(lambda: {"entries": 0, "input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0, "cache_write_tokens": 0, "reasoning_tokens": 0, "cost": 0.0})
+
+    for rec in records:
+        provider = str(rec.get("provider") or "unknown").strip() or "unknown"
+        model = str(rec.get("model") or "unknown").strip() or "unknown"
+        task = str(rec.get("task") or "unknown").strip() or "unknown"
+        usage = CanonicalUsage(
+            input_tokens=int(rec.get("input_tokens") or 0),
+            output_tokens=int(rec.get("output_tokens") or 0),
+            cache_read_tokens=int(rec.get("cache_read_tokens") or 0),
+            cache_write_tokens=int(rec.get("cache_write_tokens") or 0),
+            reasoning_tokens=int(rec.get("reasoning_tokens") or 0),
+            request_count=int(rec.get("request_count") or 1),
+            task=task if task != "unknown" else None,
+        )
+        cost, _ = _estimate_cost(
+            model,
+            usage.input_tokens,
+            usage.output_tokens,
+            cache_read_tokens=usage.cache_read_tokens,
+            cache_write_tokens=usage.cache_write_tokens,
+            provider=provider,
+        )
+        total_input += usage.input_tokens
+        total_output += usage.output_tokens
+        total_cache_read += usage.cache_read_tokens
+        total_cache_write += usage.cache_write_tokens
+        total_reasoning += usage.reasoning_tokens
+        total_cost += cost
+
+        for bucket, key in ((provider_data, provider), (model_data, model), (task_data, task)):
+            entry = bucket[key]
+            entry["entries"] += 1
+            entry["input_tokens"] += usage.input_tokens
+            entry["output_tokens"] += usage.output_tokens
+            entry["cache_read_tokens"] += usage.cache_read_tokens
+            entry["cache_write_tokens"] += usage.cache_write_tokens
+            entry["reasoning_tokens"] += usage.reasoning_tokens
+            entry["cost"] += cost
+
+    def _sorted_rows(bucket: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
+        rows = []
+        for key, data in bucket.items():
+            rows.append({"name": key, **data, "total_tokens": data["input_tokens"] + data["output_tokens"] + data["cache_read_tokens"] + data["cache_write_tokens"]})
+        rows.sort(key=lambda x: (x["cost"], x["total_tokens"], x["entries"]), reverse=True)
+        return rows
+
+    return {
+        "enabled": True,
+        "summary": {
+            "entries": len(records),
+            "input_tokens": total_input,
+            "output_tokens": total_output,
+            "cache_read_tokens": total_cache_read,
+            "cache_write_tokens": total_cache_write,
+            "reasoning_tokens": total_reasoning,
+            "total_tokens": total_input + total_output + total_cache_read + total_cache_write,
+            "estimated_cost": total_cost,
+        },
+        "by_provider": _sorted_rows(provider_data),
+        "by_model": _sorted_rows(model_data),
+        "by_task": _sorted_rows(task_data),
+    }
+
+
 
 def _bar_chart(values: List[int], max_width: int = 20) -> List[str]:
+
     """Create simple horizontal bar chart strings from values."""
     peak = max(values) if values else 1
     if peak == 0:
@@ -117,6 +233,7 @@ class InsightsEngine:
         tool_usage = self._get_tool_usage(cutoff, source)
         skill_usage = self._get_skill_usage(cutoff, source)
         message_stats = self._get_message_stats(cutoff, source)
+        usage_ledger = _compute_usage_ledger(_read_usage_ledger(days))
 
         if not sessions:
             return {
@@ -138,6 +255,7 @@ class InsightsEngine:
                 },
                 "activity": {},
                 "top_sessions": [],
+                "usage_ledger": usage_ledger,
             }
 
         # Compute insights
@@ -161,6 +279,7 @@ class InsightsEngine:
             "skills": skills,
             "activity": activity,
             "top_sessions": top_sessions,
+            "usage_ledger": usage_ledger,
         }
 
     # =========================================================================
@@ -716,10 +835,48 @@ class InsightsEngine:
 
     def format_terminal(self, report: Dict) -> str:
         """Format the insights report for terminal display (CLI)."""
-        if report.get("empty"):
+        ledger = report.get("usage_ledger", {}) or {}
+        ledger_summary = ledger.get("summary", {}) or {}
+        if report.get("empty") and not ledger_summary.get("entries"):
             days = report.get("days", 30)
             src = f" (source: {report['source_filter']})" if report.get("source_filter") else ""
             return f"  No sessions found in the last {days} days{src}."
+        if report.get("empty") and ledger_summary.get("entries"):
+            days = report.get("days", 30)
+            src_filter = report.get("source_filter")
+            lines = []
+            lines.append("")
+            lines.append("  ╔══════════════════════════════════════════════════════════╗")
+            lines.append("  ║                    📊 Hermes Insights                    ║")
+            period_label = f"Last {days} days"
+            if src_filter:
+                period_label += f" ({src_filter})"
+            padding = 58 - len(period_label) - 2
+            left_pad = padding // 2
+            right_pad = padding - left_pad
+            lines.append(f"  ║{' ' * left_pad} {period_label} {' ' * right_pad}║")
+            lines.append("  ╚══════════════════════════════════════════════════════════╝")
+            lines.append("")
+            lines.append("  No sessions found, but the local usage ledger has entries.")
+            lines.append("")
+            lines.append("  🧾 Local Usage Ledger")
+            lines.append("  " + "─" * 56)
+            lines.append(
+                f"  Entries:           {ledger_summary.get('entries', 0):<12,}  Tokens:          {ledger_summary.get('total_tokens', 0):,}"
+            )
+            lines.append(
+                f"  Input tokens:      {ledger_summary.get('input_tokens', 0):<12,}  Output tokens:   {ledger_summary.get('output_tokens', 0):,}"
+            )
+            lines.append(
+                f"  Cache read/write:  {ledger_summary.get('cache_read_tokens', 0):<12,}/{ledger_summary.get('cache_write_tokens', 0):<12,}  Reasoning: {ledger_summary.get('reasoning_tokens', 0):,}"
+            )
+            lines.append(f"  Estimated cost:    ~${ledger_summary.get('estimated_cost', 0.0):.2f}")
+            if ledger.get("by_task"):
+                lines.append("")
+                lines.append("  Top tasks:")
+                for row in ledger["by_task"][:5]:
+                    lines.append(f"    {row['name'][:24]:<24} {row['entries']:>4} runs  {row['total_tokens']:>10,} tokens")
+            return "\n".join(lines)
 
         lines = []
         o = report["overview"]
@@ -758,6 +915,24 @@ class InsightsEngine:
             lines.append(f"  Active time:       ~{format_duration_compact(o['total_hours'] * 3600):<11}  Avg session:     ~{format_duration_compact(o['avg_session_duration'])}")
         lines.append(f"  Avg msgs/session:  {o['avg_messages_per_session']:.1f}")
         lines.append("")
+
+        # Local usage ledger (opt-in)
+        if ledger_summary.get("entries"):
+            lines.append("  🧾 Local Usage Ledger")
+            lines.append("  " + "─" * 56)
+            lines.append(
+                f"  Entries:          {ledger_summary.get('entries', 0):<12,}  Tokens:         {ledger_summary.get('total_tokens', 0):,}"
+            )
+            lines.append(
+                f"  Input/Output:     {ledger_summary.get('input_tokens', 0):<12,}/{ledger_summary.get('output_tokens', 0):<12,}  Reasoning: {ledger_summary.get('reasoning_tokens', 0):,}"
+            )
+            lines.append(f"  Estimated cost:   ~${ledger_summary.get('estimated_cost', 0.0):.2f}")
+            if ledger.get("by_task"):
+                top_tasks = ", ".join(
+                    f"{row['name']} ({row['entries']})" for row in ledger["by_task"][:3]
+                )
+                lines.append(f"  Top tasks: {top_tasks}")
+            lines.append("")
 
         # Model breakdown
         if report["models"]:
@@ -872,6 +1047,20 @@ class InsightsEngine:
         if o["total_hours"] > 0:
             lines.append(f"**Active time:** ~{format_duration_compact(o['total_hours'] * 3600)} | **Avg session:** ~{format_duration_compact(o['avg_session_duration'])}")
         lines.append("")
+
+        ledger = report.get("usage_ledger", {}) or {}
+        ledger_summary = ledger.get("summary", {}) or {}
+        if ledger_summary.get("entries"):
+            lines.append("**🧾 Local Usage Ledger:**")
+            lines.append(
+                f"  Entries: {ledger_summary.get('entries', 0)} | Tokens: {ledger_summary.get('total_tokens', 0):,} | Est. cost: ~${ledger_summary.get('estimated_cost', 0.0):.2f}"
+            )
+            if ledger.get("by_task"):
+                top_tasks = ", ".join(
+                    f"{row['name']} ({row['entries']})" for row in ledger["by_task"][:3]
+                )
+                lines.append(f"  Top tasks: {top_tasks}")
+            lines.append("")
 
         # Models (top 5)
         if report["models"]:

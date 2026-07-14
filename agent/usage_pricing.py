@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
+from pathlib import Path
 from typing import Any, Dict, Literal, Optional
 
 from agent.model_metadata import fetch_endpoint_model_metadata, fetch_model_metadata
@@ -36,6 +38,7 @@ class CanonicalUsage:
     reasoning_tokens: int = 0
     request_count: int = 1
     raw_usage: Optional[dict[str, Any]] = None
+    task: Optional[str] = None
 
     @property
     def prompt_tokens(self) -> int:
@@ -46,7 +49,7 @@ class CanonicalUsage:
         return self.prompt_tokens + self.output_tokens
 
     def __add__(self, other: "CanonicalUsage") -> "CanonicalUsage":
-        """Sum two usage buckets (e.g. MoA advisor fan-out + aggregator).
+        """Sum two usage buckets (e.g. MoA advisor fan-out + aggregator.
 
         ``raw_usage`` is dropped on the sum — it describes a single API
         response and cannot be meaningfully merged. ``request_count`` adds so
@@ -62,6 +65,7 @@ class CanonicalUsage:
             reasoning_tokens=self.reasoning_tokens + other.reasoning_tokens,
             request_count=self.request_count + other.request_count,
             raw_usage=None,
+            task=self.task if self.task == other.task else None,
         )
 
 
@@ -943,20 +947,35 @@ def estimate_usage_cost(
     provider: Optional[str] = None,
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
+    task: Optional[str] = None,
 ) -> CostResult:
     route = resolve_billing_route(model_name, provider=provider, base_url=base_url)
     if route.billing_mode == "subscription_included":
-        return CostResult(
+        result = CostResult(
             amount_usd=_ZERO,
             status="included",
             source="none",
             label="included",
             pricing_version="included-route",
         )
+        _append_usage_ledger_record(
+            provider=route.provider or (provider or ""),
+            model=route.model or model_name,
+            task=task,
+            usage=usage,
+        )
+        return result
 
     entry = get_pricing_entry(model_name, provider=provider, base_url=base_url, api_key=api_key)
     if not entry:
-        return CostResult(amount_usd=None, status="unknown", source="none", label="n/a")
+        result = CostResult(amount_usd=None, status="unknown", source="none", label="n/a")
+        _append_usage_ledger_record(
+            provider=route.provider or (provider or ""),
+            model=route.model or model_name,
+            task=task,
+            usage=usage,
+        )
+        return result
 
     notes: list[str] = []
     amount = _ZERO
@@ -1004,7 +1023,7 @@ def estimate_usage_cost(
     if route.provider == "openrouter":
         notes.append("OpenRouter cost is estimated from the models API until reconciled.")
 
-    return CostResult(
+    result = CostResult(
         amount_usd=amount,
         status=status,
         source=entry.source,
@@ -1013,6 +1032,66 @@ def estimate_usage_cost(
         pricing_version=entry.pricing_version,
         notes=tuple(notes),
     )
+    _append_usage_ledger_record(
+        provider=route.provider or (provider or ""),
+        model=route.model or model_name,
+        task=task,
+        usage=usage,
+    )
+    return result
+
+
+def _usage_ledger_config() -> tuple[bool, Path]:
+    """Return (enabled, path) for the opt-in local usage ledger."""
+    try:
+        from hermes_cli.config import load_config_readonly
+        from hermes_constants import get_hermes_home
+
+        config = load_config_readonly()
+        ledger_cfg = config.get("usage_ledger", {}) if isinstance(config, dict) else {}
+        if not isinstance(ledger_cfg, dict):
+            return False, get_hermes_home() / "usage" / "usage_ledger.jsonl"
+        enabled = bool(ledger_cfg.get("enabled", False))
+        raw_path = ledger_cfg.get("path") or (get_hermes_home() / "usage" / "usage_ledger.jsonl")
+        path = Path(raw_path).expanduser()
+        if not path.is_absolute():
+            path = get_hermes_home() / path
+        return enabled, path
+    except Exception:
+        from hermes_constants import get_hermes_home
+
+        return False, get_hermes_home() / "usage" / "usage_ledger.jsonl"
+
+
+def _append_usage_ledger_record(
+    *,
+    provider: str,
+    model: str,
+    task: Optional[str],
+    usage: CanonicalUsage,
+) -> None:
+    enabled, path = _usage_ledger_config()
+    if not enabled:
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        record = {
+            "ts": datetime.now(timezone.utc).timestamp(),
+            "provider": provider,
+            "model": model,
+            "task": (task or usage.task or "").strip() or None,
+            "input_tokens": int(usage.input_tokens),
+            "output_tokens": int(usage.output_tokens),
+            "cache_read_tokens": int(usage.cache_read_tokens),
+            "cache_write_tokens": int(usage.cache_write_tokens),
+            "reasoning_tokens": int(usage.reasoning_tokens),
+            "request_count": int(usage.request_count),
+        }
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, separators=(",", ":")) + "\n")
+    except Exception:
+        # Ledger writes are best-effort only; do not disturb the main cost path.
+        pass
 
 
 def has_known_pricing(

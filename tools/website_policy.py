@@ -1,8 +1,12 @@
 """Website access policy helpers for URL-capable tools.
 
 This module loads a user-managed website blocklist from ~/.hermes/config.yaml
-and optional shared list files. It is intentionally lightweight so web/browser
-tools can enforce URL policy without pulling in the heavier CLI config stack.
+and optional shared list files. A shared default blocklist at
+`~/.claude/skills/ignite-state/references/blocklist.json` is also picked up when
+present so publish-domain policy can be shared across skills.
+
+It is intentionally lightweight so web/browser tools can enforce URL policy
+without pulling in the heavier CLI config stack.
 
 Policy is cached in memory with a short TTL so config changes take effect
 quickly without re-reading the file on every URL check.
@@ -11,6 +15,7 @@ quickly without re-reading the file on every URL check.
 from __future__ import annotations
 
 import fnmatch
+import json
 import logging
 import threading
 import time
@@ -27,6 +32,7 @@ _DEFAULT_WEBSITE_BLOCKLIST = {
     "domains": [],
     "shared_files": [],
 }
+_DEFAULT_SHARED_BLOCKLIST = Path.home() / ".claude" / "skills" / "ignite-state" / "references" / "blocklist.json"
 
 # Cache: parsed policy + timestamp.  Avoids re-reading config.yaml on every
 # URL check (a multi-URL extract with 50 pages would otherwise mean 51 YAML parses).
@@ -80,6 +86,28 @@ def _iter_blocklist_file_rules(path: Path) -> List[str]:
         return []
 
     rules: List[str] = []
+
+    # Preferred format: structured JSON with a publish-domain blocklist.
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        data = None
+
+    if isinstance(data, dict):
+        publish_blocklist = data.get("publish_domain_blocklist", {})
+        if isinstance(publish_blocklist, dict):
+            for domain in publish_blocklist:
+                normalized = _normalize_rule(str(domain))
+                if normalized:
+                    rules.append(normalized)
+        elif isinstance(publish_blocklist, list):
+            for domain in publish_blocklist:
+                normalized = _normalize_rule(str(domain))
+                if normalized:
+                    rules.append(normalized)
+        return rules
+
+    # Back-compat fallback: plain text, one host per line.
     for line in raw.splitlines():
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
@@ -90,6 +118,96 @@ def _iter_blocklist_file_rules(path: Path) -> List[str]:
     return rules
 
 
+def _load_policy_config_fallback(config_path: Path) -> Dict[str, Any]:
+    """Tiny YAML fallback for the website_blocklist subtree.
+
+    The runtime environment for this repo may not ship PyYAML. We only need a
+    very small subset of the config file (security.website_blocklist with
+    enabled/domains/shared_files), so this parser handles that structure and
+    otherwise falls back to the safe default.
+    """
+    try:
+        raw = config_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise WebsitePolicyError(f"Failed to read config file {config_path}: {exc}") from exc
+
+    def parse_bool(value: str) -> Optional[bool]:
+        v = value.strip().lower()
+        if v in {"true", "yes", "on"}:
+            return True
+        if v in {"false", "no", "off"}:
+            return False
+        return None
+
+    def parse_inline_list(value: str) -> List[str]:
+        v = value.strip()
+        if v in {"[]", "[ ]"}:
+            return []
+        if v.startswith("[") and v.endswith("]"):
+            inner = v[1:-1].strip()
+            if not inner:
+                return []
+            return [item.strip().strip('"\'') for item in inner.split(",") if item.strip()]
+        return [v]
+
+    enabled = False
+    domains: List[str] = []
+    shared_files: List[str] = []
+    in_security = False
+    in_block = False
+    current_key: Optional[str] = None
+
+    for raw_line in raw.splitlines():
+        stripped_line = raw_line.split("#", 1)[0].rstrip()
+        if not stripped_line.strip():
+            continue
+        indent = len(stripped_line) - len(stripped_line.lstrip(" "))
+        line = stripped_line.strip()
+
+        if indent == 0 and line == "security:":
+            in_security = True
+            in_block = False
+            current_key = None
+            continue
+        if in_security and indent == 2 and line == "website_blocklist:":
+            in_block = True
+            current_key = None
+            continue
+        if not in_block:
+            continue
+        if indent <= 2 and line.endswith(":") and line not in {"website_blocklist:"}:
+            break
+
+        if indent == 4 and ":" in line:
+            key, value = line.split(":", 1)
+            key = key.strip()
+            value = value.strip()
+            if key == "enabled":
+                parsed = parse_bool(value)
+                if parsed is not None:
+                    enabled = parsed
+                current_key = None
+                continue
+            if key in {"domains", "shared_files"}:
+                current_key = key
+                parsed_list = parse_inline_list(value) if value else []
+                if key == "domains":
+                    domains.extend(parsed_list)
+                else:
+                    shared_files.extend(parsed_list)
+                continue
+
+        if current_key in {"domains", "shared_files"} and indent >= 6 and line.startswith("-"):
+            item = line[1:].strip()
+            if item:
+                if current_key == "domains":
+                    domains.append(item)
+                else:
+                    shared_files.append(item)
+
+    return {"enabled": enabled, "domains": domains, "shared_files": shared_files}
+
+
 def _load_policy_config(config_path: Optional[Path] = None) -> Dict[str, Any]:
     config_path = config_path or _get_default_config_path()
     if not config_path.exists():
@@ -98,8 +216,8 @@ def _load_policy_config(config_path: Optional[Path] = None) -> Dict[str, Any]:
     try:
         import yaml
     except ImportError:
-        logger.debug("PyYAML not installed — website blocklist disabled")
-        return dict(_DEFAULT_WEBSITE_BLOCKLIST)
+        logger.debug("PyYAML not installed — falling back to tiny website_blocklist parser")
+        return _load_policy_config_fallback(config_path)
 
     try:
         with open(config_path, encoding="utf-8") as f:
@@ -160,6 +278,9 @@ def load_website_blocklist(config_path: Optional[Path] = None) -> Dict[str, Any]
     raw_shared_files = policy.get("shared_files", []) or []
     if not isinstance(raw_shared_files, list):
         raise WebsitePolicyError("security.website_blocklist.shared_files must be a list")
+    default_shared = str(_DEFAULT_SHARED_BLOCKLIST)
+    if _DEFAULT_SHARED_BLOCKLIST.exists() and default_shared not in raw_shared_files:
+        raw_shared_files = list(raw_shared_files) + [default_shared]
 
     enabled = policy.get("enabled", True)
     if not isinstance(enabled, bool):
