@@ -7,6 +7,7 @@ tests run fully offline and the curator module doesn't need real credentials.
 from __future__ import annotations
 
 import importlib
+import json
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -574,6 +575,40 @@ def test_run_review_records_state(curator_env):
     assert state["last_run_at"] is not None
     assert state["run_count"] >= 1
     assert state["last_run_summary"] is not None
+
+
+def test_run_review_alerts_when_fallbacks_exhausted(curator_env, monkeypatch):
+    c = curator_env["curator"]
+    u = curator_env["usage"]
+    skills_dir = curator_env["home"] / "skills"
+    _write_skill(skills_dir, "a")
+    u.mark_agent_created("a")
+
+    sent = []
+
+    def fake_send(args, **_kw):
+        sent.append(args)
+        return json.dumps({"success": True})
+
+    monkeypatch.setattr("tools.send_message_tool.send_message_tool", fake_send)
+    monkeypatch.setattr(
+        c,
+        "_run_llm_review",
+        lambda prompt: {
+            "final": "",
+            "summary": "error (all fallbacks exhausted)",
+            "model": "gpt-5.4-mini",
+            "provider": "openai",
+            "tool_calls": [],
+            "error": "all fallbacks exhausted",
+        },
+    )
+
+    c.run_curator_review(synchronous=True, consolidate=True)
+
+    assert len(sent) == 1
+    assert sent[0]["target"] == "slack:D0BA2PM9CFM"
+    assert "fallback_providers were exhausted" in sent[0]["message"]
 
 
 def test_dry_run_does_not_advance_state(curator_env, monkeypatch):
