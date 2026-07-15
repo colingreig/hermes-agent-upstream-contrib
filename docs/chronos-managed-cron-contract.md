@@ -183,6 +183,11 @@ Reconcile arms missing/changed-time jobs and cancels orphans. A missed
 provision (transient NAS error) self-heals on the next reconcile. There is **no
 periodic wake** of a sleeping agent — that would negate scale-to-zero.
 
+> Per-job `model` / `no_fallback` selection in `jobs.json` is out of scope for
+> this wire contract. For content-creation jobs specifically, see the
+> [model routing policy](model-routing.md) (Sonnet-only, fail closed, no
+> substitute model).
+
 ## Config (agent side)
 
 All non-secret (`cron.chronos.*` in `config.yaml`); the agent holds no scheduler
