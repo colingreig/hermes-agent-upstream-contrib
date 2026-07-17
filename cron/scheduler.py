@@ -242,7 +242,7 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
     "QQBOT_HOME_CHANNEL": "QQ_HOME_CHANNEL",
 }
 
-from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run, claim_dispatch
+from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run, claim_dispatch, _coerce_job_bool
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -2178,6 +2178,22 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
     """
     user_prompt = str(job.get("prompt") or "")
     prompt = user_prompt
+
+    # Register the job's own declared required_environment_variables as
+    # sandbox passthrough BEFORE the agent session starts, so an agent-run
+    # job's terminal-tool subprocesses (e.g. `op-run`, `node clickup.mjs`)
+    # can see secret-shaped vars like CLICKUP_API_TOKEN without needing a
+    # loaded skill's SKILL.md to separately declare the same name in its
+    # frontmatter. This mirrors — and is independent of — the
+    # skill-frontmatter-driven registration that skill_view() performs
+    # below for each of the job's skills.
+    job_required_env = _normalize_required_environment_variables(
+        job.get("required_environment_variables")
+    )
+    if job_required_env:
+        from tools.env_passthrough import register_env_passthrough
+        register_env_passthrough(job_required_env)
+
     skills = job.get("skills")
     # True when runtime-collected DATA (script stdout, upstream-job output)
     # has been injected into the prompt. Data content legitimately quotes
@@ -3092,6 +3108,21 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 )
 
         fallback_model = get_fallback_chain(_cfg) or None
+        # Per-job fail-closed pin (86e2bjac3): a job may declare ``no_fallback: true``
+        # to opt out of the global provider fallback chain entirely, so it fails
+        # closed on its pinned model instead of silently downgrading. Content-creation
+        # jobs MUST set this so the sonnet-or-nothing policy can never be defeated by
+        # the global chain. Drop the chain here too (belt-and-suspenders alongside the
+        # AIAgent hard guard) so nothing downstream sees a chain for a pinned job.
+        job_no_fallback = _coerce_job_bool(job.get("no_fallback"), default=False)
+        if job_no_fallback:
+            if fallback_model:
+                logger.info(
+                    "Job '%s': no_fallback pinned — dropping %d global fallback(s); "
+                    "job fails closed on its pinned model.",
+                    job_id, len(fallback_model),
+                )
+            fallback_model = None
         credential_pool = None
         runtime_provider = str(runtime.get("provider") or "").strip().lower()
         if runtime_provider:
@@ -3142,6 +3173,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             reasoning_config=reasoning_config,
             prefill_messages=prefill_messages,
             fallback_model=fallback_model,
+            no_fallback=job_no_fallback,
             credential_pool=credential_pool,
             providers_allowed=pr.get("only"),
             providers_ignored=pr.get("ignore"),

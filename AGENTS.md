@@ -1081,7 +1081,10 @@ Per-job fields include `skills` (load specific skills), `model` /
 stdout is injected into the prompt; `no_agent=True` turns the script
 into the entire job), `context_from` (chain job A's last output into
 job B's prompt), `workdir` (run in a specific directory with its
-`AGENTS.md`/`CLAUDE.md` loaded), and multi-platform delivery.
+`AGENTS.md`/`CLAUDE.md` loaded), `no_fallback` (fail-closed pin,
+default `False`; when `True` the job never downgrades to a backup
+provider/model via the global fallback chain — it fails closed on its
+pinned model instead), and multi-platform delivery.
 
 Hardening invariants:
 - **3-minute hard interrupt** on cron sessions — runaway agent loops
@@ -1092,6 +1095,12 @@ Hardening invariants:
   across processes.
 - Cron sessions pass `skip_memory=True` by default; memory providers
   intentionally do not run during cron.
+- `no_fallback=True` jobs (e.g. content-creation jobs protecting the
+  Sonnet-only policy) fail closed at `run_job` and again inside
+  `try_activate_fallback` — a single choke point every fallback
+  activation flows through, so the pin holds for every failover
+  reason (billing, rate limits, server errors, etc.), never silently
+  substituting a cheaper/different model.
 
 Cron deliveries are **not** mirrored into the target gateway session —
 they land in their own cron session with a header/footer frame so the

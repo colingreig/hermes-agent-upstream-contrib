@@ -2367,6 +2367,78 @@ class TestRunJobSkillBacked:
         assert error is None
         assert final_response == "ok"
 
+    def test_run_job_registers_job_level_required_environment_variables(self, tmp_path):
+        """A job-level ``required_environment_variables`` declaration (e.g.
+        ``["CLICKUP_API_TOKEN"]``) must be registered as sandbox passthrough
+        before the agent session starts, WITHOUT requiring any loaded
+        skill's SKILL.md to separately declare the same name in its
+        frontmatter. Regression test for cron jobs (hermes-pr-validate,
+        clickup-executor) whose terminal-tool subprocesses (op-run, node
+        clickup.mjs) were losing CLICKUP_API_TOKEN to the secret-shape
+        scrubbing gate.
+        """
+        job = {
+            "id": "clickup-env-job",
+            "name": "clickup env test",
+            "prompt": "Do the thing.",
+            "required_environment_variables": ["CLICKUP_API_TOKEN"],
+        }
+
+        fake_db = MagicMock()
+
+        def _run_conversation(prompt):
+            from tools.env_passthrough import is_env_passthrough
+
+            assert is_env_passthrough("CLICKUP_API_TOKEN") is True
+            return {"final_response": "ok"}
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+             patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "***",
+                     "base_url": "https://example.invalid/v1",
+                     "provider": "openrouter",
+                     "api_mode": "chat_completions",
+                 },
+             ), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.side_effect = _run_conversation
+            mock_agent_cls.return_value = mock_agent
+
+            try:
+                success, output, final_response, error = run_job(job)
+            finally:
+                clear_env_passthrough()
+
+        assert success is True
+        assert error is None
+        assert final_response == "ok"
+
+    def test_build_job_prompt_registers_job_level_required_environment_variables(self):
+        """Unit-level check on _build_job_prompt itself (no agent session
+        involved): calling it must register the job's declared
+        required_environment_variables via register_env_passthrough."""
+        from tools.env_passthrough import is_env_passthrough
+
+        job = {
+            "id": "clickup-env-job-2",
+            "name": "clickup env test 2",
+            "prompt": "Do the thing.",
+            "required_environment_variables": ["CLICKUP_API_TOKEN"],
+        }
+
+        try:
+            _build_job_prompt(job)
+            assert is_env_passthrough("CLICKUP_API_TOKEN") is True
+        finally:
+            clear_env_passthrough()
+
     def test_run_job_preserves_credential_file_passthrough_into_worker_thread(self, tmp_path):
         """copy_context() also propagates credential_files ContextVar."""
         job = {

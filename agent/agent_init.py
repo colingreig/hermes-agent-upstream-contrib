@@ -229,6 +229,7 @@ def init_agent(
     parent_session_id: str = None,
     iteration_budget: "IterationBudget" = None,
     fallback_model: Dict[str, Any] = None,
+    no_fallback: bool = False,
     credential_pool=None,
     checkpoints_enabled: bool = False,
     checkpoint_max_snapshots: int = 20,
@@ -1033,7 +1034,18 @@ def init_agent(
     # when the primary is exhausted (rate-limit, overload, connection
     # failure).  Supports both legacy single-dict ``fallback_model`` and
     # new list ``fallback_providers`` format.
-    if isinstance(fallback_model, list):
+    # Per-job fail-closed pin (86e2bjac3): a job constructed with
+    # ``no_fallback=True`` gets an EMPTY fallback chain so it fails closed on its
+    # pinned model rather than downgrading. This keeps _has_pending_fallback()
+    # and any chain-length telemetry honest; the load-bearing enforcement is the
+    # hard guard at the top of try_activate_fallback (covers every FailoverReason
+    # even if the chain were later repopulated). Content-creation jobs set this.
+    agent._no_fallback = bool(no_fallback)
+    if agent._no_fallback:
+        agent._fallback_chain = []
+        if fallback_model and not agent.quiet_mode:
+            print("🔒 no_fallback pinned — fallback chain disabled; job fails closed on its model.")
+    elif isinstance(fallback_model, list):
         agent._fallback_chain = [
             f for f in fallback_model
             if isinstance(f, dict) and f.get("provider") and f.get("model")
