@@ -364,9 +364,9 @@ def _hermetic_environment(tmp_path, monkeypatch):
 
     # ``cron.jobs`` may already be imported during test collection, before
     # this fixture redirects HERMES_HOME. Rebind its cached default store.
+    cron_dir = fake_hermes_home / "cron"
     cron_jobs = sys.modules.get("cron.jobs")
     if cron_jobs is not None:
-        cron_dir = fake_hermes_home / "cron"
         monkeypatch.setattr(cron_jobs, "HERMES_DIR", fake_hermes_home, raising=False)
         monkeypatch.setattr(cron_jobs, "CRON_DIR", cron_dir, raising=False)
         monkeypatch.setattr(
@@ -380,6 +380,16 @@ def _hermetic_environment(tmp_path, monkeypatch):
             "TICKER_HEARTBEAT_FILE",
             cron_dir / "ticker_heartbeat",
             raising=False,
+        )
+
+    # ``cron.__init__`` re-exports JOBS_FILE by value, so rebinding only the
+    # implementation module leaves the public alias pointing at the profile
+    # that was active during collection. Keep the alias in lockstep without
+    # requiring lightweight test stubs to define it up front.
+    cron_package = sys.modules.get("cron")
+    if cron_package is not None:
+        monkeypatch.setattr(
+            cron_package, "JOBS_FILE", cron_dir / "jobs.json", raising=False
         )
         monkeypatch.setattr(
             cron_jobs,
