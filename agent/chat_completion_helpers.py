@@ -1256,7 +1256,11 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     # _fallback_chain when no_fallback is set (so _has_pending_fallback/telemetry
     # agree), but this guard is the load-bearing one and wins even if something
     # later repopulates the chain.
-    if getattr(agent, "_no_fallback", False):
+    # ``is True`` (not just truthy) on purpose: init_agent always stores a real
+    # bool, so this fires only on an explicit pin — and it stays inert for test
+    # doubles (a MagicMock agent auto-creates a truthy child for _no_fallback,
+    # which must NOT be read as "pinned"). See test_fallback_credential_isolation.
+    if getattr(agent, "_no_fallback", False) is True:
         logger.warning(
             "Fallback suppressed (no_fallback pinned): failing closed on %s/%s "
             "(reason=%s) — NOT downgrading.",
