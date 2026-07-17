@@ -211,6 +211,27 @@ def _coerce_job_text(value: Any, fallback: str = "") -> str:
     return str(value)
 
 
+def _coerce_job_bool(value: Any, default: bool = False) -> bool:
+    """Coerce a hand-edited/JSON/CLI cron boolean field to a real bool.
+
+    Jobs are persisted as JSON (native bool) but may be set via CLI (``"true"``)
+    or hand-edited, so accept the usual truthy/falsey string spellings too. Used
+    for the ``no_fallback`` fail-closed pin (86e2bjac3).
+    """
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return value != 0
+    s = str(value).strip().lower()
+    if s in ("true", "1", "yes", "on"):
+        return True
+    if s in ("false", "0", "no", "off", ""):
+        return False
+    return default
+
+
 def _schedule_display_for_job(job: Dict[str, Any]) -> str:
     display = _coerce_job_text(job.get("schedule_display")).strip()
     if display:
@@ -864,6 +885,7 @@ def create_job(
     enabled_toolsets: Optional[List[str]] = None,
     workdir: Optional[str] = None,
     no_agent: bool = False,
+    no_fallback: bool = False,
     attach_to_session: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """
@@ -994,6 +1016,11 @@ def create_job(
         "base_url": normalized_base_url,
         "script": normalized_script,
         "no_agent": normalized_no_agent,
+        # Per-job fail-closed pin (86e2bjac3): when true, the job opts out of the
+        # global provider fallback chain and fails closed on its pinned model
+        # rather than downgrading. Content-creation jobs set this to protect the
+        # sonnet-or-nothing policy. Read at dispatch in cron/scheduler.py run_job.
+        "no_fallback": _coerce_job_bool(no_fallback, default=False),
         "context_from": context_from,
         "schedule": parsed_schedule,
         "schedule_display": parsed_schedule.get("display", schedule),
@@ -1111,6 +1138,11 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     updates["workdir"] = None
                 else:
                     updates["workdir"] = _normalize_workdir(_wd)
+
+            # Coerce the fail-closed pin (86e2bjac3) to a real bool so a CLI/JSON
+            # "true"/"false" string doesn't persist as a truthy string.
+            if "no_fallback" in updates:
+                updates["no_fallback"] = _coerce_job_bool(updates["no_fallback"], default=False)
 
             previous_inference_axes = _normalized_inference_axes(job)
             updated = _apply_skill_fields({**job, **updates})
