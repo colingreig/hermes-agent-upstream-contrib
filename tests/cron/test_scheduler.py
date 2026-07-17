@@ -1038,7 +1038,7 @@ class TestRunJobSessionPersistence:
                  },
              ), \
              patch("run_agent.AIAgent") as mock_agent_cls, \
-             patch("cron.scheduler.concurrent.futures.ThreadPoolExecutor", ShutdownExecutor):
+             patch("cron.scheduler._DaemonThreadPoolExecutor", ShutdownExecutor):
             mock_agent = MagicMock()
             mock_agent.run_conversation.return_value = {"final_response": "ok"}
             mock_agent_cls.return_value = mock_agent
