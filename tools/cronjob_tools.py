@@ -753,6 +753,18 @@ def cronjob(
             )
             _notify_provider_jobs_changed_safe()
             _create_message = f"Cron job '{job['name']}' created."
+            route_health = None
+            try:
+                from agent.route_health import format_route_health, resolve_effective_routes
+
+                route_report = resolve_effective_routes("cron", job=job)
+                route_health = route_report.to_dict()
+                _create_message = (
+                    f"{_create_message}\n\nRouting health:\n"
+                    f"{format_route_health(route_report, indent='  ')}"
+                )
+            except Exception as route_exc:
+                route_health = {"error": str(route_exc)}
             _local_notice = _local_delivery_notice(job, _normalize_deliver_param(deliver))
             if _local_notice:
                 _create_message = f"{_create_message} {_local_notice}"
@@ -767,6 +779,7 @@ def cronjob(
                     "repeat": _repeat_display(job),
                     "deliver": job.get("deliver", "local"),
                     "next_run_at": job["next_run_at"],
+                    "route_health": route_health,
                     "job": _format_job(job),
                     "message": _create_message,
                 },

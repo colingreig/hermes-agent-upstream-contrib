@@ -1229,6 +1229,8 @@ def restore_primary_runtime(agent) -> bool:
     ``gateway/run.py``), so this restoration IS needed there too.
     """
     if not agent._fallback_activated:
+        agent._routing_chain_exhausted = False
+        agent._routing_chain_exhausted_reason = ""
         # Reset the chain index even when no fallback was activated this
         # turn.  Without this, a turn where _try_activate_fallback() was
         # called but returned False (chain exhausted or provider not

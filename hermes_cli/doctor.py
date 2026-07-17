@@ -1002,6 +1002,24 @@ def run_doctor(args):
         except Exception:
             pass
 
+        try:
+            from agent.route_health import format_route_health, resolve_effective_routes
+
+            _section("Routing Health")
+            for _report in (
+                resolve_effective_routes("interactive"),
+                resolve_effective_routes("cron"),
+            ):
+                if _report.healthy:
+                    check_ok(f"{_report.role} routing has at least one usable entry")
+                else:
+                    check_fail(f"{_report.role} routing has no usable entries")
+                    issues.append(f"Fix {_report.role} provider credentials or fallback routing")
+                for _line in format_route_health(_report, indent="").splitlines():
+                    check_info(_line)
+        except Exception as route_exc:
+            check_warn("Routing health unavailable", f"({route_exc})")
+
         # Detect stale HERMES_MAX_ITERATIONS ghost in .env shadowing
         # agent.max_turns in config.yaml (issue #17534). The setup wizard
         # used to dual-write the iteration budget to both stores; users who

@@ -601,6 +601,20 @@ def _print_setup_summary(config: dict, hermes_home):
 
     print()
 
+    try:
+        from agent.route_health import format_route_health, resolve_effective_routes
+
+        print_header("Routing Health")
+        for _report in (
+            resolve_effective_routes("interactive", config=config),
+            resolve_effective_routes("cron", config=config),
+        ):
+            print(format_route_health(_report, indent="   "))
+        print()
+    except Exception as _route_exc:
+        print_warning(f"Routing health unavailable: {_route_exc}")
+        print()
+
     disabled_tools = [(name, var) for name, avail, var in tool_status if not avail]
     if disabled_tools:
         print_warning(

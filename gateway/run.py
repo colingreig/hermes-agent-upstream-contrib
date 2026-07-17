@@ -1934,6 +1934,20 @@ from gateway.whatsapp_identity import (
 
 logger = logging.getLogger(__name__)
 
+try:
+    from agent.route_health import format_route_health, resolve_effective_routes
+
+    logger.info(
+        "Gateway route health (interactive):\n%s",
+        format_route_health(resolve_effective_routes("interactive"), indent="  "),
+    )
+    logger.info(
+        "Gateway route health (cron):\n%s",
+        format_route_health(resolve_effective_routes("cron"), indent="  "),
+    )
+except Exception as _route_health_exc:
+    logger.warning("Gateway route health unavailable: %s", _route_health_exc)
+
 
 _OWN_POLICY_OPEN_ENV = {
     Platform.WECOM: ("WECOM_DM_POLICY", "WECOM_GROUP_POLICY", "WECOM_ALLOW_ALL_USERS"),

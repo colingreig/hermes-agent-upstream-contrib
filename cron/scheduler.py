@@ -140,6 +140,22 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     return f"⚠️ Cron '{job_name}' failed: {cleaned}"
 
 
+def _cron_routing_chain_exhausted_message(agent, cron_route_health=None) -> str | None:
+    """Return a deterministic cron failure message for exhausted routing."""
+    if not getattr(agent, "_routing_chain_exhausted", False):
+        return None
+    reason = getattr(agent, "_routing_chain_exhausted_reason", "") or "fallback_chain_exhausted"
+    routes = ""
+    if cron_route_health is not None:
+        try:
+            from agent.route_health import format_route_health
+
+            routes = "\n" + format_route_health(cron_route_health, indent="  ")
+        except Exception:
+            routes = ""
+    return f"Routing chain exhausted ({reason}); no cron objective was completed." + routes
+
+
 class CronPromptInjectionBlocked(Exception):
     """Raised by _build_job_prompt when the fully-assembled prompt trips the
     injection scanner. Caught in run_job so the operator sees a clean
@@ -3280,6 +3296,14 @@ def run_job(
             )
 
         fallback_model = get_fallback_chain(_cfg) or None
+        cron_route_health = None
+        try:
+            from agent.route_health import resolve_effective_routes
+
+            cron_route_health = resolve_effective_routes("cron", job=job, config=_cfg)
+            logger.info("Job '%s': resolved cron routing health: %s", job_id, cron_route_health.to_dict())
+        except Exception as route_exc:
+            logger.debug("Job '%s': route health resolution failed: %s", job_id, route_exc)
         credential_pool = None
         runtime_provider = str(runtime.get("provider") or "").strip().lower()
         if runtime_provider:
@@ -3512,6 +3536,9 @@ def run_job(
                 or "agent reported failure"
             )
             raise RuntimeError(_err_text)
+        chain_exhausted_error = _cron_routing_chain_exhausted_message(agent, cron_route_health)
+        if chain_exhausted_error:
+            raise RuntimeError(chain_exhausted_error)
         if max_iteration_summary:
             logger.warning(
                 "Job '%s' reached the iteration limit but produced a final fallback response; "

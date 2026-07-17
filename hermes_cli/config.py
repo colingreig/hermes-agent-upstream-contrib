@@ -8677,6 +8677,17 @@ def config_command(args):
             print()
             print(color(f"  {len(missing_config)} new config option(s) available", Colors.YELLOW))
             print("    Run 'hermes config migrate' to add them")
+
+        try:
+            from agent.route_health import format_route_health, resolve_effective_routes
+
+            print()
+            print(color("  Routing Health:", Colors.BOLD))
+            print(format_route_health(resolve_effective_routes("interactive"), indent="    "))
+            print(format_route_health(resolve_effective_routes("cron"), indent="    "))
+        except Exception as exc:
+            print()
+            print(color(f"  Routing Health: unavailable ({exc})", Colors.YELLOW))
         
         print()
     
