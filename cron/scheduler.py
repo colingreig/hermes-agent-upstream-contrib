@@ -3201,7 +3201,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             _cron_timeout = 600.0
         _cron_inactivity_limit = _cron_timeout if _cron_timeout > 0 else None
         _POLL_INTERVAL = 5.0
-        _cron_pool = _DaemonThreadPoolExecutor(max_workers=1)
+        _cron_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         # Preserve scheduler-scoped ContextVar state (for example skill-declared
         # env passthrough registrations) when the cron run hops into the worker
         # thread used for inactivity timeout monitoring.
