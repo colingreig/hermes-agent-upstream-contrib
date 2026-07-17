@@ -519,6 +519,20 @@ Cron jobs inherit your configured fallback providers and credential pool rotatio
 
 This means cron jobs that run at high frequency or during peak hours are more resilient — a single rate-limited key won't fail the entire run.
 
+### Pinning a job against fallback (`no_fallback`)
+
+Some jobs must never silently downgrade — e.g. content-creation jobs that only produce acceptable output on a specific model. Pass `no_fallback=True` at creation or via `cronjob action=update` to opt a job out of provider recovery entirely:
+
+```text
+cronjob(action="create", schedule="every 1h", prompt="...",
+        provider="anthropic", model="claude-sonnet-5", no_fallback=True)
+```
+
+- Default is `False` — jobs recover via fallback providers/credential rotation as described above.
+- When `True`, the job fails closed on its pinned `provider`/`model` instead: no fallback chain is walked, no alternate provider is tried, no credential rotation past the pinned provider. A failing run stays failed and reports the error rather than completing on a different model.
+- The pin is enforced at the single choke point every fallback activation flows through, so it holds for every failure reason (rate limits, billing, server errors, timeouts, etc.), not just some of them.
+- Use this for jobs where the content-creation Sonnet-only policy (or an equivalent model-fidelity requirement) must never be silently defeated by the global fallback chain.
+
 ## Schedule formats
 
 The agent's final response is automatically delivered to the job's `deliver:` target — the agent no longer fires messages itself, so the user-facing content simply goes in the final response. To deliver to **additional or different** targets, list multiple `deliver:` targets on the cron job (comma-separated, e.g. `deliver: "telegram,discord"`) rather than having the agent send them.

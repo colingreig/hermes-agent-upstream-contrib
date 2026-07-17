@@ -337,6 +337,14 @@ def _run_agent(
     # honour the same merge semantics as interactive CLI and gateway sessions.
     _fb = get_fallback_chain(cfg)
 
+    # Per-job fail-closed pin (86e2bjac3): an oneshot worker launched for a
+    # no_fallback cron job (env HERMES_NO_FALLBACK=1) must fail closed on its
+    # pinned model — never downgrade via the global chain. Mirrors the
+    # scheduler.run_job path for jobs that dispatch through a oneshot subprocess.
+    _no_fallback = os.getenv("HERMES_NO_FALLBACK", "").strip().lower() in ("1", "true", "yes", "on")
+    if _no_fallback:
+        _fb = None
+
     agent = AIAgent(
         api_key=runtime.get("api_key"),
         base_url=runtime.get("base_url"),
@@ -349,6 +357,7 @@ def _run_agent(
         session_db=session_db,
         credential_pool=runtime.get("credential_pool"),
         fallback_model=_fb or None,
+        no_fallback=_no_fallback,
         # Interactive callbacks are intentionally NOT wired beyond this
         # one.  In oneshot mode there's no user sitting at a terminal:
         #   - clarify  → returns a synthetic "pick a default" instruction

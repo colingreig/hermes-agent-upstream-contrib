@@ -1168,6 +1168,69 @@ def _fallback_entry_unavailable_without_network(agent, fb: dict) -> Optional[str
     return None
 
 
+# Durable ledger of real fallback/downgrade activations — the source the
+# status-email digest (~/.hermes/scripts/hermes_report_build.py) renders into
+# its "Model fallbacks" section (86e2bjage). Append-only JSONL; overridable for
+# tests via HERMES_FALLBACK_EVENTS_LEDGER.
+_FALLBACK_EVENTS_LEDGER = os.path.expanduser(
+    os.environ.get("HERMES_FALLBACK_EVENTS_LEDGER", "~/.hermes/logs/fallback-events.jsonl")
+)
+
+
+def _record_and_alert_fallback_activation(
+    agent, from_provider, from_model, to_provider, to_model, reason
+) -> None:
+    """Emit a deduped Slack alert + durable ledger record for a real downgrade.
+
+    Called once per actual provider/model switch inside try_activate_fallback,
+    AFTER the switch is confirmed. Reuses the existing ops_alerts Slack path and
+    ITS in-process signature dedup — no new channel, no second dedup mechanism
+    (86e2bjage; coordinates with 86e2abmmj). Fleet-wide: makes every model
+    downgrade loud so a future silent rampdown cannot recur. Never raises —
+    alerting must not interfere with the fallback path.
+    """
+    reason_val = getattr(reason, "value", reason)
+    reason_str = str(reason_val) if reason_val is not None else "unknown"
+    job = str(getattr(agent, "session_id", None) or "unknown")
+    platform = str(getattr(agent, "platform", None) or "")
+    ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    from_route = f"{from_provider or 'unknown'}/{from_model or 'unknown'}"
+    to_route = f"{to_provider or 'unknown'}/{to_model or 'unknown'}"
+
+    # (a) Durable ledger for the digest — best-effort append.
+    try:
+        os.makedirs(os.path.dirname(_FALLBACK_EVENTS_LEDGER), exist_ok=True)
+        with open(_FALLBACK_EVENTS_LEDGER, "a", encoding="utf-8") as _f:
+            _f.write(json.dumps({
+                "ts": ts,
+                "job": job,
+                "platform": platform,
+                "from_provider": from_provider or None,
+                "from_model": from_model or None,
+                "to_provider": to_provider or None,
+                "to_model": to_model or None,
+                "reason": reason_str,
+            }) + "\n")
+    except Exception:
+        logger.debug("fallback-events ledger write failed (fail-open)", exc_info=True)
+
+    # (b) Deduped Slack alert via the existing ops path.
+    try:
+        from agent.ops_alerts import alert_once
+        signature = f"fallback:{job}:{from_route}->{to_route}:{reason_str}"
+        alert_once(
+            signature,
+            (
+                "⚠️ Model FALLBACK/downgrade fired\n"
+                f"• job/session: {job}" + (f" ({platform})" if platform else "") + "\n"
+                f"• from → to: {from_route} → {to_route}\n"
+                f"• reason: {reason_str}\n"
+                f"• at: {ts}"
+            ),
+        )
+    except Exception:
+        logger.debug("fallback-activation slack alert failed (fail-open)", exc_info=True)
+
 
 def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool:
     """Switch to the next fallback model/provider in the chain.
@@ -1181,6 +1244,27 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     auth resolution and client construction — no duplicated provider→key
     mappings.
     """
+    # Per-job fail-closed pin (86e2bjac3). A job constructed with
+    # ``no_fallback=True`` must NEVER downgrade to a backup provider/model —
+    # it fails closed on its pinned model instead. This is the single choke
+    # point every fallback activation flows through (all ~15 conversation_loop
+    # call sites forward to agent._try_activate_fallback), so short-circuiting
+    # here covers EVERY FailoverReason (billing AND rate_limit/upstream_rate_limit
+    # AND server_error/etc.) with one guard, regardless of what the chain holds.
+    # The content-creation jobs set this so the sonnet-or-nothing policy can never
+    # be defeated by the global fallback chain. init_agent also empties
+    # _fallback_chain when no_fallback is set (so _has_pending_fallback/telemetry
+    # agree), but this guard is the load-bearing one and wins even if something
+    # later repopulates the chain.
+    if getattr(agent, "_no_fallback", False):
+        logger.warning(
+            "Fallback suppressed (no_fallback pinned): failing closed on %s/%s "
+            "(reason=%s) — NOT downgrading.",
+            (getattr(agent, "provider", "") or "").strip().lower() or "unknown",
+            getattr(agent, "model", "") or "unknown",
+            getattr(reason, "value", reason),
+        )
+        return False
     if reason in {FailoverReason.rate_limit, FailoverReason.billing, FailoverReason.upstream_rate_limit}:
         # Only start cooldown when leaving the primary provider.  If we're
         # already on a fallback and chain-switching, the primary wasn't the
@@ -1368,6 +1452,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             fb_api_mode = "bedrock_converse"
 
         old_model = agent.model
+        old_provider = (getattr(agent, "provider", "") or "").strip().lower()
 
         # Clear the per-config context_length override so the fallback
         # model's actual context window is resolved instead of inheriting
@@ -1516,6 +1601,17 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         logger.info(
             "Fallback activated: %s → %s (%s)",
             old_model, fb_model, fb_provider,
+        )
+
+        # Fleet-wide fallback/downgrade alerting (86e2bjage): every actual
+        # provider/model downgrade emits a deduped Slack alert AND a durable
+        # ledger record the status-email digest renders. So a future silent
+        # rampdown can never happen — a downgrade is always surfaced with
+        # job/from→to/reason/timestamp. Never raises (alerting must not break
+        # the fallback path). no_fallback-pinned agents short-circuit above and
+        # never reach this point, so they never emit a spurious downgrade alert.
+        _record_and_alert_fallback_activation(
+            agent, old_provider, old_model, fb_provider, fb_model, reason
         )
 
         # Persist the new billing route immediately. update_token_counts()

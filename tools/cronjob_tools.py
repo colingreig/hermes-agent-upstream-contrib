@@ -594,6 +594,8 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         result["script"] = job["script"]
     if job.get("no_agent"):
         result["no_agent"] = True
+    if job.get("no_fallback"):
+        result["no_fallback"] = True
     if job.get("enabled_toolsets"):
         result["enabled_toolsets"] = job["enabled_toolsets"]
     if job.get("workdir"):
@@ -666,6 +668,7 @@ def cronjob(
     enabled_toolsets: Optional[List[str]] = None,
     workdir: Optional[str] = None,
     no_agent: Optional[bool] = None,
+    no_fallback: Optional[bool] = None,
     attach_to_session: Optional[bool] = None,
     task_id: str = None,
 ) -> str:
@@ -739,6 +742,7 @@ def cronjob(
                 enabled_toolsets=enabled_toolsets or None,
                 workdir=_normalize_optional_job_value(workdir),
                 no_agent=_no_agent,
+                no_fallback=bool(no_fallback),
                 attach_to_session=attach_to_session,
             )
             _notify_provider_jobs_changed_safe()
@@ -913,6 +917,10 @@ def cronjob(
                 updates["enabled_toolsets"] = enabled_toolsets or None
             if attach_to_session is not None:
                 updates["attach_to_session"] = bool(attach_to_session)
+            if no_fallback is not None:
+                # Fail-closed pin (86e2bjac3): opt this job out of the global
+                # provider fallback chain so it fails closed on its pinned model.
+                updates["no_fallback"] = bool(no_fallback)
             if workdir is not None:
                 # Empty string clears the field (restores old behaviour);
                 # otherwise pass raw — update_job() validates / normalizes.
@@ -1047,6 +1055,17 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
                     "\n\n"
                     "WHEN TO USE True: recurring script-only pings where the script itself produces the exact message text (memory/disk/GPU watchdogs, threshold alerts, heartbeats, CI notifications, API pollers with a fixed output shape). "
                     "WHEN TO USE False (default): anything that needs reasoning — summarize a feed, draft a daily briefing, pick interesting items, rephrase data for a human, follow conditional logic based on content."
+                ),
+            },
+            "no_fallback": {
+                "type": "boolean",
+                "default": False,
+                "description": (
+                    "Default: False (the job may downgrade to the global provider fallback chain if its pinned model is exhausted/rate-limited/over the spend cap). "
+                    "Set True to FAIL CLOSED: the job runs on its pinned provider/model ONLY and, on any failure (spend cap, rate limit, billing, server error), returns the failure instead of silently switching to a cheaper backup model. "
+                    "\n\n"
+                    "WHEN TO USE True: content-creation jobs and anything where a silent model downgrade is worse than a visible failure — e.g. the sonnet-or-nothing content policy. A downgrade that produces off-policy output undetected is the failure mode this prevents. "
+                    "WHEN TO USE False (default): resilience-first jobs where getting *some* answer from a backup model beats failing."
                 ),
             },
             "context_from": {
