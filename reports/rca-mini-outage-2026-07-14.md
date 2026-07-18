@@ -15,6 +15,28 @@ The ~22:00Z claim is not supported. The activity gap starts ~03:10Z (20:10 PDT) 
 ## Conclusion
 Root cause: an ungraceful power interruption (no clean shutdown record) at ~20:10-20:19 PDT on 2026-07-14, self-recovered via `pmset autorestart`. No manual intervention required. This RCA motivates the external heartbeat dead-man's switch (scripts/hermes_heartbeat.sh + scripts/launchd/com.colingreig.hermes.heartbeat.plist) so future outages are detected independent of the mini's own ability to self-report.
 
+## The larger impact: the ~53h scheduled-monitor blackout (reboot-without-login)
+The 9-minute power gap is not the significant part of this incident. The box came back at 20:19 PDT, but macOS booted straight to the login window and **no console/Aqua login happened until 2026-07-17 01:47 PDT — a ~53-hour (~2.5-day) window** during which the mini looked "up" (SSH, gateway, dashboard all reachable) while an entire class of scheduled work silently did not run.
+
+**Mechanism.** The Hermes scheduled monitors run as per-user LaunchAgents in the `gui/501` domain, which macOS only bootstraps while a console session is active. Auto-restart brings the *machine* back but not a *login session*, so any GUI-domain job without `RunAtLoad` was never scheduled:
+
+- **Silently dead the whole window** (StartInterval / StartCalendarInterval, no `RunAtLoad`, `runs = 0`): `com.colingreig.hermes.ignite-sentinel`, `…ignite-sentinel-digest`, `…daily-spend-alert`, `…worktree-backstop-sweep`, `com.hermes.offbox-restic-backup`.
+- **Recovered fine** (`RunAtLoad` in an already-loaded domain): gateway, dashboard, degraded-secrets-monitor.
+
+This is why the outage's real cost was hidden: the always-on services self-recovered and reported healthy, so nothing flagged that the monitoring/backup fleet — including the very sentinel meant to catch outages — was itself offline for 53h. A reboot-without-login is indistinguishable from "the monitors are broken" without checking `launchctl print gui/501/<label>` (`runs = 0 / last exit code = (never exited)`) against `last reboot` + `who`.
+
+**Diagnostic signature.** GUI-domain scheduled jobs at `runs = 0` while `RunAtLoad` jobs show `runs = 1` after a fresh login; `sysctl kern.boottime` / `last reboot` shows a reboot with no subsequent `who` login until much later.
+
+**Fix applied 2026-07-17.** FileVault is OFF (`fdesetup status`), so the disk unlocks at cold boot and macOS can auto-login without interaction. Enabled auto-login for `colingreig` so an Aqua session (and `gui/501`) always comes up after any reboot — **zero job-plist changes, fixes every GUI-domain agent at once**. From a non-console SSH session, plain `sudo sysadminctl` fails with `error:22`; it must be wrapped in `launchctl asuser 501`:
+
+```
+sudo launchctl asuser 501 sysadminctl -autologin set -userName colingreig -password <secret>
+```
+
+This wrote `autoLoginUser=colingreig` to `/Library/Preferences/com.apple.loginwindow` + `/etc/kcpassword` (0600); backup at `…loginwindow.plist.bak-autologin-20260717`. **Rollback:** `sudo sysadminctl -autologin off`. Security delta is contained (FileVault was already OFF; no new network surface). A LaunchDaemon migration was viable but rejected as more invasive for no benefit. The kcpassword was XOR-decoded and SHA-256-matched to the real password, so boot will not stall at a login prompt — though it has not been exercised through a real reboot yet.
+
+**Residual gap.** The two controls added from this incident are complementary: the external heartbeat dead-man's switch catches the *machine* going away; auto-login catches the *session* not coming back. Neither yet actively asserts "the GUI-domain scheduled fleet ran on schedule" — a reboot-without-login before 2026-07-17, or any future regression of the auto-login setting, would still produce a silent scheduled-monitor blackout until the next heartbeat gap or manual `launchctl print` check surfaces it.
+
 ## Verification: deliberate simulated-miss (2026-07-18)
 
 To confirm the dead-man's switch actually alerts (not just that it pings), a deliberate miss was triggered against the live healthchecks.io check backing `scripts/hermes_heartbeat.sh` on the mini.
