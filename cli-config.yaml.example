@@ -518,6 +518,21 @@ prompt_caching:
 #                           # extra_body:
 #                           #   chat_template_kwargs:
 #                           #     enable_thinking: false
+#
+#   # Direct Gemini routing for auxiliary tasks is intentionally locked down.
+#   # Leave this empty until a task class is explicitly approved for direct
+#   # Google AI Studio / Gemini use.
+#   direct_gemini_tasks: []
+
+# =============================================================================
+# Local Usage Ledger (opt-in)
+# =============================================================================
+# Records provider/model/task/token counts only; prompts and credentials are
+# never written. Disabled by default.
+#
+# usage_ledger:
+#   enabled: false
+#   path: "~/.hermes/usage/usage_ledger.jsonl"
 
 # =============================================================================
 # Persistent Memory
