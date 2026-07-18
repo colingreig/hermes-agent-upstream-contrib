@@ -2736,10 +2736,16 @@ DEFAULT_CONFIG = {
         # chat is ever touched — fan-out / broadcast targets are never mirrored.
         "mirror_delivery": False,
         # Maximum number of due jobs to run in parallel per tick.
-        # null/0 = unbounded (limited only by thread count).
+        # Defaults to 4 (86e2abmkq): an unbounded default let a burst of due
+        # jobs spawn as many concurrent agent runs as ThreadPoolExecutor's own
+        # default sizing allows (min(32, cpu_count+4) workers when max_workers
+        # is left as None) — each hitting the shared state.db and the
+        # provider's API concurrently. 4 keeps bursts bounded without
+        # serializing every tick. null/0 = unbounded (limited only by thread
+        # count) for operators who explicitly want the old behaviour.
         # 1 = serial (pre-v0.9 behaviour).
         # Also overridable via HERMES_CRON_MAX_PARALLEL env var.
-        "max_parallel_jobs": None,
+        "max_parallel_jobs": 4,
         # Per-job output-file retention: save_job_output keeps the N most
         # recent .md files and prunes older ones. 0 or negative disables
         # pruning (for operators who manage cleanup externally). Default 50.

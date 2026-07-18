@@ -1884,6 +1884,14 @@ class AIAgent:
             self._last_flushed_db_idx = len(messages)
         except Exception as e:
             logger.warning("Session DB append_message failed: %s", e)
+            # Record it (86e2abmkq): this except previously swallowed the
+            # failure completely — the turn continues normally and nothing
+            # else ever learns a message failed to persist. Callers that
+            # need this fail-visible (cron's run_job) surface it via
+            # mark_job_run instead of it being invisible outside this log
+            # line. First failure wins so the earliest/root cause is kept.
+            if self._session_persistence_error is None:
+                self._session_persistence_error = f"append_message failed: {e}"
 
     def _get_messages_up_to_last_assistant(self, messages: List[Dict]) -> List[Dict]:
         """

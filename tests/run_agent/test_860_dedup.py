@@ -265,3 +265,116 @@ class TestFlushIdxInit:
         agent._flush_messages_to_session_db(messages, [])
         # Should not crash, idx should remain 0
         assert agent._last_flushed_db_idx == 0
+
+
+class TestFlushPersistenceErrorTracking:
+    """86e2abmkq: append_message failures inside _flush_messages_to_session_db
+    are caught (fail-open, by design — most callers shouldn't abort a turn
+    over a persistence hiccup) but must no longer be *invisible*. Verifies
+    the new ``agent._session_persistence_error`` flag that lets a caller
+    which DOES need this fail-visible (cron/scheduler.py's run_job) detect
+    it after the fact instead of it only ever hitting a WARNING log.
+    """
+
+    def _make_agent(self, session_db):
+        with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
+            from run_agent import AIAgent
+            agent = AIAgent(
+                api_key="test-key",
+                base_url="https://openrouter.ai/api/v1",
+                model="test/model",
+                quiet_mode=True,
+                session_db=session_db,
+                session_id="test-session-persist-err",
+                skip_context_files=True,
+                skip_memory=True,
+            )
+        agent._ensure_db_session()
+        return agent
+
+    def test_flag_starts_unset(self):
+        """A fresh agent has no persistence error recorded."""
+        with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
+            from run_agent import AIAgent
+            agent = AIAgent(
+                api_key="test-key",
+                base_url="https://openrouter.ai/api/v1",
+                model="test/model",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+        assert agent._session_persistence_error is None
+
+    def test_append_message_failure_sets_flag_but_does_not_raise(self):
+        """A raising append_message is still caught (fail-open) — the turn
+        must not crash — but the failure is now recorded on the agent
+        instead of vanishing after the WARNING log line."""
+        from unittest.mock import MagicMock
+
+        broken_db = MagicMock()
+        broken_db.append_message.side_effect = RuntimeError("database is locked")
+        agent = self._make_agent(broken_db)
+
+        messages = [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi"},
+        ]
+
+        # Must not raise despite the underlying write failing.
+        agent._flush_messages_to_session_db(messages, [])
+
+        assert agent._session_persistence_error is not None
+        assert "database is locked" in agent._session_persistence_error
+        assert "append_message" in agent._session_persistence_error
+
+    def test_successful_flush_leaves_flag_unset(self):
+        """A normal, successful flush against a real SessionDB never sets
+        the flag — proves the check isn't a false-positive trap."""
+        import tempfile
+        from pathlib import Path
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            db = SessionDB(db_path=db_path)
+            try:
+                agent = self._make_agent(db)
+                messages = [{"role": "user", "content": "hello"}]
+                agent._flush_messages_to_session_db(messages, [])
+                assert agent._session_persistence_error is None
+            finally:
+                db.close()
+
+    def test_first_failure_is_sticky_across_multiple_flushes(self):
+        """First-failure-wins: a later successful flush must not clear an
+        earlier recorded failure — the earlier turn's message is still
+        permanently missing from state.db even if a subsequent write
+        happens to succeed."""
+        from unittest.mock import MagicMock
+
+        calls = {"n": 0}
+
+        def _flaky_append(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("database is locked")
+            return 1
+
+        broken_db = MagicMock()
+        broken_db.append_message.side_effect = _flaky_append
+        agent = self._make_agent(broken_db)
+
+        agent._flush_messages_to_session_db(
+            [{"role": "user", "content": "first"}], []
+        )
+        first_error = agent._session_persistence_error
+        assert first_error is not None
+
+        # Second flush's write succeeds, but the flag must still reflect
+        # the earlier, real, un-recovered data loss.
+        agent._flush_messages_to_session_db(
+            [{"role": "user", "content": "first"}, {"role": "assistant", "content": "second"}],
+            [],
+        )
+        assert agent._session_persistence_error == first_error

@@ -3345,3 +3345,26 @@ def test_sync_anthropic_entry_clears_all_error_fields(tmp_path, monkeypatch):
     assert synced.last_error_reason is None
     assert synced.last_error_message is None
     assert synced.last_error_reset_at is None
+
+
+def test_empty_pool_log_line_names_provider_and_keeps_alert_substring(tmp_path, monkeypatch, caplog):
+    """hermes-usage-alert (86e2a2p9q) matches the exhausted-pool page on the
+    literal substring "no available entries (all exhausted" and separately
+    parses out a "[provider=...]" suffix to name which pool paged. Both must
+    survive any future refactor of this log line.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(tmp_path, {"version": 1, "credential_pool": {"zai": []}})
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("zai")
+
+    with caplog.at_level("INFO"):
+        entry = pool._select_unlocked()
+
+    assert entry is None
+    matching = [r.message for r in caplog.records if "no available entries" in r.message]
+    assert matching, "expected a 'no available entries' log line"
+    assert "no available entries (all exhausted" in matching[0]
+    assert "[provider=zai]" in matching[0]

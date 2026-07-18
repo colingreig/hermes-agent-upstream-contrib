@@ -1054,6 +1054,88 @@ class TestRunJobSessionPersistence:
         fake_db.close.assert_called_once()
         mock_agent.close.assert_called_once()
 
+    def test_run_job_surfaces_swallowed_session_persistence_failure(self, tmp_path):
+        """86e2abmkq: a state write (append_message) that failed and was
+        caught inside the agent turn (AIAgent._session_persistence_error)
+        must not be reported as a clean cron success — it's real data loss
+        (the session transcript is now missing a message). run_job() must
+        turn this into a failure so it reaches mark_job_run's last_error,
+        instead of the failure only ever hitting a WARNING log no one reads.
+        """
+        job = {"id": "test-job", "name": "test", "prompt": "hello"}
+        fake_db = MagicMock()
+        fake_db.get_compression_tip.side_effect = lambda sid: sid
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+             patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "test-key",
+                     "base_url": "https://example.invalid/v1",
+                     "provider": "openrouter",
+                     "api_mode": "chat_completions",
+                 },
+             ), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            # Simulate what _flush_messages_to_session_db sets when
+            # append_message raises and the exception is caught rather than
+            # propagated (see run_agent.py).
+            mock_agent._session_persistence_error = (
+                "append_message failed: database is locked"
+            )
+            mock_agent_cls.return_value = mock_agent
+
+            success, output, final_response, error = run_job(job)
+
+        assert success is False
+        assert error is not None
+        assert "database is locked" in error
+        assert "data loss" in error.lower()
+        # The generated response must not be silently delivered as if
+        # nothing went wrong — run_one_job's failure path takes over instead.
+        assert final_response == ""
+
+    def test_run_job_no_persistence_error_when_flag_unset(self, tmp_path):
+        """Sanity companion: a real AIAgent with no persistence failure
+        (the normal case — _session_persistence_error stays None) must
+        still report success, proving the new check doesn't misfire.
+        """
+        job = {"id": "test-job", "name": "test", "prompt": "hello"}
+        fake_db = MagicMock()
+        fake_db.get_compression_tip.side_effect = lambda sid: sid
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+             patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "test-key",
+                     "base_url": "https://example.invalid/v1",
+                     "provider": "openrouter",
+                     "api_mode": "chat_completions",
+                 },
+             ), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent._session_persistence_error = None
+            mock_agent_cls.return_value = mock_agent
+
+            success, output, final_response, error = run_job(job)
+
+        assert success is True
+        assert error is None
+        assert final_response == "ok"
+
     def test_run_job_suppresses_empty_turn_explainer(self, tmp_path):
         """An empty model turn becomes the '⚠️ No reply…' explainer (#34452).
         For cron, that abnormal-empty explainer must be treated as empty so it
@@ -3564,6 +3646,47 @@ class TestParallelTick:
         end_s1 = [t for action, jid, t in call_times if action == "end" and jid == "s1"][0]
         start_s2 = [t for action, jid, t in call_times if action == "start" and jid == "s2"][0]
         assert start_s2 >= end_s1, "Jobs ran concurrently despite max_parallel=1"
+
+    def test_max_parallel_config_default_bounds_concurrency(self):
+        """cron.max_parallel_jobs=4 (86e2abmkq default) caps a burst of due
+        jobs to at most 4 running simultaneously, even when 8 are due at once.
+        """
+        import threading
+
+        lock = threading.Lock()
+        state = {"current": 0, "max_seen": 0}
+
+        def mock_run_job(job):
+            with lock:
+                state["current"] += 1
+                state["max_seen"] = max(state["max_seen"], state["current"])
+            time.sleep(0.15)
+            with lock:
+                state["current"] -= 1
+            return (True, "output", "response", None)
+
+        jobs = [
+            {"id": f"burst-{i}", "name": f"burst-{i}", "deliver": "local"}
+            for i in range(8)
+        ]
+
+        with patch("cron.scheduler.get_due_jobs", return_value=jobs), \
+             patch("cron.scheduler.advance_next_run"), \
+             patch("cron.scheduler.run_job", side_effect=mock_run_job), \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch("cron.scheduler._deliver_result", return_value=None), \
+             patch("cron.scheduler.mark_job_run"), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"max_parallel_jobs": 4}}):
+            from cron.scheduler import tick
+            result = tick(verbose=False)
+
+        assert result == 8
+        assert state["max_seen"] <= 4, (
+            f"concurrency cap violated: {state['max_seen']} jobs ran simultaneously "
+            f"(max_parallel_jobs=4)"
+        )
+        # Sanity: still genuinely parallel, not accidentally serialized to 1.
+        assert state["max_seen"] > 1
 
 
 class TestDeliverResultTimeoutCancelsFuture:
