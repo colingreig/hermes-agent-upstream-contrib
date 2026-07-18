@@ -248,22 +248,35 @@ def _git(gitdir, *args):
     return _run(cmd + list(args))
 
 
-def _git_contexts(bare_root):
+def _git_contexts(bare_root, repo_match=None):
     """Yield (label, gitdir) git contexts to scan for local branches.
 
-    Always yields the current working repo (gitdir=None → git uses discovery). Then yields
-    every bare mirror under `bare_root` (the mini's shared ``~/.hermes/bare/<owner>__<repo>.git``
-    worktree source). A branch committed in a per-task worktree lives in the mirror's
-    refs/heads, so scanning the CWD repo alone would miss it on the mini.
+    Always yields the current working repo (gitdir=None → git uses discovery). Then yields the
+    bare mirror(s) under `bare_root` (the mini's shared ``~/.hermes/bare/<owner>__<repo>.git``
+    worktree source) **that belong to the same repo as this sweep** — a branch committed in a
+    per-task worktree lives in the mirror's refs/heads, so scanning the CWD repo alone would
+    miss it on the mini.
+
+    `repo_match` (e.g. "colingreig__hermes-agent") restricts which mirrors are scanned. This is
+    REQUIRED for correctness: bare_root holds mirrors for many *different* repos (client sites,
+    upstreams), and comparing another repo's branches against this sweep's remote/base is nonsense.
+    Match the full ``<owner>__<repo>`` stem, not just the repo name — the mini holds BOTH
+    ``colingreig__hermes-agent.git`` (the fork) and ``nousresearch__hermes-agent.git`` (the
+    upstream); the latter's ``agent/hermes-agent`` reads as "+1673 commits ahead of fork/main" and
+    must not match. When `repo_match` is None we scan NO mirrors (cwd only), because without knowing
+    the repo we cannot tell which mirror is right and must not emit cross-repo false positives.
     """
     yield ("cwd", None)
-    if not bare_root or not os.path.isdir(bare_root):
+    if not repo_match or not bare_root or not os.path.isdir(bare_root):
         return
     try:
         for name in sorted(os.listdir(bare_root)):
             path = os.path.join(bare_root, name)
-            # A bare repo dir ends in .git and has a HEAD file; be lenient and let git decide.
-            if name.endswith(".git") and os.path.isdir(path):
+            # Exact stem match (owner__repo.git). A bare repo-name form is also honored for
+            # manual --repo-match use, but the derived default is always the full stem.
+            if os.path.isdir(path) and (
+                name == f"{repo_match}.git" or name.endswith(f"__{repo_match}.git")
+            ):
                 yield (name, path)
     except OSError as e:
         print(f"[orphan-sweep] could not list bare root {bare_root}: {e!r}", file=sys.stderr)
@@ -311,17 +324,24 @@ def _ahead_of_base_local(gitdir, branch, base, remote="origin"):
 
 
 def check_unpushed(base="main", prefixes=DEFAULT_PREFIXES, bare_root=None, push=False,
-                   dry_run=False, remote="origin", gh_repo=None):
+                   dry_run=False, remote="origin", gh_repo=None, repo_match=None):
     """Detect committed-but-never-pushed local branches (86e2d6vjj gap 3).
 
     Returns 0 when nothing is stranded, 1 when at least one unpushed-ahead branch is found
     (so a cron treats it as an actionable condition). With `push=True` (opt-in), pushes each
     stranded branch to `remote` and opens its PR; otherwise it is report-only.
+
+    `repo_match` scopes the bare-mirror scan to this sweep's repo (see `_git_contexts`); it is
+    derived from `gh_repo` when not passed explicitly, so cross-repo mirrors never false-positive.
     """
     bare_root = bare_root if bare_root is not None else DEFAULT_BARE_ROOT
+    if repo_match is None and gh_repo and "/" in gh_repo:
+        # Full owner__repo stem so colingreig__hermes-agent.git is matched but the
+        # nousresearch__hermes-agent.git upstream mirror is NOT.
+        repo_match = gh_repo.replace("/", "__")
     stranded = []  # (label, gitdir, branch, sha, ahead)
     seen = set()   # de-dupe a branch that appears in multiple contexts (same name+sha)
-    for label, gitdir in _git_contexts(bare_root):
+    for label, gitdir in _git_contexts(bare_root, repo_match):
         for branch, sha in _local_branch_tips(gitdir, prefixes).items():
             key = (branch, sha)
             if key in seen:
@@ -449,6 +469,20 @@ def main():
         help="owner/repo passed to `gh -R` so PR calls target the fork explicitly rather than "
         "gh's inference from remotes (e.g. colingreig/hermes-agent). Default: gh's inference.",
     )
+    parser.add_argument(
+        "--repo-match",
+        default=None,
+        help="owner__repo stem (e.g. colingreig__hermes-agent) scoping the --check-unpushed "
+        "bare-mirror scan to that ~/.hermes/bare mirror. Default: derived from --gh-repo.",
+    )
+    parser.add_argument(
+        "--no-remote-sweep",
+        action="store_true",
+        help="With --check-unpushed: run ONLY the committed-but-unpushed detection, NOT the "
+        "acting remote orphan sweep. Use this for a monitoring cron: the acting sweep opens a PR "
+        "for every branch ahead-of-base with no PR, which is unsafe against a fork holding a large "
+        "backlog of upstream-mirror hermes/* branches (it would create hundreds of bogus PRs).",
+    )
     args = parser.parse_args()
     prefixes = tuple(args.prefixes) if args.prefixes else DEFAULT_PREFIXES
     if args.check_unpushed:
@@ -461,8 +495,11 @@ def main():
             dry_run=args.dry_run,
             remote=args.remote,
             gh_repo=args.gh_repo,
+            repo_match=args.repo_match,
         )
-        # Run the remote sweep too so a single cron invocation covers both surfaces.
+        if args.no_remote_sweep:
+            return rc_unpushed
+        # Otherwise run the acting remote sweep too so one invocation covers both surfaces.
         rc_remote = sweep(
             base=args.base, prefixes=prefixes, dry_run=args.dry_run,
             remote=args.remote, gh_repo=args.gh_repo,
