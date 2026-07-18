@@ -710,6 +710,51 @@ def _delete_tag(task_id, tag):
               file=sys.stderr)
 
 
+WORKED_BY_FIELD_ID = "2bf5c958-ca2a-4f6b-bab5-25693b98b1f1"  # "Worked By" dropdown field
+# The Hermes option's UUID within that dropdown is workspace-specific and is
+# intentionally NOT hardcoded here; supply it via env. If unset, the stamp is
+# skipped (logged, not fatal) rather than guessing an id and mis-tagging a
+# task with the wrong option.
+WORKED_BY_HERMES_OPTION_ENV = "CLICKUP_WORKED_BY_HERMES_OPTION_ID"
+
+
+def _stamp_worked_by_hermes(task_id):
+    """Best-effort POST to set the "Worked By" custom field to the Hermes
+    option, so the review-SLA staleness sweep's `_worked_by_hermes()` check
+    (which only ever READS this field) can actually see that Hermes worked
+    this task. Until now nothing in the fleet ever wrote it, so that safety
+    net could never fire for Hermes-claimed work.
+
+    Mirrors `_delete_tag`'s best-effort contract: log and continue on any
+    failure, never raise, never block the wake/claim it's called from."""
+    option_id = os.environ.get(WORKED_BY_HERMES_OPTION_ENV, "").strip()
+    if not option_id:
+        print(
+            f"[gate] worked-by stamp skipped for {task_id}: "
+            f"{WORKED_BY_HERMES_OPTION_ENV} not set in env",
+            file=sys.stderr,
+        )
+        return
+    try:
+        body = json.dumps({"value": option_id}).encode("utf-8")
+        req = urllib.request.Request(
+            f"https://api.clickup.com/api/v2/task/{task_id}/field/{WORKED_BY_FIELD_ID}",
+            data=body,
+            method="POST",
+            headers={
+                "Authorization": _token(),
+                "Content-Type": "application/json",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            print(f"[gate] POST /field/Worked-By on {task_id}: rc={resp.status}")
+    except Exception as e:
+        # Best-effort: a failed stamp must never block the wake it rides
+        # along with — the staleness-sweep gap this closes is a safety net,
+        # not the primary claim mechanism.
+        print(f"[gate] worked-by stamp failed for {task_id}: {e!r}", file=sys.stderr)
+
+
 def _self_park(parked_tasks):
     """Handle parked tasks surfaced by _classify(): drop agent-ready so the
     next cron wake cannot re-wake the executor on them. This is the gate's
@@ -996,6 +1041,12 @@ def main():
         else:
             woke = _wake(f"continuation of {task['id']}")
             if woke:
+                # WORKED-BY STAMP (86e29q8pg): the ClickUp task_id is known here
+                # (unlike the unclaimed path below, where the executor self-
+                # selects) — this is the tracked choke point for marking the
+                # task as Hermes-worked. Best-effort; never blocks the wake.
+                if not os.environ.get("DRY_RUN"):
+                    _stamp_worked_by_hermes(task["id"])
                 rec["count"] = rec.get("count", 0) + 1
                 rec["last_ts"] = now
                 # Cumulative no-progress strike bookkeeping (reset on progress in _pick).
