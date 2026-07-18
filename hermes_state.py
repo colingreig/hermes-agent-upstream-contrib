@@ -5105,7 +5105,7 @@ class SessionDB:
     # real tip dangling forever. Same "only touch what we're sure is safe"
     # philosophy, applied to the opposite end of the session lifecycle.
 
-    _CRON_SESSION_ID_RE = re.compile(r"^cron_.+_\d{8}_\d{6}(?:_\d+)?$")
+    _CRON_SESSION_ID_RE = re.compile(r"^cron_(.+)_\d{8}_\d{6}(?:_\d+)?$")
 
     def classify_stale_sessions(
         self,
@@ -5139,8 +5139,8 @@ class SessionDB:
             for rows created before the fix landed.
 
         Returns a list of dicts (one per active session), each with keys
-        ``id``, ``source``, ``started_at``, ``age_seconds``, ``reason``,
-        ``candidate``.
+        ``id``, ``source``, ``started_at``, ``age_seconds``, ``owner``,
+        ``reason``, ``candidate``.
         """
         now = time.time()
         with self._lock:
@@ -5154,17 +5154,25 @@ class SessionDB:
             row_source = row["source"]
             started_at = row["started_at"]
             age = max(0.0, now - float(started_at or now))
+            id_match = self._CRON_SESSION_ID_RE.match(sid or "")
             entry: Dict[str, Any] = {
                 "id": sid,
                 "source": row_source,
                 "started_at": started_at,
                 "age_seconds": age,
+                # Process/session ownership signal: the cron job id parsed out
+                # of a cron_<job_id>_<timestamp> id, i.e. which cron job
+                # process this row belongs to. None when the id doesn't match
+                # that shape — we then can't attribute ownership at all, which
+                # is exactly why "cron-unparseable-id" below is protected
+                # rather than guessed at.
+                "owner": id_match.group(1) if id_match else None,
                 "reason": None,
                 "candidate": False,
             }
             if row_source != source:
                 entry["reason"] = "non-cron-source"
-            elif not self._CRON_SESSION_ID_RE.match(sid or ""):
+            elif not id_match:
                 entry["reason"] = "cron-unparseable-id"
             elif age < float(min_age_seconds):
                 entry["reason"] = "cron-recent-active"

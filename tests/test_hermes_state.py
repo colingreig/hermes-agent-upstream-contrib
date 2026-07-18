@@ -2020,6 +2020,9 @@ class TestReconcileStaleSessions:
         entry = next(c for c in classified if c["id"] == sid)
         assert entry["reason"] == "cron-stale-active"
         assert entry["candidate"] is True
+        # Process/session-ownership signal: which cron job this row belongs
+        # to, parsed from the cron_<job_id>_<timestamp> id shape.
+        assert entry["owner"] == "old-job"
 
     def test_classify_recent_cron_session_is_protected(self, db):
         """A cron job younger than min_age_seconds may still be running —
