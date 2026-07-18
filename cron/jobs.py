@@ -999,6 +999,16 @@ def create_job(
         base_url=normalized_base_url,
         no_agent=normalized_no_agent,
     )
+    route_health = None
+    try:
+        from hermes_cli.route_health import resolve_route_health
+
+        route_health = resolve_route_health(
+            requested_provider=normalized_provider or None,
+            target_model=normalized_model or None,
+        )
+    except Exception:
+        route_health = None
 
     job = {
         "id": job_id,
@@ -1013,6 +1023,7 @@ def create_job(
         # any pre-existing job written before these fields existed (back-compat).
         "provider_snapshot": provider_snapshot,
         "model_snapshot": model_snapshot,
+        "route_health": route_health,
         "base_url": normalized_base_url,
         "script": normalized_script,
         "no_agent": normalized_no_agent,

@@ -8307,6 +8307,16 @@ def config_command(args):
                 print(color(f"    ○ {var_name}{tools_str}", Colors.DIM))
         
         missing_config = get_missing_config_fields()
+        try:
+            from hermes_cli.route_health import resolve_route_health, summarize_route_health
+
+            route_health = resolve_route_health()
+            print()
+            print(color("  Runtime readiness:", Colors.BOLD))
+            print(f"    {summarize_route_health(route_health)}")
+        except Exception as exc:
+            print()
+            print(color(f"  Runtime readiness: unavailable ({exc})", Colors.DIM))
         if missing_config:
             print()
             print(color(f"  {len(missing_config)} new config option(s) available", Colors.YELLOW))
