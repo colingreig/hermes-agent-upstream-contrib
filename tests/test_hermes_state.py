@@ -1165,6 +1165,103 @@ class TestMessageStorage:
 
 
 # =========================================================================
+# Concurrent writes (86e2abmkq) — cron/scheduler.py's tick() runs multiple
+# due jobs in parallel threads, and each cron job run (cron/scheduler.py
+# run_job()) opens its OWN SessionDB() instance/connection pointed at the
+# same on-disk state.db — the same shape of contention a multiprocess
+# writer would produce, since each connection has an independent BEGIN
+# IMMEDIATE/WAL-lock lifecycle. These tests exercise that shape directly
+# (many independent SessionDB connections against one shared db file) to
+# confirm WAL mode + _execute_write's jitter-retry actually delivers
+# lossless writes under load, rather than asserting that in the abstract.
+# =========================================================================
+
+class TestConcurrentSessionWrites:
+    def test_wal_mode_is_enabled_on_the_shared_db(self, tmp_path):
+        """Precondition for the concurrency guarantees below."""
+        db_path = tmp_path / "concurrent_state.db"
+        session_db = SessionDB(db_path=db_path)
+        try:
+            mode = session_db._conn.execute("PRAGMA journal_mode").fetchone()[0]
+            assert mode.lower() == "wal"
+        finally:
+            session_db.close()
+
+    def test_concurrent_appends_from_independent_connections_are_lossless(self, tmp_path):
+        """N threads, each with its OWN SessionDB (own sqlite3 connection —
+        mirrors N concurrent cron jobs each constructing SessionDB()),
+        append_message() into the SAME session concurrently. Every write
+        must land: none may be silently dropped by lock contention.
+        """
+        import threading
+
+        db_path = tmp_path / "concurrent_state.db"
+
+        # Create the session once, up front, via one connection.
+        setup_db = SessionDB(db_path=db_path)
+        setup_db.create_session(session_id="shared-session", source="cli")
+        setup_db.close()
+
+        N_WRITERS = 8
+        N_MESSAGES_PER_WRITER = 10
+        errors = []
+
+        def _writer(idx: int) -> None:
+            try:
+                # Independent connection per thread — the same isolation
+                # shape as cron/scheduler.py's run_job() opening its own
+                # SessionDB() per concurrently-running job.
+                writer_db = SessionDB(db_path=db_path)
+                try:
+                    for m in range(N_MESSAGES_PER_WRITER):
+                        writer_db.append_message(
+                            "shared-session",
+                            role="user",
+                            content=f"writer-{idx}-msg-{m}",
+                        )
+                finally:
+                    writer_db.close()
+            except Exception as exc:  # pragma: no cover - failure path asserted below
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=_writer, args=(i,)) for i in range(N_WRITERS)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+
+        assert not errors, f"concurrent append_message raised: {errors}"
+
+        verify_db = SessionDB(db_path=db_path)
+        try:
+            messages = verify_db.get_messages("shared-session")
+            session = verify_db.get_session("shared-session")
+        finally:
+            verify_db.close()
+
+        expected_total = N_WRITERS * N_MESSAGES_PER_WRITER
+        assert len(messages) == expected_total, (
+            f"lossy concurrent writes: expected {expected_total} messages, "
+            f"found {len(messages)}"
+        )
+        # message_count is maintained by the same write transaction as the
+        # INSERT (see append_message's _do()); it must agree with the row
+        # count, not just be non-zero, or a partial write inside _do() would
+        # go undetected.
+        assert session["message_count"] == expected_total
+
+        contents = {m["content"] for m in messages}
+        expected_contents = {
+            f"writer-{i}-msg-{m}"
+            for i in range(N_WRITERS)
+            for m in range(N_MESSAGES_PER_WRITER)
+        }
+        assert contents == expected_contents, "some writer's messages are missing"
+
+
+# =========================================================================
 # FTS5 search
 # =========================================================================
 

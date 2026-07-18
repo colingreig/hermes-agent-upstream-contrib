@@ -3274,7 +3274,30 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         # Use a separate variable for log display; keep final_response clean
         # for delivery logic (empty response = no delivery).
         logged_response = final_response if final_response else "(No response generated)"
-        
+
+        # Fail-visible persistence check (86e2abmkq): the agent turn itself
+        # succeeded, but if a state write (append_message) was silently
+        # swallowed along the way — see AIAgent._session_persistence_error /
+        # _flush_messages_to_session_db — the session transcript in state.db
+        # is now missing a message. That's real, permanent data loss (a
+        # future turn/continuation replays an incomplete history) and must
+        # not be reported as a clean success. Route it through the same
+        # failure path as an agent-reported failure above so it reaches
+        # mark_job_run's `last_error` instead of only ever hitting a WARNING
+        # log line no one is watching.
+        # isinstance-guarded (not just truthy) because ``agent`` is a
+        # MagicMock() in most run_job() unit tests — an unconfigured mock
+        # attribute auto-vivifies as a truthy child Mock, which would trip
+        # this check on every mocked test. A genuine failure is always a str
+        # (see the f-string that sets it), so the isinstance check is both
+        # the correct real-world condition and mock-safe.
+        _persist_err = getattr(agent, "_session_persistence_error", None)
+        if isinstance(_persist_err, str) and _persist_err:
+            raise RuntimeError(
+                f"Cron job produced a response but a session-state write "
+                f"failed (data loss risk): {_persist_err}"
+            )
+
         output = f"""# Cron Job: {job_name}
 
 **Job ID:** {job_id}
