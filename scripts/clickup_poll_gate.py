@@ -711,11 +711,13 @@ def _delete_tag(task_id, tag):
 
 
 WORKED_BY_FIELD_ID = "2bf5c958-ca2a-4f6b-bab5-25693b98b1f1"  # "Worked By" dropdown field
-# The Hermes option's UUID within that dropdown is workspace-specific and is
-# intentionally NOT hardcoded here; supply it via env. If unset, the stamp is
-# skipped (logged, not fatal) rather than guessing an id and mis-tagging a
-# task with the wrong option.
+# The Hermes option's UUID within that dropdown is a stable workspace-level
+# value (looked up from the ClickUp "Worked By" field, orderindex 1) and is
+# hardcoded as the default below. CLICKUP_WORKED_BY_HERMES_OPTION_ID still
+# overrides it if set (e.g. a different workspace/option id), but an unset
+# env var no longer causes the stamp to self-skip.
 WORKED_BY_HERMES_OPTION_ENV = "CLICKUP_WORKED_BY_HERMES_OPTION_ID"
+WORKED_BY_HERMES_OPTION_ID_DEFAULT = "36c0d22d-3128-42b3-94d2-0d6072d2c0ea"
 
 
 def _stamp_worked_by_hermes(task_id):
@@ -727,14 +729,10 @@ def _stamp_worked_by_hermes(task_id):
 
     Mirrors `_delete_tag`'s best-effort contract: log and continue on any
     failure, never raise, never block the wake/claim it's called from."""
-    option_id = os.environ.get(WORKED_BY_HERMES_OPTION_ENV, "").strip()
-    if not option_id:
-        print(
-            f"[gate] worked-by stamp skipped for {task_id}: "
-            f"{WORKED_BY_HERMES_OPTION_ENV} not set in env",
-            file=sys.stderr,
-        )
-        return
+    option_id = (
+        os.environ.get(WORKED_BY_HERMES_OPTION_ENV, "").strip()
+        or WORKED_BY_HERMES_OPTION_ID_DEFAULT
+    )
     try:
         body = json.dumps({"value": option_id}).encode("utf-8")
         req = urllib.request.Request(

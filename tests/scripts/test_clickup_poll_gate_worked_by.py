@@ -26,21 +26,30 @@ class _FakeResponse:
         return b"{}"
 
 
-def test_stamp_worked_by_hermes_skips_without_option_id(monkeypatch, capsys):
+def test_stamp_worked_by_hermes_uses_default_option_id_without_env(monkeypatch):
+    """No env var set: must POST using the hardcoded default Hermes option id
+    rather than self-skipping (this was the bug — the stamp never fired on
+    the mini because CLICKUP_WORKED_BY_HERMES_OPTION_ID was unset there)."""
     monkeypatch.delenv(gate_mod.WORKED_BY_HERMES_OPTION_ENV, raising=False)
-    called = {}
-    monkeypatch.setattr(
-        gate_mod.urllib.request,
-        "urlopen",
-        lambda *a, **k: called.setdefault("called", True),
-    )
+    monkeypatch.setenv("CLICKUP_API_TOKEN", "tok-abc")
+
+    captured = {}
+
+    def fake_urlopen(req, timeout=30):
+        captured["url"] = req.full_url
+        captured["method"] = req.get_method()
+        captured["body"] = json.loads(req.data.decode("utf-8"))
+        return _FakeResponse(200)
+
+    monkeypatch.setattr(gate_mod.urllib.request, "urlopen", fake_urlopen)
 
     gate_mod._stamp_worked_by_hermes("task-123")
 
-    assert "called" not in called
-    err = capsys.readouterr().err
-    assert "worked-by stamp skipped" in err
-    assert gate_mod.WORKED_BY_HERMES_OPTION_ENV in err
+    assert captured["method"] == "POST"
+    assert captured["url"] == (
+        f"https://api.clickup.com/api/v2/task/task-123/field/{gate_mod.WORKED_BY_FIELD_ID}"
+    )
+    assert captured["body"] == {"value": gate_mod.WORKED_BY_HERMES_OPTION_ID_DEFAULT}
 
 
 def test_stamp_worked_by_hermes_posts_field_value(monkeypatch):
