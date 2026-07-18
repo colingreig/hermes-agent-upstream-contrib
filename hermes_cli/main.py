@@ -13449,6 +13449,50 @@ def main():
     sessions_rename.add_argument("session_id", help="Session ID to rename")
     sessions_rename.add_argument("title", nargs="+", help="New title for the session")
 
+    sessions_reconcile = sessions_subparsers.add_parser(
+        "reconcile",
+        help="Close abandoned active sessions (e.g. never-closed cron compression tips)",
+        description=(
+            "Find active sessions (ended_at IS NULL) that were actually "
+            "abandoned by their owner and close them. Only ever considers "
+            "cron-sourced sessions whose id matches the cron_<job_id>_<ts> "
+            "shape and are older than --min-age-seconds; every other source "
+            "(cli, telegram, discord, slack, whatsapp, signal, matrix, "
+            "gateway, tool, ...) is a live/resumable surface and is never "
+            "touched. Dry-run by default; pass --apply to actually close "
+            "the classified candidates (backup-first)."
+        ),
+    )
+    sessions_reconcile.add_argument(
+        "--source",
+        default="cron",
+        help="Only classify/close sessions from this source (default: cron)",
+    )
+    sessions_reconcile.add_argument(
+        "--min-age-seconds",
+        type=int,
+        default=3600,
+        help=(
+            "Minimum age (seconds) before an active session is considered "
+            "abandoned rather than possibly still running (default: 3600)"
+        ),
+    )
+    sessions_reconcile.add_argument(
+        "--apply",
+        action="store_true",
+        help="Actually close the classified candidates (default: dry-run report only)",
+    )
+    sessions_reconcile.add_argument(
+        "--no-backup",
+        action="store_true",
+        help="Skip the pre-apply state.db backup copy (not recommended)",
+    )
+    sessions_reconcile.add_argument(
+        "--end-reason",
+        default="cron_reconciled",
+        help="end_reason stamped on closed sessions (default: cron_reconciled)",
+    )
+
     sessions_browse = sessions_subparsers.add_parser(
         "browse",
         help="Interactive session picker — browse, search, and resume sessions",
@@ -13619,6 +13663,57 @@ def main():
                 older_than_days=days, source=args.source, sessions_dir=sessions_dir
             )
             print(f"Pruned {count} session(s).")
+
+        elif action == "reconcile":
+            src = args.source
+            min_age = args.min_age_seconds
+            if not getattr(args, "apply", False):
+                classified = db.classify_stale_sessions(
+                    source=src, min_age_seconds=min_age
+                )
+                candidates = [c for c in classified if c["candidate"]]
+                by_reason: Dict[str, int] = {}
+                for c in classified:
+                    by_reason[c["reason"]] = by_reason.get(c["reason"], 0) + 1
+                print(
+                    f"Dry run — {len(classified)} active session(s) examined "
+                    f"(source={src!r}, min_age_seconds={min_age}):"
+                )
+                for reason, n in sorted(by_reason.items()):
+                    flag = " [candidate for --apply]" if reason == "cron-stale-active" else ""
+                    print(f"  {reason}: {n}{flag}")
+                if candidates:
+                    print(f"\n{len(candidates)} candidate(s) for closure:")
+                    for c in candidates[:20]:
+                        age_h = c["age_seconds"] / 3600.0
+                        print(f"  {c['id']}  age={age_h:.1f}h  source={c['source']}")
+                    if len(candidates) > 20:
+                        print(f"  ... and {len(candidates) - 20} more")
+                    print(
+                        "\nRe-run with --apply to close these "
+                        f"(end_reason={args.end_reason!r}). A state.db backup "
+                        "is taken first unless --no-backup is passed."
+                    )
+                else:
+                    print("\nNo candidates — nothing to reconcile.")
+            else:
+                report = db.reconcile_stale_sessions(
+                    source=src,
+                    min_age_seconds=min_age,
+                    end_reason=args.end_reason,
+                    backup=not getattr(args, "no_backup", False),
+                )
+                if report.get("backup_path"):
+                    print(f"Backup: {report['backup_path']}")
+                print(
+                    f"Classified {report['classified']} active session(s), "
+                    f"{report['candidates']} candidate(s) for closure."
+                )
+                print(
+                    f"Active sessions before: {report['before_active']}  "
+                    f"after: {report['after_active']}  "
+                    f"closed: {report['closed']}"
+                )
 
         elif action == "rename":
             resolved_session_id = db.resolve_session_id(args.session_id)

@@ -4,6 +4,7 @@ import contextlib
 import json
 import logging
 import os
+import time
 from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
@@ -964,6 +965,9 @@ class TestRunJobSessionPersistence:
             "prompt": "hello",
         }
         fake_db = MagicMock()
+        # No compression chain in this test — get_compression_tip() on a real
+        # SessionDB echoes the input id back when there's no continuation.
+        fake_db.get_compression_tip.side_effect = lambda sid: sid
 
         with patch("cron.scheduler._hermes_home", tmp_path), \
              patch("cron.scheduler._resolve_origin", return_value=None), \
@@ -1096,6 +1100,7 @@ class TestRunJobSessionPersistence:
             "prompt": "summarize my inbox",
         }
         fake_db = MagicMock()
+        fake_db.get_compression_tip.side_effect = lambda sid: sid
 
         with patch("cron.scheduler._hermes_home", tmp_path), \
              patch("cron.scheduler._resolve_origin", return_value=None), \
@@ -1743,6 +1748,291 @@ class TestRunJobSessionPersistence:
         assert os.getenv("HERMES_CRON_AUTO_DELIVER_CHAT_ID") is None
         assert os.getenv("HERMES_CRON_AUTO_DELIVER_THREAD_ID") is None
         assert fake_db.close.call_count == 2
+
+
+class TestRunJobClosesCompressedCronTips:
+    """86e2abmm6: run_job's finally block must resolve the compression chain
+    before titling/ending the cron session, so a job that rotates its
+    session mid-run (agent/conversation_compression.py's legacy "rotation"
+    path) ends with exactly one ``cron_complete`` tip and no active child
+    left dangling forever.
+
+    Unlike TestRunJobSessionPersistence above (which uses a MagicMock
+    fake_db), these tests use a REAL hermes_state.SessionDB backed by a temp
+    sqlite file so get_compression_tip()'s chain walk and end_session()'s
+    first-reason-wins no-op run for real, not a mock's default truthy
+    return value.
+    """
+
+    def _patches(self, tmp_path, agent_cls):
+        return [
+            patch("cron.scheduler._hermes_home", tmp_path),
+            patch("cron.scheduler._resolve_origin", return_value=None),
+            patch("hermes_cli.env_loader.load_hermes_dotenv"),
+            patch("hermes_cli.env_loader.reset_secret_source_cache"),
+            patch(
+                "hermes_cli.runtime_provider.resolve_runtime_provider",
+                return_value={
+                    "api_key": "test-key",
+                    "base_url": "https://example.invalid/v1",
+                    "provider": "openrouter",
+                    "api_mode": "chat_completions",
+                },
+            ),
+            patch("run_agent.AIAgent", agent_cls),
+        ]
+
+    @staticmethod
+    def _query_sessions(db_path):
+        """run_job's finally block closes (and thus dead-ends) the SessionDB
+        connection it was given, so read back the persisted rows through a
+        fresh connection to the same file rather than the exhausted one."""
+        from hermes_state import SessionDB
+
+        verify_db = SessionDB(db_path=db_path)
+        try:
+            rows = verify_db._conn.execute(
+                "SELECT id, end_reason, ended_at FROM sessions"
+            ).fetchall()
+            return {r["id"]: r for r in rows}
+        finally:
+            verify_db.close()
+
+    def test_success_path_no_compression_closes_the_single_session(self, tmp_path):
+        """Baseline: no compression happened — the tip IS the original id,
+        so the finally block closes exactly the session run_job created."""
+        from hermes_state import SessionDB
+
+        db_path = tmp_path / "state.db"
+        real_db = SessionDB(db_path=db_path)
+
+        class PlainAgent:
+            def __init__(self, *args, **kwargs):
+                self.session_id = kwargs["session_id"]
+                # Mirror run_agent.py's _ensure_db_session(): the real
+                # AIAgent creates its own row lazily on first use.
+                kwargs["session_db"].create_session(
+                    session_id=self.session_id, source="cron",
+                )
+
+            def run_conversation(self, *args, **kwargs):
+                return {"final_response": "ok"}
+
+            def close(self):
+                pass
+
+        job = {"id": "plain-job", "name": "test", "prompt": "hello"}
+        with contextlib.ExitStack() as stack:
+            for cm in self._patches(tmp_path, PlainAgent):
+                stack.enter_context(cm)
+            stack.enter_context(patch("hermes_state.SessionDB", return_value=real_db))
+            success, output, final_response, error = run_job(job)
+
+        assert success is True
+        assert final_response == "ok"
+        rows = self._query_sessions(db_path)
+        assert len(rows) == 1
+        (sid, row), = rows.items()
+        assert sid.startswith("cron_plain-job_")
+        assert row["end_reason"] == "cron_complete"
+        assert row["ended_at"] is not None
+
+    def test_exception_path_still_resolves_and_closes_the_tip(self, tmp_path):
+        """A failing run_conversation must not skip session closing — the
+        finally block still runs, tip resolution included."""
+        from hermes_state import SessionDB
+
+        db_path = tmp_path / "state.db"
+        real_db = SessionDB(db_path=db_path)
+
+        class FailingAgent:
+            def __init__(self, *args, **kwargs):
+                self.session_id = kwargs["session_id"]
+                kwargs["session_db"].create_session(
+                    session_id=self.session_id, source="cron",
+                )
+
+            def run_conversation(self, *args, **kwargs):
+                raise RuntimeError("boom")
+
+            def close(self):
+                pass
+
+        job = {"id": "failing-job", "name": "test", "prompt": "hello"}
+        with contextlib.ExitStack() as stack:
+            for cm in self._patches(tmp_path, FailingAgent):
+                stack.enter_context(cm)
+            stack.enter_context(patch("hermes_state.SessionDB", return_value=real_db))
+            success, output, final_response, error = run_job(job)
+
+        assert success is False
+        assert "RuntimeError: boom" in error
+        rows = self._query_sessions(db_path)
+        assert len(rows) == 1
+        (_sid, row), = rows.items()
+        assert row["end_reason"] == "cron_complete"
+        assert row["ended_at"] is not None
+
+    def test_timeout_path_still_resolves_and_closes_the_tip(self, tmp_path, monkeypatch):
+        """Inactivity-timeout path (HERMES_CRON_TIMEOUT): run_job raises
+        TimeoutError instead of returning normally. The finally block must
+        still run tip resolution and close the session.
+
+        ``concurrent.futures.wait`` is faked to always report "still
+        running" so the test doesn't have to burn a real 5s poll interval
+        to reach the idle check — get_activity_summary() reports the run as
+        already stuck, so the very first idle check trips the timeout.
+        """
+        from hermes_state import SessionDB
+
+        db_path = tmp_path / "state.db"
+        real_db = SessionDB(db_path=db_path)
+        monkeypatch.setenv("HERMES_CRON_TIMEOUT", "0.01")
+
+        class HangingAgent:
+            def __init__(self, *args, **kwargs):
+                self.session_id = kwargs["session_id"]
+                kwargs["session_db"].create_session(
+                    session_id=self.session_id, source="cron",
+                )
+
+            def run_conversation(self, *args, **kwargs):
+                # Real background work is brief; the faked wait() below is
+                # what actually drives run_job to give up on it.
+                time.sleep(0.05)
+                return {"final_response": "should never be observed"}
+
+            def get_activity_summary(self):
+                return {"seconds_since_activity": 99999.0, "last_activity_desc": "stuck"}
+
+            def interrupt(self, reason):
+                pass
+
+            def close(self):
+                pass
+
+        def fake_wait(fs, timeout=None):
+            return set(), set(fs)  # never "done" from run_job's perspective
+
+        job = {"id": "timeout-job", "name": "test", "prompt": "hello"}
+        with contextlib.ExitStack() as stack:
+            for cm in self._patches(tmp_path, HangingAgent):
+                stack.enter_context(cm)
+            stack.enter_context(patch("hermes_state.SessionDB", return_value=real_db))
+            stack.enter_context(patch("concurrent.futures.wait", side_effect=fake_wait))
+            success, output, final_response, error = run_job(job)
+
+        assert success is False
+        assert "TimeoutError" in error
+        rows = self._query_sessions(db_path)
+        assert len(rows) == 1
+        (_sid, row), = rows.items()
+        assert row["end_reason"] == "cron_complete"
+        assert row["ended_at"] is not None
+
+    def test_compression_rotation_closes_the_child_tip_not_the_parent(self, tmp_path):
+        """The exact defect (86e2abmm6): a mid-run compression rotates the
+        live session onto a child row (agent/conversation_compression.py's
+        legacy rotation path — end_session(parent, "compression") + a new
+        child row). The finally block must end the CHILD with
+        'cron_complete', leaving the parent's 'compression' reason intact —
+        not end the (already-ended, now stale) parent id a second time."""
+        from hermes_state import SessionDB
+
+        db_path = tmp_path / "state.db"
+        real_db = SessionDB(db_path=db_path)
+
+        class RotatingAgent:
+            def __init__(self, *args, **kwargs):
+                self.session_id = kwargs["session_id"]
+                self._session_db = kwargs["session_db"]
+                self._session_db.create_session(
+                    session_id=self.session_id, source="cron",
+                )
+
+            def run_conversation(self, *args, **kwargs):
+                # Mirror agent/conversation_compression.py's rotation branch.
+                old_id = self.session_id
+                self._session_db.end_session(old_id, "compression")
+                self.session_id = f"{old_id}_rotated"
+                self._session_db.create_session(
+                    session_id=self.session_id,
+                    source="cron",
+                    parent_session_id=old_id,
+                )
+                return {"final_response": "ok"}
+
+            def close(self):
+                pass
+
+        job = {"id": "compress-job", "name": "test", "prompt": "hello"}
+        with contextlib.ExitStack() as stack:
+            for cm in self._patches(tmp_path, RotatingAgent):
+                stack.enter_context(cm)
+            stack.enter_context(patch("hermes_state.SessionDB", return_value=real_db))
+            success, output, final_response, error = run_job(job)
+
+        assert success is True
+        rows = self._query_sessions(db_path)
+        assert len(rows) == 2
+        root_id = next(
+            sid for sid in rows if sid.startswith("cron_compress-job_") and not sid.endswith("_rotated")
+        )
+        tip_id = f"{root_id}_rotated"
+        assert tip_id in rows
+
+        # The tip — not the parent — got the cron_complete stamp.
+        assert rows[tip_id]["end_reason"] == "cron_complete"
+        assert rows[tip_id]["ended_at"] is not None
+        # The parent keeps its compression end_reason (end_session's
+        # first-reason-wins no-op means a stray call on it would be a no-op
+        # anyway, but this proves the finally block targeted the tip, not
+        # a second call on the stale parent id).
+        assert rows[root_id]["end_reason"] == "compression"
+        assert rows[root_id]["ended_at"] is not None
+
+    def test_concurrent_completion_does_not_clobber_an_already_closed_session(self, tmp_path):
+        """Acceptance criterion 5: if something else (e.g. a duplicate tick,
+        or the agent's own cleanup path) already ended the session by the
+        time the finally block runs, end_session()'s first-reason-wins
+        no-op must mean the job's own cron_complete stamp never clobbers the
+        real reason — and the job must still report success."""
+        from hermes_state import SessionDB
+
+        db_path = tmp_path / "state.db"
+        real_db = SessionDB(db_path=db_path)
+
+        class RacyAgent:
+            def __init__(self, *args, **kwargs):
+                self.session_id = kwargs["session_id"]
+                self._session_db = kwargs["session_db"]
+                self._session_db.create_session(
+                    session_id=self.session_id, source="cron",
+                )
+
+            def run_conversation(self, *args, **kwargs):
+                # Simulate a concurrent writer ending this exact session
+                # before run_job's finally block gets a chance to.
+                self._session_db.end_session(self.session_id, "agent_close")
+                return {"final_response": "ok"}
+
+            def close(self):
+                pass
+
+        job = {"id": "race-job", "name": "test", "prompt": "hello"}
+        with contextlib.ExitStack() as stack:
+            for cm in self._patches(tmp_path, RacyAgent):
+                stack.enter_context(cm)
+            stack.enter_context(patch("hermes_state.SessionDB", return_value=real_db))
+            success, output, final_response, error = run_job(job)
+
+        assert success is True
+        rows = self._query_sessions(db_path)
+        assert len(rows) == 1
+        (_sid, row), = rows.items()
+        # NOT clobbered to "cron_complete" — the earlier writer's reason wins.
+        assert row["end_reason"] == "agent_close"
+        assert row["ended_at"] is not None
 
 
 class TestRunJobConfigLogging:

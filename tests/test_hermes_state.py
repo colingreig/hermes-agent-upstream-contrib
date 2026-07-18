@@ -3,6 +3,7 @@
 import sqlite3
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 import pytest
 
 import hermes_state
@@ -1993,6 +1994,147 @@ class TestPruneSessions:
         assert pruned == 3
         for sid in ("X", "Y", "Z"):
             assert db.get_session(sid) is None
+
+
+class TestReconcileStaleSessions:
+    """86e2abmm6: classify_stale_sessions() / reconcile_stale_sessions() —
+    the ``hermes sessions reconcile`` engine.  Mirror image of prune_sessions:
+    that method only ever touches rows that are already ended; this one only
+    ever considers rows that look active but were actually abandoned (e.g. a
+    cron job whose finally-block closed the wrong id after a compression
+    rotation — see cron/scheduler.py and TestRunJobClosesCompressedCronTips)."""
+
+    def _make_cron_session(self, db, job_id: str, *, age_seconds: float) -> str:
+        sid = f"cron_{job_id}_20260101_000000"
+        db.create_session(session_id=sid, source="cron")
+        db._conn.execute(
+            "UPDATE sessions SET started_at = ? WHERE id = ?",
+            (time.time() - age_seconds, sid),
+        )
+        db._conn.commit()
+        return sid
+
+    def test_classify_stale_active_cron_session_is_a_candidate(self, db):
+        sid = self._make_cron_session(db, "old-job", age_seconds=7200)
+        classified = db.classify_stale_sessions(min_age_seconds=3600)
+        entry = next(c for c in classified if c["id"] == sid)
+        assert entry["reason"] == "cron-stale-active"
+        assert entry["candidate"] is True
+
+    def test_classify_recent_cron_session_is_protected(self, db):
+        """A cron job younger than min_age_seconds may still be running —
+        never a candidate."""
+        sid = self._make_cron_session(db, "fresh-job", age_seconds=10)
+        classified = db.classify_stale_sessions(min_age_seconds=3600)
+        entry = next(c for c in classified if c["id"] == sid)
+        assert entry["reason"] == "cron-recent-active"
+        assert entry["candidate"] is False
+
+    def test_classify_never_flags_non_cron_interactive_sessions(self, db):
+        """Acceptance criterion 2: normal interactive resumable sessions
+        (cli/telegram/discord/slack/whatsapp/signal/matrix/gateway/...) are
+        NEVER classified as reconcile candidates, no matter how old."""
+        for source in ("cli", "telegram", "discord", "slack", "whatsapp"):
+            sid = f"{source}-session"
+            db.create_session(session_id=sid, source=source)
+            db._conn.execute(
+                "UPDATE sessions SET started_at = ? WHERE id = ?",
+                (time.time() - 999999, sid),
+            )
+        db._conn.commit()
+
+        classified = db.classify_stale_sessions(min_age_seconds=3600)
+        for entry in classified:
+            assert entry["reason"] == "non-cron-source"
+            assert entry["candidate"] is False
+
+    def test_classify_flags_cron_source_with_unparseable_id_as_protected(self, db):
+        """A row with source='cron' but an id that doesn't match the
+        cron_<job_id>_<timestamp> shape can't be trusted as a finished cron
+        tick — protected rather than guessed at."""
+        db.create_session(session_id="not-a-cron-shaped-id", source="cron")
+        db._conn.execute(
+            "UPDATE sessions SET started_at = ? WHERE id = ?",
+            (time.time() - 999999, "not-a-cron-shaped-id"),
+        )
+        db._conn.commit()
+
+        classified = db.classify_stale_sessions(min_age_seconds=3600)
+        entry = next(c for c in classified if c["id"] == "not-a-cron-shaped-id")
+        assert entry["reason"] == "cron-unparseable-id"
+        assert entry["candidate"] is False
+
+    def test_classify_is_read_only(self, db):
+        """Dry-run must never mutate rows."""
+        sid = self._make_cron_session(db, "old-job", age_seconds=7200)
+        db.classify_stale_sessions(min_age_seconds=3600)
+        session = db.get_session(sid)
+        assert session["ended_at"] is None
+
+    def test_reconcile_apply_closes_only_the_stale_cron_candidates(self, db):
+        stale = self._make_cron_session(db, "stale-job", age_seconds=7200)
+        fresh = self._make_cron_session(db, "fresh-job", age_seconds=10)
+        db.create_session(session_id="interactive", source="cli")
+        db._conn.execute(
+            "UPDATE sessions SET started_at = ? WHERE id = ?",
+            (time.time() - 999999, "interactive"),
+        )
+        db._conn.commit()
+
+        report = db.reconcile_stale_sessions(min_age_seconds=3600, backup=False)
+
+        assert report["candidates"] == 1
+        assert report["closed"] == 1
+        assert report["before_active"] == 3
+        assert report["after_active"] == 2
+
+        assert db.get_session(stale)["end_reason"] == "cron_reconciled"
+        assert db.get_session(stale)["ended_at"] is not None
+        assert db.get_session(fresh)["ended_at"] is None
+        assert db.get_session("interactive")["ended_at"] is None
+
+    def test_reconcile_apply_is_backup_first(self, db, tmp_path):
+        self._make_cron_session(db, "stale-job", age_seconds=7200)
+        report = db.reconcile_stale_sessions(min_age_seconds=3600, backup=True)
+        assert report["backup_path"]
+        backup_path = Path(report["backup_path"])
+        assert backup_path.exists()
+        assert backup_path.parent == db.db_path.parent
+
+    def test_reconcile_apply_skips_backup_when_no_candidates(self, db):
+        """No wasted backup copy when there's nothing to reconcile."""
+        self._make_cron_session(db, "fresh-job", age_seconds=10)
+        report = db.reconcile_stale_sessions(min_age_seconds=3600, backup=True)
+        assert report["candidates"] == 0
+        assert report["backup_path"] is None
+
+    def test_reconcile_is_restart_safe_idempotent_rerun(self, db):
+        """Simulates a process dying mid-backfill and being re-run: the
+        second pass must be a safe no-op, not a double-close or crash."""
+        self._make_cron_session(db, "stale-job", age_seconds=7200)
+
+        first = db.reconcile_stale_sessions(min_age_seconds=3600, backup=False)
+        assert first["closed"] == 1
+
+        second = db.reconcile_stale_sessions(min_age_seconds=3600, backup=False)
+        assert second["candidates"] == 0  # already ended, no longer active
+        assert second["closed"] == 0
+        assert second["before_active"] == second["after_active"] == 0
+
+    def test_reconcile_concurrent_completion_is_a_safe_noop(self, db):
+        """Acceptance criterion 5: if the owning cron job itself closes the
+        session (normal path) between classify and reconcile's end_session
+        call, end_session()'s first-reason-wins no-op means reconcile must
+        not clobber the real reason nor error out."""
+        sid = self._make_cron_session(db, "race-job", age_seconds=7200)
+        # Simulate the owning job's own finally-block winning the race.
+        db.end_session(sid, "cron_complete")
+
+        report = db.reconcile_stale_sessions(min_age_seconds=3600, backup=False)
+
+        assert report["closed"] == 0  # already inactive before reconcile ran
+        session = db.get_session(sid)
+        assert session["end_reason"] == "cron_complete"  # not clobbered
 
 
 class TestDeleteSessionOrphansChildren:

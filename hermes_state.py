@@ -473,18 +473,20 @@ def _claim_repair_attempt(db_path: Path) -> bool:
         return True
 
 
-def _backup_db_file(db_path: Path) -> Optional[Path]:
-    """Copy a (possibly malformed) DB file to a timestamped backup beside it.
+def _backup_db_file(db_path: Path, *, tag: str = "malformed-backup") -> Optional[Path]:
+    """Copy a DB file to a timestamped backup beside it.
 
-    Raw file copy on purpose: the DB won't open cleanly, so we preserve the
-    bytes exactly for forensics / manual restore. WAL and SHM sidecars are
-    copied too when present. Returns the backup path, or None on failure.
+    Raw file copy on purpose: e.g. the schema-repair caller's DB won't open
+    cleanly, so we preserve the bytes exactly for forensics / manual restore.
+    WAL and SHM sidecars are copied too when present. Returns the backup
+    path, or None on failure. *tag* distinguishes callers (schema repair vs
+    the stale-session reconciler) in the resulting filename.
     """
     import datetime
     import shutil
 
     stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    backup_path = db_path.with_name(f"{db_path.name}.malformed-backup-{stamp}")
+    backup_path = db_path.with_name(f"{db_path.name}.{tag}-{stamp}")
     try:
         shutil.copy2(db_path, backup_path)
         for suffix in ("-wal", "-shm"):
@@ -5091,6 +5093,165 @@ class SessionDB:
         for sid in removed_ids:
             self._remove_session_files(sessions_dir, sid)
         return count
+
+    # ── Stale active-session reconciliation (``hermes sessions reconcile``) ──
+    #
+    # prune_sessions() / maybe_auto_prune_and_vacuum() above only ever touch
+    # rows that are ALREADY ended (``ended_at IS NOT NULL``) — that's their
+    # safety boundary. The reconciler below is the mirror image: it only ever
+    # considers rows that look ACTIVE (``ended_at IS NULL``) but are actually
+    # abandoned, e.g. a cron job whose run_job() finally-block closed the
+    # wrong id after a mid-run compression rotation (86e2abmm6) and left the
+    # real tip dangling forever. Same "only touch what we're sure is safe"
+    # philosophy, applied to the opposite end of the session lifecycle.
+
+    _CRON_SESSION_ID_RE = re.compile(r"^cron_.+_\d{8}_\d{6}(?:_\d+)?$")
+
+    def classify_stale_sessions(
+        self,
+        *,
+        source: str = "cron",
+        min_age_seconds: int = 3600,
+    ) -> List[Dict[str, Any]]:
+        """Read-only triage of every active (``ended_at IS NULL``) session.
+
+        This is the dry-run half of the reconciler and is always safe to call
+        — it never mutates anything. For each active row it reports the
+        ``source``, ``age_seconds`` (process/session-ownership signal — a cron
+        job younger than *min_age_seconds* may still legitimately be running),
+        and a ``reason`` explaining the classification:
+
+          - ``"non-cron-source"``   — protected. Any source other than
+            *source* (default ``"cron"``) is a human-facing / resumable
+            surface (cli, telegram, discord, slack, whatsapp, signal, matrix,
+            gateway, tool, ...) and is NEVER a reconcile candidate — see
+            86e2abmm6 acceptance criterion 2.
+          - ``"cron-unparseable-id"`` — protected. ``source == source`` but the
+            id doesn't match the ``cron_<job_id>_<timestamp>`` shape cron/
+            scheduler.py generates, so we can't trust it belongs to a
+            finished cron tick.
+          - ``"cron-recent-active"`` — protected. A real cron session younger
+            than *min_age_seconds*; it may still be mid-run.
+          - ``"cron-stale-active"`` — the only reason with ``candidate=True``:
+            a cron-sourced, id-shaped, sufficiently-old active row. This is
+            exactly the shape of the never-closed compression tip this task
+            fixes going forward; reconcile --apply is the one-time backfill
+            for rows created before the fix landed.
+
+        Returns a list of dicts (one per active session), each with keys
+        ``id``, ``source``, ``started_at``, ``age_seconds``, ``reason``,
+        ``candidate``.
+        """
+        now = time.time()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, source, started_at FROM sessions WHERE ended_at IS NULL"
+            ).fetchall()
+
+        results: List[Dict[str, Any]] = []
+        for row in rows:
+            sid = row["id"]
+            row_source = row["source"]
+            started_at = row["started_at"]
+            age = max(0.0, now - float(started_at or now))
+            entry: Dict[str, Any] = {
+                "id": sid,
+                "source": row_source,
+                "started_at": started_at,
+                "age_seconds": age,
+                "reason": None,
+                "candidate": False,
+            }
+            if row_source != source:
+                entry["reason"] = "non-cron-source"
+            elif not self._CRON_SESSION_ID_RE.match(sid or ""):
+                entry["reason"] = "cron-unparseable-id"
+            elif age < float(min_age_seconds):
+                entry["reason"] = "cron-recent-active"
+            else:
+                entry["reason"] = "cron-stale-active"
+                entry["candidate"] = True
+            results.append(entry)
+        return results
+
+    def reconcile_stale_sessions(
+        self,
+        *,
+        source: str = "cron",
+        min_age_seconds: int = 3600,
+        end_reason: str = "cron_reconciled",
+        backup: bool = True,
+    ) -> Dict[str, Any]:
+        """Apply-mode counterpart to :meth:`classify_stale_sessions`.
+
+        Backup-first: unless *backup* is False, checkpoints the WAL (so the
+        copy is a consistent snapshot, not a torn one) and raw-copies
+        ``state.db`` beside itself before mutating anything — same convention
+        as :func:`repair_state_db_schema`.
+
+        Restart-safe: each candidate is closed with its own
+        :meth:`end_session` call, which commits independently and is a no-op
+        on a row that's already ended. If the process dies mid-loop, every
+        completed call is already durable and a re-run simply reclassifies +
+        closes whatever remains — it never depends on reaching the end of the
+        loop. This also makes concurrent completion safe: if the cron job
+        itself closes the session (normal finally-block path) between
+        classify and here, ``end_session`` on that row is a harmless no-op
+        rather than clobbering the real ``cron_complete``/``compression``
+        reason (86e2abmm6 acceptance criterion 5).
+
+        Returns ``{"backup_path", "classified", "candidates",
+        "before_active", "after_active", "closed"}`` — before/after are total
+        active-session counts (all sources), so the caller can report
+        exactly what changed even if end_session() no-ops on some rows.
+        """
+        result: Dict[str, Any] = {
+            "backup_path": None,
+            "classified": 0,
+            "candidates": 0,
+            "before_active": 0,
+            "after_active": 0,
+            "closed": 0,
+        }
+        classified = self.classify_stale_sessions(
+            source=source, min_age_seconds=min_age_seconds,
+        )
+        candidates = [c for c in classified if c["candidate"]]
+        result["classified"] = len(classified)
+        result["candidates"] = len(candidates)
+
+        with self._lock:
+            result["before_active"] = self._conn.execute(
+                "SELECT COUNT(*) FROM sessions WHERE ended_at IS NULL"
+            ).fetchone()[0]
+
+        if not candidates:
+            result["after_active"] = result["before_active"]
+            return result
+
+        if backup:
+            try:
+                self._try_wal_checkpoint()
+            except Exception:
+                pass
+            bpath = _backup_db_file(self.db_path, tag="reconcile-backup")
+            result["backup_path"] = str(bpath) if bpath else None
+
+        for c in candidates:
+            try:
+                self.end_session(c["id"], end_reason)
+            except Exception as exc:
+                logger.warning(
+                    "reconcile_stale_sessions: failed to end session %s: %s",
+                    c["id"], exc,
+                )
+
+        with self._lock:
+            result["after_active"] = self._conn.execute(
+                "SELECT COUNT(*) FROM sessions WHERE ended_at IS NULL"
+            ).fetchone()[0]
+        result["closed"] = max(0, result["before_active"] - result["after_active"])
+        return result
 
     # ── Meta key/value (for scheduler bookkeeping) ──
 

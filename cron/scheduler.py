@@ -3335,6 +3335,30 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         for _var_name in _cron_delivery_vars:
             _VAR_MAP[_var_name].set("")
         if _session_db:
+            # A mid-run compression may have rotated the live session onto a
+            # child row (see agent/conversation_compression.py's "Rotation
+            # (legacy)" path), leaving `_cron_session_id` pointing at the
+            # now-ended parent. Titling/ending that stale parent id would
+            # leave the actual tip active forever (no cron_complete tip, an
+            # orphaned "still running" child) — resolve the compression chain
+            # forward first, same as gateway/session.py, gateway/run.py,
+            # hermes_cli/main.py and hermes_cli/web_server.py already do
+            # before touching a session by id. Falls back to `agent.session_id`
+            # (updated in place by conversation_compression.py on rotation) if
+            # the DB lookup itself fails, so we still target the live row
+            # instead of the known-stale original id.
+            _resolved_cron_session_id = _cron_session_id
+            try:
+                _resolved_cron_session_id = (
+                    _session_db.get_compression_tip(_cron_session_id) or _cron_session_id
+                )
+            except (Exception, KeyboardInterrupt) as e:
+                logger.debug(
+                    "Job '%s': compression-tip lookup failed for %s: %s",
+                    job_id, _cron_session_id, e,
+                )
+                if agent is not None and getattr(agent, "session_id", None):
+                    _resolved_cron_session_id = agent.session_id
             # Title the cron session from the job (name → short prompt → id) so
             # sidebars/history show a meaningful label instead of the injected
             # "[IMPORTANT: …]" hint that is the session's first message. Set here
@@ -3344,11 +3368,16 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             try:
                 _title_base = " ".join(job_name.split())[:60].strip() or f"cron {job_id}"
                 _cron_title = f"{_title_base} · {_hermes_now().strftime('%b %d %H:%M')}"
-                _session_db.set_session_title(_cron_session_id, _cron_title)
+                _session_db.set_session_title(_resolved_cron_session_id, _cron_title)
             except (Exception, KeyboardInterrupt) as e:
                 logger.debug("Job '%s': failed to set cron session title: %s", job_id, e)
             try:
-                _session_db.end_session(_cron_session_id, "cron_complete")
+                # end_session() no-ops on rows that already have ended_at set,
+                # so ending the (now-stale) original id here would be a no-op
+                # when a rotation happened — the tip resolved above is what
+                # actually needs the cron_complete stamp to avoid a dangling
+                # active child (86e2abmm6).
+                _session_db.end_session(_resolved_cron_session_id, "cron_complete")
             except (Exception, KeyboardInterrupt) as e:
                 logger.debug("Job '%s': failed to end session: %s", job_id, e)
             try:
