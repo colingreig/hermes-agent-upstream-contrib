@@ -1716,3 +1716,24 @@ class TestConfigNormalizationDoesNotOverwriteUserValues:
 
     def test_explicit_config_paths_ignore_empty_sections(self):
         assert _explicit_config_paths({"memory": {}, "display": {}}) == set()
+
+
+class TestCronMaxParallelJobsDefault:
+    """cron.max_parallel_jobs (86e2abmkq): default must be a bounded int.
+
+    Previously defaulted to None, which cron/scheduler.py's tick() resolves
+    to an unbounded ThreadPoolExecutor(max_workers=None) — Python sizes that
+    as min(32, cpu_count()+4) worker threads, all hitting state.db and the
+    provider API concurrently on any tick with a burst of due jobs. 4 caps
+    that burst without serializing the ticker.
+    """
+
+    def test_default_config_caps_cron_parallelism(self):
+        assert DEFAULT_CONFIG["cron"]["max_parallel_jobs"] == 4
+
+    def test_default_is_a_positive_int_not_none(self):
+        # Explicit regression guard: None/0 mean "unbounded" downstream
+        # (cron/scheduler.py's tick()), so the shipped default must never
+        # silently regress back to null.
+        value = DEFAULT_CONFIG["cron"]["max_parallel_jobs"]
+        assert isinstance(value, int) and value > 0

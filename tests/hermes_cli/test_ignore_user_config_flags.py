@@ -258,3 +258,78 @@ class TestArgparseFlagsRegistered:
         src = inspect.getsource(hm)
         assert "HERMES_IGNORE_USER_CONFIG" in src
         assert "HERMES_IGNORE_RULES" in src
+
+
+class TestCliMainForcesFreshConfig:
+    """cli.main() (86e2a0phj) must re-resolve the CLI_CONFIG singleton itself
+    when ignore_user_config/ignore_rules are passed as kwargs, instead of
+    relying on the caller having already set the env vars before ``cli`` was
+    imported (CLI_CONFIG is computed once at import time). Exercised via the
+    ``gateway=True`` early-return path — it hits the CLI_CONFIG reassignment
+    at the very top of main() and returns immediately after, before any
+    worktree/session/agent construction, so no heavy side effects run.
+    """
+
+    def _patch_gateway_noop(self, monkeypatch):
+        import gateway.run as gateway_run
+
+        async def _fake_start_gateway():
+            return None
+
+        monkeypatch.setattr(gateway_run, "start_gateway", _fake_start_gateway)
+
+    def test_ignore_user_config_kwarg_forces_fresh_cli_config(self, monkeypatch):
+        import cli as cli_module
+
+        stale_config = dict(cli_module.CLI_CONFIG)
+        stale_config["_test_marker"] = "stale"
+        monkeypatch.setattr(cli_module, "CLI_CONFIG", stale_config)
+
+        fresh_config = dict(cli_module.CLI_CONFIG)
+        fresh_config["_test_marker"] = "fresh"
+        monkeypatch.setattr(cli_module, "load_cli_config", lambda: fresh_config)
+        self._patch_gateway_noop(monkeypatch)
+
+        cli_module.main(ignore_user_config=True, gateway=True)
+
+        assert cli_module.CLI_CONFIG is fresh_config
+        assert os.environ.get("HERMES_IGNORE_USER_CONFIG") == "1"
+
+    def test_ignore_rules_kwarg_also_forces_fresh_cli_config(self, monkeypatch):
+        import cli as cli_module
+
+        stale_config = dict(cli_module.CLI_CONFIG)
+        stale_config["_test_marker"] = "stale"
+        monkeypatch.setattr(cli_module, "CLI_CONFIG", stale_config)
+
+        fresh_config = dict(cli_module.CLI_CONFIG)
+        fresh_config["_test_marker"] = "fresh"
+        monkeypatch.setattr(cli_module, "load_cli_config", lambda: fresh_config)
+        self._patch_gateway_noop(monkeypatch)
+
+        cli_module.main(ignore_rules=True, gateway=True)
+
+        assert cli_module.CLI_CONFIG is fresh_config
+        assert os.environ.get("HERMES_IGNORE_RULES") == "1"
+
+    def test_no_flags_leaves_stale_cli_config_untouched(self, monkeypatch):
+        """No behavior change when both flags are unset (AC: no-op path)."""
+        import cli as cli_module
+
+        stale_config = dict(cli_module.CLI_CONFIG)
+        stale_config["_test_marker"] = "stale"
+        monkeypatch.setattr(cli_module, "CLI_CONFIG", stale_config)
+
+        load_calls = {"n": 0}
+
+        def _fake_load_cli_config():
+            load_calls["n"] += 1
+            return {"_test_marker": "should-not-be-used"}
+
+        monkeypatch.setattr(cli_module, "load_cli_config", _fake_load_cli_config)
+        self._patch_gateway_noop(monkeypatch)
+
+        cli_module.main(gateway=True)
+
+        assert load_calls["n"] == 0
+        assert cli_module.CLI_CONFIG is stale_config
