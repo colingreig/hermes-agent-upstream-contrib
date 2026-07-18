@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.colingreig.hermes.heartbeat</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/colingreig/.hermes/scripts/hermes_heartbeat.sh</string>
+    </array>
+    <key>StandardErrorPath</key>
+    <string>/Users/colingreig/.hermes/logs/heartbeat-launchd.log</string>
+    <key>StandardOutPath</key>
+    <string>/Users/colingreig/.hermes/logs/heartbeat-launchd.log</string>
+    <key>StartInterval</key>
+    <integer>600</integer>
+    <key>RunAtLoad</key>
+    <true/>
+</dict>
+</plist>
