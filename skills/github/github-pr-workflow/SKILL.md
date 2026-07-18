@@ -128,6 +128,41 @@ Closes #42"
 
 Options: `--draft`, `--reviewer user1,user2`, `--label "enhancement"`, `--base develop`
 
+### If `gh pr create` fails: retry + re-auth, never silently strand the push
+
+The branch is already pushed at this point (Section 3 above) — a failed
+`gh pr create` does NOT undo that. Treat a non-zero exit as recoverable, not
+fatal:
+
+```bash
+create_pr() {
+  gh pr create --title "$1" --body "$2"
+}
+
+attempt=0
+until create_pr "$TITLE" "$BODY"; do
+  attempt=$((attempt + 1))
+  if [ "$attempt" -gt 2 ]; then
+    echo "gh pr create failed after $attempt attempts — branch $(git branch --show-current) is pushed but PR-less" >&2
+    break
+  fi
+  # Only auth failures are worth retrying; a validation error (bad base,
+  # duplicate PR, etc.) will fail the same way every time.
+  if ! gh auth status &>/dev/null; then
+    gh auth refresh || true   # or reload the token per the git-only
+                              # fallback in the github-auth skill
+  fi
+  sleep $((attempt * 5))      # backoff: 5s, 10s
+done
+```
+
+If it still fails after retries: **do not drop it silently.**
+- Tag the ClickUp task `needs-validation` so it surfaces on the board instead
+  of vanishing.
+- Record the pushed-but-PR-less branch so the orphan-PR sweep
+  (`scripts/ops/orphan_pr_sweep.py`) can pick it up and open the PR later —
+  matching either `agent/*` or `hermes/*` branch prefixes.
+
 **With git + curl:**
 
 ```bash
