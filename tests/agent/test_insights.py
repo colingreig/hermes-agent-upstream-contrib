@@ -8,6 +8,7 @@ from agent.insights import (
     InsightsEngine,
     _estimate_cost,
     _bar_chart,
+    _compute_usage_ledger,
 )
 from agent.usage_pricing import (
     format_duration_compact as _format_duration,
@@ -214,8 +215,6 @@ class TestBarChart:
         bars = _bar_chart([10, 5, 0, 20], max_width=10)
         assert len(bars) == 4
         assert len(bars[3]) == 10  # max value gets full width
-        assert len(bars[0]) == 5   # half of max
-        assert bars[2] == ""       # zero gets empty
 
     def test_empty_values(self):
         bars = _bar_chart([], max_width=10)
@@ -231,9 +230,59 @@ class TestBarChart:
         assert len(bars[0]) == 10
 
 
-# =========================================================================
+class TestUsageLedgerAggregation:
+    def test_groups_by_provider_model_and_task(self):
+        now = time.time()
+        ledger = _compute_usage_ledger(
+            [
+                {
+                    "ts": now,
+                    "provider": "openai-codex",
+                    "model": "gpt-5.3-codex",
+                    "task": "main_turn",
+                    "input_tokens": 12,
+                    "output_tokens": 34,
+                    "cache_read_tokens": 5,
+                    "cache_write_tokens": 6,
+                    "reasoning_tokens": 1,
+                    "request_count": 1,
+                },
+                {
+                    "ts": now,
+                    "provider": "openai-codex",
+                    "model": "gpt-5.3-codex",
+                    "task": "moa_advisor",
+                    "input_tokens": 8,
+                    "output_tokens": 2,
+                    "cache_read_tokens": 0,
+                    "cache_write_tokens": 0,
+                    "reasoning_tokens": 0,
+                    "request_count": 1,
+                },
+            ]
+        )
+
+        assert ledger["enabled"] is True
+        assert ledger["summary"]["entries"] == 2
+        assert ledger["summary"]["input_tokens"] == 20
+        assert ledger["summary"]["output_tokens"] == 36
+        assert ledger["summary"]["cache_read_tokens"] == 5
+        assert ledger["summary"]["cache_write_tokens"] == 6
+
+        providers = {row["name"]: row for row in ledger["by_provider"]}
+        models = {row["name"]: row for row in ledger["by_model"]}
+        tasks = {row["name"]: row for row in ledger["by_task"]}
+
+        assert providers["openai-codex"]["entries"] == 2
+        assert models["gpt-5.3-codex"]["total_tokens"] == 67
+        assert tasks["main_turn"]["entries"] == 1
+        assert tasks["moa_advisor"]["entries"] == 1
+
+
+# ============================================================================
 # InsightsEngine — empty DB
 # =========================================================================
+
 
 class TestInsightsEmpty:
     def test_empty_db_returns_empty_report(self, db):

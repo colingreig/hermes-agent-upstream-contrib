@@ -44,11 +44,12 @@ import contextlib
 import json
 import logging
 import os
+import queue
 import threading
 import time
 from pathlib import Path  # noqa: F401 — used by test mocks
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, Set, Tuple, TYPE_CHECKING
 from urllib.parse import urlparse, parse_qs, urlunparse
 
 # NOTE: `from openai import OpenAI` is deliberately NOT at module top — the
@@ -127,6 +128,42 @@ _LOGGED_UNHANDLED_AUTHTYPE_KEYS: set = set()
 # with no matching handler. Keyed by provider name.
 _LOGGED_UNSUPPORTED_EXTPROC_KEYS: set = set()
 _LOGGED_UNSUPPORTED_OAUTH_KEYS: set = set()
+_VISION_EXHAUSTION_ALERT_KEYS: Set[str] = set()
+_VISION_EXHAUSTION_ALERT_LOCK = threading.Lock()
+
+
+def _alert_vision_exhaustion_once(
+    *,
+    resolved_provider: str,
+    reason: str,
+    err: Exception,
+) -> None:
+    """Send one loud alert when vision fallbacks are fully exhausted."""
+    error_text = str(err or "").strip()
+    if not error_text:
+        return
+
+    dedupe_key = f"{resolved_provider}|{reason}|{error_text[:240]}"
+    with _VISION_EXHAUSTION_ALERT_LOCK:
+        if dedupe_key in _VISION_EXHAUSTION_ALERT_KEYS:
+            return
+        _VISION_EXHAUSTION_ALERT_KEYS.add(dedupe_key)
+
+    try:
+        from tools.send_message_tool import _sanitize_error_text, send_message_tool
+
+        send_message_tool({
+            "action": "send",
+            "target": "slack:D0BA2PM9CFM",
+            "message": (
+                "⚠️ Hermes vision request failed after auto fallback exhaustion\n\n"
+                f"provider: {resolved_provider}\n"
+                f"reason: {reason}\n"
+                f"error: {_sanitize_error_text(error_text)}"
+            ),
+        })
+    except Exception as exc:
+        logger.debug("Vision exhaustion alert delivery failed: %s", exc, exc_info=True)
 
 
 def _alert_vision_chain_exhausted(resolved_provider: Optional[str], detail: str = "") -> None:
@@ -429,6 +466,42 @@ def _get_aux_model_for_provider(provider_id: str) -> str:
     except Exception:
         pass
     return _API_KEY_PROVIDER_AUX_MODELS_FALLBACK.get(provider_id, "")
+
+
+def _direct_gemini_task_allowlist() -> set[str]:
+    """Return approved auxiliary tasks that may use the main Gemini route.
+
+    Default is empty: no task class is approved for direct Gemini yet.
+    The list is read from ``auxiliary.direct_gemini_tasks`` (or the legacy
+    alias ``auxiliary.direct_gemini_approved_tasks``) and accepts either a
+    YAML list or a comma-separated string.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        config = load_config_readonly()
+        aux = config.get("auxiliary", {}) if isinstance(config, dict) else {}
+        if not isinstance(aux, dict):
+            return set()
+        raw = aux.get("direct_gemini_tasks")
+        if raw is None:
+            raw = aux.get("direct_gemini_approved_tasks")
+        if isinstance(raw, str):
+            items = [item.strip() for item in raw.split(",")]
+        elif isinstance(raw, (list, tuple, set)):
+            items = [str(item).strip() for item in raw]
+        else:
+            items = []
+        return {item.lower() for item in items if item}
+    except Exception:
+        return set()
+
+
+def _aux_task_allows_direct_gemini(task: Optional[str]) -> bool:
+    task_name = str(task or "").strip().lower()
+    if not task_name:
+        return False
+    return task_name in _direct_gemini_task_allowlist()
 
 
 # Fallback for providers not yet migrated to ProviderProfile.default_aux_model,
@@ -1054,9 +1127,52 @@ class _CodexCompletionsAdapter:
                 _check_cancelled()
 
             event_stream = self._client.responses.create(**stream_kwargs)
+
+            event_queue: "queue.Queue[Any]" = queue.Queue(maxsize=1)
+            stream_error: List[BaseException] = []
+            _QUEUE_SENTINEL = object()
+
+            def _pump_event_stream() -> None:
+                try:
+                    for event in event_stream:
+                        event_queue.put(event)
+                    event_queue.put(_QUEUE_SENTINEL)
+                except BaseException as exc:
+                    stream_error.append(exc)
+                    event_queue.put(_QUEUE_SENTINEL)
+
+            pump_thread = threading.Thread(target=_pump_event_stream, daemon=True)
+            pump_thread.start()
+
+            class _TimeoutGuardedIterator:
+                def __iter__(self) -> "_TimeoutGuardedIterator":
+                    return self
+
+                def __next__(self) -> Any:
+                    _check_cancelled()
+                    remaining = None
+                    if deadline is not None:
+                        remaining = max(0.0, deadline - time.monotonic())
+                        if remaining <= 0:
+                            _check_cancelled()
+                    try:
+                        item = event_queue.get(timeout=remaining)
+                    except queue.Empty:
+                        _check_cancelled()
+                        raise TimeoutError(_timeout_message())
+                    if item is _QUEUE_SENTINEL:
+                        if stream_error:
+                            raise stream_error[0]
+                        raise StopIteration
+                    if deadline is not None and time.monotonic() >= deadline:
+                        if not timed_out.is_set():
+                            _close_client_on_timeout()
+                        raise TimeoutError(_timeout_message())
+                    return item
+
             try:
                 final = _consume_codex_event_stream(
-                    event_stream,
+                    _TimeoutGuardedIterator(),
                     model=resp_kwargs.get("model"),
                     on_event=_on_each_event,
                 )
@@ -3906,6 +4022,19 @@ def _resolve_auto(
     # config.yaml (auxiliary.<task>.provider) still win over this.
     main_provider = str(runtime_provider or _read_main_provider() or "")
     main_model = str(runtime_model or _read_main_model() or "")
+    direct_gemini_main = main_provider.strip().lower() in {
+        "gemini",
+        "google",
+        "google-gemini",
+        "google-ai-studio",
+    }
+    if direct_gemini_main and not _aux_task_allows_direct_gemini(task):
+        logger.info(
+            "Auxiliary auto-detect: skipping direct Gemini for task %s (not approved); falling back to the configured chain.",
+            task or "<none>",
+        )
+        main_provider = ""
+        main_model = ""
 
     # MoA virtual provider: the "model" is a preset name (e.g. "opus-gpt") and
     # there is no real "moa" HTTP endpoint, so resolving an aux client against
@@ -6582,9 +6711,15 @@ def call_llm(
                     base_url=str(getattr(fb_client, "base_url", "") or ""))
                 return _validate_llm_response(
                     fb_client.chat.completions.create(**fb_kwargs), task)
-            # All fallback layers exhausted — emit a single user-visible
-            # warning so the operator knows aux task is about to fail.
+            # All fallback layers exhausted — emit a loud alert for vision
+            # requests before re-raising the original error.
             # (#26882) The error itself is re-raised below.
+            if task == "vision":
+                _alert_vision_exhaustion_once(
+                    resolved_provider=resolved_provider,
+                    reason=reason,
+                    err=first_err,
+                )
             logger.warning(
                 "Auxiliary %s: %s on %s and all fallbacks exhausted "
                 "(fallback_chain + main agent model). Raising original error.",
@@ -7101,6 +7236,12 @@ async def async_call_llm(
                 return _validate_llm_response(
                     await async_fb.chat.completions.create(**fb_kwargs), task)
             # All fallback layers exhausted — warn before re-raising. (#26882)
+            if task == "vision":
+                _alert_vision_exhaustion_once(
+                    resolved_provider=resolved_provider,
+                    reason=reason,
+                    err=first_err,
+                )
             logger.warning(
                 "Auxiliary %s (async): %s on %s and all fallbacks exhausted "
                 "(fallback_chain + main agent model). Raising original error.",

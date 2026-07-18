@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 
 from agent.usage_pricing import (
@@ -297,6 +298,38 @@ def test_bedrock_cross_region_profile_prefix_resolves_to_pricing():
         assert scoped is not None, prefix
         assert scoped.input_cost_per_million == bare.input_cost_per_million
         assert scoped.cache_read_cost_per_million == bare.cache_read_cost_per_million
+
+
+def test_estimate_usage_cost_writes_opt_in_usage_ledger(tmp_path, monkeypatch):
+    ledger_path = tmp_path / "usage_ledger.jsonl"
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {"usage_ledger": {"enabled": True, "path": str(ledger_path)}},
+    )
+
+    result = estimate_usage_cost(
+        "gpt-5.3-codex",
+        CanonicalUsage(input_tokens=12, output_tokens=34, cache_read_tokens=5, cache_write_tokens=6),
+        provider="openai-codex",
+        base_url="https://chatgpt.com/backend-api/codex",
+        task="main_turn",
+    )
+
+    assert result.status == "included"
+    content = ledger_path.read_text(encoding="utf-8").strip().splitlines()
+    assert len(content) == 1
+    record = json.loads(content[0])
+    assert record["provider"] == "openai-codex"
+    assert record["model"] == "gpt-5.3-codex"
+    assert record["task"] == "main_turn"
+    assert record["input_tokens"] == 12
+    assert record["output_tokens"] == 34
+    assert record["cache_read_tokens"] == 5
+    assert record["cache_write_tokens"] == 6
+    assert record["reasoning_tokens"] == 0
+    assert record["request_count"] == 1
+    assert "prompt" not in record
+    assert "api_key" not in record
 
 
 def test_openai_api_provider_routes_to_openai_pricing():
