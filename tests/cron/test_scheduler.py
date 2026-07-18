@@ -2736,6 +2736,28 @@ class TestSilentDelivery:
             delivery_error=None,
         )
 
+    def test_whitespace_only_response_reports_route_chain_exhaustion(self):
+        """When the route health snapshot says the chain is exhausted, the
+        cron outcome should fail loudly with that reason rather than a generic
+        success-like status."""
+        exhausted_job = self._make_job()
+        exhausted_job["route_health"] = {"chain_exhausted": True}
+
+        with patch("cron.scheduler.get_due_jobs", return_value=[exhausted_job]), \
+             patch("cron.scheduler.run_job", return_value=(True, "# output", "   \n\t  ", None)), \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch("cron.scheduler._deliver_result") as deliver_mock, \
+             patch("cron.scheduler.mark_job_run") as mark_mock:
+            from cron.scheduler import tick
+            tick(verbose=False)
+
+        deliver_mock.assert_not_called()
+        mark_mock.assert_called_once()
+        args = mark_mock.call_args.args
+        assert args[0] == "monitor-job"
+        assert args[1] is False
+        assert "route chain was exhausted" in args[2]
+
 
 class TestOneShotDispatchClaim:
     """run_one_job must claim a finite one-shot's dispatch BEFORE run_job so a

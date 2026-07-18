@@ -8311,6 +8311,17 @@ def config_command(args):
             print()
             print(color(f"  {len(missing_config)} new config option(s) available", Colors.YELLOW))
             print("    Run 'hermes config migrate' to add them")
+
+        try:
+            from hermes_cli.routing_health import print_route_health
+
+            print()
+            print(color("  Provider Route Health", Colors.BOLD))
+            route_snapshot = print_route_health(label="", config=load_config())
+            if route_snapshot.get("chain_exhausted"):
+                print(color("    Route chain exhausted: no healthy provider in the chain", Colors.RED))
+        except Exception as exc:
+            print(color(f"  Provider Route Health unavailable: {exc}", Colors.DIM))
         
         print()
     

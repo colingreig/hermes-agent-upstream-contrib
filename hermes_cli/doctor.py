@@ -1148,6 +1148,19 @@ def run_doctor(args):
     except Exception:
         pass
 
+    try:
+        from hermes_cli.routing_health import print_route_health
+
+        _section("Provider Route Health")
+        route_snapshot = print_route_health(label="", config=load_config())
+        if route_snapshot.get("chain_exhausted"):
+            check_fail(
+                "Provider route chain exhausted",
+                "(no healthy provider in the configured route chain)",
+            )
+    except Exception as e:
+        check_warn("Provider route health", f"(could not check: {e})")
+
     _section("Directory Structure")
     hermes_home = HERMES_HOME
     if hermes_home.exists():

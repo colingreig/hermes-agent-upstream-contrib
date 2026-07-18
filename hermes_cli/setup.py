@@ -610,6 +610,16 @@ def _print_setup_summary(config: dict, hermes_home):
         print_warning(f"or edit {_dhh()}/.env directly to add the missing API keys.")
         print()
 
+    try:
+        from hermes_cli.routing_health import print_route_health
+
+        print_header("Provider Route Health")
+        route_snapshot = print_route_health(label="", config=config)
+        if route_snapshot.get("chain_exhausted"):
+            print_warning("Configured route chain has no healthy provider")
+    except Exception as exc:
+        print_warning(f"Provider route health unavailable: {exc}")
+
     # Done banner
     print()
     print(

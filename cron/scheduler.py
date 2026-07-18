@@ -3552,8 +3552,22 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         # is not "ok" — the agent ran but produced nothing useful.
         # (issue #8585)
         if success and not final_response.strip():
+            route_snapshot = job.get("route_health") if isinstance(job.get("route_health"), dict) else {}
+            if not route_snapshot:
+                try:
+                    from hermes_cli.routing_health import build_route_health
+
+                    route_snapshot = build_route_health()
+                except Exception:
+                    route_snapshot = {}
             success = False
-            error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
+            if route_snapshot.get("chain_exhausted"):
+                error = (
+                    "Agent completed but the configured provider route chain was exhausted "
+                    "before any useful work could be produced"
+                )
+            else:
+                error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
         mark_job_run(job["id"], success, error, delivery_error=delivery_error)
         return True

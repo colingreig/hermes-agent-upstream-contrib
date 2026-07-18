@@ -6471,6 +6471,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except RuntimeError:
             self._gateway_loop = None
         logger.info("Session storage: %s", self.config.sessions_dir)
+        try:
+            from hermes_cli.routing_health import build_route_health
+
+            route_snapshot = build_route_health()
+            logger.info(
+                "Provider route health: %s (healthy=%d, exhausted=%s)",
+                route_snapshot.get("summary", "unknown"),
+                route_snapshot.get("healthy_count", 0),
+                route_snapshot.get("chain_exhausted", False),
+            )
+        except Exception as _route_err:
+            logger.debug("Provider route health unavailable: %s", _route_err)
 
         # Sanity-check that systemd's TimeoutStopSec covers our drain
         # window.  When the user upgraded hermes-agent without re-running
