@@ -138,7 +138,7 @@ def _match_decision_thread(channel: str, thread_ts: str) -> Optional[str]:
     if not thread_ts:
         return None
     try:
-        with open(_REVIEW_SLA_STATE_PATH) as f:
+        with open(_REVIEW_SLA_STATE_PATH, encoding="utf-8") as f:
             state = json.load(f)
     except Exception:
         return None
