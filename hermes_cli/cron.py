@@ -164,6 +164,15 @@ def cron_list(show_all: bool = False):
         if workdir:
             print(f"    Workdir:   {workdir}")
 
+        route_health = job.get("route_health")
+        if route_health:
+            try:
+                from hermes_cli.route_health import summarize_route_health
+
+                print(f"    Route:     {summarize_route_health(route_health)}")
+            except Exception:
+                pass
+
         # Execution history
         last_status = job.get("last_status")
         if last_status:
@@ -352,6 +361,24 @@ def cron_create(args):
     if job_data.get("workdir"):
         print(f"  Workdir: {job_data['workdir']}")
     print(f"  Next run: {result['next_run_at']}")
+
+    # ``_format_job`` (the API-layer view in tools/cronjob_tools.py) doesn't
+    # carry the ``route_health`` snapshot captured at creation time, so pull
+    # the raw stored job record to surface the resolved provider/model chain
+    # here — otherwise it's computed and never shown (dead data).
+    try:
+        from cron.jobs import get_job
+        from hermes_cli.route_health import summarize_route_health_verbose
+
+        stored_job = get_job(result.get("job_id"))
+        route_health = stored_job.get("route_health") if stored_job else None
+        if route_health:
+            print(f"  {color('Route chain:', Colors.BOLD)}")
+            for line in summarize_route_health_verbose(route_health):
+                print(f"    {line}")
+    except Exception:
+        pass
+
     _warn_if_gateway_not_running()
     return 0
 
