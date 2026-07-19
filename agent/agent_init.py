@@ -1201,14 +1201,15 @@ def init_agent(
     agent._parent_session_id = parent_session_id
     agent._last_flushed_db_idx = 0  # tracks DB-write cursor to prevent duplicate writes
     agent._session_db_created = False  # DB row deferred to run_conversation()
-    # Set by _flush_messages_to_session_db (86e2abmkq) when a state write
-    # (append_message) raises and is caught rather than propagated — e.g.
-    # SQLite write-lock retries exhausted under concurrent cron load. Kept
-    # as a flag rather than re-raising there because most callers (gateway,
-    # TUI) intentionally fail-open on a persistence hiccup rather than abort
-    # an otherwise-successful turn. Callers that need the failure to be
-    # fail-visible (cron's run_job) check this after the turn completes and
-    # surface it through mark_job_run instead of losing it in a WARNING log.
+    # Set when a session-state write (append_message or update_system_prompt)
+    # raises and is caught rather than propagated — e.g. SQLite write-lock
+    # retries exhausted under concurrent cron load. Kept as a flag rather
+    # than re-raising there because most callers (gateway, TUI) intentionally
+    # fail-open on a persistence hiccup rather than abort an otherwise-
+    # successful turn. Callers that need the failure to be fail-visible
+    # (cron's run_job) check this after the turn completes and surface it
+    # through mark_job_run instead of losing it in a WARNING log. The first
+    # failure wins because it is the earliest known point of state loss.
     agent._session_persistence_error = None
     # Most agents own their session row and should finalize it on close().
     # Some temporary helper agents (manual compression / session-hygiene /

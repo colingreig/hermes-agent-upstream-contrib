@@ -3448,12 +3448,14 @@ Skipped because Python was already shutting down before the cron worker could be
         logged_response = final_response if final_response else "(No response generated)"
 
         # Fail-visible persistence check (86e2abmkq): the agent turn itself
-        # succeeded, but if a state write (append_message) was silently
+        # succeeded, but if a state write (append_message or
+        # update_system_prompt) was silently
         # swallowed along the way — see AIAgent._session_persistence_error /
-        # _flush_messages_to_session_db — the session transcript in state.db
-        # is now missing a message. That's real, permanent data loss (a
-        # future turn/continuation replays an incomplete history) and must
-        # not be reported as a clean success. Route it through the same
+        # _flush_messages_to_session_db / the prompt persistence paths — the
+        # session transcript or byte-stable cache prefix in state.db is now
+        # incomplete. That's real, permanent state loss (a future turn either
+        # replays incomplete history or misses its prompt cache) and must not
+        # be reported as a clean success. Route it through the same
         # failure path as an agent-reported failure above so it reaches
         # mark_job_run's `last_error` instead of only ever hitting a WARNING
         # log line no one is watching.

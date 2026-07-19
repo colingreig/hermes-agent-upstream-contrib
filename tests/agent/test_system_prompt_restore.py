@@ -32,6 +32,7 @@ def _make_agent(session_db=None, prebuilt_prompt: str = "BUILT_PROMPT"):
     agent.provider = "openrouter"
     agent.platform = "cli"
     agent._session_db = session_db
+    agent._session_persistence_error = None
     agent._build_system_prompt = MagicMock(return_value=prebuilt_prompt)
     return agent
 
@@ -193,7 +194,7 @@ class TestSilentFailureWarnings:
             f"Expected empty-stored-prompt warning, got: {warnings}"
 
     def test_db_write_failure_warns_loudly(self, caplog):
-        """update_system_prompt raising → WARNING (was DEBUG before)."""
+        """A swallowed prompt write warns and records durable-state loss."""
         db = MagicMock()
         # No prior row (first turn)
         db.get_session.return_value = None
@@ -212,6 +213,24 @@ class TestSilentFailureWarnings:
             "update_system_prompt failed" in m and "database is locked" in m
             for m in warnings
         ), f"Expected write-failure warning, got: {warnings}"
+        assert agent._session_persistence_error == (
+            "update_system_prompt failed: database is locked"
+        )
+
+    def test_db_write_failure_preserves_earlier_persistence_error(self):
+        """First failure wins when a message write already failed this turn."""
+        db = MagicMock()
+        db.update_system_prompt.side_effect = RuntimeError("disk full")
+        agent = _make_agent(session_db=db)
+        agent._session_persistence_error = (
+            "append_message failed: database is locked"
+        )
+
+        _restore_or_build_system_prompt(agent, None, [])
+
+        assert agent._session_persistence_error == (
+            "append_message failed: database is locked"
+        )
 
     def test_no_history_with_null_row_does_not_warn(self, caplog):
         """First turn (no history) hitting a null row is not surprising — no warn."""
