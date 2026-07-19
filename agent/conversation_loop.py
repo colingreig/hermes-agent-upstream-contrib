@@ -396,6 +396,13 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
                 "miss the prefix cache.",
                 agent.session_id, exc,
             )
+            # Keep interactive surfaces fail-open, but make the lost cache
+            # prefix visible to callers that require durable state (cron).
+            # Preserve the earliest persistence failure as the root cause.
+            if getattr(agent, "_session_persistence_error", None) is None:
+                agent._session_persistence_error = (
+                    f"update_system_prompt failed: {exc}"
+                )
 
 
 def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:

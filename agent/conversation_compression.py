@@ -796,7 +796,20 @@ def compress_context(
                 # in-place keeps and rotation has already reassigned to the new id):
                 # refresh the stored system prompt and reset the flush cursor so the
                 # next turn re-bases its append diff.
-                agent._session_db.update_system_prompt(agent.session_id, new_system_prompt)
+                try:
+                    agent._session_db.update_system_prompt(
+                        agent.session_id, new_system_prompt
+                    )
+                except Exception as _prompt_write_err:
+                    # Compression still fails open for interactive callers,
+                    # but cron must not report success after losing the new
+                    # cache-prefix snapshot. Keep the earliest persistence
+                    # failure if another write already failed this turn.
+                    if getattr(agent, "_session_persistence_error", None) is None:
+                        agent._session_persistence_error = (
+                            f"update_system_prompt failed: {_prompt_write_err}"
+                        )
+                    raise
                 agent._last_flushed_db_idx = 0
             except Exception as e:
                 # If the rotation rolled back to the parent (orphan-avoidance

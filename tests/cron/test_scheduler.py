@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import time
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
@@ -1135,6 +1136,160 @@ class TestRunJobSessionPersistence:
         assert success is True
         assert error is None
         assert final_response == "ok"
+
+    def test_run_job_fails_when_initial_system_prompt_write_is_lost(self, tmp_path):
+        """The real prompt-build write path must turn cron status into failure."""
+        from agent.conversation_loop import _restore_or_build_system_prompt
+
+        job = {"id": "test-job", "name": "test", "prompt": "hello"}
+        fake_db = MagicMock()
+        fake_db.get_compression_tip.side_effect = lambda sid: sid
+        fake_db.update_system_prompt.side_effect = RuntimeError("database is locked")
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+             patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "test-key",
+                     "base_url": "https://example.invalid/v1",
+                     "provider": "openrouter",
+                     "api_mode": "chat_completions",
+                 },
+             ), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent._session_persistence_error = None
+            mock_agent.session_id = "cron-prompt-write"
+            mock_agent.model = "test-model"
+            mock_agent.provider = "openrouter"
+            mock_agent.platform = "cron"
+            mock_agent._session_db = fake_db
+            mock_agent._cached_system_prompt = None
+            mock_agent._build_system_prompt.return_value = "built prompt"
+
+            def _run_conversation(*_args, **_kwargs):
+                _restore_or_build_system_prompt(mock_agent, None, [])
+                return {"final_response": "ok"}
+
+            mock_agent.run_conversation.side_effect = _run_conversation
+            mock_agent_cls.return_value = mock_agent
+
+            success, _output, final_response, error = run_job(job)
+
+        assert success is False
+        assert final_response == ""
+        assert error is not None
+        assert "update_system_prompt failed" in error
+        assert "database is locked" in error
+
+    def test_run_one_job_persists_and_delivers_prompt_write_failure(
+        self, tmp_path, monkeypatch
+    ):
+        """Prompt-prefix loss traverses execute, alert, and persisted status.
+
+        This exercises the real ``run_one_job -> run_job`` orchestration and
+        real jobs/output stores. Only the model/provider and delivery edges are
+        replaced; the prompt write is fault-injected on a real temporary
+        SessionDB so the production fail-visible mechanism sets the error.
+        """
+        import cron.jobs as jobs_store
+        import cron.scheduler as scheduler
+        from hermes_state import SessionDB
+
+        cron_dir = tmp_path / "cron"
+        monkeypatch.setattr(jobs_store, "CRON_DIR", cron_dir)
+        monkeypatch.setattr(jobs_store, "JOBS_FILE", cron_dir / "jobs.json")
+        monkeypatch.setattr(jobs_store, "OUTPUT_DIR", cron_dir / "output")
+        monkeypatch.setattr(scheduler, "_hermes_home", tmp_path)
+
+        job = jobs_store.create_job(
+            prompt="produce a durable report",
+            schedule="every 1h",
+            name="prompt persistence contract",
+            deliver="local",
+            model="test/model",
+            provider="openrouter",
+        )
+
+        prompt_write_attempts = []
+
+        def fail_prompt_write(_db, session_id, prompt):
+            prompt_write_attempts.append((session_id, prompt))
+            raise RuntimeError("database is locked")
+
+        delivered = []
+
+        def capture_delivery(_job, content, adapters=None, loop=None):
+            delivered.append(content)
+            return None
+
+        model_message = SimpleNamespace(
+            content="model response",
+            tool_calls=None,
+            reasoning_content=None,
+            reasoning=None,
+            reasoning_details=None,
+        )
+        model_response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(message=model_message, finish_reason="stop")
+            ],
+            model="test/model",
+            usage=None,
+        )
+        model_client = MagicMock()
+        model_client.chat.completions.create.return_value = model_response
+
+        monkeypatch.setattr(SessionDB, "update_system_prompt", fail_prompt_write)
+        # Keep the real AIAgent constructor and run_conversation loop. Replace
+        # only the OpenAI-compatible client at the outbound model boundary.
+        monkeypatch.setattr("run_agent.OpenAI", lambda **_kwargs: model_client)
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            lambda **_kwargs: {
+                "api_key": "test-key",
+                "base_url": "https://example.invalid/v1",
+                "provider": "openrouter",
+                "api_mode": "chat_completions",
+            },
+        )
+        monkeypatch.setattr(
+            "hermes_cli.env_loader.load_hermes_dotenv", lambda *_a, **_k: None
+        )
+        monkeypatch.setattr(
+            "hermes_cli.env_loader.reset_secret_source_cache", lambda: None
+        )
+        monkeypatch.setattr(scheduler, "_deliver_result", capture_delivery)
+
+        processed = scheduler.run_one_job(job)
+
+        assert processed is True
+        assert model_client.chat.completions.create.call_count == 1
+        assert len(prompt_write_attempts) == 1
+        assert prompt_write_attempts[0][0].startswith(f"cron_{job['id']}_")
+        assert "Model: test/model" in prompt_write_attempts[0][1]
+        updated = jobs_store.get_job(job["id"])
+        assert updated is not None
+        assert updated["last_status"] == "error"
+        assert "update_system_prompt failed" in updated["last_error"]
+        assert "database is locked" in updated["last_error"]
+        assert updated["last_delivery_error"] is None
+
+        assert len(delivered) == 1
+        alert = delivered[0]
+        assert alert.startswith("⚠️ Cron 'prompt persistence contract' failed:")
+        assert "update_system_prompt failed" in alert
+        assert "database is locked" in alert
+        output_files = list((cron_dir / "output" / job["id"]).glob("*.md"))
+        assert len(output_files) == 1
+        saved_output = output_files[0].read_text(encoding="utf-8")
+        assert "(FAILED)" in saved_output
+        assert "update_system_prompt failed" in saved_output
+        assert "database is locked" in saved_output
 
     def test_run_job_suppresses_empty_turn_explainer(self, tmp_path):
         """An empty model turn becomes the '⚠️ No reply…' explainer (#34452).

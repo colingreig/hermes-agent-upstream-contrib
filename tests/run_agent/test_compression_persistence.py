@@ -19,7 +19,7 @@ Bug scenario (pre-fix):
 import os
 import tempfile
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 
 
@@ -236,6 +236,122 @@ class TestFlushAfterCompression:
                 f"Expected {len(compressed)} rows in child session, got {len(child_rows)}. "
                 f"_db_persisted marker propagation bug (#57491)."
             )
+            db.close()
+
+
+class TestCompressionSystemPromptPersistence:
+    """Compression prompt writes share cron's fail-visible state contract."""
+
+    @staticmethod
+    def _make_agent(db):
+        with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
+            from run_agent import AIAgent
+
+            agent = AIAgent(
+                api_key="test-key",
+                base_url="https://openrouter.ai/api/v1",
+                model="test/model",
+                quiet_mode=True,
+                session_db=db,
+                session_id="compression-prompt-write",
+                skip_context_files=True,
+                skip_memory=True,
+            )
+        agent.compression_in_place = True
+        agent._compression_feasibility_checked = True
+        agent.context_compressor = MagicMock()
+        agent.context_compressor.compress.return_value = [
+            {"role": "user", "content": "[CONTEXT COMPACTION] summary"},
+            {"role": "user", "content": "tail"},
+        ]
+        agent.context_compressor._last_compress_aborted = False
+        agent.context_compressor._last_summary_error = None
+        agent.context_compressor._last_aux_model_failure_model = None
+        agent.context_compressor._last_aux_model_failure_error = None
+        agent.context_compressor.compression_count = 1
+        agent._build_system_prompt = MagicMock(return_value="compressed prompt")
+        agent.commit_memory_session = MagicMock()
+        return agent
+
+    def test_update_failure_sets_flag_without_aborting_compression(self, tmp_path):
+        """A lost compressed prefix is recorded while interactive flow continues."""
+        from agent.conversation_compression import compress_context
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        db.create_session("compression-prompt-write", source="test")
+        agent = self._make_agent(db)
+        real_update = db.update_system_prompt
+
+        try:
+            db.update_system_prompt = MagicMock(
+                side_effect=RuntimeError("database is locked")
+            )
+            compressed, prompt = compress_context(
+                agent,
+                [{"role": "user", "content": "before compression"}],
+                "old prompt",
+            )
+
+            assert compressed[0]["content"] == "[CONTEXT COMPACTION] summary"
+            assert prompt == "compressed prompt"
+            assert agent._session_persistence_error == (
+                "update_system_prompt failed: database is locked"
+            )
+        finally:
+            db.update_system_prompt = real_update
+            db.close()
+
+    def test_successful_update_leaves_flag_unset(self, tmp_path):
+        """Normal compression persists its prefix without a false failure."""
+        from agent.conversation_compression import compress_context
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        db.create_session("compression-prompt-write", source="test")
+        agent = self._make_agent(db)
+
+        try:
+            compress_context(
+                agent,
+                [{"role": "user", "content": "before compression"}],
+                "old prompt",
+            )
+            assert agent._session_persistence_error is None
+            assert db.get_session("compression-prompt-write")["system_prompt"] == (
+                "compressed prompt"
+            )
+        finally:
+            db.close()
+
+    def test_update_failure_preserves_earlier_persistence_error(self, tmp_path):
+        """Compression obeys first-failure-wins across sibling state writes."""
+        from agent.conversation_compression import compress_context
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        db.create_session("compression-prompt-write", source="test")
+        agent = self._make_agent(db)
+        agent._session_persistence_error = (
+            "append_message failed: database is locked"
+        )
+        real_update = db.update_system_prompt
+
+        try:
+            db.update_system_prompt = MagicMock(
+                side_effect=RuntimeError("disk full")
+            )
+            compress_context(
+                agent,
+                [{"role": "user", "content": "before compression"}],
+                "old prompt",
+            )
+
+            assert agent._session_persistence_error == (
+                "append_message failed: database is locked"
+            )
+        finally:
+            db.update_system_prompt = real_update
             db.close()
 
 
