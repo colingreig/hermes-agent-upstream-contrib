@@ -149,6 +149,20 @@ class TestLazySecretFallback:
         assert ss.get_secret("ENV_WINS_KEY") == "from-environ"
         assert calls == []
 
+    def test_caller_can_disable_lazy_fallback_for_suppressed_source(self, monkeypatch):
+        monkeypatch.setenv("HERMES_LAZY_SECRET_RESOLUTION", "true")
+        monkeypatch.delenv("SUPPRESSED_KEY", raising=False)
+
+        calls = []
+        import agent.lazy_secret_resolver as lsr
+
+        monkeypatch.setattr(
+            lsr, "get", lambda name: calls.append(name) or "must-not-resolve"
+        )
+
+        assert ss.get_secret("SUPPRESSED_KEY", allow_lazy=False) is None
+        assert calls == []
+
 
 class TestEnvFileParsing:
     """load_env_file parses without mutating os.environ."""

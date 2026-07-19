@@ -490,10 +490,8 @@ def get_anthropic_key() -> str:
 
         ANTHROPIC_API_KEY -> ANTHROPIC_TOKEN -> CLAUDE_CODE_OAUTH_TOKEN
     """
-    from hermes_cli.config import get_env_value_prefer_dotenv
-
     for var in PROVIDER_REGISTRY["anthropic"].api_key_env_vars:
-        value = get_env_value_prefer_dotenv(var) or ""
+        value = _resolve_provider_env_secret("anthropic", var)
         if value:
             return value
     return ""
@@ -574,6 +572,50 @@ def has_usable_secret(value: Any, *, min_length: int = 4) -> bool:
     return True
 
 
+def _resolve_provider_env_secret(
+    provider_id: str,
+    env_var: str,
+    *,
+    allow_lazy_when_unreferenced: bool = True,
+) -> str:
+    """Resolve one provider env source without bypassing user suppression.
+
+    When sanitized env references already exist for a provider, lazy discovery
+    is limited to those exact fingerprinted sources. Real dotenv, active
+    profile-scope, and process-env values retain their normal precedence; only
+    the process-global lazy tier is constrained. With no persisted references,
+    legacy lazy discovery remains available for first-time configuration.
+    """
+    source = f"env:{env_var}"
+    if is_source_suppressed(provider_id, source):
+        return ""
+
+    try:
+        persisted_pool_entries = read_credential_pool(provider_id)
+    except Exception:
+        persisted_pool_entries = []
+    persisted_env_sources = {
+        str(entry.get("source") or "")
+        for entry in persisted_pool_entries
+        if isinstance(entry, dict)
+        and str(entry.get("source") or "").startswith("env:")
+        and isinstance(entry.get("secret_fingerprint"), str)
+        and str(entry.get("secret_fingerprint")).startswith("sha256:")
+    }
+    allow_lazy = allow_lazy_when_unreferenced and (
+        not persisted_env_sources or source in persisted_env_sources
+    )
+
+    from hermes_cli.config import get_env_value_prefer_dotenv
+
+    value = (
+        get_env_value_prefer_dotenv(env_var)
+        if allow_lazy
+        else get_env_value_prefer_dotenv(env_var, allow_lazy=False)
+    )
+    return str(value or "").strip()
+
+
 def _resolve_api_key_provider_secret(
     provider_id: str, pconfig: ProviderConfig
 ) -> tuple[str, str]:
@@ -592,12 +634,17 @@ def _resolve_api_key_provider_secret(
             pass
         return "", ""
 
-    from hermes_cli.config import get_env_value_prefer_dotenv
     for env_var in pconfig.api_key_env_vars:
+        # A user-removed env source stays removed across every resolution
+        # tier, including the broad lazy 1Password fallback owned by
+        # get_env_value_prefer_dotenv(). Checking after the read is too late:
+        # the lazy resolver may already have resurrected the suppressed key.
+        if is_source_suppressed(provider_id, f"env:{env_var}"):
+            continue
         # Prefer ~/.hermes/.env over os.environ so a deliberate key rotation
         # in the user's .env file isn't shadowed by a stale shell export
         # inherited from a parent process (Codex CLI, test runners, etc.).
-        val = (get_env_value_prefer_dotenv(env_var) or "").strip()
+        val = _resolve_provider_env_secret(provider_id, env_var)
         if has_usable_secret(val):
             return val, env_var
 
@@ -6175,7 +6222,7 @@ def _get_azure_foundry_auth_status() -> Dict[str, Any]:
     """
     info: Dict[str, Any] = {"provider": "azure-foundry"}
     try:
-        from hermes_cli.config import load_config, get_env_value_prefer_dotenv
+        from hermes_cli.config import load_config
         cfg = load_config()
     except Exception:
         cfg = {}
@@ -6228,9 +6275,11 @@ def _get_azure_foundry_auth_status() -> Dict[str, Any]:
 
     # api_key mode (default)
     try:
-        api_key = get_env_value_prefer_dotenv("AZURE_FOUNDRY_API_KEY") or ""
+        api_key = _resolve_provider_env_secret(
+            "azure-foundry", "AZURE_FOUNDRY_API_KEY"
+        )
     except Exception:
-        api_key = os.getenv("AZURE_FOUNDRY_API_KEY", "")
+        api_key = ""
     info["logged_in"] = has_usable_secret(api_key)
     return info
 

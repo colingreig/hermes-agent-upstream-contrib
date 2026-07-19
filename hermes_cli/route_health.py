@@ -226,10 +226,12 @@ def _provider_health(provider: str) -> RouteHealthSummary:
         )
 
     if provider == "openrouter":
-        from hermes_cli.config import get_env_value_prefer_dotenv
+        from hermes_cli.auth import _resolve_provider_env_secret
 
-        api_key = _text(get_env_value_prefer_dotenv("OPENROUTER_API_KEY")) or _text(
-            get_env_value_prefer_dotenv("OPENAI_API_KEY")
+        api_key = _text(
+            _resolve_provider_env_secret("openrouter", "OPENROUTER_API_KEY")
+        ) or _text(
+            _resolve_provider_env_secret("openrouter", "OPENAI_API_KEY")
         )
         configured = bool(api_key)
         return RouteHealthSummary(

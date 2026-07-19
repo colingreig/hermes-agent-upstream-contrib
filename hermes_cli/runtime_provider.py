@@ -1120,8 +1120,10 @@ def _resolve_openrouter_runtime(
     if _is_openrouter_context:
         api_key_candidates = [
             explicit_api_key,
-            _getenv("OPENROUTER_API_KEY"),
-            _getenv("OPENAI_API_KEY"),
+            auth_mod._resolve_provider_env_secret(
+                "openrouter", "OPENROUTER_API_KEY"
+            ),
+            auth_mod._resolve_provider_env_secret("openrouter", "OPENAI_API_KEY"),
         ]
     else:
         # Custom endpoint: use api_key from config when using config base_url (#1760).
@@ -1331,13 +1333,9 @@ def _resolve_azure_foundry_runtime(
     # ── Static API key (legacy / default) ──────────────────────────────
     api_key = explicit_api_key
     if not api_key:
-        try:
-            from hermes_cli.config import get_env_value
-            api_key = get_env_value("AZURE_FOUNDRY_API_KEY") or ""
-        except Exception:
-            api_key = ""
-    if not api_key:
-        api_key = _getenv("AZURE_FOUNDRY_API_KEY", "").strip()
+        api_key = auth_mod._resolve_provider_env_secret(
+            "azure-foundry", "AZURE_FOUNDRY_API_KEY"
+        )
     if not api_key:
         raise AuthError(
             "Azure Foundry requires an API key. Set AZURE_FOUNDRY_API_KEY in "
@@ -1552,7 +1550,9 @@ def resolve_runtime_provider(
         _azure_key = (
             (explicit_api_key or "").strip()
             or _getenv("AZURE_ANTHROPIC_KEY", "").strip()
-            or _getenv("ANTHROPIC_API_KEY", "").strip()
+            or auth_mod._resolve_provider_env_secret(
+                "anthropic", "ANTHROPIC_API_KEY"
+            )
         )
         return {
             "provider": "anthropic",
@@ -1944,7 +1944,9 @@ def resolve_runtime_provider(
             if not token:
                 token = (
                     _getenv("AZURE_ANTHROPIC_KEY", "").strip()
-                    or _getenv("ANTHROPIC_API_KEY", "").strip()
+                    or auth_mod._resolve_provider_env_secret(
+                        "anthropic", "ANTHROPIC_API_KEY"
+                    )
                 )
             if not token:
                 raise AuthError(

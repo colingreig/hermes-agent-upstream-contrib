@@ -1194,9 +1194,19 @@ def _write_claude_code_credentials(
         logger.debug("Failed to write refreshed credentials: %s", e)
 
 
-def _resolve_claude_code_token_from_credentials(creds: Optional[Dict[str, Any]] = None) -> Optional[str]:
-    """Resolve a token from Claude Code credential files, refreshing if needed."""
-    creds = creds or read_claude_code_credentials()
+def _resolve_claude_code_token_from_credentials(
+    creds: Optional[Dict[str, Any]] = None,
+    *,
+    read_if_missing: bool = True,
+) -> Optional[str]:
+    """Resolve a Claude Code token, refreshing it when needed.
+
+    ``read_if_missing=False`` makes a supplied ``None`` authoritative. This is
+    required when the caller has already applied source suppression: treating
+    that ``None`` as a cache miss would silently re-read the removed source.
+    """
+    if creds is None and read_if_missing:
+        creds = read_claude_code_credentials()
     if creds and is_claude_code_token_valid(creds):
         logger.debug("Using Claude Code credentials (auto-detected)")
         return creds["accessToken"]
@@ -1284,10 +1294,15 @@ def resolve_anthropic_token() -> Optional[str]:
 
     Returns the token string or None.
     """
-    creds = read_claude_code_credentials()
+    from hermes_cli.auth import is_source_suppressed, _resolve_provider_env_secret
+
+    claude_code_suppressed = is_source_suppressed("anthropic", "claude_code")
+    creds = None if claude_code_suppressed else read_claude_code_credentials()
 
     # 1. Hermes-managed OAuth/setup token env var
-    token = os.getenv("ANTHROPIC_TOKEN", "").strip()
+    token = _resolve_provider_env_secret(
+        "anthropic", "ANTHROPIC_TOKEN", allow_lazy_when_unreferenced=False
+    )
     if token:
         preferred = _prefer_refreshable_claude_code_token(token, creds)
         if preferred:
@@ -1295,7 +1310,9 @@ def resolve_anthropic_token() -> Optional[str]:
         return token
 
     # 2. CLAUDE_CODE_OAUTH_TOKEN (used by Claude Code for setup-tokens)
-    cc_token = os.getenv("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
+    cc_token = _resolve_provider_env_secret(
+        "anthropic", "CLAUDE_CODE_OAUTH_TOKEN", allow_lazy_when_unreferenced=False
+    )
     if cc_token:
         preferred = _prefer_refreshable_claude_code_token(cc_token, creds)
         if preferred:
@@ -1303,7 +1320,10 @@ def resolve_anthropic_token() -> Optional[str]:
         return cc_token
 
     # 3. Claude Code credential file
-    resolved_claude_token = _resolve_claude_code_token_from_credentials(creds)
+    resolved_claude_token = _resolve_claude_code_token_from_credentials(
+        creds,
+        read_if_missing=False,
+    )
     if resolved_claude_token:
         return resolved_claude_token
 
@@ -1319,9 +1339,7 @@ def resolve_anthropic_token() -> Optional[str]:
     # export, matching the rest of this resolver's env-reading conventions,
     # and so the flag-gated lazy 1Password tier is reachable as a final
     # fallback when HERMES_LAZY_SECRET_RESOLUTION is enabled.
-    from hermes_cli.config import get_env_value_prefer_dotenv
-
-    api_key = (get_env_value_prefer_dotenv("ANTHROPIC_API_KEY") or "").strip()
+    api_key = _resolve_provider_env_secret("anthropic", "ANTHROPIC_API_KEY")
     if api_key:
         return api_key
 

@@ -159,7 +159,12 @@ def _lazy_secret_fallback(name: str) -> Optional[str]:
         return None
 
 
-def get_secret(name: str, default: Optional[str] = None) -> Optional[str]:
+def get_secret(
+    name: str,
+    default: Optional[str] = None,
+    *,
+    allow_lazy: bool = True,
+) -> Optional[str]:
     """Resolve a credential by env-var name, honoring the active profile scope.
 
     Resolution order:
@@ -196,7 +201,7 @@ def get_secret(name: str, default: Optional[str] = None) -> Optional[str]:
         val = scope.get(name)
         if val is not None:
             return val
-        if not _MULTIPLEX_ACTIVE:
+        if allow_lazy and not _MULTIPLEX_ACTIVE:
             lazy = _lazy_secret_fallback(name)
             if lazy is not None:
                 return lazy
@@ -216,9 +221,10 @@ def get_secret(name: str, default: Optional[str] = None) -> Optional[str]:
     if val is not None:
         return val
 
-    lazy = _lazy_secret_fallback(name)
-    if lazy is not None:
-        return lazy
+    if allow_lazy:
+        lazy = _lazy_secret_fallback(name)
+        if lazy is not None:
+            return lazy
 
     return default
 

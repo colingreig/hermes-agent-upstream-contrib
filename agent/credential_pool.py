@@ -1876,9 +1876,26 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
         # same reason `_seed_from_env` does — that's the authoritative file
         # that `hermes setup` writes.
         _env_file = load_env()
+        _persisted_env_sources = {
+            entry.source
+            for entry in entries
+            if entry.source.startswith("env:")
+            and isinstance(getattr(entry, "secret_fingerprint", None), str)
+            and getattr(entry, "secret_fingerprint", "").startswith("sha256:")
+        }
 
         def _env_val(key: str) -> str:
-            return (_env_file.get(key) or _get_secret(key, "") or "").strip()
+            source = f"env:{key}"
+            if _is_suppressed(provider, source):
+                return ""
+            allow_lazy = (
+                not _persisted_env_sources or source in _persisted_env_sources
+            )
+            return (
+                _env_file.get(key)
+                or _get_secret(key, "", allow_lazy=allow_lazy)
+                or ""
+            ).strip()
 
         anthropic_api_key = _env_val("ANTHROPIC_API_KEY")
         anthropic_oauth_env = (
@@ -1903,13 +1920,18 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
 
         from agent.anthropic_adapter import read_claude_code_credentials, read_hermes_oauth_credentials
 
-        for source_name, creds in (
-            ("hermes_pkce", read_hermes_oauth_credentials()),
-            ("claude_code", read_claude_code_credentials()),
+        for source_name, credential_reader in (
+            ("hermes_pkce", read_hermes_oauth_credentials),
+            ("claude_code", read_claude_code_credentials),
         ):
+            # Suppression is an authorization boundary, not merely an upsert
+            # filter. Do not even read a removed file/keychain source: doing so
+            # can expose it to later resolution paths or machine-local side
+            # effects before the post-read gate has a chance to run.
+            if _is_suppressed(provider, source_name):
+                continue
+            creds = credential_reader()
             if creds and creds.get("accessToken"):
-                if _is_suppressed(provider, source_name):
-                    continue
                 active_sources.add(source_name)
                 changed |= _upsert_entry(
                     entries,
@@ -2164,26 +2186,81 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
 def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool, Set[str]]:
     changed = False
     active_sources: Set[str] = set()
-
-    # Prefer ~/.hermes/.env over os.environ — the user's config file is the
-    # authoritative source for Hermes credentials. Stale env vars from parent
-    # processes (Codex CLI, test scripts, etc.) should not override deliberate
-    # changes to the .env file.
-    def _get_env_prefer_dotenv(key: str) -> str:
-        env_file = load_env()
-        val = env_file.get(key) or _get_secret(key, "") or ""
-        return val.strip()
+    persisted_env_sources = {
+        entry.source
+        for entry in entries
+        if entry.source.startswith("env:")
+        and isinstance(getattr(entry, "secret_fingerprint", None), str)
+        and getattr(entry, "secret_fingerprint", "").startswith("sha256:")
+    }
+    restrict_lazy_to_pool_sources = bool(persisted_env_sources)
 
     # Honour user suppression — `hermes auth remove <provider> <N>` for an
     # env-seeded credential marks the env:<VAR> source as suppressed so it
-    # won't be re-seeded from the user's shell environment or ~/.hermes/.env.
-    # Without this gate the removal is silently undone on the next
-    # load_pool() call whenever the var is still exported by the shell.
+    # won't be re-seeded from the user's shell environment, ~/.hermes/.env,
+    # or the lazy secret store.
     try:
         from hermes_cli.auth import is_source_suppressed as _is_source_suppressed
     except ImportError:
         def _is_source_suppressed(_p, _s):  # type: ignore[misc]
             return False
+
+    # Prefer ~/.hermes/.env over os.environ — the user's config file is the
+    # authoritative source for Hermes credentials. Stale env vars from parent
+    # processes (Codex CLI, test scripts, etc.) should not override deliberate
+    # changes to the .env file.
+    def _rehydrate_persisted_env_reference(key: str) -> str:
+        """Resolve a sanitized ``env:<key>`` pool reference on demand.
+
+        Borrowed env credentials intentionally persist only their source and
+        fingerprint.  Once boot-time bulk secret export is removed, a later
+        ``load_pool()`` therefore has to rehydrate that specific reference
+        from the lazy secret store or the entry remains metadata-only forever.
+
+        The persisted source plus fingerprint are the authorization boundary:
+        an arbitrary provider/env name that has never held a credential does
+        not trigger a 1Password lookup.  Multiplex mode is deliberately
+        excluded because the lazy resolver's manifest/cache is process-global;
+        the profile scope checked by ``_get_secret`` above is authoritative.
+        """
+        source = f"env:{key}"
+        if _is_source_suppressed(provider, source):
+            return ""
+        referenced = any(
+            entry.source == source
+            and isinstance(getattr(entry, "secret_fingerprint", None), str)
+            and getattr(entry, "secret_fingerprint", "").startswith("sha256:")
+            for entry in entries
+        )
+        if not referenced:
+            return ""
+
+        try:
+            from agent.secret_scope import is_multiplex_active
+
+            if is_multiplex_active():
+                return ""
+            from agent.lazy_secret_resolver import get as _lazy_get
+
+            value = (_lazy_get(key) or "").strip()
+            if value and auth_mod.has_usable_secret(value):
+                return value
+        except Exception:
+            # The lazy resolver is a fail-open final tier. Existing dotenv,
+            # scope, and process-env behavior above remains authoritative.
+            pass
+        return ""
+
+    def _get_env_prefer_dotenv(key: str, *, allow_lazy: bool = True) -> str:
+        env_file = load_env()
+        val = (
+            env_file.get(key)
+            or _get_secret(key, "", allow_lazy=allow_lazy)
+            or ""
+        )
+        if not val:
+            val = _rehydrate_persisted_env_reference(key)
+        return val.strip()
 
     def _secret_source_for_env(env_var: str) -> Optional[str]:
         try:
@@ -2215,11 +2292,17 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
 
     if provider == "openrouter":
         # Prefer ~/.hermes/.env over os.environ
-        token = _get_env_prefer_dotenv("OPENROUTER_API_KEY")
+        source = "env:OPENROUTER_API_KEY"
+        if _is_source_suppressed(provider, source):
+            return changed, active_sources
+        token = _get_env_prefer_dotenv(
+            "OPENROUTER_API_KEY",
+            allow_lazy=(
+                not restrict_lazy_to_pool_sources
+                or source in persisted_env_sources
+            ),
+        )
         if token:
-            source = "env:OPENROUTER_API_KEY"
-            if _is_source_suppressed(provider, source):
-                return changed, active_sources
             active_sources.add(source)
             changed |= _upsert_entry(
                 entries,
@@ -2238,9 +2321,7 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
     if not pconfig or pconfig.auth_type != AUTH_TYPE_API_KEY:
         return changed, active_sources
 
-    env_url = ""
-    if pconfig.base_url_env_var:
-        env_url = _get_env_prefer_dotenv(pconfig.base_url_env_var).rstrip("/")
+    env_url: Optional[str] = None
 
     env_vars = list(pconfig.api_key_env_vars)
     if provider == "anthropic":
@@ -2251,13 +2332,25 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
         ]
 
     for env_var in env_vars:
-        # Prefer ~/.hermes/.env over os.environ
-        token = _get_env_prefer_dotenv(env_var)
-        if not token:
-            continue
         source = f"env:{env_var}"
         if _is_source_suppressed(provider, source):
             continue
+        # Prefer ~/.hermes/.env over os.environ
+        token = _get_env_prefer_dotenv(
+            env_var,
+            allow_lazy=(
+                not restrict_lazy_to_pool_sources
+                or source in persisted_env_sources
+            ),
+        )
+        if not token:
+            continue
+        if env_url is None:
+            env_url = (
+                _get_env_prefer_dotenv(pconfig.base_url_env_var).rstrip("/")
+                if pconfig.base_url_env_var
+                else ""
+            )
         active_sources.add(source)
         # Claude Code OAuth tokens are the only Anthropic credentials that should flow into the OAuth refresh path.
         auth_type = (

@@ -7740,7 +7740,9 @@ def get_env_value(key: str) -> Optional[str]:
     return val
 
 
-def get_env_value_prefer_dotenv(key: str) -> Optional[str]:
+def get_env_value_prefer_dotenv(
+    key: str, *, allow_lazy: bool = True
+) -> Optional[str]:
     """Resolve a credential env value, preferring ``~/.hermes/.env`` over ``os.environ``.
 
     Used for Hermes-managed credentials where a deliberate edit to ``.env``
@@ -7754,27 +7756,38 @@ def get_env_value_prefer_dotenv(key: str) -> Optional[str]:
     is scope-checked rather than leaking another profile's raw ``os.environ``
     value — matching the credential-pool seeding path's behaviour.
 
-    When ``HERMES_LAZY_SECRET_RESOLUTION`` is set, a final flag-gated tier
-    resolves the secret lazily via 1Password (``agent.lazy_secret_resolver``)
-    if neither ``.env`` nor the scoped/env lookup produced a value. This tier
-    is a no-op (returns None) when the flag is off, so behavior is unchanged
-    by default.
+    ``secret_scope.get_secret`` owns the final, flag-gated lazy 1Password tier
+    when neither ``.env`` nor the scoped/env lookup produced a value. Keeping
+    that tier inside the scope-aware resolver is what prevents a multiplexed
+    profile miss from falling through to the process-global 1Password cache.
     """
     env_vars = load_env()
     val = env_vars.get(key)
     if val:
         return val
     try:
-        from agent.secret_scope import get_secret as _get_secret
-
-        scoped = _get_secret(key)
+        from agent.secret_scope import (
+            UnscopedSecretError,
+            get_secret as _get_secret,
+        )
     except Exception:
         scoped = os.environ.get(key)
+    else:
+        try:
+            scoped = _get_secret(key, allow_lazy=allow_lazy)
+        except UnscopedSecretError:
+            # Multiplex mode deliberately fails closed on an unscoped
+            # credential read. Falling back to process-global env or the
+            # process-global lazy 1Password manifest here would cross the
+            # profile boundary.
+            raise
+        except Exception:
+            scoped = os.environ.get(key)
     if scoped:
         return scoped
-    lazy = _lazy_secret_fallback(key)
-    if lazy:
-        return lazy
+    # ``get_secret`` owns the flag-gated lazy tier. Keeping a second direct
+    # lazy fallback here would bypass its multiplex isolation rule on a scoped
+    # miss and could hand a secondary profile the default profile's secret.
     return scoped
 
 

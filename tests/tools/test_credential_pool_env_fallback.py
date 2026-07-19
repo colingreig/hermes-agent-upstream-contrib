@@ -8,6 +8,7 @@ Covers the fix from #15914 / PR #15920 and the rotation fix from #20591:
 - env / dotenv values take priority over credential pool (pool fires only when both are empty)
 """
 
+import json
 import os
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -248,6 +249,324 @@ class TestAuthCredentialPoolFallback:
         assert key == "sk-dotenv-priority-xyz"
         assert source == "DEEPSEEK_API_KEY"
         mp.assert_not_called()
+
+
+class TestSanitizedPoolReferenceRehydration:
+    """Borrowed pool entries remain usable without persisting raw secrets."""
+
+    @staticmethod
+    def _write_sanitized_gemini_pool(
+        home: Path, *, suppressed_sources=None
+    ) -> None:
+        payload = {
+            "version": 1,
+            "providers": {},
+            "credential_pool": {
+                "gemini": [
+                    {
+                        "id": "gemini-ref",
+                        "label": "GEMINI_API_KEY",
+                        "auth_type": "api_key",
+                        "priority": 0,
+                        "source": "env:GEMINI_API_KEY",
+                        "base_url": "https://generativelanguage.googleapis.com/v1beta",
+                        "secret_fingerprint": "sha256:0123456789abcdef",
+                    }
+                ]
+            },
+        }
+        if suppressed_sources:
+            payload["suppressed_sources"] = suppressed_sources
+        (home / "auth.json").write_text(json.dumps(payload))
+
+    @staticmethod
+    def _write_suppressed_reference(
+        home: Path, *, provider: str, env_var: str, base_url: str
+    ) -> None:
+        (home / "auth.json").write_text(json.dumps({
+            "version": 1,
+            "providers": {},
+            "suppressed_sources": {provider: [f"env:{env_var}"]},
+            "credential_pool": {
+                provider: [{
+                    "id": f"{provider}-ref",
+                    "label": env_var,
+                    "auth_type": "api_key",
+                    "priority": 0,
+                    "source": f"env:{env_var}",
+                    "base_url": base_url,
+                    "secret_fingerprint": "sha256:0123456789abcdef",
+                }]
+            },
+        }))
+
+    def test_runtime_rehydrates_exact_pool_source_without_global_env(
+        self, isolated_hermes_home, monkeypatch
+    ):
+        """The real runtime path receives a pool-backed key and keeps disk clean."""
+        self._write_sanitized_gemini_pool(isolated_hermes_home)
+        monkeypatch.setattr(
+            Path, "home", lambda: isolated_hermes_home.parent / "user-home"
+        )
+        for key in ("GOOGLE_API_KEY", "GEMINI_API_KEY"):
+            monkeypatch.delenv(key, raising=False)
+        # The broad rollout flag is intentionally absent: an existing,
+        # fingerprinted pool reference is a narrower authorization boundary.
+        monkeypatch.delenv("HERMES_LAZY_SECRET_RESOLUTION", raising=False)
+
+        calls = []
+
+        def lazy_get(name):
+            calls.append(name)
+            return "gemini-live-from-1password" if name == "GEMINI_API_KEY" else None
+
+        monkeypatch.setattr("agent.lazy_secret_resolver.get", lazy_get)
+
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+
+        runtime = resolve_runtime_provider(requested="gemini")
+
+        assert runtime["api_key"] == "gemini-live-from-1password"
+        assert runtime["source"] == "env:GEMINI_API_KEY"
+        assert runtime["credential_pool"] is not None
+        assert calls == ["GEMINI_API_KEY"]
+        assert "GEMINI_API_KEY" not in os.environ
+
+        persisted_text = (isolated_hermes_home / "auth.json").read_text()
+        assert "gemini-live-from-1password" not in persisted_text
+        persisted = json.loads(persisted_text)["credential_pool"]["gemini"][0]
+        assert "access_token" not in persisted
+        assert persisted["secret_fingerprint"].startswith("sha256:")
+        assert persisted["secret_fingerprint"] != "sha256:0123456789abcdef"
+
+    def test_multiplex_scoped_miss_never_uses_process_global_lazy_secret(
+        self, isolated_hermes_home, monkeypatch
+    ):
+        """A profile without Gemini cannot inherit the default profile's 1P key."""
+        self._write_sanitized_gemini_pool(isolated_hermes_home)
+        monkeypatch.setattr(
+            Path, "home", lambda: isolated_hermes_home.parent / "user-home"
+        )
+        for key in ("GOOGLE_API_KEY", "GEMINI_API_KEY"):
+            monkeypatch.delenv(key, raising=False)
+        monkeypatch.setenv("HERMES_LAZY_SECRET_RESOLUTION", "true")
+
+        import agent.secret_scope as secret_scope
+
+        calls = []
+        monkeypatch.setattr(
+            "agent.lazy_secret_resolver.get",
+            lambda name: calls.append(name) or "must-not-cross-profiles",
+        )
+        secret_scope.set_multiplex_active(True)
+        token = secret_scope.set_secret_scope({})
+        try:
+            from hermes_cli.auth import PROVIDER_REGISTRY, _resolve_api_key_provider_secret
+
+            key, source = _resolve_api_key_provider_secret(
+                "gemini", PROVIDER_REGISTRY["gemini"]
+            )
+        finally:
+            secret_scope.reset_secret_scope(token)
+            secret_scope.set_multiplex_active(False)
+
+        assert (key, source) == ("", "")
+        assert calls == []
+        assert "GEMINI_API_KEY" not in os.environ
+
+    def test_runtime_never_lazily_resolves_suppressed_pool_sources(
+        self, isolated_hermes_home, monkeypatch
+    ):
+        """Removing Gemini env sources is authoritative through runtime fallback."""
+        self._write_sanitized_gemini_pool(
+            isolated_hermes_home,
+            suppressed_sources={"gemini": ["env:GEMINI_API_KEY"]},
+        )
+        monkeypatch.setattr(
+            Path, "home", lambda: isolated_hermes_home.parent / "user-home"
+        )
+        for key in ("GOOGLE_API_KEY", "GEMINI_API_KEY"):
+            monkeypatch.delenv(key, raising=False)
+        monkeypatch.setenv("HERMES_LAZY_SECRET_RESOLUTION", "true")
+
+        calls = []
+
+        def lazy_get(name):
+            if name == "GEMINI_API_KEY":
+                calls.append(name)
+                return "SHOULD-NOT-RESOLVE"
+            return None
+
+        monkeypatch.setattr(
+            "agent.lazy_secret_resolver.get",
+            lazy_get,
+        )
+
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+
+        runtime = resolve_runtime_provider(requested="gemini")
+
+        assert runtime["api_key"] == ""
+        assert runtime.get("credential_pool") is None
+        assert calls == []
+        assert "GOOGLE_API_KEY" not in os.environ
+        assert "GEMINI_API_KEY" not in os.environ
+
+    def test_anthropic_runtime_never_lazily_resolves_suppressed_api_key(
+        self, isolated_hermes_home, monkeypatch
+    ):
+        self._write_suppressed_reference(
+            isolated_hermes_home,
+            provider="anthropic",
+            env_var="ANTHROPIC_API_KEY",
+            base_url="https://api.anthropic.com",
+        )
+        monkeypatch.setattr(
+            Path, "home", lambda: isolated_hermes_home.parent / "user-home"
+        )
+        for key in (
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+        ):
+            monkeypatch.delenv(key, raising=False)
+        monkeypatch.setenv("HERMES_LAZY_SECRET_RESOLUTION", "true")
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.read_claude_code_credentials", lambda: None
+        )
+
+        calls = []
+
+        def lazy_get(name):
+            if name == "ANTHROPIC_API_KEY":
+                calls.append(name)
+                return "SHOULD-NOT-RESOLVE"
+            return None
+
+        monkeypatch.setattr("agent.lazy_secret_resolver.get", lazy_get)
+
+        from hermes_cli.auth import AuthError
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+
+        with pytest.raises(AuthError, match="No Anthropic credentials found"):
+            resolve_runtime_provider(requested="anthropic")
+
+        assert calls == []
+        assert "ANTHROPIC_API_KEY" not in os.environ
+
+    def test_anthropic_runtime_never_reads_suppressed_claude_code_source(
+        self, isolated_hermes_home, monkeypatch
+    ):
+        """A removed Claude Code source cannot be resurrected by a second read."""
+        (isolated_hermes_home / "auth.json").write_text(json.dumps({
+            "version": 1,
+            "active_provider": "anthropic",
+            "providers": {},
+            "suppressed_sources": {
+                "anthropic": ["claude_code", "hermes_pkce"],
+            },
+            "credential_pool": {"anthropic": []},
+        }))
+        monkeypatch.setattr(
+            Path, "home", lambda: isolated_hermes_home.parent / "user-home"
+        )
+        for key in (
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+        ):
+            monkeypatch.delenv(key, raising=False)
+
+        reader_calls = []
+
+        def forbidden_claude_code_read():
+            reader_calls.append("claude_code")
+            raise AssertionError("suppressed Claude Code credentials were read")
+
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.read_claude_code_credentials",
+            forbidden_claude_code_read,
+        )
+
+        from hermes_cli.auth import AuthError
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+
+        with pytest.raises(AuthError, match="No Anthropic credentials found"):
+            resolve_runtime_provider(requested="anthropic")
+
+        assert reader_calls == []
+
+    def test_openrouter_runtime_never_lazily_resolves_suppressed_api_key(
+        self, isolated_hermes_home, monkeypatch
+    ):
+        self._write_suppressed_reference(
+            isolated_hermes_home,
+            provider="openrouter",
+            env_var="OPENROUTER_API_KEY",
+            base_url="https://openrouter.ai/api/v1",
+        )
+        monkeypatch.setattr(
+            Path, "home", lambda: isolated_hermes_home.parent / "user-home"
+        )
+        for key in ("OPENROUTER_API_KEY", "OPENAI_API_KEY"):
+            monkeypatch.delenv(key, raising=False)
+        monkeypatch.setenv("HERMES_LAZY_SECRET_RESOLUTION", "true")
+
+        calls = []
+
+        def lazy_get(name):
+            if name == "OPENROUTER_API_KEY":
+                calls.append(name)
+                return "SHOULD-NOT-RESOLVE"
+            return None
+
+        monkeypatch.setattr("agent.lazy_secret_resolver.get", lazy_get)
+
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+
+        runtime = resolve_runtime_provider(requested="openrouter")
+
+        assert runtime["api_key"] == ""
+        assert calls == []
+        assert "OPENROUTER_API_KEY" not in os.environ
+
+    def test_azure_runtime_never_lazily_resolves_suppressed_api_key(
+        self, isolated_hermes_home, monkeypatch
+    ):
+        self._write_suppressed_reference(
+            isolated_hermes_home,
+            provider="azure-foundry",
+            env_var="AZURE_FOUNDRY_API_KEY",
+            base_url="https://example.services.ai.azure.com/models",
+        )
+        monkeypatch.setattr(
+            Path, "home", lambda: isolated_hermes_home.parent / "user-home"
+        )
+        monkeypatch.delenv("AZURE_FOUNDRY_API_KEY", raising=False)
+        monkeypatch.setenv("HERMES_LAZY_SECRET_RESOLUTION", "true")
+
+        calls = []
+
+        def lazy_get(name):
+            if name == "AZURE_FOUNDRY_API_KEY":
+                calls.append(name)
+                return "SHOULD-NOT-RESOLVE"
+            return None
+
+        monkeypatch.setattr("agent.lazy_secret_resolver.get", lazy_get)
+
+        from hermes_cli.auth import AuthError, _get_azure_foundry_auth_status
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+
+        with pytest.raises(AuthError, match="Azure Foundry requires an API key"):
+            resolve_runtime_provider(
+                requested="azure-foundry",
+                explicit_base_url="https://example.services.ai.azure.com/models",
+            )
+
+        assert _get_azure_foundry_auth_status()["logged_in"] is False
+        assert calls == []
+        assert "AZURE_FOUNDRY_API_KEY" not in os.environ
 
 
 class TestAnthropicEnvAuthTypeClassification:
