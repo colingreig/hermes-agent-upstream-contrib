@@ -21,16 +21,14 @@ from run_agent import AIAgent
 # _SKILL_REVIEW_PROMPT
 # ---------------------------------------------------------------------------
 
-def test_skill_review_prompt_biases_toward_active_updates():
-    """Prompt must frame updating as the default stance, not something rare."""
+def test_skill_review_prompt_requires_durable_updates():
+    """Routine ticks must not manufacture persistent skill-library churn."""
     prompt = AIAgent._SKILL_REVIEW_PROMPT
-    assert "ACTIVE" in prompt or "active" in prompt.lower(), (
-        "must tell the reviewer to be active"
-    )
-    # "missed learning opportunity" or equivalent framing for not acting
-    assert "missed" in prompt.lower() or "opportunity" in prompt.lower(), (
-        "must frame inaction as a miss, not a neutral outcome"
-    )
+    lowered = prompt.lower()
+    assert "genuinely novel" in lowered
+    assert "transferable" in lowered
+    assert "nothing to save" in lowered
+    assert "only act" in lowered
 
 
 def test_skill_review_prompt_treats_user_corrections_as_skill_signal():
@@ -133,12 +131,15 @@ def test_combined_review_prompt_has_memory_section():
     assert "memory tool" in prompt
 
 
-def test_combined_review_prompt_skills_biased_toward_active_updates():
-    """Skills half must carry the active-update bias."""
+def test_combined_review_prompt_skills_require_durable_updates():
+    """Combined reviews apply the same durable-learning gate to skills."""
     prompt = AIAgent._COMBINED_REVIEW_PROMPT
     assert "**Skills**" in prompt
-    assert "ACTIVE" in prompt or "active" in prompt.lower()
-    assert "missed" in prompt.lower() or "opportunity" in prompt.lower()
+    lowered = prompt.lower()
+    assert "genuinely novel" in lowered
+    assert "transferable" in lowered
+    assert "nothing to save" in lowered
+    assert "only" in lowered
 
 
 def test_combined_review_prompt_treats_user_corrections_as_skill_signal():

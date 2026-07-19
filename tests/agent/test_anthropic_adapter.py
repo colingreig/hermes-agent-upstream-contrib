@@ -29,6 +29,29 @@ from agent.anthropic_adapter import (
 from agent.transports import get_transport
 
 
+@pytest.fixture(autouse=True)
+def isolate_host_anthropic_credentials(monkeypatch, tmp_path):
+    """Keep adapter unit tests independent of the developer's live auth state.
+
+    ``Path.home`` overrides used by individual tests isolate Claude's JSON
+    files, but the current resolver also reads two sources outside that path:
+    Hermes' active-profile credential pool (via ``HERMES_HOME``) and the macOS
+    Keychain. A logged-in development machine can therefore win the resolver's
+    documented priority order and make otherwise-local assertions consume a
+    real token. It can also turn a broad ``subprocess.run`` mock into a bogus
+    keychain JSON payload. Tests that exercise file/env/pool behavior provide
+    those sources explicitly; none in this module exercise the keychain reader
+    itself, so neutralize both host-owned sources for every case.
+    """
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir(exist_ok=True)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setattr(
+        "agent.anthropic_adapter._read_claude_code_credentials_from_keychain",
+        lambda: None,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Auth helpers
 # ---------------------------------------------------------------------------
@@ -200,6 +223,44 @@ class TestBuildAnthropicClient:
             # Azure keeps the 1M-context beta (it's not MiniMax).
             betas = kwargs["default_headers"]["anthropic-beta"]
             assert "context-1m-2025-08-07" in betas
+
+    def test_palantir_foundry_anthropic_endpoint_uses_bearer_auth(self):
+        """Palantir Foundry's LLM proxy requires Authorization: Bearer.
+
+        Regression test for PR #36043: Palantir's
+        ``<org>.palantirfoundry.com/api/v2/llm/proxy/anthropic`` endpoint
+        rejects x-api-key with 401 — the SDK must be built with auth_token.
+        """
+        with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
+            build_anthropic_client(
+                "foundry-secret-123",
+                base_url="https://acme.palantirfoundry.com/api/v2/llm/proxy/anthropic",
+            )
+            kwargs = mock_sdk.Anthropic.call_args[1]
+            assert kwargs["auth_token"] == "foundry-secret-123"
+            assert "api_key" not in kwargs
+
+    def test_palantir_bearer_auth_matches_hostname_not_substring(self):
+        """The palantirfoundry check must be a hostname match, not a loose
+        substring match — a URL merely *containing* the string (path segment,
+        lookalike domain) must not trigger Bearer auth."""
+        from agent.anthropic_adapter import _requires_bearer_auth
+
+        # Real Foundry hosts (org subdomains) → Bearer.
+        assert _requires_bearer_auth(
+            "https://acme.palantirfoundry.com/api/v2/llm/proxy/anthropic"
+        ) is True
+        assert _requires_bearer_auth("https://palantirfoundry.com/anthropic") is True
+        # Substring false-positives → x-api-key (default).
+        assert _requires_bearer_auth(
+            "https://evil.example.com/palantirfoundry/anthropic"
+        ) is False
+        assert _requires_bearer_auth(
+            "https://palantirfoundry.com.evil.example/anthropic"
+        ) is False
+        assert _requires_bearer_auth(
+            "https://notpalantirfoundry.com/anthropic"
+        ) is False
 
     def test_disables_sdk_retries_for_api_key(self):
         """#26293: the SDK's default max_retries=2 ignores Retry-After and
@@ -1447,6 +1508,16 @@ class TestBuildAnthropicKwargs:
         )
         assert kwargs["thinking"] == {"type": "adaptive", "display": "summarized"}
         assert kwargs["output_config"] == {"effort": "xhigh"}
+
+    def test_reasoning_config_clamps_generic_ultra_to_anthropic_max(self):
+        kwargs = build_anthropic_kwargs(
+            model="claude-opus-4.8",
+            messages=[{"role": "user", "content": "think harder"}],
+            tools=None,
+            max_tokens=4096,
+            reasoning_config={"enabled": True, "effort": "ultra"},
+        )
+        assert kwargs["output_config"] == {"effort": "max"}
 
     def test_reasoning_config_maps_max_effort_for_4_7_models(self):
         kwargs = build_anthropic_kwargs(

@@ -1,5 +1,6 @@
 import asyncio
 import os
+import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -119,8 +120,18 @@ def test_run_stdio_uses_resolved_command_and_prepended_path(tmp_path):
             server = MCPServerTask("srv")
             await server.start({"command": "npx", "args": ["-y", "pkg"], "env": {"PATH": "/usr/bin"}})
 
+            # The real (resolved) command no longer reaches StdioServerParameters
+            # directly -- it's now wrapped in the parent-death watchdog
+            # supervisor (tools/mcp_stdio_watchdog.py) so an ungraceful exit of
+            # this process can't orphan it. Assert the resolved npx path and
+            # its args still flow through correctly as the watchdog's target
+            # command, preserving this test's original path-resolution intent.
             call_kwargs = mock_params.call_args.kwargs
-            assert call_kwargs["command"] == str(npx_path)
+            assert call_kwargs["command"] == sys.executable
+            assert call_kwargs["args"][0].endswith("mcp_stdio_watchdog.py")
+            assert "--" in call_kwargs["args"]
+            sep = call_kwargs["args"].index("--")
+            assert call_kwargs["args"][sep + 1:] == [str(npx_path), "-y", "pkg"]
             assert call_kwargs["env"]["PATH"].split(os.pathsep)[0] == str(node_bin)
 
             await server.shutdown()
@@ -190,7 +201,10 @@ def test_run_stdio_malware_check_times_out_fail_open():
     mock_stdio_cm, mock_session_cm = _stdio_mocks()
 
     def hung_check(_command, _args):
-        time.sleep(0.5)  # outlasts the 0.2s timeout 2.5x; short enough not to stall teardown
+        # Keep the blocking call comfortably beyond the assertion budget. The
+        # old 0.5s sleep could finish normally and still satisfy ``< 1s``, so
+        # it did not actually prove that the 0.2s fail-open path won.
+        time.sleep(3.0)
         return "MALWARE"  # would block startup if awaited to completion
 
     async def _test():
@@ -204,7 +218,8 @@ def test_run_stdio_malware_check_times_out_fail_open():
             await server.start({"command": "npx", "args": ["-y", "pkg"]})
             elapsed = time.monotonic() - start
             await server.shutdown()
-        # Returned shortly after the 0.2s timeout (fail-open), not the 0.5s hang.
-        assert elapsed < 1.0, f"startup did not fail-open promptly ({elapsed:.1f}s)"
+        # Returned well before the 3s blocking check (fail-open). Leave enough
+        # scheduling headroom for the fully parallel suite on loaded runners.
+        assert elapsed < 2.0, f"startup did not fail-open promptly ({elapsed:.1f}s)"
 
     asyncio.run(_test())

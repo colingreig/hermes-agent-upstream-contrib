@@ -17,6 +17,16 @@ import pytest
 from agent.lsp.client import LSPClient
 
 
+# These E2E tests intentionally spawn and shut down their own mock language
+# server. The child can exit cleanly between ``proc.returncode is None`` and
+# asyncio's best-effort SIGTERM, briefly becoming a reparented zombie that the
+# global live-system guard can no longer prove belongs to this test process.
+# The guard documents this narrow bypass for tests that require real signal
+# delivery to an owned child; production LSP cleanup and the global guard stay
+# unchanged.
+pytestmark = pytest.mark.live_system_guard_bypass
+
+
 MOCK_SERVER = str(Path(__file__).parent / "_mock_lsp_server.py")
 
 

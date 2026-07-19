@@ -8,6 +8,47 @@ import pytest
 from hermes_cli import runtime_provider as rp
 
 
+def test_configured_api_key_provider_without_key_fails_closed(monkeypatch):
+    """A saved provider must not resolve as another authenticated provider."""
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {"provider": "deepseek", "default": "deepseek-v4-pro"},
+    )
+    monkeypatch.setattr(rp, "load_pool", lambda _provider: SimpleNamespace(has_credentials=lambda: False))
+    monkeypatch.setattr(
+        "hermes_cli.auth.resolve_api_key_provider_credentials",
+        lambda _provider: {
+            "provider": "deepseek",
+            "api_key": "",
+            "base_url": "https://api.deepseek.com/v1",
+            "source": "default",
+        },
+    )
+
+    with pytest.raises(rp.AuthError, match="No usable credentials.*deepseek"):
+        rp.resolve_runtime_provider()
+
+
+def test_noauth_lmstudio_still_resolves(monkeypatch):
+    """The fail-closed key guard preserves LM Studio's no-auth contract."""
+    monkeypatch.setattr(rp, "load_pool", lambda _provider: SimpleNamespace(has_credentials=lambda: False))
+    monkeypatch.setattr(
+        "hermes_cli.auth.resolve_api_key_provider_credentials",
+        lambda _provider: {
+            "provider": "lmstudio",
+            "api_key": "lmstudio-noauth",
+            "base_url": "http://localhost:1234/v1",
+            "source": "default",
+        },
+    )
+
+    resolved = rp.resolve_runtime_provider(requested="lmstudio")
+
+    assert resolved["provider"] == "lmstudio"
+    assert resolved["api_key"]
+
+
 def _fake_invoke_jwt(ttl_seconds=3600):
     header = base64.urlsafe_b64encode(b'{"alg":"none","typ":"JWT"}').decode().rstrip("=")
     payload = base64.urlsafe_b64encode(
@@ -336,6 +377,15 @@ def test_resolve_runtime_provider_codex(monkeypatch):
 
 def test_resolve_runtime_provider_qwen_oauth(monkeypatch):
     monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "qwen-oauth")
+    # This case exercises the direct Qwen resolver. Keep a developer's real
+    # ~/.qwen/oauth_creds.json from being auto-seeded into the credential pool
+    # and winning before the mocked resolver below. Pool precedence has its own
+    # explicit test immediately after this one.
+    monkeypatch.setattr(
+        rp,
+        "load_pool",
+        lambda _provider: SimpleNamespace(has_credentials=lambda: False),
+    )
     monkeypatch.setattr(
         rp,
         "resolve_qwen_runtime_credentials",
@@ -396,6 +446,13 @@ def test_qwen_oauth_auto_fallthrough_on_auth_failure(monkeypatch):
     from hermes_cli.auth import AuthError
 
     monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "qwen-oauth")
+    # Exercise the resolver's auth-failure path rather than an ambient Qwen CLI
+    # credential auto-seeded from the developer's home directory.
+    monkeypatch.setattr(
+        rp,
+        "load_pool",
+        lambda _provider: SimpleNamespace(has_credentials=lambda: False),
+    )
     monkeypatch.setattr(
         rp,
         "resolve_qwen_runtime_credentials",

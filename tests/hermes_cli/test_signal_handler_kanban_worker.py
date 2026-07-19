@@ -103,6 +103,19 @@ def _is_alive_like_dispatcher(pid: int) -> bool:
                         break
         except (FileNotFoundError, PermissionError, OSError):
             pass
+    elif sys.platform == "darwin":
+        try:
+            status = subprocess.run(
+                ["/bin/ps", "-o", "stat=", "-p", str(pid)],
+                capture_output=True,
+                text=True,
+                timeout=1,
+                check=False,
+            )
+            if status.returncode != 0 or "Z" in status.stdout.strip():
+                return False
+        except (OSError, subprocess.SubprocessError, TimeoutError):
+            pass
     return True
 
 
@@ -160,8 +173,8 @@ def test_sigterm_with_kanban_task_env_terminates_quickly():
                 return
             time.sleep(0.02)
         pytest.fail(
-            f"process still alive 2s after SIGTERM with HERMES_KANBAN_TASK set "
-            f"(dispatcher would keep extending claim) — fix regressed"
+            "process still alive 2s after SIGTERM with HERMES_KANBAN_TASK set "
+            "(dispatcher would keep extending claim) — fix regressed"
         )
     finally:
         _cleanup(proc)
