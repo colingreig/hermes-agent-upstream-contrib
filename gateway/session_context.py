@@ -86,6 +86,13 @@ _SESSION_MESSAGE_ID: ContextVar = ContextVar("HERMES_SESSION_MESSAGE_ID", defaul
 
 _SESSION_PROFILE: ContextVar = ContextVar("HERMES_SESSION_PROFILE", default=_UNSET)
 
+# Directory-scope label for the skills-catalog filter (Phase 2B prompt-bloat
+# reduction). Empty/_UNSET => build_skills_system_prompt() scans every
+# configured external skills dir, exactly as before this change. Only cron
+# jobs that explicitly set jobs.json[].skill_scope populate this — CLI,
+# gateway, and every other cron job leave it unset and are unaffected.
+_SESSION_SKILL_SCOPE: ContextVar = ContextVar("HERMES_SESSION_SKILL_SCOPE", default=_UNSET)
+
 # Whether the current session's delivery channel can route an ASYNC completion
 # back to the agent AFTER the current turn ends (i.e. wake a fresh turn).
 #
@@ -125,6 +132,7 @@ _VAR_MAP = {
     "HERMES_SESSION_ID": _SESSION_ID,
     "HERMES_SESSION_MESSAGE_ID": _SESSION_MESSAGE_ID,
     "HERMES_SESSION_PROFILE": _SESSION_PROFILE,
+    "HERMES_SESSION_SKILL_SCOPE": _SESSION_SKILL_SCOPE,
     "HERMES_CRON_AUTO_DELIVER_PLATFORM": _CRON_AUTO_DELIVER_PLATFORM,
     "HERMES_CRON_AUTO_DELIVER_CHAT_ID": _CRON_AUTO_DELIVER_CHAT_ID,
     "HERMES_CRON_AUTO_DELIVER_THREAD_ID": _CRON_AUTO_DELIVER_THREAD_ID,
@@ -160,6 +168,7 @@ def set_session_vars(
     profile: str = "",
     cwd: str = "",
     async_delivery: bool = True,
+    skill_scope: str = "",
 ) -> list:
     """Set all session context variables and return reset tokens.
 
@@ -194,6 +203,7 @@ def set_session_vars(
         _SESSION_MESSAGE_ID.set(message_id),
         _SESSION_PROFILE.set(profile),
         _SESSION_ASYNC_DELIVERY.set(bool(async_delivery)),
+        _SESSION_SKILL_SCOPE.set(skill_scope),
     ]
     try:
         from agent.runtime_cwd import set_session_cwd
@@ -227,6 +237,7 @@ def clear_session_vars(tokens: list) -> None:
         _SESSION_ID,
         _SESSION_MESSAGE_ID,
         _SESSION_PROFILE,
+        _SESSION_SKILL_SCOPE,
     ):
         var.set("")
     # Reset async-delivery capability to the "never set" sentinel rather than a

@@ -907,6 +907,22 @@ def run_doctor(args):
                 except Exception:
                     pass
 
+            try:
+                from hermes_cli.route_health import (
+                    resolve_route_health,
+                    summarize_route_health_verbose,
+                )
+
+                route_health = resolve_route_health(requested_provider=runtime_provider or None)
+                lines = summarize_route_health_verbose(route_health)
+                check_info(f"Runtime readiness: {lines[0]}")
+                for line in lines[1:]:
+                    check_info(f"  {line}")
+                if not route_health.get("runnable", False):
+                    issues.append("Resolve the runtime route chain before unattended runs")
+            except Exception as exc:
+                check_warn("Could not resolve runtime route health", f"({exc})")
+
         except Exception as e:
             check_warn("Could not validate model/provider config", f"({e})")
     else:

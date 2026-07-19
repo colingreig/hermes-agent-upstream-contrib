@@ -793,6 +793,37 @@ def check_command_security(command: str) -> dict:
         if fail_open:
             return {"action": "allow", "findings": [], "summary": f"tirith unavailable: {exc}"}
         return {"action": "block", "findings": [], "summary": f"tirith spawn failed (fail-closed): {exc}"}
+    except ValueError as exc:
+        # HERMES-PATCH: tirith-nul-byte-block (2026-06-24)
+        # subprocess.run raises ValueError("embedded null byte") at argv
+        # construction when ``command`` contains a NUL — *before* spawning,
+        # so neither OSError nor TimeoutExpired catches it and the exception
+        # propagates out of the guard (observed 17x in gateway.error.log).
+        # A NUL byte in a command is a scanner-evasion signal AND the command
+        # is non-executable by any shell anyway, so we ALWAYS block it,
+        # independent of fail_open — allowing it would let an un-scanned,
+        # malformed command reach execution.
+        _warn_once(
+            f"tirith_argv_valueerror:{type(exc).__name__}",
+            "tirith could not scan command (argv error, blocking): %s",
+            exc,
+        )
+        return {
+            "action": "block",
+            "findings": [{
+                "rule_id": "malformed_command_unscannable",
+                "severity": "HIGH",
+                "title": "Command contains a NUL/control byte and cannot be scanned",
+                "description": (
+                    "The command string contains an embedded null byte (or "
+                    "similar argv-invalid content) that prevents the security "
+                    "scanner from inspecting it. Such commands are non-executable "
+                    "and may indicate scanner-evasion; blocking unconditionally."
+                ),
+                "evidence": [],
+            }],
+            "summary": f"command unscannable, blocked ({exc})",
+        }
     except subprocess.TimeoutExpired:
         _warn_once(
             f"tirith_timeout:{timeout}",

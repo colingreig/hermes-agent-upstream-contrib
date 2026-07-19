@@ -4339,6 +4339,19 @@ def _make_agent(
             "requested": requested_provider,
             "target_model": model or None,
         })
+    try:
+        from hermes_cli.route_health import resolve_route_health, summarize_route_health
+
+        startup_route_health = resolve_route_health(
+            requested_provider=requested_provider,
+            target_model=model,
+        )
+        logger.debug(
+            "TUI startup route health: %s",
+            summarize_route_health(startup_route_health),
+        )
+    except Exception:
+        pass
     _pr = _load_provider_routing()
     return AIAgent(
         model=model,
@@ -10907,8 +10920,17 @@ def _(rid, params: dict) -> dict:
 def _(rid, params: dict) -> dict:
     try:
         from hermes_cli.main import _has_any_provider_configured
+        from hermes_cli.route_health import resolve_route_health
 
-        return _ok(rid, {"provider_configured": bool(_has_any_provider_configured())})
+        requested = str(params.get("provider") or "").strip() or None
+        route_health = resolve_route_health(requested_provider=requested)
+        return _ok(
+            rid,
+            {
+                "provider_configured": bool(_has_any_provider_configured()),
+                "route_health": route_health,
+            },
+        )
     except Exception as e:
         return _err(rid, 5016, str(e))
 
@@ -10928,12 +10950,14 @@ def _(rid, params: dict) -> dict:
         from hermes_cli.runtime_provider import resolve_runtime_provider
         from hermes_cli.auth import has_usable_secret
         from hermes_cli.main import _has_any_provider_configured
+        from hermes_cli.route_health import resolve_route_health
 
         requested = str(params.get("provider") or "").strip() or None
         runtime = resolve_runtime_provider(requested=requested)
         provider_configured = bool(_has_any_provider_configured())
         provider = runtime.get("provider") or "provider"
         source = str(runtime.get("source") or "")
+        route_health = resolve_route_health(requested_provider=requested)
         if not provider_configured and provider == "bedrock" and source in {
             "iam-role",
             "aws-sdk-default-chain",
@@ -10946,6 +10970,7 @@ def _(rid, params: dict) -> dict:
                     "model": runtime.get("model"),
                     "source": source,
                     "error": "No Hermes provider is configured.",
+                    "route_health": route_health,
                 },
             )
 
@@ -10967,6 +10992,7 @@ def _(rid, params: dict) -> dict:
                     "model": runtime.get("model"),
                     "source": runtime.get("source"),
                     "error": f"No usable credentials found for {provider}.",
+                    "route_health": route_health,
                 },
             )
 
@@ -10977,6 +11003,7 @@ def _(rid, params: dict) -> dict:
                 "provider": runtime.get("provider"),
                 "model": runtime.get("model"),
                 "source": runtime.get("source"),
+                "route_health": route_health,
             },
         )
     except Exception as e:

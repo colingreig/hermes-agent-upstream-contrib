@@ -72,6 +72,16 @@ dependencies = [
   # py3-none-any wheel, no compiled extensions — safe to ship everywhere.
   # Pinned to the version already resolved in uv.lock (no resolution churn).
   "packaging==26.0",
+  # 1Password service-account SDK (scripts/op_sdk_resolve.py, imported as
+  # `onepassword`). Added 2026-07-05 to replace shell-outs to the `op` CLI,
+  # which hung under OP_SERVICE_ACCOUNT_TOKEN and took the gateway down in a
+  # boot-crash loop for hours. Every gateway/dashboard boot resolves its
+  # secrets through this SDK (gateway_secrets_wrap.sh / dashboard_secrets_wrap.sh),
+  # so it belongs in core, not an extra. It was never declared here — only
+  # present because it happened to be pip-installed by hand into the old venv
+  # — so a lock-based `uv sync --locked` venv rebuild silently dropped it and
+  # put both services into the same boot-crash loop again (2026-07-08).
+  "onepassword-sdk==0.4.0",
   # Markdown -> HTML conversion for rich message delivery (Matrix
   # `formatted_body`, and the `send_message` tool's HTML path). Now on the
   # DEFAULT delivery path, not matrix-specific: without it both

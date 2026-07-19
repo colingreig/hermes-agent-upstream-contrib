@@ -656,6 +656,24 @@ def classify_api_error(
             should_compress=False,
         )
 
+    # Anthropic Pro/Max OAuth subscription depletion. Native Anthropic returns
+    # HTTP 400 invalid_request_error with "You're out of extra usage. Add more
+    # at claude.ai/settings/usage and keep going." when the subscription's usage
+    # allowance is spent. Without this, _classify_by_status (step 2) downgrades
+    # the bare 400 to format_error (non-retryable, no rotation) and the credential
+    # pool never rotates to the paid ANTHROPIC_API_KEY_HERMES fallback, so the
+    # plan's "subscription-first, capped key overflow" silently fails. Classify
+    # as billing so recover_with_credential_pool rotates to the next pool entry.
+    # Narrow phrase ("out of extra usage") won't collide with the 429 long-context
+    # tier gate (different status) or the 400 long-context-beta rule (different text).
+    if status_code == 400 and "out of extra usage" in error_msg:
+        return _result(
+            FailoverReason.billing,
+            retryable=False,
+            should_rotate_credential=True,
+            should_fallback=True,
+        )
+
     # llama.cpp's ``json-schema-to-grammar`` converter (used by its OAI
     # server to build GBNF tool-call parsers) rejects regex escape classes
     # like ``\d``/``\w``/``\s`` and most ``format`` values. MCP servers

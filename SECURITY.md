@@ -125,6 +125,10 @@ only. In that mode the system is no longer accepting user text from
 Slack as an execution trigger; the remaining local backend trade-off
 is an operator choice, not an implicit trust boundary.
 
+See the companion compensating controls in tasks 86e29q8jt
+(remove YOLO) and 86e29q8j3 (strip business secrets from the
+gateway env).
+
 ### 2.3 Credential Scoping
 
 Hermes Agent filters the environment it passes to its lower-trust
@@ -284,6 +288,12 @@ private-disclosure channel and don't receive advisories.
   local backend in production, development profiles that bypass
   hermes-home security, and similar. Reports against those
   configurations are not vulnerabilities — that's the flag's job.
+- **Accepted local-backend + Slack posture.** Operators may keep the
+  local terminal backend and intentionally disable Slack inbound
+  command handling as a notify-only compromise. That leaves only the
+  residual prompt-injection leg from operator-approved content intake,
+  which is an accepted break-glass choice when paired with the
+  documented controls in 86e29q8jt and 86e29q8j3.
 - **Community-contributed skills and plugins.** Third-party skills
   (including the community skills repository) and third-party
   plugins are in the operator's review surface, not Hermes Agent's

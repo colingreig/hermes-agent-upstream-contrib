@@ -1383,6 +1383,56 @@ def _parse_skill_file(skill_file: Path) -> tuple[bool, dict, str]:
         return True, {}, ""
 
 
+# ── Phase 2B: directory-level skill-catalog scoping ───────────────────────
+# Maps each configured external skills dir (agent/skill_utils.get_all_skills_dirs())
+# to a short label, and each role to the set of labels it needs. Local
+# ~/.hermes/skills/ is NEVER filtered — it holds operationally load-bearing
+# skills (clickup-queue-poller, hermes-agent, devops, github, extensions/*).
+# Keyed on absolute path *strings* deliberately (not basenames) so a
+# same-named dir under a different root can't collide.
+_SKILL_DIR_LABELS: dict[str, str] = {
+    "/Users/colingreig/dev/ignite-skills-live/skills": "ops",
+    "/Users/colingreig/dev/ignite-skills-live/ignite-code/skills": "dev",
+    "/Users/colingreig/dev/ignite-skills-live/ignite-content/skills": "content",
+    "/Users/colingreig/.claude/plugins/marketplaces/anthropic-agent-skills/skills": "general-dev",
+    "/Users/colingreig/brain/packs/social-hub": "content",
+    "/Users/colingreig/brain/packs/local-seo-brain": "seo",
+    "/Users/colingreig/brain/packs/marketing-brain": "seo",
+    "/Users/colingreig/brain/packs/website-brain": "seo",
+    "/Users/colingreig/.claude/plugins/marketplaces/ignite-marketplace/plugins/claude-ads": "seo",
+    "/Users/colingreig/.claude/plugins/marketplaces/ignite-marketplace/plugins/claude-seo": "seo",
+    "/Users/colingreig/.claude/plugins/marketplaces/ignite-marketplace/plugins/claude-blog": "content",
+}
+
+# Role -> included labels. A role name not present here (including "" / unset)
+# means "no filtering" — build_skills_system_prompt falls back to today's
+# unfiltered behavior. This is the single point of truth for the mapping
+# documented in phase2b-design.md; keep it in sync if dirs move.
+_SKILL_ROLE_GROUPS: dict[str, frozenset[str]] = {
+    "dev-executor": frozenset({"ops", "dev", "general-dev"}),
+    "content-executor": frozenset({"content", "general-dev"}),
+    "seo-ppc-executor": frozenset({"seo"}),
+    "validator": frozenset({"ops", "general-dev"}),
+    "messaging-ops": frozenset(),  # local skills only
+}
+
+
+def _resolve_skill_dir_scope(role: str) -> "frozenset[str] | None":
+    """Return the set of external-dir path strings to keep for ``role``.
+
+    Returns ``None`` when the role is unset/unknown — callers must treat
+    that as "no filtering" (today's behavior), never as "filter to nothing".
+    """
+    if not role:
+        return None
+    labels = _SKILL_ROLE_GROUPS.get(role)
+    if labels is None:
+        return None
+    return frozenset(
+        path for path, label in _SKILL_DIR_LABELS.items() if label in labels
+    )
+
+
 def _skill_should_show(
     conditions: dict,
     available_tools: "set[str] | None",
@@ -1454,6 +1504,14 @@ def build_skills_system_prompt(
         or get_session_env("HERMES_SESSION_PLATFORM")
         or ""
     )
+    # Phase 2B: opt-in directory scope. Unset for every session that doesn't
+    # explicitly request one (CLI, gateway, and any cron job without
+    # jobs.json["skill_scope"]) => _skill_dir_scope stays None => no filtering,
+    # byte-for-byte identical to pre-Phase-2B output.
+    _skill_scope_role = get_session_env("HERMES_SESSION_SKILL_SCOPE") or ""
+    _skill_dir_scope = _resolve_skill_dir_scope(_skill_scope_role)
+    if _skill_dir_scope is not None:
+        external_dirs = [d for d in external_dirs if str(d) in _skill_dir_scope]
     disabled = get_disabled_skill_names(_platform_hint or None)
     cache_key = (
         str(skills_dir.resolve()),

@@ -47,6 +47,11 @@ from hermes_time import now as _hermes_now
 logger = logging.getLogger(__name__)
 
 
+def _is_interpreter_shutdown_runtime_error(exc: BaseException) -> bool:
+    """True when a threadpool submit failed because Python is finalizing."""
+    return isinstance(exc, RuntimeError) and "cannot schedule new futures after interpreter shutdown" in str(exc)
+
+
 def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     """Return a compact one-line failure message for chat delivery.
 
@@ -2500,6 +2505,51 @@ def _guard_job_credential_exfil(job: dict) -> None:
         raise RuntimeError(f"Cron job '{job_id}' blocked for safety: {err}")
 
 
+
+# Route-chain-exhaustion side channel for run_one_job()'s post-run success
+# determination (HERMES audit: "last_status can still be 'ok' when the agent
+# reports that zero work occurred" for a fully-exhausted provider fallback
+# chain). run_job() already loads the credential pool for whatever provider
+# it resolved (see the `credential_pool = load_pool(runtime_provider)` block
+# below) — this ContextVar carries that pool's `has_available()` reading out
+# to run_one_job() WITHOUT changing run_job()'s return tuple (which ~50
+# call sites across tests/production unpack positionally) and WITHOUT a
+# second load_pool() call/disk touch. A ContextVar (not a module global) so
+# concurrent job runs on different threads/tasks never cross-contaminate —
+# mirrors the existing per-job pattern in gateway/session_context.py's
+# HERMES_CRON_AUTO_DELIVER_* vars. Values:
+#   True  -> pool has at least one non-exhausted credential
+#   False -> pool is fully exhausted (no entry outside cooldown)
+#   None  -> indeterminate (no pool for this provider, provider without a
+#            managed pool, run_job() exited before reaching that block, or
+#            the lookup itself failed) — callers MUST treat None as
+#            "cannot determine" and fail OPEN, never as "exhausted".
+_JOB_CREDENTIAL_POOL_AVAILABLE: contextvars.ContextVar = contextvars.ContextVar(
+    "_JOB_CREDENTIAL_POOL_AVAILABLE", default=None
+)
+
+
+def _is_route_chain_exhausted_no_work(
+    pool_has_available: Optional[bool], final_response: str
+) -> bool:
+    """Pure decision helper (no I/O — directly unit-testable): should this
+    run be attributed to a fully-exhausted provider fallback chain?
+
+    True only when BOTH:
+      - the pool is DEFINITELY exhausted (``pool_has_available is False``;
+        ``None`` is indeterminate and must never be treated as exhausted), AND
+      - no objective work was produced (``final_response`` is empty/blank).
+
+    Gating on both keeps this fail-safe in both directions: it never fires
+    on a merely-indeterminate pool state, and it never fires when the run
+    actually produced real output (a last credential can exhaust on the
+    final call of an otherwise-successful run).
+    """
+    if pool_has_available is not False:
+        return False
+    return not (final_response or "").strip()
+
+
 def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     """
     Execute a single cron job.
@@ -2732,6 +2782,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         platform="",
         chat_id="",
         chat_name="",
+        skill_scope=str(job.get("skill_scope") or ""),
     )
     _cron_delivery_vars = (
         "HERMES_CRON_AUTO_DELIVER_PLATFORM",
@@ -2911,8 +2962,23 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
                     logger.warning("Job '%s': failed to parse prefill messages file '%s': %s", job_id, pfpath, e)
                     prefill_messages = None
 
-        # Max iterations
-        max_iterations = _cfg.get("agent", {}).get("max_turns") or _cfg.get("max_turns") or 90
+        # Max iterations (a job-record "max_turns" overrides the global config —
+        # long-form worker jobs like the clickup-executor need a bigger budget
+        # than interactive turns). `bool` is a subclass of `int`, so exclude it
+        # explicitly: `max_turns: true` must fall back to the default, not
+        # silently set a 1-turn budget. (HERMES-PATCH 03)
+        _job_max_turns = job.get("max_turns")
+        _job_max_turns_valid = (
+            isinstance(_job_max_turns, int)
+            and not isinstance(_job_max_turns, bool)
+            and _job_max_turns > 0
+        )
+        max_iterations = (
+            (_job_max_turns if _job_max_turns_valid else None)
+            or _cfg.get("agent", {}).get("max_turns")
+            or _cfg.get("max_turns")
+            or 90
+        )
 
         # Provider routing
         pr = _cfg.get("provider_routing") or {}
@@ -3035,6 +3101,57 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 f"(or pin the original values to keep them). See #44585."
             )
 
+        # HERMES-PATCH 06 — pinned-provider credential preflight.
+        # When a job PINS a provider (job["provider"]) but the resolved runtime
+        # has NO usable API key, refuse to run rather than sliding into
+        # agent_init's #17929 init-time fallback. That fallback promotes the
+        # config fallback (e.g. anthropic/claude-haiku-4-5) to PRIMARY and builds
+        # it as an OpenAI-compat client pointed at api.anthropic.com, which hits
+        # /v1/chat/completions (404 — Anthropic only serves /v1/messages) on every
+        # call and 404-loops SILENTLY for hours. Root cause of the 2026-06-24
+        # outage: the gateway booted (post `hermes update`) before doppler had
+        # exported OPENAI_API_KEY, so openai-api resolved keyless. Fail LOUD with
+        # an actionable alert instead. Scoped to HTTP key-based providers: skips
+        # bedrock (boto3, no key), acp-command providers (carry a command), and
+        # the auto/openrouter/custom routers. See learnings/2026-06-24 …404 outage.
+        _pinned_provider = (job.get("provider") or "").strip().lower()
+        _rt_api_mode = str(runtime.get("api_mode") or "").strip().lower()
+        if (
+            _pinned_provider
+            and _pinned_provider not in {"auto", "openrouter", "custom"}
+            and _rt_api_mode != "bedrock_converse"
+            and not runtime.get("command")
+        ):
+            _rt_key = runtime.get("api_key")
+            # A callable key (Azure Entra ID mints a JWT per request) counts as
+            # present; otherwise require a non-blank string.
+            _has_key = callable(_rt_key) or bool(isinstance(_rt_key, str) and _rt_key.strip())
+            if not _has_key:
+                _env_hint = f"{_pinned_provider.upper().replace('-', '_')}_API_KEY"
+                try:
+                    from hermes_cli.auth import PROVIDER_REGISTRY
+                    _pcfg = PROVIDER_REGISTRY.get(_pinned_provider)
+                    if _pcfg and _pcfg.api_key_env_vars:
+                        _env_hint = _pcfg.api_key_env_vars[0]
+                except Exception:
+                    pass
+                logger.error(
+                    "Job '%s': pinned provider '%s' resolved with NO API key — "
+                    "refusing to run on the silent anthropic fallback (HERMES-PATCH 06). "
+                    "Gateway likely booted before doppler exported %s. "
+                    "Contact the operator to restart the Hermes gateway service.",
+                    job_name, _pinned_provider, _env_hint,
+                )
+                raise RuntimeError(
+                    f"Job '{job_name}' pins provider '{_pinned_provider}' but the "
+                    f"resolved runtime has NO API key. Refusing to run: the init-time "
+                    f"fallback would route to api.anthropic.com as an OpenAI-compat "
+                    f"client and 404-loop silently. Likely the gateway booted before "
+                    f"doppler exported {_env_hint}. "
+                    f"The gateway needs to be restarted by the operator — do not run "
+                    f"launchctl commands directly. No inference call was made."
+                )
+
         fallback_model = get_fallback_chain(_cfg) or None
         # Per-job fail-closed pin (86e2bjac3): a job may declare ``no_fallback: true``
         # to opt out of the global provider fallback chain entirely, so it fails
@@ -3067,6 +3184,20 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
                     )
             except Exception as e:
                 logger.debug("Job '%s': failed to load credential pool for %s: %s", job_id, runtime_provider, e)
+
+        # Publish this job's pool-exhaustion reading for run_one_job()'s
+        # post-run success determination (see _JOB_CREDENTIAL_POOL_AVAILABLE
+        # above). Deliberately best-effort: `credential_pool` above is None
+        # both when the provider has no managed pool AND when the lookup
+        # failed — both cases are legitimately "indeterminate", not
+        # "exhausted", so this stays None (the ContextVar default) rather
+        # than guessing.
+        try:
+            _JOB_CREDENTIAL_POOL_AVAILABLE.set(
+                credential_pool.has_available() if credential_pool is not None else None
+            )
+        except Exception:
+            pass
 
         # Initialize MCP servers so configured mcp_servers are available to
         # the agent's tool registry before AIAgent is constructed. Without
@@ -3150,8 +3281,35 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         # env passthrough registrations) when the cron run hops into the worker
         # thread used for inactivity timeout monitoring.
         _cron_context = contextvars.copy_context()
-        _cron_future = _cron_pool.submit(_cron_context.run, agent.run_conversation, prompt)
+        _cron_future = None
         _inactivity_timeout = False
+        try:
+            _cron_future = _cron_pool.submit(_cron_context.run, agent.run_conversation, prompt)
+        except RuntimeError as exc:
+            if not _is_interpreter_shutdown_runtime_error(exc):
+                _cron_pool.shutdown(wait=False, cancel_futures=True)
+                raise
+            logger.warning(
+                "Job '%s' skipped before dispatch because Python is shutting down: %s",
+                job_name,
+                exc,
+            )
+            _cron_pool.shutdown(wait=False, cancel_futures=True)
+            output = f"""# Cron Job: {job_name}
+
+**Job ID:** {job_id}
+**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}
+**Schedule:** {job.get('schedule_display', 'N/A')}
+
+## Prompt
+
+{prompt}
+
+## Response
+
+Skipped because Python was already shutting down before the cron worker could be scheduled.
+"""
+            return True, output, SILENT_MARKER, None
         try:
             if _cron_inactivity_limit is None:
                 # Unlimited — just wait for the result.
@@ -3226,11 +3384,25 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         # builds the proper failure tuple. (issue #17855)
         turn_exit_reason = str(result.get("turn_exit_reason") or "")
         final_response_text = (result.get("final_response") or "").strip()
+        explainer_text = ""
+        if turn_exit_reason:
+            try:
+                explainer_text = AIAgent._format_turn_completion_explanation(turn_exit_reason).strip()
+            except Exception:
+                explainer_text = ""
+        # HERMES-PATCH 03: a max-iterations stop that still produced a
+        # substantive report is PARTIAL work, not a failure. Upstream already
+        # spares "max_iterations_reached" stops with any non-empty response; we
+        # only keep the exact turn-completion explainer out of this path so a
+        # real fallback summary is not rejected just because it is short.
+        # NOTE: "budget_exhausted" is deliberately NOT in this carve-out — a
+        # budget stop must fail closed even with a report (regression 86e2d6h8y).
         max_iteration_summary = (
             result.get("failed") is not True
             and result.get("completed") is False
             and turn_exit_reason.startswith("max_iterations_reached(")
-            and bool(final_response_text)
+            and final_response_text
+            and final_response_text != explainer_text
         )
         if result.get("failed") is True or (result.get("completed") is False and not max_iteration_summary):
             _err_text = (
@@ -3241,9 +3413,9 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             raise RuntimeError(_err_text)
         if max_iteration_summary:
             logger.warning(
-                "Job '%s' reached the iteration limit but produced a final fallback response; "
-                "delivering the response instead of failing the cron run",
-                job_name,
+                "Job '%s' hit the iteration/budget limit (%s) but produced a substantive "
+                "report — recording as PARTIAL success (handoff brief)",
+                job_name, turn_exit_reason,
             )
 
         final_response = result.get("final_response", "") or ""
@@ -3473,10 +3645,17 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         _scope_token = set_secret_scope(
             build_profile_secret_scope(_get_hermes_home())
         )
+        # Reset the route-chain-exhaustion side channel before this job's
+        # run_job() call so a stale reading from a PRIOR job run on this same
+        # thread/task can never leak in — see _JOB_CREDENTIAL_POOL_AVAILABLE
+        # above. Default is indeterminate (fail-open) until run_job() itself
+        # publishes a real reading.
+        _JOB_CREDENTIAL_POOL_AVAILABLE.set(None)
         try:
             success, output, final_response, error = run_job(job)
         finally:
             reset_secret_scope(_scope_token)
+        _pool_available = _JOB_CREDENTIAL_POOL_AVAILABLE.get()
 
         output_file = save_job_output(job["id"], output)
         if verbose:
@@ -3510,10 +3689,34 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
 
         # Treat empty final_response as a soft failure so last_status
         # is not "ok" — the agent ran but produced nothing useful.
-        # (issue #8585)
+        # (issue #8585) Extended for the HERMES audit finding "last_status
+        # can still be 'ok' when the agent reports that zero work occurred":
+        # when the run_job()-resolved provider's credential pool was
+        # DEFINITELY fully exhausted (not merely indeterminate — see
+        # _is_route_chain_exhausted_no_work above) at the same time no
+        # objective work was produced, attribute the forced failure
+        # deterministically to chain exhaustion instead of the generic
+        # empty-response message, so operators get an actionable signal
+        # rather than a guess at model error/timeout/misconfiguration.
+        _chain_exhausted_no_work = _is_route_chain_exhausted_no_work(_pool_available, final_response)
         if success and not final_response.strip():
             success = False
-            error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
+            error = (
+                "route chain exhausted — no usable provider credential available; "
+                "no objective work produced"
+                if _chain_exhausted_no_work
+                else "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
+            )
+        elif not success and _pool_available is False:
+            # Failure path: last_status is already non-ok (unchanged here).
+            # Attribute the recorded error clearly to chain exhaustion so
+            # operators get a deterministic signal instead of a generic
+            # upstream error string.
+            error = (
+                f"{error} (route chain exhausted — no usable provider credential available)"
+                if error
+                else "route chain exhausted — no usable provider credential available"
+            )
 
         mark_job_run(job["id"], success, error, delivery_error=delivery_error)
         return True
