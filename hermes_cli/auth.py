@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import shlex
 import ssl
@@ -548,6 +549,17 @@ _PLACEHOLDER_SECRET_VALUES = {
 }
 
 
+# An unexpanded shell/format template literal (e.g. "${GEMINI_API_KEY}") is
+# NOT a credential — it's a reference to one that never got substituted (the
+# recurring "Gemini 400 was .env poison, not the key" incident: a literal
+# ${GEMINI_API_KEY} string poisoned the credential pool and looked "usable"
+# because it was long enough and not in the placeholder set). Only reject
+# values that are UNAMBIGUOUSLY a bare template reference with nothing else —
+# a real key that merely contains a "$" character must still pass.
+_BARE_TEMPLATE_REF_RE = re.compile(r"^\$\{[^}]+\}$|^\$[A-Za-z_][A-Za-z0-9_]*$")
+_PYTHON_PERCENT_TEMPLATE_RE = re.compile(r"^%\([^)]+\)s$")
+
+
 def has_usable_secret(value: Any, *, min_length: int = 4) -> bool:
     """Return True when a configured secret looks usable, not empty/placeholder."""
     if not isinstance(value, str):
@@ -556,6 +568,8 @@ def has_usable_secret(value: Any, *, min_length: int = 4) -> bool:
     if len(cleaned) < min_length:
         return False
     if cleaned.lower() in _PLACEHOLDER_SECRET_VALUES:
+        return False
+    if _BARE_TEMPLATE_REF_RE.match(cleaned) or _PYTHON_PERCENT_TEMPLATE_RE.match(cleaned):
         return False
     return True
 

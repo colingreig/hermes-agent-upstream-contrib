@@ -1006,6 +1006,7 @@ def create_job(
         route_health = resolve_route_health(
             requested_provider=normalized_provider or None,
             target_model=normalized_model or None,
+            no_fallback=_coerce_job_bool(no_fallback, default=False),
         )
     except Exception:
         route_health = None

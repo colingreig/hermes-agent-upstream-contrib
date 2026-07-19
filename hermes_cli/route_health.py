@@ -319,6 +319,7 @@ def resolve_route_health(
     requested_provider: Optional[str] = None,
     target_model: Optional[str] = None,
     config: Optional[dict[str, Any]] = None,
+    no_fallback: bool = False,
 ) -> Dict[str, Any]:
     """Return a structural, read-only snapshot of the effective route chain.
 
@@ -326,6 +327,11 @@ def resolve_route_health(
     configuration points at. ``fallbacks`` contains the configured fallback
     chain in precedence order. The result is deterministic and read-only —
     no refresh, no selection, no mutation.
+
+    ``no_fallback`` mirrors the per-job fail-closed pin in cron/scheduler.py
+    (job.get("no_fallback")): when True, the job opts out of the global
+    provider fallback chain entirely and fails closed on its pinned model, so
+    the returned snapshot must not advertise fallbacks the job will never use.
     """
 
     if config is None:
@@ -337,7 +343,9 @@ def resolve_route_health(
         config, requested_provider=requested_provider
     )
     effective_model = target_model or model_default
-    fallback_chain = get_fallback_chain(config if isinstance(config, dict) else {})
+    fallback_chain = (
+        [] if no_fallback else get_fallback_chain(config if isinstance(config, dict) else {})
+    )
 
     primary = _surface_health(model_provider, effective_model, config=config)
     primary_dict = primary.to_dict()
@@ -388,3 +396,41 @@ def summarize_route_health(route_health: Dict[str, Any]) -> str:
     if fallback_count:
         parts.append(f"{fallback_count} fallback(s)")
     return "; ".join(parts)
+
+
+def summarize_route_health_verbose(route_health: Dict[str, Any]) -> list[str]:
+    """Return the full route chain as display lines: primary + each fallback.
+
+    Unlike ``summarize_route_health`` (a one-line summary that collapses the
+    fallback chain to a count), this returns one line for the primary route
+    and one line per fallback entry — the actual provider/model/health/source
+    for each hop, so the resolved chain is visible rather than dead data
+    computed and discarded.
+    """
+    if not isinstance(route_health, dict):
+        return ["unavailable"]
+    primary = route_health.get("primary")
+    if not isinstance(primary, dict):
+        return ["unavailable"]
+
+    lines: list[str] = [f"Primary: {summarize_route_health(route_health)}"]
+
+    fallbacks = route_health.get("fallbacks") or []
+    for entry in fallbacks:
+        if not isinstance(entry, dict):
+            continue
+        provider = entry.get("provider") or "unknown"
+        model = entry.get("model") or "(no model)"
+        health = entry.get("health") or "unknown"
+        order = entry.get("order")
+        fallback_kind = entry.get("fallback_kind") or "unknown"
+        credential_source = entry.get("credential_source")
+        parts = [f"{provider}/{model} — {health}"]
+        if order is not None:
+            parts.append(f"order={order}")
+        parts.append(fallback_kind)
+        if credential_source:
+            parts.append(f"source={credential_source}")
+        lines.append(f"Fallback: {'; '.join(parts)}")
+
+    return lines
