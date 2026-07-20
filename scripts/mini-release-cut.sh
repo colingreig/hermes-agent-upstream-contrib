@@ -43,8 +43,9 @@ MIN_PLATFORMS=2
 VERIFY_TIMEOUT=60          # seconds
 KEEP_RELEASES=3
 
-# node/npm live in Homebrew, which is NOT on a non-interactive ssh PATH.
-export PATH="/opt/homebrew/bin:${PATH:-}"
+# node/npm live in Homebrew, and uv lives at ~/.local/bin — neither is on a
+# non-interactive ssh PATH.
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:${PATH:-}"
 
 DEFAULT_REF="prod-live-patches"
 
@@ -329,7 +330,10 @@ command -v npm  >/dev/null || die "npm not found on PATH (expected /opt/homebrew
 command -v uv   >/dev/null || warn "uv not found — will fall back to python venv+pip if needed"
 
 log "fetching origin in current release clone: $CURRENT_LINK"
-run git_current fetch --prune origin
+# Disable background maintenance (auto-gc/repack) for this fetch: a
+# maintenance job detached by the fetch can race the local clone below and
+# produce transient "unable to read sha1 file" errors.
+run git -c gc.auto=0 -c maintenance.auto=false -C "$CURRENT_LINK" fetch --prune origin
 
 ORIGIN_URL="$(git_current remote get-url origin)"
 log "origin: $ORIGIN_URL"
@@ -360,16 +364,53 @@ assert_not_forbidden "$NEW_DIR"
 
 log "new release dir: $NEW_DIR"
 
+# --- Failure cleanup: remove this run's partially-built release dir --------
+# If anything below fails (or the script is interrupted) before the cut
+# completes, remove ONLY the release dir this run created — and only if
+# runtime-current does not point at it (i.e. the cut never went live) — so a
+# failed run doesn't leave a half-built directory that blocks a retry (the
+# "already exists" in-place-mutation guard above would otherwise trip on the
+# same version+sha).
+cleanup_on_failure() {
+  local status=$?
+  if [ "$status" -ne 0 ] && [ "$DRY_RUN" -ne 1 ] && [ -e "$NEW_DIR" ]; then
+    local live=""
+    [ -L "$CURRENT_LINK" ] && live="$(readlink "$CURRENT_LINK")"
+    if [ "$live" != "$NEW_DIR" ]; then
+      warn "cleanup: removing partially-built release dir: $NEW_DIR"
+      rm -rf "$NEW_DIR"
+    fi
+  fi
+  return "$status"
+}
+trap cleanup_on_failure EXIT
+
 # --- Build ENTIRELY in the new dir before any switch -----------------------
 
 # Offline-friendly clone: copy from the local runtime-current clone (all
 # fetched objects are already present locally), then point origin at the real
 # remote URL and detach-checkout the exact sha.
-log "clone (from local): git clone --no-checkout $CURRENT_LINK $NEW_DIR"
-run git clone --no-checkout "$CURRENT_LINK" "$NEW_DIR"
-run git -C "$NEW_DIR" remote set-url origin "$ORIGIN_URL"
-log "checkout $SHA (detached)"
-run git -C "$NEW_DIR" checkout --detach "$SHA"
+#
+# Retry once on failure: git background maintenance (auto-gc/repack) detached
+# by the fetch above can race this same-second local clone/checkout and
+# produce transient "unable to read sha1 file" errors. On failure, blow away
+# the partial dir, wait for maintenance to settle, and redo the whole
+# sequence; a second failure aborts.
+clone_and_checkout() {
+  log "clone (from local): git clone --no-checkout $CURRENT_LINK $NEW_DIR"
+  run git clone --no-checkout "$CURRENT_LINK" "$NEW_DIR" \
+    && run git -C "$NEW_DIR" remote set-url origin "$ORIGIN_URL" \
+    && { log "checkout $SHA (detached)"; run git -C "$NEW_DIR" checkout --detach "$SHA"; }
+}
+
+if ! clone_and_checkout; then
+  warn "clone/checkout failed (possible git maintenance race) — retrying once"
+  assert_under_releases "$NEW_DIR"
+  run rm -rf "$NEW_DIR"
+  sleep 5
+  clone_and_checkout \
+    || die "clone/checkout failed twice for $SHA — aborting (possible non-transient git maintenance/object race)"
+fi
 
 # --- Build the Python venv inside the release dir --------------------------
 # The repo's own setup-hermes.sh prefers a hash-verified `uv sync --extra all
@@ -390,10 +431,28 @@ if command -v uv >/dev/null; then
     fi
   fi
 else
+  # uv is unavailable: DO NOT fall through to bare `python3` — on the mini
+  # that resolves to Homebrew's python 3.14, which violates this repo's
+  # `<3.14,>=3.11` pin (pyproject.toml). Probe explicitly compatible
+  # interpreters (checking both PATH and Homebrew's bin directly, since a
+  # non-interactive ssh PATH may omit /opt/homebrew/bin) and abort if none
+  # are present rather than silently building an incompatible venv.
+  FALLBACK_PYTHON=""
+  for cand in python3.13 python3.12 python3.11; do
+    for bin in "$cand" "/opt/homebrew/bin/$cand"; do
+      if command -v "$bin" >/dev/null 2>&1; then
+        FALLBACK_PYTHON="$(command -v "$bin")"
+        break 2
+      fi
+    done
+  done
+  [ -n "$FALLBACK_PYTHON" ] \
+    || die "uv not found and no compatible python interpreter found (tried python3.13/python3.12/python3.11 on PATH and in /opt/homebrew/bin) — refusing to fall back to bare python3"
+  log "uv unavailable; using fallback interpreter: $FALLBACK_PYTHON"
   if [ "$DRY_RUN" -eq 1 ]; then
-    printf '\033[35m[DRY-RUN]\033[0m (cd %s && python3 -m venv venv && venv/bin/pip install -e ".[all]")\n' "$NEW_DIR"
+    printf '\033[35m[DRY-RUN]\033[0m (cd %s && %s -m venv venv && venv/bin/pip install -e ".[all]")\n' "$NEW_DIR" "$FALLBACK_PYTHON"
   else
-    ( cd "$NEW_DIR" && python3 -m venv venv \
+    ( cd "$NEW_DIR" && "$FALLBACK_PYTHON" -m venv venv \
         && "$NEW_DIR/venv/bin/pip" install --upgrade pip \
         && "$NEW_DIR/venv/bin/pip" install -e ".[all]" ) || die "venv build failed"
   fi
