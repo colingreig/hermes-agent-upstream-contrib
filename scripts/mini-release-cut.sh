@@ -216,25 +216,32 @@ gateway_platforms_ready() {
 verify_gateway() {
   local release_dir="${1:-}" offset="${2:-0}"
   local deadline=$((SECONDS + VERIFY_TIMEOUT))
-  local proc_ok=0 plat_ok=0 port_ok=0
+  local proc_ok=0 plat_ok=0 port_ok=0 link_ok=0
   if [ "$DRY_RUN" -eq 1 ]; then
-    printf '\033[35m[DRY-RUN]\033[0m verify gateway: proc from %s, >=%s platform(s), :%s listening\n' \
+    printf '\033[35m[DRY-RUN]\033[0m verify gateway: runtime-current -> %s, proc via runtime-current, >=%s platform(s), :%s listening\n' \
       "$release_dir" "$MIN_PLATFORMS" "$GATEWAY_PORT"
     return 0
   fi
   log "verifying gateway (up to ${VERIFY_TIMEOUT}s)…"
   while [ "$SECONDS" -lt "$deadline" ]; do
-    proc_ok=0; plat_ok=0; port_ok=0
-    pgrep -f "$release_dir/venv/bin/python" >/dev/null 2>&1 && proc_ok=1
+    proc_ok=0; plat_ok=0; port_ok=0; link_ok=0
+    # The LaunchAgent's ProgramArguments are generated against the
+    # `runtime-current` symlink path (see hermes_cli/gateway.py's plist
+    # generator), not the literal per-release directory — so pgrep/ps only
+    # ever observe "runtime-current" in argv, never $release_dir itself.
+    # Confirm the symlink currently resolves to the expected release AND
+    # match the process via the stable symlink-relative command line.
+    [ -L "$CURRENT_LINK" ] && [ "$(readlink "$CURRENT_LINK")" = "$release_dir" ] && link_ok=1
+    pgrep -f "${CURRENT_LINK}/venv/bin/python.*gateway run" >/dev/null 2>&1 && proc_ok=1
     gateway_platforms_ready "$offset" && plat_ok=1
     port_listening "$GATEWAY_PORT" && port_ok=1
-    if [ "$proc_ok" = 1 ] && [ "$plat_ok" = 1 ] && [ "$port_ok" = 1 ]; then
-      ok "gateway healthy (proc from new release, >=${MIN_PLATFORMS} platforms, :${GATEWAY_PORT} listening)"
+    if [ "$link_ok" = 1 ] && [ "$proc_ok" = 1 ] && [ "$plat_ok" = 1 ] && [ "$port_ok" = 1 ]; then
+      ok "gateway healthy (runtime-current → $release_dir, proc matches, >=${MIN_PLATFORMS} platforms, :${GATEWAY_PORT} listening)"
       return 0
     fi
     sleep 2
   done
-  warn "gateway verify failed: proc=$proc_ok platforms=$plat_ok port=$port_ok"
+  warn "gateway verify failed: link=$link_ok proc=$proc_ok platforms=$plat_ok port=$port_ok"
   return 1
 }
 
