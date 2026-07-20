@@ -168,12 +168,25 @@ repoint_symlink() {
   local tmp="${CURRENT_LINK}.swap.$$"
   if [ "$DRY_RUN" -eq 1 ]; then
     # The build was dry-run-skipped, so $target won't exist yet — don't assert.
-    printf '\033[35m[DRY-RUN]\033[0m ln -sfn %s %s && mv -f %s %s\n' "$target" "$tmp" "$tmp" "$CURRENT_LINK"
+    printf '\033[35m[DRY-RUN]\033[0m ln -sfn %s %s && mv -fh %s %s\n' "$target" "$tmp" "$tmp" "$CURRENT_LINK"
     return 0
   fi
   [ -d "$target" ] || die "repoint_symlink: target is not a directory: $target"
   ln -sfn "$target" "$tmp"
-  mv -f "$tmp" "$CURRENT_LINK"   # rename() over the existing symlink = atomic
+  # -h: do NOT follow CURRENT_LINK even though it is a symlink to a
+  # directory. Without -h, macOS/BSD mv(1) treats an existing
+  # symlink-that-resolves-to-a-directory destination as its "second form"
+  # (move source INTO that directory) rather than replacing the symlink —
+  # so $tmp would silently land inside the *current* release dir instead of
+  # ever repointing CURRENT_LINK, while this function still reported
+  # success. -h forces "rename source to target" instead; same filesystem
+  # means this is still a plain rename(2) under the hood, i.e. still atomic.
+  mv -fh "$tmp" "$CURRENT_LINK"
+  # Belt-and-suspenders: don't just trust the exit code — confirm the swap
+  # actually took effect before declaring success (this is exactly the
+  # invariant that was silently violated before the -h fix above).
+  [ "$(readlink "$CURRENT_LINK")" = "$target" ] \
+    || die "repoint_symlink: swap did not take effect (runtime-current still -> $(readlink "$CURRENT_LINK" 2>/dev/null))"
   ok "runtime-current → $target"
 }
 
