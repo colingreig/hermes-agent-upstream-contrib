@@ -56,10 +56,11 @@ REF="$DEFAULT_REF"
 DO_ROLLBACK=0
 DRY_RUN=0
 DO_PRUNE=0
+OFFLINE=0
 
 usage() {
   cat <<'EOF'
-Usage: mini-release-cut.sh [--ref <branch-or-sha>] [--rollback] [--prune] [--dry-run]
+Usage: mini-release-cut.sh [--ref <branch-or-sha>] [--rollback] [--prune] [--dry-run] [--offline]
 
   --ref <ref>   Branch or sha to cut (default: prod-live-patches).
   --rollback    Repoint runtime-current to the previous release and restart.
@@ -67,6 +68,14 @@ Usage: mini-release-cut.sh [--ref <branch-or-sha>] [--rollback] [--prune] [--dry
   --prune       After a successful cut, delete releases older than the newest
                 3 (never the active or previous release). Off by default.
   --dry-run     Print every mutating action without performing it.
+  --offline     Clone the new release from the local runtime-current clone
+                instead of the network origin. runtime-current is normally a
+                blobless partial clone, so this mode can only produce a
+                complete tree for blobs it has already fetched on demand —
+                the post-checkout integrity check will catch and fail on any
+                gap rather than silently shipping a corrupt release. Prefer
+                the default network clone; use this only when origin is
+                genuinely unreachable.
 EOF
 }
 
@@ -77,6 +86,7 @@ while [ $# -gt 0 ]; do
     --rollback) DO_ROLLBACK=1; shift ;;
     --prune)    DO_PRUNE=1; shift ;;
     --dry-run)  DRY_RUN=1; shift ;;
+    --offline)  OFFLINE=1; shift ;;
     -h|--help)  usage; exit 0 ;;
     *) echo "ERROR: unknown argument: ${1:-}" >&2; usage >&2; exit 2 ;;
   esac
@@ -387,29 +397,83 @@ trap cleanup_on_failure EXIT
 
 # --- Build ENTIRELY in the new dir before any switch -----------------------
 
-# Offline-friendly clone: copy from the local runtime-current clone (all
-# fetched objects are already present locally), then point origin at the real
-# remote URL and detach-checkout the exact sha.
+# Network clone (default): clone straight from the real origin URL over the
+# network, full (no --filter). runtime-current is a blobless partial clone
+# (remote.origin.partialclonefilter=blob:none) — a *local-path* clone from it
+# only copies whatever blobs happen to already be present in its object
+# store, and the resulting clone has no promisor remote configured to fetch
+# the rest on demand. That is what produced the "unable to read sha1 file" /
+# silently-deleted-files failures in cut attempts 1-2: `checkout --detach`
+# can exit 0 while dropping files whose blobs were never locally cached.
+# Cloning from $ORIGIN_URL instead always yields a complete object set.
+#
+# --offline opts into the old local-path behavior (network origin
+# unreachable). It is NOT relied on for correctness — the post-checkout
+# integrity check below (git status/diff + a spot-check file) catches any
+# gap from either path and fails loudly instead of shipping a silently
+# corrupt release.
 #
 # Retry once on failure: git background maintenance (auto-gc/repack) detached
-# by the fetch above can race this same-second local clone/checkout and
-# produce transient "unable to read sha1 file" errors. On failure, blow away
-# the partial dir, wait for maintenance to settle, and redo the whole
-# sequence; a second failure aborts.
+# by the fetch above can race a same-second clone/checkout and produce
+# transient "unable to read sha1 file" errors. On failure, blow away the
+# partial dir, wait for maintenance to settle, and redo the whole sequence;
+# a second failure aborts.
 clone_and_checkout() {
-  log "clone (from local): git clone --no-checkout $CURRENT_LINK $NEW_DIR"
-  run git clone --no-checkout "$CURRENT_LINK" "$NEW_DIR" \
-    && run git -C "$NEW_DIR" remote set-url origin "$ORIGIN_URL" \
-    && { log "checkout $SHA (detached)"; run git -C "$NEW_DIR" checkout --detach "$SHA"; }
+  local src="$ORIGIN_URL" desc="network"
+  if [ "$OFFLINE" -eq 1 ]; then
+    src="$CURRENT_LINK"
+    desc="local (--offline)"
+  fi
+
+  log "clone ($desc): git clone --no-checkout $src $NEW_DIR"
+  run git clone --no-checkout "$src" "$NEW_DIR" || return 1
+
+  if [ "$OFFLINE" -eq 1 ]; then
+    run git -C "$NEW_DIR" remote set-url origin "$ORIGIN_URL" || return 1
+  fi
+
+  # Defensive: never let a blobless partial-clone filter leak into the new
+  # release regardless of source — a filtered clone can silently drop files
+  # during checkout, which is the exact root cause being fixed here.
+  if [ "$DRY_RUN" -ne 1 ]; then
+    git -C "$NEW_DIR" config --unset-all remote.origin.partialclonefilter 2>/dev/null || true
+  fi
+
+  log "checkout $SHA (detached)"
+  run git -C "$NEW_DIR" checkout --detach "$SHA" || return 1
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    return 0
+  fi
+
+  # Never trust checkout's exit code alone — it has been observed to exit 0
+  # while silently deleting files when object data is missing. Verify tree
+  # integrity explicitly before this release dir is allowed to go live.
+  local dirty
+  dirty="$(git -C "$NEW_DIR" status --porcelain)"
+  if [ -n "$dirty" ]; then
+    warn "post-checkout tree is dirty (possible silent corruption):"
+    printf '%s\n' "$dirty" >&2
+    return 1
+  fi
+  if ! git -C "$NEW_DIR" diff --quiet HEAD; then
+    warn "post-checkout diff vs HEAD is non-empty (possible silent corruption)"
+    return 1
+  fi
+  if [ ! -f "$NEW_DIR/hermes_cli/config.py" ]; then
+    warn "post-checkout spot-check failed: hermes_cli/config.py missing"
+    return 1
+  fi
+  ok "post-checkout tree integrity verified (clean status, diff matches HEAD, config.py present)"
 }
 
 if ! clone_and_checkout; then
-  warn "clone/checkout failed (possible git maintenance race) — retrying once"
+  warn "clone/checkout failed (possible git maintenance race, or a genuine object gap) — retrying once"
   assert_under_releases "$NEW_DIR"
   run rm -rf "$NEW_DIR"
   sleep 5
   clone_and_checkout \
-    || die "clone/checkout failed twice for $SHA — aborting (possible non-transient git maintenance/object race)"
+    || die "clone/checkout failed twice for $SHA — aborting (possible non-transient git maintenance/object race, or missing objects at origin)"
 fi
 
 # --- Build the Python venv inside the release dir --------------------------
