@@ -6,11 +6,12 @@ import json
 import logging
 import os
 import time
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
 
-from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt, _resolve_cron_enabled_toolsets, _merge_mcp_into_per_job_toolsets
+from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt, _resolve_cron_enabled_toolsets, _merge_mcp_into_per_job_toolsets, _is_route_chain_exhausted_no_work
 from tools.env_passthrough import clear_env_passthrough
 from tools.credential_files import clear_credential_files
 
@@ -1137,6 +1138,160 @@ class TestRunJobSessionPersistence:
         assert error is None
         assert final_response == "ok"
 
+    def test_run_job_fails_when_initial_system_prompt_write_is_lost(self, tmp_path):
+        """The real prompt-build write path must turn cron status into failure."""
+        from agent.conversation_loop import _restore_or_build_system_prompt
+
+        job = {"id": "test-job", "name": "test", "prompt": "hello"}
+        fake_db = MagicMock()
+        fake_db.get_compression_tip.side_effect = lambda sid: sid
+        fake_db.update_system_prompt.side_effect = RuntimeError("database is locked")
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+             patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "test-key",
+                     "base_url": "https://example.invalid/v1",
+                     "provider": "openrouter",
+                     "api_mode": "chat_completions",
+                 },
+             ), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent._session_persistence_error = None
+            mock_agent.session_id = "cron-prompt-write"
+            mock_agent.model = "test-model"
+            mock_agent.provider = "openrouter"
+            mock_agent.platform = "cron"
+            mock_agent._session_db = fake_db
+            mock_agent._cached_system_prompt = None
+            mock_agent._build_system_prompt.return_value = "built prompt"
+
+            def _run_conversation(*_args, **_kwargs):
+                _restore_or_build_system_prompt(mock_agent, None, [])
+                return {"final_response": "ok"}
+
+            mock_agent.run_conversation.side_effect = _run_conversation
+            mock_agent_cls.return_value = mock_agent
+
+            success, _output, final_response, error = run_job(job)
+
+        assert success is False
+        assert final_response == ""
+        assert error is not None
+        assert "update_system_prompt failed" in error
+        assert "database is locked" in error
+
+    def test_run_one_job_persists_and_delivers_prompt_write_failure(
+        self, tmp_path, monkeypatch
+    ):
+        """Prompt-prefix loss traverses execute, alert, and persisted status.
+
+        This exercises the real ``run_one_job -> run_job`` orchestration and
+        real jobs/output stores. Only the model/provider and delivery edges are
+        replaced; the prompt write is fault-injected on a real temporary
+        SessionDB so the production fail-visible mechanism sets the error.
+        """
+        import cron.jobs as jobs_store
+        import cron.scheduler as scheduler
+        from hermes_state import SessionDB
+
+        cron_dir = tmp_path / "cron"
+        monkeypatch.setattr(jobs_store, "CRON_DIR", cron_dir)
+        monkeypatch.setattr(jobs_store, "JOBS_FILE", cron_dir / "jobs.json")
+        monkeypatch.setattr(jobs_store, "OUTPUT_DIR", cron_dir / "output")
+        monkeypatch.setattr(scheduler, "_hermes_home", tmp_path)
+
+        job = jobs_store.create_job(
+            prompt="produce a durable report",
+            schedule="every 1h",
+            name="prompt persistence contract",
+            deliver="local",
+            model="test/model",
+            provider="openrouter",
+        )
+
+        prompt_write_attempts = []
+
+        def fail_prompt_write(_db, session_id, prompt):
+            prompt_write_attempts.append((session_id, prompt))
+            raise RuntimeError("database is locked")
+
+        delivered = []
+
+        def capture_delivery(_job, content, adapters=None, loop=None):
+            delivered.append(content)
+            return None
+
+        model_message = SimpleNamespace(
+            content="model response",
+            tool_calls=None,
+            reasoning_content=None,
+            reasoning=None,
+            reasoning_details=None,
+        )
+        model_response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(message=model_message, finish_reason="stop")
+            ],
+            model="test/model",
+            usage=None,
+        )
+        model_client = MagicMock()
+        model_client.chat.completions.create.return_value = model_response
+
+        monkeypatch.setattr(SessionDB, "update_system_prompt", fail_prompt_write)
+        # Keep the real AIAgent constructor and run_conversation loop. Replace
+        # only the OpenAI-compatible client at the outbound model boundary.
+        monkeypatch.setattr("run_agent.OpenAI", lambda **_kwargs: model_client)
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            lambda **_kwargs: {
+                "api_key": "test-key",
+                "base_url": "https://example.invalid/v1",
+                "provider": "openrouter",
+                "api_mode": "chat_completions",
+            },
+        )
+        monkeypatch.setattr(
+            "hermes_cli.env_loader.load_hermes_dotenv", lambda *_a, **_k: None
+        )
+        monkeypatch.setattr(
+            "hermes_cli.env_loader.reset_secret_source_cache", lambda: None
+        )
+        monkeypatch.setattr(scheduler, "_deliver_result", capture_delivery)
+
+        processed = scheduler.run_one_job(job)
+
+        assert processed is True
+        assert model_client.chat.completions.create.call_count == 1
+        assert len(prompt_write_attempts) == 1
+        assert prompt_write_attempts[0][0].startswith(f"cron_{job['id']}_")
+        assert "Model: test/model" in prompt_write_attempts[0][1]
+        updated = jobs_store.get_job(job["id"])
+        assert updated is not None
+        assert updated["last_status"] == "error"
+        assert "update_system_prompt failed" in updated["last_error"]
+        assert "database is locked" in updated["last_error"]
+        assert updated["last_delivery_error"] is None
+
+        assert len(delivered) == 1
+        alert = delivered[0]
+        assert alert.startswith("⚠️ Cron 'prompt persistence contract' failed:")
+        assert "update_system_prompt failed" in alert
+        assert "database is locked" in alert
+        output_files = list((cron_dir / "output" / job["id"]).glob("*.md"))
+        assert len(output_files) == 1
+        saved_output = output_files[0].read_text(encoding="utf-8")
+        assert "(FAILED)" in saved_output
+        assert "update_system_prompt failed" in saved_output
+        assert "database is locked" in saved_output
+
     def test_run_job_suppresses_empty_turn_explainer(self, tmp_path):
         """An empty model turn becomes the '⚠️ No reply…' explainer (#34452).
         For cron, that abnormal-empty explainer must be treated as empty so it
@@ -1668,12 +1823,18 @@ class TestRunJobSessionPersistence:
         assert "final fallback report" in output
         assert "(FAILED)" not in output
 
-    def test_run_job_rejects_budget_exhausted_fallback_summary(self, tmp_path):
-        """Budget exhaustion fails closed even when a summary was produced."""
+    def test_run_job_budget_exhausted_fails_closed_despite_final_response(self, tmp_path):
+        """86e2d6h8y: a ``budget_exhausted`` turn must fail closed even when the
+        agent produced a substantive ``final_response``. Unlike
+        ``max_iterations_reached(...)``, ``budget_exhausted`` does not qualify
+        for the max-iteration-summary carve-out, so ``completed=False`` here
+        must still raise and be surfaced as a cron failure rather than
+        delivered as a PARTIAL success.
+        """
         job = {
-            "id": "budget-job",
-            "name": "budget",
-            "prompt": "finish the report",
+            "id": "budget-exhausted-job",
+            "name": "budget exhausted",
+            "prompt": "do something expensive",
         }
         fake_db = MagicMock()
 
@@ -1694,7 +1855,7 @@ class TestRunJobSessionPersistence:
              patch("run_agent.AIAgent") as mock_agent_cls:
             mock_agent = MagicMock()
             mock_agent.run_conversation.return_value = {
-                "final_response": "incomplete budget summary",
+                "final_response": "here is what I got before the budget ran out",
                 "completed": False,
                 "failed": False,
                 "turn_exit_reason": "budget_exhausted",
@@ -1705,8 +1866,57 @@ class TestRunJobSessionPersistence:
 
         assert success is False
         assert final_response == ""
+        assert error is not None
+        # Output should be the FAILED template, not the success template.
         assert "(FAILED)" in output
-        assert error == "RuntimeError: incomplete budget summary"
+        # Ephemeral cron agent must still be closed even on agent-flagged failure.
+        mock_agent.close.assert_called_once()
+
+    def test_run_job_max_iterations_reached_with_response_still_partial(self, tmp_path):
+        """86e2d6h8y no-regression guard: a genuine
+        ``max_iterations_reached(...)`` turn_exit_reason with a substantive
+        final_response must still be delivered as a PARTIAL success (not
+        raised), distinguishing it from the ``budget_exhausted`` fail-closed
+        case above.
+        """
+        job = {
+            "id": "max-iterations-job",
+            "name": "max iterations",
+            "prompt": "finish the long task",
+        }
+        fake_db = MagicMock()
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+             patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "***",
+                     "base_url": "https://example.invalid/v1",
+                     "provider": "openrouter",
+                     "api_mode": "chat_completions",
+                 },
+             ), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {
+                "final_response": "partial progress summary before hitting the limit",
+                "completed": False,
+                "failed": False,
+                "turn_exit_reason": "max_iterations_reached(60/60)",
+            }
+            mock_agent_cls.return_value = mock_agent
+
+            success, output, final_response, error = run_job(job)
+
+        assert success is True
+        assert error is None
+        assert final_response == "partial progress summary before hitting the limit"
+        assert "partial progress summary before hitting the limit" in output
+        assert "(FAILED)" not in output
 
     def test_tick_skips_due_jobs_while_dispatch_is_paused(self, tmp_path):
         """The drain gate runs before advancing a due job's schedule."""
@@ -3317,6 +3527,185 @@ class TestOneShotDispatchClaim:
         run_mock.assert_not_called()
         deliver_mock.assert_not_called()
         mark_mock.assert_not_called()
+
+
+class TestRouteChainExhaustedNoWork:
+    """HERMES audit: 'Scheduler last_status can still be ok when the agent
+    reports that zero work occurred' — a run whose provider fallback chain
+    was fully exhausted (CredentialPool.has_available() is False) AND that
+    produced no objective work (empty final_response) must never record
+    last_status='ok'. Covers both the pure decision helper and the
+    run_one_job()/tick() wiring via the _JOB_CREDENTIAL_POOL_AVAILABLE
+    ContextVar side channel."""
+
+    # -- Pure helper: _is_route_chain_exhausted_no_work ---------------------
+
+    def test_helper_true_when_exhausted_and_empty(self):
+        assert _is_route_chain_exhausted_no_work(False, "") is True
+
+    def test_helper_true_when_exhausted_and_whitespace_only(self):
+        assert _is_route_chain_exhausted_no_work(False, "   \n\t  ") is True
+
+    def test_helper_false_when_exhausted_but_real_output(self):
+        """A last credential can exhaust on the FINAL call of an otherwise
+        successful run — must never flip a genuinely-successful run."""
+        assert _is_route_chain_exhausted_no_work(False, "Daily report: done.") is False
+
+    def test_helper_false_when_pool_available(self):
+        assert _is_route_chain_exhausted_no_work(True, "") is False
+
+    def test_helper_false_when_indeterminate(self):
+        """None (no pool / lookup failed / no_agent job / ACP command
+        runtime) must fail OPEN — never treated as exhausted."""
+        assert _is_route_chain_exhausted_no_work(None, "") is False
+
+    # -- Wiring: run_one_job() / tick() via the ContextVar side channel -----
+
+    def _make_job(self):
+        return {
+            "id": "monitor-job",
+            "name": "monitor",
+            "deliver": "origin",
+            "origin": {"platform": "telegram", "chat_id": "123"},
+        }
+
+    def test_exhausted_and_empty_response_forces_non_ok(self):
+        """OLD behavior (pre-fix) already forced success=False here via the
+        #8585 empty-response guard, but recorded a generic message with no
+        exhaustion attribution. This asserts the NEW deterministic
+        chain-exhaustion message so the test fails against a version that
+        does not read/attribute the pool state."""
+        def fake_run_job(job):
+            # Fetch the ContextVar from whatever module object is *currently*
+            # live in sys.modules — NOT the name bound at file-import/collection
+            # time (see module docstring note below `TestRouteChainExhaustedNoWork`).
+            # Other test files (e.g. test_cron_no_agent.py's `hermes_env`
+            # fixture) call ``importlib.reload(cron.scheduler)`` to pick up a
+            # fresh HERMES_HOME, which replaces ``cron.scheduler``'s module
+            # namespace — including creating a BRAND NEW
+            # ``_JOB_CREDENTIAL_POOL_AVAILABLE`` ContextVar object. A name bound
+            # via ``from cron.scheduler import _JOB_CREDENTIAL_POOL_AVAILABLE``
+            # at collection time keeps pointing at the stale pre-reload object,
+            # so setting it here would silently diverge from the ContextVar
+            # ``tick()``/``run_one_job()`` actually read from (both freshly
+            # imported below, so always the live module). Always re-import here
+            # to stay pinned to the live module, whatever test order produced it.
+            import cron.scheduler as _live_scheduler
+            _live_scheduler._JOB_CREDENTIAL_POOL_AVAILABLE.set(False)
+            return (True, "# out", "", None)
+
+        with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
+             patch("cron.scheduler.run_job", side_effect=fake_run_job), \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch("cron.scheduler._deliver_result") as deliver_mock, \
+             patch("cron.scheduler.mark_job_run") as mark_mock:
+            from cron.scheduler import tick
+            tick(verbose=False)
+
+        deliver_mock.assert_not_called()
+        mark_mock.assert_called_once_with(
+            "monitor-job",
+            False,
+            "route chain exhausted — no usable provider credential available; "
+            "no objective work produced",
+            delivery_error=None,
+        )
+
+    def test_available_and_empty_response_keeps_generic_message(self):
+        """Non-regression: when the pool is NOT exhausted, the empty-response
+        guard still fires (unchanged) but keeps the original generic
+        message — no false exhaustion attribution."""
+        def fake_run_job(job):
+            # See the isolation note in test_exhausted_and_empty_response_forces_non_ok
+            # above — must re-import to stay pinned to the live module's ContextVar.
+            import cron.scheduler as _live_scheduler
+            _live_scheduler._JOB_CREDENTIAL_POOL_AVAILABLE.set(True)
+            return (True, "# out", "", None)
+
+        with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
+             patch("cron.scheduler.run_job", side_effect=fake_run_job), \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch("cron.scheduler._deliver_result") as deliver_mock, \
+             patch("cron.scheduler.mark_job_run") as mark_mock:
+            from cron.scheduler import tick
+            tick(verbose=False)
+
+        mark_mock.assert_called_once_with(
+            "monitor-job",
+            False,
+            "Agent completed but produced empty response (model error, timeout, or misconfiguration)",
+            delivery_error=None,
+        )
+
+    def test_exhausted_but_real_output_stays_ok(self):
+        """The last credential exhausting on the final (successful) call
+        must NOT flip a genuinely-successful run to failed."""
+        def fake_run_job(job):
+            # See the isolation note in test_exhausted_and_empty_response_forces_non_ok
+            # above — must re-import to stay pinned to the live module's ContextVar.
+            import cron.scheduler as _live_scheduler
+            _live_scheduler._JOB_CREDENTIAL_POOL_AVAILABLE.set(False)
+            return (True, "# out", "Daily report: 4 PRs merged.", None)
+
+        with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
+             patch("cron.scheduler.run_job", side_effect=fake_run_job), \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch("cron.scheduler._deliver_result", return_value=None) as deliver_mock, \
+             patch("cron.scheduler.mark_job_run") as mark_mock:
+            from cron.scheduler import tick
+            tick(verbose=False)
+
+        mark_mock.assert_called_once_with(
+            "monitor-job",
+            True,
+            None,
+            delivery_error=None,
+        )
+
+    def test_failure_path_attributes_exhaustion_to_error(self):
+        """success is already False (agent raised) — last_status semantics
+        stay non-ok, but the recorded error is attributed to chain
+        exhaustion for a deterministic operator signal."""
+        def fake_run_job(job):
+            # See the isolation note in test_exhausted_and_empty_response_forces_non_ok
+            # above — must re-import to stay pinned to the live module's ContextVar.
+            import cron.scheduler as _live_scheduler
+            _live_scheduler._JOB_CREDENTIAL_POOL_AVAILABLE.set(False)
+            return (False, "# out (FAILED)", "", "RuntimeError: boom")
+
+        with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
+             patch("cron.scheduler.run_job", side_effect=fake_run_job), \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch("cron.scheduler._deliver_result", return_value=None) as deliver_mock, \
+             patch("cron.scheduler.mark_job_run") as mark_mock:
+            from cron.scheduler import tick
+            tick(verbose=False)
+
+        mark_mock.assert_called_once_with(
+            "monitor-job",
+            False,
+            "RuntimeError: boom (route chain exhausted — no usable provider credential available)",
+            delivery_error=None,
+        )
+
+    def test_indeterminate_pool_state_does_not_force_failure_message(self):
+        """Default/unmocked path: run_job() never sets the ContextVar (mirrors
+        every pre-existing test in this file) -> indeterminate -> must fail
+        OPEN and keep pre-existing behavior exactly."""
+        with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
+             patch("cron.scheduler.run_job", return_value=(True, "# out", "", None)), \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch("cron.scheduler._deliver_result") as deliver_mock, \
+             patch("cron.scheduler.mark_job_run") as mark_mock:
+            from cron.scheduler import tick
+            tick(verbose=False)
+
+        mark_mock.assert_called_once_with(
+            "monitor-job",
+            False,
+            "Agent completed but produced empty response (model error, timeout, or misconfiguration)",
+            delivery_error=None,
+        )
 
 
 class TestBuildJobPromptSilentHint:

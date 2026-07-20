@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import shlex
 import ssl
@@ -553,6 +554,17 @@ _PLACEHOLDER_SECRET_VALUES = {
 }
 
 
+# An unexpanded shell/format template literal (e.g. "${GEMINI_API_KEY}") is
+# NOT a credential — it's a reference to one that never got substituted (the
+# recurring "Gemini 400 was .env poison, not the key" incident: a literal
+# ${GEMINI_API_KEY} string poisoned the credential pool and looked "usable"
+# because it was long enough and not in the placeholder set). Only reject
+# values that are UNAMBIGUOUSLY a bare template reference with nothing else —
+# a real key that merely contains a "$" character must still pass.
+_BARE_TEMPLATE_REF_RE = re.compile(r"^\$\{[^}]+\}$|^\$[A-Za-z_][A-Za-z0-9_]*$")
+_PYTHON_PERCENT_TEMPLATE_RE = re.compile(r"^%\([^)]+\)s$")
+
+
 def has_usable_secret(value: Any, *, min_length: int = 4) -> bool:
     """Return True when a configured secret looks usable, not empty/placeholder."""
     if not isinstance(value, str):
@@ -562,7 +574,56 @@ def has_usable_secret(value: Any, *, min_length: int = 4) -> bool:
         return False
     if cleaned.lower() in _PLACEHOLDER_SECRET_VALUES:
         return False
+    if _BARE_TEMPLATE_REF_RE.match(cleaned) or _PYTHON_PERCENT_TEMPLATE_RE.match(cleaned):
+        return False
     return True
+
+
+def _resolve_pool_entry_lazy(provider_id: str, pconfig: "ProviderConfig", entry: Any) -> str:
+    """Live-resolve a fingerprint-only credential-pool entry's secret from 1Password.
+
+    Post-migration pool entries may carry only a ``secret_fingerprint`` with no eager
+    ``access_token``. Such an entry has no eager value to fall back to, so we resolve the
+    real secret at call time via the lazy 1Password resolver, keyed off the provider's
+    env-var name(s). Not gated behind HERMES_LAZY_SECRET_RESOLUTION for that reason.
+    Returns the resolved secret, or "" on any miss/error (fail-open)."""
+    try:
+        candidates = list(pconfig.api_key_env_vars)
+        source = str(getattr(entry, "source", "") or "")
+        if source.startswith("env:"):
+            env_name = source[len("env:"):].strip()
+            if env_name and env_name not in candidates:
+                candidates.append(env_name)
+
+        expected_fingerprint = getattr(entry, "secret_fingerprint", None)
+
+        for env_var in candidates:
+            try:
+                from agent.lazy_secret_resolver import get as _lazy_get
+                val = (_lazy_get(env_var) or "").strip()
+            except Exception:
+                continue
+            if not has_usable_secret(val):
+                continue
+            if isinstance(expected_fingerprint, str) and expected_fingerprint.startswith("sha256:"):
+                try:
+                    from agent.credential_persistence import _fingerprint_value
+                    computed = _fingerprint_value(val)
+                except Exception:
+                    # Can't reproduce the fingerprint algorithm — skip verification
+                    # rather than risk rejecting the correct key.
+                    return val
+                if computed != expected_fingerprint:
+                    logger.warning(
+                        "resolve_pool_entry_lazy: %s lazy-resolved %s fingerprint "
+                        "mismatch, skipping candidate", provider_id, env_var)
+                    continue
+            return val
+    except Exception as exc:
+        logger.warning(
+            "resolve_pool_entry_lazy: %s lazy resolution raised %s: %s",
+            provider_id, type(exc).__name__, exc)
+    return ""
 
 
 def _resolve_api_key_provider_secret(
@@ -622,6 +683,13 @@ def _resolve_api_key_provider_secret(
         key = getattr(entry, "access_token", "") or getattr(entry, "runtime_api_key", "")
         key = str(key).strip()
         if not has_usable_secret(key):
+            # Fingerprint-only entries (post-migration, no eager access_token) have
+            # no eager value to fall back to — try a live 1Password resolve before
+            # giving up. See _resolve_pool_entry_lazy for why this isn't gated
+            # behind HERMES_LAZY_SECRET_RESOLUTION.
+            lazy_key = _resolve_pool_entry_lazy(provider_id, pconfig, entry)
+            if has_usable_secret(lazy_key):
+                return lazy_key, f"credential_pool_lazy:{provider_id}"
             logger.warning(
                 "resolve_api_key_provider_secret: %s pool entry %s has no usable "
                 "secret (empty/placeholder access_token and runtime_api_key)",

@@ -316,7 +316,7 @@ _COMBINED_REVIEW_PROMPT = (
     "like this', 'I hate when you Y' — embed the lesson in the skill "
     "that governs that task so the next session starts fixed.\n"
     "  • Non-trivial technique, fix, workaround, or debugging path "
-    "emerged.\n"
+    "emerged — a missed learning opportunity if ignored.\n"
     "  • A skill that was loaded or consulted turned out wrong, "
     "missing, or outdated — patch it now.\n\n"
     "Preference order for skills — pick the earliest that fits:\n"
