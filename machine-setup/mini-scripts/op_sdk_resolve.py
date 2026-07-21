@@ -145,7 +145,7 @@ def _write_cache(key: str, payload: dict) -> None:
         _ensure_cache_dir()
         path = _cache_path(key)
         tmp_path = f"{path}.tmp-{os.getpid()}"
-        with open(tmp_path, "w") as f:
+        with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump({"ts": time.time(), "data": payload}, f)
         os.chmod(tmp_path, 0o600)
         os.replace(tmp_path, path)
@@ -168,7 +168,7 @@ def _read_cache_any_age(key: str):
     """Serve-stale fallback: return (ts, data) regardless of age, or None if
     no cache entry exists / it's unreadable."""
     try:
-        with open(_cache_path(key)) as f:
+        with open(_cache_path(key), encoding="utf-8") as f:
             raw = json.load(f)
         return raw["ts"], raw["data"]
     except (OSError, ValueError, KeyError):
@@ -190,7 +190,7 @@ def resolve_refs(refs: list[str]) -> dict[str, str]:
 
 
 async def _resolve_by_ref(unique_refs: list[str]) -> dict[str, str]:
-    token = open(TOKEN_FILE).read().strip()
+    token = open(TOKEN_FILE, encoding="utf-8").read().strip()
     client = await Client.authenticate(
         auth=token,
         integration_name=INTEGRATION_NAME,
@@ -206,7 +206,7 @@ async def _resolve_by_ref(unique_refs: list[str]) -> dict[str, str]:
 
 
 async def _resolve_all_fields_async(vault_ref: str, item_ref: str) -> dict[str, str]:
-    token = open(TOKEN_FILE).read().strip()
+    token = open(TOKEN_FILE, encoding="utf-8").read().strip()
     client = await Client.authenticate(
         auth=token,
         integration_name=INTEGRATION_NAME,
@@ -297,7 +297,7 @@ def resolve_all_fields(vault_ref: str, item_ref: str) -> dict[str, str]:
 
 def _parse_env_file(path: str) -> dict[str, str]:
     refs: dict[str, str] = {}
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line or line.startswith("#") or "=" not in line:
