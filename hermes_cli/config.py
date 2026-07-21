@@ -3075,9 +3075,10 @@ DEFAULT_CONFIG = {
         # Default false: session history is valuable for search recall, and
         # silently deleting it could surprise users.  Opt in explicitly.
         "auto_prune": False,
-        # How many days of ended-session history to keep.  Matches the
-        # default of ``hermes sessions prune``.
-        "retention_days": 90,
+        # How many days of ended-session history to keep.  90 is a no-op on
+        # a cron-heavy Hermes install (transcripts churn faster than that;
+        # see 86e261t2z re-scope) — 30 is the value that actually prunes.
+        "retention_days": 30,
         # VACUUM after a prune that actually deleted rows.  SQLite does not
         # reclaim disk space on DELETE — freed pages are just reused on
         # subsequent INSERTs — so without VACUUM the file stays bloated

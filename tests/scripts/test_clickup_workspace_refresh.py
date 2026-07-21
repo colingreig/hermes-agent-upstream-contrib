@@ -159,3 +159,98 @@ def test_detect_markdown_drift_ignores_generated_noise():
     current = """# ClickUp workspace map (auto-generated 2026-07-06T06:00:00+00:00)\n\n_Sampled 12 task(s) updated in the last 7 days._\n\nreal line\n"""
 
     assert refresh_mod.detect_markdown_drift(prior, current) == []
+
+
+def test_cron_expr_to_hours_handles_hourly_and_minute_steps():
+    assert refresh_mod._cron_expr_to_hours("0 */6 * * *") == 6.0
+    assert refresh_mod._cron_expr_to_hours("*/30 * * * *") == 0.5
+    assert refresh_mod._cron_expr_to_hours("0 2 * * *") is None
+    assert refresh_mod._cron_expr_to_hours("not a cron expr") is None
+
+
+def test_derive_refresh_cadence_reads_the_live_cron_registration(monkeypatch):
+    """86e1vw79j: cadence must come from the registered job, never a literal."""
+    import cron.jobs as cron_jobs_mod
+
+    monkeypatch.setattr(
+        cron_jobs_mod,
+        "load_jobs",
+        lambda: [
+            {"script": "some_other_script.py", "schedule": {"expr": "0 2 * * *"}},
+            {"script": refresh_mod.THIS_SCRIPT_NAME, "schedule": {"expr": "0 */3 * * *"}},
+        ],
+    )
+
+    cadence = refresh_mod._derive_refresh_cadence()
+
+    assert cadence == {
+        "hours": 3.0,
+        "cron_expr": "0 */3 * * *",
+        "source": "cron_registration",
+    }
+
+
+def test_derive_refresh_cadence_falls_back_when_job_not_registered(monkeypatch):
+    import cron.jobs as cron_jobs_mod
+
+    monkeypatch.setattr(cron_jobs_mod, "load_jobs", lambda: [])
+
+    cadence = refresh_mod._derive_refresh_cadence()
+
+    assert cadence["source"] == "ttl_fallback"
+    assert cadence["cron_expr"] is None
+    assert cadence["hours"] == refresh_mod.REFRESH_TTL_SECONDS / 3600
+
+
+def test_derive_refresh_cadence_survives_cron_subsystem_errors(monkeypatch):
+    import cron.jobs as cron_jobs_mod
+
+    def _boom():
+        raise RuntimeError("jobs.json corrupted")
+
+    monkeypatch.setattr(cron_jobs_mod, "load_jobs", _boom)
+
+    cadence = refresh_mod._derive_refresh_cadence()
+
+    assert cadence["source"] == "ttl_fallback"
+
+
+def test_format_cadence_text_reflects_derived_cadence_not_a_literal():
+    assert refresh_mod._format_cadence_text(
+        {"refresh_cadence_hours": 3, "refresh_cadence_cron_expr": "0 */3 * * *", "refresh_cadence_source": "cron_registration"}
+    ) == "every 3 hours (`0 */3 * * *`)"
+    assert refresh_mod._format_cadence_text(
+        {"refresh_cadence_hours": 0.5, "refresh_cadence_cron_expr": "*/30 * * * *", "refresh_cadence_source": "cron_registration"}
+    ) == "every 30 minutes (`*/30 * * * *`)"
+    fallback_text = refresh_mod._format_cadence_text(
+        {"refresh_cadence_hours": 6.0, "refresh_cadence_cron_expr": None, "refresh_cadence_source": "ttl_fallback"}
+    )
+    assert "fallback default" in fallback_text
+
+
+def test_render_markdown_mirror_reflects_a_changed_cadence_and_keeps_root_cause_note():
+    """The literal this task exists to kill: cadence text must track a schedule
+    change (not stay pinned at 'every 6 hours'), and the root-cause note must
+    survive every regeneration, not just the day it was written."""
+    workspace_map = {
+        "schema_version": refresh_mod.SCHEMA_VERSION,
+        "generated_at": 123000,
+        "generated_at_iso": "1970-01-01T00:02:03+00:00",
+        "team_id": "team-1",
+        "refresh_cadence_hours": 3,
+        "refresh_cadence_cron_expr": "0 */3 * * *",
+        "refresh_cadence_source": "cron_registration",
+        "root_cause_note_2026_07_09": refresh_mod.ROOT_CAUSE_NOTE_2026_07_09,
+        "spaces": [],
+        "folders": [],
+        "lists": [],
+        "task_tags": {"sampled_task_count": 0, "lookback_days": 7, "tags": []},
+        "clients_aliases": {},
+    }
+
+    markdown = refresh_mod.render_markdown_mirror(workspace_map)
+
+    assert "every 3 hours" in markdown
+    assert "every 6 hours" not in markdown
+    assert "2026-07-09" in markdown
+    assert refresh_mod.ROOT_CAUSE_NOTE_2026_07_09 in markdown
