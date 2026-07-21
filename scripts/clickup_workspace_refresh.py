@@ -41,6 +41,23 @@ SCHEMA_VERSION = 2
 REFRESH_TTL_SECONDS = 6 * 60 * 60
 TASK_LOOKBACK_DAYS = 7
 TASK_PAGE_LIMIT = 10
+THIS_SCRIPT_NAME = "clickup_workspace_refresh.py"
+
+# 86e1vw79j: this note documents a specific historical incident (the
+# 2026-07-09 out-of-band rewrite that upgraded the output schema and hand-ran
+# the script once outside the cron dispatcher, causing the emitted cadence to
+# drift from the registered cron). It is deliberately a literal, not derived
+# — it is a permanent record, unlike the cadence text below which must stay
+# live. Kept in the source (not just a ClickUp comment) so it regenerates
+# into every future map instead of being lost on the next overwrite.
+_ROOT_CAUSE_DATE = "2026-07-09"
+ROOT_CAUSE_NOTE_2026_07_09 = (
+    "2026-07-09: the script was upgraded to a new output schema and manually "
+    "test-run once outside the cron dispatcher, which is why the map briefly "
+    "diverged from the registered cron schedule. The cadence line above is "
+    "now always derived from the live cron registration (see "
+    "_derive_refresh_cadence), not hardcoded, so this can't recur."
+)
 
 STATE_DIR = get_hermes_home() / "state"
 DEFAULT_JSON_PATH = STATE_DIR / "clickup-map.json"
@@ -344,6 +361,61 @@ def _alias_candidates(name: str) -> set[str]:
     return {_slugify_alias(candidate) for candidate in candidates if _slugify_alias(candidate)}
 
 
+def _cron_expr_to_hours(expr: str) -> float | None:
+    """Best-effort conversion of a simple 5-field cron expr to a period in hours.
+
+    Only handles the shapes this refresh cron realistically uses (fixed
+    minute + ``*/N`` hour, or ``*/N`` minute with ``*`` hour). Anything else
+    returns ``None`` — callers fall back to showing the raw expr instead of
+    guessing.
+    """
+    parts = expr.split()
+    if len(parts) != 5:
+        return None
+    minute, hour = parts[0], parts[1]
+    hour_step = re.fullmatch(r"\*/(\d+)", hour)
+    if hour_step and minute.isdigit():
+        return float(hour_step.group(1))
+    minute_step = re.fullmatch(r"\*/(\d+)", minute)
+    if hour == "*" and minute_step:
+        return round(int(minute_step.group(1)) / 60, 4)
+    return None
+
+
+def _derive_refresh_cadence(script_name: str = THIS_SCRIPT_NAME) -> dict[str, Any]:
+    """Read the ACTUAL registered cron schedule for this script's own job.
+
+    86e1vw79j (4 prior FAIL cycles): the cadence text/hours were a hardcoded
+    literal that drifted stale the moment the registered cron changed. This
+    always re-derives from the live job registration instead, so the map can
+    never claim a cadence the cron isn't actually running.
+    """
+    try:
+        from cron.jobs import load_jobs  # local import: optional dependency
+
+        for job in load_jobs():
+            if job.get("script") != script_name:
+                continue
+            expr = str((job.get("schedule") or {}).get("expr") or "").strip()
+            if not expr:
+                continue
+            return {
+                "hours": _cron_expr_to_hours(expr),
+                "cron_expr": expr,
+                "source": "cron_registration",
+            }
+    except Exception:
+        pass
+    # Cron subsystem unreadable or job not found (e.g. renamed) — report the
+    # script's own TTL as a best-effort fallback rather than asserting a
+    # cadence we couldn't actually verify.
+    return {
+        "hours": REFRESH_TTL_SECONDS / 3600,
+        "cron_expr": None,
+        "source": "ttl_fallback",
+    }
+
+
 def build_clients_aliases(
     spaces: list[dict[str, Any]],
     folders: list[dict[str, Any]],
@@ -471,12 +543,16 @@ def build_workspace_map(team_id: str) -> dict[str, Any]:
     folders.sort(key=lambda item: (item.get("space_name") or "", item.get("name") or "", str(item.get("id") or "")))
 
     generated_at = _now_ms()
+    cadence = _derive_refresh_cadence()
     return {
         "schema_version": SCHEMA_VERSION,
         "generated_at": generated_at,
         "generated_at_iso": _iso_utc(generated_at),
         "team_id": team_id,
-        "refresh_cadence_hours": 6,
+        "refresh_cadence_hours": cadence["hours"],
+        "refresh_cadence_cron_expr": cadence["cron_expr"],
+        "refresh_cadence_source": cadence["source"],
+        "root_cause_note_2026_07_09": ROOT_CAUSE_NOTE_2026_07_09,
         "spaces": spaces,
         "folders": folders,
         "lists": lists,
@@ -492,6 +568,27 @@ def build_workspace_map(team_id: str) -> dict[str, Any]:
     }
 
 
+def _format_cadence_text(workspace_map: dict[str, Any]) -> str:
+    """Render the derived cadence (see ``_derive_refresh_cadence``) as prose."""
+    hours = workspace_map.get("refresh_cadence_hours")
+    expr = workspace_map.get("refresh_cadence_cron_expr")
+    source = workspace_map.get("refresh_cadence_source")
+    if hours is None:
+        text = "unknown (cron expr not recognized)" if expr else "unknown (cron registration unavailable)"
+    elif hours < 1:
+        text = f"every {round(hours * 60)} minutes"
+    elif float(hours).is_integer():
+        n = int(hours)
+        text = f"every {n} hour{'s' if n != 1 else ''}"
+    else:
+        text = f"every {hours} hours"
+    if expr:
+        text += f" (`{expr}`)"
+    if source == "ttl_fallback":
+        text += " — fallback default, live cron registration could not be read"
+    return text
+
+
 def render_markdown_mirror(workspace_map: dict[str, Any]) -> str:
     out: list[str] = []
     generated_iso = workspace_map.get("generated_at_iso") or _iso_utc(workspace_map.get("generated_at"))
@@ -499,8 +596,10 @@ def render_markdown_mirror(workspace_map: dict[str, Any]) -> str:
     out.append("")
     out.append(f"**Team ID:** `{workspace_map['team_id']}`  ")
     out.append(f"**Schema version:** `{workspace_map['schema_version']}`  ")
-    out.append("**Refresh cadence:** every 6 hours  ")
+    out.append(f"**Refresh cadence:** {_format_cadence_text(workspace_map)}  ")
     out.append(f"**JSON cache:** `{display_hermes_home()}/state/clickup-map.json`")
+    out.append("")
+    out.append(f"**Root cause note ({_ROOT_CAUSE_DATE}):** {workspace_map.get('root_cause_note_2026_07_09', ROOT_CAUSE_NOTE_2026_07_09)}")
     out.append("")
 
     out.append("## Spaces")
