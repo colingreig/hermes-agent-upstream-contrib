@@ -5881,7 +5881,7 @@ class SessionDB:
 
     def maybe_auto_prune_and_vacuum(
         self,
-        retention_days: int = 90,
+        retention_days: int = 30,
         min_interval_hours: int = 24,
         vacuum: bool = True,
         sessions_dir: Optional[Path] = None,
