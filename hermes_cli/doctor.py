@@ -5,6 +5,7 @@ Diagnoses issues with Hermes Agent setup.
 """
 
 import os
+import re
 import sys
 import subprocess
 import shutil
@@ -101,6 +102,91 @@ def _termux_install_all_fallback_notes() -> list[str]:
 def _has_provider_env_config(content: str) -> bool:
     """Return True when ~/.hermes/.env contains provider auth/base URL settings."""
     return any(key in content for key in _PROVIDER_ENV_HINTS)
+
+
+# ── Stale "self-tag agent-ready" instruction detector ──────────────────────
+# Durable memory files (MEMORY.md / USER.md) can accumulate old personal
+# instructions like "capture new Slack work as a task tagged agent-ready"
+# written before the ignite-prep gate existed. That contradicts current
+# policy: agent-ready may only be added by ignite-prep, after it writes a
+# canonical Execution Brief, resolves every product decision, confirms any
+# predecessor task is complete, and sets exactly one model:* floor tag. A
+# stale instruction file can silently steer Hermes into skipping that gate,
+# so doctor flags it (advisory — check_warn, not check_fail).
+_AGENT_READY_MENTION_PATTERN = re.compile(r"agent-ready", re.IGNORECASE)
+
+_TASK_CAPTURE_LANGUAGE_PATTERN = re.compile(
+    r"\bnew\s+(?:\w+\s+){0,2}tasks?\b"     # e.g. "new task" / "new tasks" / "new Slack task"
+    r"|\bcaptur(?:e|ed|es|ing)\b"
+    r"|\bcreat(?:e|ed|es|ing)\s+(?:a\s+)?(?:new\s+)?tasks?\b"
+    r"|\btag(?:ged|ging)?\s+(?:it\b|new\s+tasks?\b)",
+    re.IGNORECASE,
+)
+
+# Deliberately NOT including a bare `\bprep(?:ped|ping)?\b` alternative here:
+# it used to match ANY unrelated use of "prep" anywhere in the sentence (e.g.
+# "prep the client deck"), which silently suppressed real stale-instruction
+# flags. "ignite-prep" (below) already covers the specific gate concept; a
+# generic "prep" mention elsewhere in the sentence should not exempt a
+# sentence that otherwise instructs self-tagging agent-ready.
+_EXECUTION_BRIEF_GATE_PATTERN = re.compile(
+    r"execution\s+brief"
+    r"|ignite-prep"
+    r"|model\s*floor"
+    r"|model:\*"
+    r"|predecessor",
+    re.IGNORECASE,
+)
+
+# Negation cues: a sentence telling the agent NOT to self-tag ("never",
+# "don't", "do not", "shouldn't"/"should not", "must not", "no longer") is
+# compliant/cautionary wording, not a stale violation, even if it doesn't
+# also reference the Execution-Brief/ignite-prep/model-floor gate. We
+# deliberately favor NOT flagging over flagging (see module docstring above).
+#
+# Known unhandled edge case: "don't forget to tag new tasks agent-ready" is a
+# real violation (the negation cue "don't" attaches to "forget", not to the
+# self-tag instruction), but this cheap sentence-level check has no reliable
+# way to distinguish "don't forget to X" from "don't X" without much deeper
+# parsing, so it is suppressed like any other negated sentence. Accepted per
+# the low-false-positive design bias.
+_NEGATION_CUE_PATTERN = re.compile(
+    r"\b(?:never|don'?t|do not|shouldn'?t|should not|must not|no longer)\b",
+    re.IGNORECASE,
+)
+
+
+def _detects_stale_agent_ready_instruction(content: str) -> str | None:
+    """Return the offending sentence if ``content`` instructs self-tagging a
+    freshly-captured task ``agent-ready`` without also mentioning the
+    Prep -> Execution Brief -> model-floor gate. Returns ``None`` when clean.
+
+    This is a heuristic sentence-level co-occurrence check, not a parser: a
+    sentence is flagged only when it mentions BOTH the literal "agent-ready"
+    tag AND task-creation/capture language, AND does NOT also reference the
+    gating concept (Execution Brief / ignite-prep / model floor /
+    predecessor) in that same sentence, AND does NOT contain a negation cue
+    (never / don't / shouldn't / must not / no longer) that indicates the
+    sentence is telling the agent NOT to self-tag. This favors a low
+    false-positive rate over perfect recall.
+    """
+    if not content or "agent-ready" not in content.lower():
+        return None
+
+    normalized = " ".join(content.split())
+    sentences = re.split(r"(?<=[.!?])\s+", normalized)
+    for sentence in sentences:
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+        if (
+            _AGENT_READY_MENTION_PATTERN.search(sentence)
+            and _TASK_CAPTURE_LANGUAGE_PATTERN.search(sentence)
+            and not _EXECUTION_BRIEF_GATE_PATTERN.search(sentence)
+            and not _NEGATION_CUE_PATTERN.search(sentence)
+        ):
+            return sentence
+    return None
 
 
 def _honcho_is_configured_for_doctor() -> bool:
@@ -1227,6 +1313,35 @@ def run_doctor(args):
             check_ok(f"USER.md exists ({size} chars)")
         else:
             check_info("USER.md not created yet (will be created when the agent first writes a memory)")
+
+        # Scan the durable instruction files for a stale "self-tag agent-ready"
+        # instruction. This contradicts current policy — agent-ready may only be
+        # added by ignite-prep after it writes a canonical Execution Brief,
+        # resolves every product decision, confirms any predecessor task is
+        # complete, and sets exactly one model:* floor tag — so a leftover
+        # personal instruction here could silently steer Hermes into skipping
+        # that gate.
+        for _durable_file in (memory_file, user_file):
+            if not _durable_file.exists():
+                continue
+            try:
+                _durable_content = _durable_file.read_text(encoding="utf-8")
+            except Exception:
+                continue
+            _offending_sentence = _detects_stale_agent_ready_instruction(_durable_content)
+            if _offending_sentence:
+                check_warn(
+                    f"{_durable_file.name} instructs self-tagging agent-ready",
+                    f'("{_offending_sentence}")',
+                )
+                manual_issues.append(
+                    f"{_DHH}/memories/{_durable_file.name} tells the agent to self-tag new tasks "
+                    "agent-ready — that contradicts policy: agent-ready may only be added by "
+                    "ignite-prep, after it writes a canonical Execution Brief, resolves every "
+                    "product decision, confirms any predecessor task is complete, and sets "
+                    "exactly one model:* floor tag. Update the file to remove the self-tagging "
+                    "instruction."
+                )
     else:
         check_warn(f"{_DHH}/memories/ not found", "(will be created on first use)")
         if should_fix:
