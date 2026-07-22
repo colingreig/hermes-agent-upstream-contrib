@@ -44,9 +44,12 @@ def test_default_and_mini_chat_models_are_current_and_paired():
     top-level "model" is intentionally "") is expected to be the flagship
     reasoning model here, with the mini/cheap pair right behind it in the
     curated fallback list so a fresh install / offline first run still
-    offers both tiers. If this ever drifts (e.g. gpt-5.5 renamed/retired),
-    this test catches it before it's discovered as a stale live config."""
-    assert DEFAULT_CODEX_MODELS[0] == "gpt-5.5", (
+    offers both tiers. If this ever drifts (e.g. gpt-5.6-sol renamed/
+    retired), this test catches it before it's discovered as a stale live
+    config. Updated 2026-07-22 during the prod-live-patches integration:
+    gpt-5.6-sol GA'd 2026-07-09 and superseded gpt-5.5 as the flagship
+    entry in DEFAULT_CODEX_MODELS on this branch."""
+    assert DEFAULT_CODEX_MODELS[0] == "gpt-5.6-sol", (
         "the flagship reasoning default (main interactive chat, tool-heavy/"
         "long-context work) must lead the curated Codex model list"
     )
