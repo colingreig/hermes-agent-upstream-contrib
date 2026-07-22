@@ -249,6 +249,67 @@ class TestAuthCredentialPoolFallback:
         assert source == "DEEPSEEK_API_KEY"
         mp.assert_not_called()
 
+    def test_peek_excludes_fingerprint_only_entry_lazy_resolve_still_tried(
+        self, isolated_hermes_home
+    ):
+        """86e29q8mz: peek()'s availability filter (e.g. an eager-runtime-key
+        requirement some releases apply) can exclude a fingerprint-only entry
+        before lazy resolution ever runs, even though 1Password can resolve
+        it fine. Raw entries() must still be tried."""
+        fingerprint_entry = MagicMock()
+        fingerprint_entry.access_token = ""
+        fingerprint_entry.runtime_api_key = ""
+        fingerprint_entry.last_status = None
+        fingerprint_entry.source = "env:GEMINI_API_KEY"
+        fingerprint_entry.secret_fingerprint = "sha256:deadbeef"
+
+        mock_pool = MagicMock()
+        mock_pool.has_credentials.return_value = True
+        mock_pool.peek.return_value = None  # excluded by the pool's own filter
+        mock_pool.entries.return_value = [fingerprint_entry]
+
+        from hermes_cli.auth import _resolve_api_key_provider_secret
+        with patch("agent.credential_pool.load_pool", return_value=mock_pool):
+            with patch(
+                "hermes_cli.auth._resolve_pool_entry_lazy",
+                return_value="lazy-resolved-gemini-key",
+            ) as mock_lazy:
+                key, source = _resolve_api_key_provider_secret(
+                    provider_id="gemini",
+                    pconfig=_make_pconfig(provider_id="gemini"),
+                )
+        assert key == "lazy-resolved-gemini-key"
+        assert source == "credential_pool_lazy:gemini"
+        mock_lazy.assert_called_once()
+        called_provider_id, _pconfig, called_entry = mock_lazy.call_args[0]
+        assert called_provider_id == "gemini"
+        assert called_entry is fingerprint_entry
+
+    def test_peek_excludes_all_entries_and_no_raw_entry_lazy_resolves(
+        self, isolated_hermes_home
+    ):
+        """When even the raw entries can't lazy-resolve, fail closed to empty."""
+        dead_entry = MagicMock()
+        dead_entry.last_status = "dead"
+
+        mock_pool = MagicMock()
+        mock_pool.has_credentials.return_value = True
+        mock_pool.peek.return_value = None
+        mock_pool.entries.return_value = [dead_entry]
+
+        from hermes_cli.auth import _resolve_api_key_provider_secret
+        with patch("agent.credential_pool.load_pool", return_value=mock_pool):
+            with patch(
+                "hermes_cli.auth._resolve_pool_entry_lazy", return_value=""
+            ) as mock_lazy:
+                key, source = _resolve_api_key_provider_secret(
+                    provider_id="gemini",
+                    pconfig=_make_pconfig(provider_id="gemini"),
+                )
+        assert key == ""
+        # dead_entry is skipped outright — lazy resolution is never even tried on it
+        mock_lazy.assert_not_called()
+
 
 class TestAnthropicEnvAuthTypeClassification:
     """_seed_from_env must classify Anthropic env tokens by the sk-ant-oat prefix.
