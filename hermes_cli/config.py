@@ -2741,8 +2741,13 @@ DEFAULT_CONFIG = {
         # default sizing allows (min(32, cpu_count+4) workers when max_workers
         # is left as None) — each hitting the shared state.db and the
         # provider's API concurrently. 4 keeps bursts bounded without
-        # serializing every tick. null/0 = unbounded (limited only by thread
-        # count) for operators who explicitly want the old behaviour.
+        # serializing every tick.
+        # null/unset resolves to this same bounded default (cron/scheduler.py's
+        # tick() falls back to this DEFAULT_CONFIG value rather than treating
+        # a saved-but-empty key as unbounded) — a stale config.yaml written
+        # before this cap existed no longer silently reopens it. To
+        # genuinely opt back into the pre-86e2abmkq unbounded behaviour, set
+        # max_parallel_jobs: 0 explicitly.
         # 1 = serial (pre-v0.9 behaviour).
         # Also overridable via HERMES_CRON_MAX_PARALLEL env var.
         "max_parallel_jobs": 4,

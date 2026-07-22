@@ -40,7 +40,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from hermes_constants import get_hermes_home
 from hermes_cli._subprocess_compat import windows_hide_flags
-from hermes_cli.config import load_config, _expand_env_vars
+from hermes_cli.config import load_config, _expand_env_vars, DEFAULT_CONFIG
 from hermes_cli.fallback_config import get_fallback_chain
 from hermes_time import now as _hermes_now
 
@@ -3812,6 +3812,19 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
                 _cfg_par = (
                     _ucfg.get("cron", {}) if isinstance(_ucfg, dict) else {}
                 ).get("max_parallel_jobs")
+                # 86e2abmkq: a saved config.yaml with an explicit
+                # ``max_parallel_jobs: null`` (a stale artifact from before
+                # this cap existed, or any config that pins the key to null)
+                # must not defeat DEFAULT_CONFIG's bounded default the way
+                # an *absent* key doesn't. Treat null/unset identically —
+                # both fall through to the compiled-in bounded default (4).
+                # To genuinely opt back into the pre-86e2abmkq unbounded
+                # behaviour, set max_parallel_jobs: 0 explicitly (or
+                # HERMES_CRON_MAX_PARALLEL=0).
+                if _cfg_par is None:
+                    _cfg_par = (DEFAULT_CONFIG.get("cron") or {}).get(
+                        "max_parallel_jobs"
+                    )
                 if _cfg_par is not None:
                     _max_workers = int(_cfg_par) or None
             except Exception:

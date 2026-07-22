@@ -4117,6 +4117,98 @@ class TestParallelTick:
         # Sanity: still genuinely parallel, not accidentally serialized to 1.
         assert state["max_seen"] > 1
 
+    def test_max_parallel_explicit_null_config_still_bounds_concurrency(self):
+        """Regression for the live mini bug found while validating 86e2abmkq:
+        a *saved* config.yaml with an explicit ``max_parallel_jobs: null``
+        (a stale artifact from before this cap existed) must resolve to the
+        same bounded default (4) as an absent key — not fall through to
+        unbounded. Before the fix, ``tick()``'s config-resolution branch only
+        looked at the *loaded* value and skipped straight past ``None``,
+        leaving ``_max_workers`` at its unbounded initial value even though
+        DEFAULT_CONFIG's compiled-in default is 4.
+
+        This is exactly the on-disk shape the Mac mini's config.yaml had
+        (``cron: {max_parallel_jobs: null}``) — the null key present, not
+        just an empty ``cron:`` section.
+        """
+        import threading
+
+        lock = threading.Lock()
+        state = {"current": 0, "max_seen": 0}
+
+        def mock_run_job(job):
+            with lock:
+                state["current"] += 1
+                state["max_seen"] = max(state["max_seen"], state["current"])
+            time.sleep(0.15)
+            with lock:
+                state["current"] -= 1
+            return (True, "output", "response", None)
+
+        jobs = [
+            {"id": f"burst-{i}", "name": f"burst-{i}", "deliver": "local"}
+            for i in range(8)
+        ]
+
+        with patch("cron.scheduler.get_due_jobs", return_value=jobs), \
+             patch("cron.scheduler.advance_next_run"), \
+             patch("cron.scheduler.run_job", side_effect=mock_run_job), \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch("cron.scheduler._deliver_result", return_value=None), \
+             patch("cron.scheduler.mark_job_run"), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"max_parallel_jobs": None}}):
+            from cron.scheduler import tick
+            result = tick(verbose=False)
+
+        assert result == 8
+        assert state["max_seen"] <= 4, (
+            f"explicit null config defeated the bounded default: "
+            f"{state['max_seen']} jobs ran simultaneously (expected <=4)"
+        )
+        assert state["max_seen"] > 1
+
+    def test_max_parallel_explicit_zero_config_is_still_unbounded_opt_out(self):
+        """``max_parallel_jobs: 0`` remains the explicit unbounded opt-out —
+        distinct from ``null``/absent, which now bounds to the default (4).
+        Regression guard so the null-handling fix above doesn't accidentally
+        collapse the escape hatch operators use to restore old behaviour.
+        """
+        import threading
+
+        lock = threading.Lock()
+        state = {"current": 0, "max_seen": 0}
+
+        def mock_run_job(job):
+            with lock:
+                state["current"] += 1
+                state["max_seen"] = max(state["max_seen"], state["current"])
+            time.sleep(0.05)
+            with lock:
+                state["current"] -= 1
+            return (True, "output", "response", None)
+
+        jobs = [
+            {"id": f"burst-{i}", "name": f"burst-{i}", "deliver": "local"}
+            for i in range(8)
+        ]
+
+        with patch("cron.scheduler.get_due_jobs", return_value=jobs), \
+             patch("cron.scheduler.advance_next_run"), \
+             patch("cron.scheduler.run_job", side_effect=mock_run_job), \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch("cron.scheduler._deliver_result", return_value=None), \
+             patch("cron.scheduler.mark_job_run"), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"max_parallel_jobs": 0}}):
+            from cron.scheduler import tick
+            result = tick(verbose=False)
+
+        assert result == 8
+        # Unbounded opt-out: all 8 due jobs may run simultaneously (no cap).
+        assert state["max_seen"] > 4, (
+            "max_parallel_jobs: 0 should remain an explicit unbounded opt-out, "
+            f"but concurrency was capped at {state['max_seen']}"
+        )
+
 
 class TestDeliverResultTimeoutCancelsFuture:
     """When future.result(timeout=60) raises TimeoutError in the live adapter
