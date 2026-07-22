@@ -2146,6 +2146,7 @@ class TestAuxiliaryFallbackLayering:
             "title_generation",
             "nvidia",
             reason="invalid provider response",
+            skip_providers=set(),
         )
         mock_main.assert_not_called()
 
@@ -2179,6 +2180,7 @@ class TestAuxiliaryFallbackLayering:
             "compression",
             "nvidia",
             reason="invalid provider response",
+            skip_providers=set(),
         )
 
     def test_auto_provider_uses_task_then_main_chain_before_builtin_chain(self, monkeypatch):
@@ -2207,7 +2209,7 @@ class TestAuxiliaryFallbackLayering:
 
         assert main_chain_client.chat.completions.create.called
         mock_task_chain.assert_called_once_with(
-            "title_generation", "auto", reason="payment error")
+            "title_generation", "auto", reason="payment error", skip_providers=set())
         mock_main_chain.assert_called_once_with(
             "title_generation", "auto", reason="payment error")
         mock_builtin_chain.assert_not_called()
@@ -5271,22 +5273,23 @@ class TestAuxiliaryTaskFallback:
         """DEFAULT_CONFIG must actually carry the zai/glm-4.7 fallback for the
         newly-covered text-only tasks — this is what makes the parametrized
         test above true against the real shipped config, not just against a
-        monkeypatched stand-in. ``monitor`` still ships the older singular
-        ``fallback`` shape (out of scope for the 3rd-rung migration — 86e29q8ng
-        covers 9 named tasks only); the rest were migrated to
-        ``fallback_chain`` with zai as rung 2 (see the class below for the
-        rung-3 Anthropic coverage)."""
+        monkeypatched stand-in. ``monitor`` was migrated to ``fallback_chain``
+        here too (86e29q8ng: it was named explicitly in that task's own
+        Files/locations list and was NOT actually out of scope — a prior pass
+        left it on the old singular ``fallback`` shape, which
+        ignite-validate caught as an unauthorized scope narrowing since a dead
+        Gemini + dead zai left important-mail scoring with zero working
+        fallback). All of these tasks now carry zai as rung 2 of a
+        ``fallback_chain`` (see the class below for the rung-3 Anthropic
+        coverage)."""
         from hermes_cli.config import DEFAULT_CONFIG
 
         aux = DEFAULT_CONFIG["auxiliary"]
-        for task in ("approval", "mcp", "title_generation"):
+        for task in ("approval", "mcp", "title_generation", "monitor"):
             chain = aux[task].get("fallback_chain")
             assert chain and chain[0] == self._ZAI_RUNG, (
                 f"auxiliary.{task}.fallback_chain[0] missing or wrong in DEFAULT_CONFIG"
             )
-        assert aux["monitor"].get("fallback") == self._ZAI_RUNG, (
-            "auxiliary.monitor.fallback missing or wrong in DEFAULT_CONFIG"
-        )
 
     def test_default_config_fallback_now_wired_for_previously_uncovered_tasks(self):
         """The previously-uncovered TEXT tasks are now covered with the
@@ -5642,19 +5645,25 @@ class TestAuxiliaryFallbackCoverage:
 
 
 class TestThirdRungAnthropicFallback:
-    """86e29q8ng: a single-point-of-failure guard. All nine text auxiliary
+    """86e29q8ng: a single-point-of-failure guard. All ten text auxiliary
     tasks previously had exactly one fallback rung (zai/glm-4.7) behind the
-    primary provider — if primary AND zai were down simultaneously, all nine
+    primary provider — if primary AND zai were down simultaneously, all ten
     tasks failed with zero working failover. Each task's ``fallback`` dict
     was converted to a ``fallback_chain`` list so the existing
     _try_configured_fallback_chain provider-skip machinery can walk multiple
     rungs: primary -> zai/glm-4.7 -> anthropic/claude-haiku-4-5.
+
+    ``monitor`` was initially left out of the first pass despite being named
+    explicitly in this task's own Files/locations list (ignite-validate FAIL,
+    2026-07-22) — it's included in ``_NINE_TASKS`` below (a ten-task tuple;
+    name kept for historical/diff continuity with the original nine) so it
+    gets the exact same coverage as the other nine.
     """
 
     _NINE_TASKS = (
         "web_extract", "compression", "skills_hub", "approval", "mcp",
         "title_generation", "tts_audio_tags", "triage_specifier",
-        "profile_describer",
+        "profile_describer", "monitor",
     )
 
     @pytest.mark.parametrize("task", _NINE_TASKS)
@@ -5753,3 +5762,217 @@ class TestThirdRungAnthropicFallback:
         assert resolved_providers == ["zai"], (
             "anthropic rung must only be tried after zai fails, never in parallel/ahead of it"
         )
+
+
+class _ZaiExpiredTokenError(Exception):
+    """Mirrors z.ai's real live wire error observed 2026-07-22 in
+    ~/.hermes/logs/gateway.error.log: 'HTTP 401: token expired or incorrect'
+    against base_url=https://api.z.ai/api/coding/paas/v4. Unlike an
+    unresolvable-client case (no credentials found at all — already covered
+    by test_anthropic_rung_engages_when_primary_and_zai_both_fail above), a
+    client resolves fine here (the credential exists and looks well-formed);
+    only the LIVE call fails."""
+
+    status_code = 401
+
+    def __init__(self, message="token expired or incorrect"):
+        super().__init__(message)
+
+
+class TestFallbackChainEscalatesOnLiveCallFailure:
+    """86e29q8ng (ignite-validate FAIL, 2026-07-22): _try_configured_fallback_chain
+    only ever advanced past a rung on a RESOLVE failure (no credentials) or a
+    too-small-context skip — never on a live-call failure of an
+    already-resolved client. That is exactly today's live prod state: zai's
+    client resolves (its token/base_url are configured and well-formed) but
+    every real request 401s (token expired/revoked). Before this fix, that
+    meant rung 1 (zai) was handed back as "the" fallback, its live call was
+    attempted with no retry, and the exception propagated straight out —
+    reproducing the "zero working failover" bug this whole task exists to
+    close, even after nine tasks were "converted" to a fallback_chain.
+
+    Covers the new _try_configured_fallback_chain_with_live_call(_async)
+    escalation wrapper, both directly and through call_llm()/async_call_llm()
+    end-to-end.
+    """
+
+    def _two_rung_chain(self):
+        return [
+            {"provider": "zai", "model": "glm-4.7",
+             "base_url": "https://api.z.ai/api/coding/paas/v4"},
+            {"provider": "anthropic", "model": "claude-haiku-4-5-20251001"},
+        ]
+
+    def test_helper_escalates_past_a_resolved_but_live_failing_rung(self, monkeypatch):
+        """Direct unit test of the new escalation wrapper: rung 1 resolves
+        and its call_fn raises the exact zai 401 shape; the wrapper must
+        retry rung 2 rather than propagating."""
+        from agent.auxiliary_client import _try_configured_fallback_chain_with_live_call
+
+        chain = self._two_rung_chain()
+        zai_client, anthropic_client = MagicMock(name="zai"), MagicMock(name="anthropic")
+
+        def fake_resolve(entry):
+            if entry["provider"] == "zai":
+                return zai_client, entry["model"]
+            return anthropic_client, entry["model"]
+
+        monkeypatch.setattr(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            lambda t: {"fallback_chain": chain} if t == "monitor" else {},
+        )
+        attempts = []
+
+        def call_fn(client, model, label):
+            attempts.append(label)
+            if client is zai_client:
+                raise _ZaiExpiredTokenError()
+            return f"success via {label} model={model}"
+
+        with patch("agent.auxiliary_client._resolve_fallback_entry", side_effect=fake_resolve):
+            result = _try_configured_fallback_chain_with_live_call(
+                task="monitor", failed_provider="gemini", reason="auth error", call_fn=call_fn)
+
+        assert result == "success via fallback_chain[1](anthropic) model=claude-haiku-4-5-20251001"
+        assert len(attempts) == 2, f"expected both rungs attempted, got: {attempts}"
+        assert "zai" in attempts[0] and "anthropic" in attempts[1]
+
+    def test_helper_gives_up_and_returns_none_when_every_rung_live_fails(self, monkeypatch):
+        """When even the last rung's live call fails, the wrapper returns
+        None (not raises) so the caller falls through to its next fallback
+        layer exactly as if no fallback_chain existed."""
+        from agent.auxiliary_client import _try_configured_fallback_chain_with_live_call
+
+        chain = self._two_rung_chain()
+        monkeypatch.setattr(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            lambda t: {"fallback_chain": chain} if t == "monitor" else {},
+        )
+
+        def fake_resolve(entry):
+            return MagicMock(name=entry["provider"]), entry["model"]
+
+        def call_fn(client, model, label):
+            raise _ZaiExpiredTokenError("all rungs dead")
+
+        with patch("agent.auxiliary_client._resolve_fallback_entry", side_effect=fake_resolve):
+            result = _try_configured_fallback_chain_with_live_call(
+                task="monitor", failed_provider="gemini", reason="auth error", call_fn=call_fn)
+
+        assert result is None
+
+    def test_helper_reraises_a_non_fallback_worthy_error_immediately(self, monkeypatch):
+        """A live-call error that ISN'T fallback-worthy (e.g. a plain
+        ValueError from caller-side response validation, not a
+        provider-shaped failure) must propagate immediately — never silently
+        swallowed by the escalation loop."""
+        from agent.auxiliary_client import _try_configured_fallback_chain_with_live_call
+
+        chain = self._two_rung_chain()
+        monkeypatch.setattr(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            lambda t: {"fallback_chain": chain} if t == "monitor" else {},
+        )
+
+        def fake_resolve(entry):
+            return MagicMock(name=entry["provider"]), entry["model"]
+
+        def call_fn(client, model, label):
+            raise ValueError("not a provider failure at all")
+
+        with patch("agent.auxiliary_client._resolve_fallback_entry", side_effect=fake_resolve), \
+             pytest.raises(ValueError, match="not a provider failure at all"):
+            _try_configured_fallback_chain_with_live_call(
+                task="monitor", failed_provider="gemini", reason="auth error", call_fn=call_fn)
+
+    def test_end_to_end_call_llm_escalates_when_zai_resolves_but_401s(self, monkeypatch):
+        """Full call_llm() path, the real prod scenario named in the FAIL
+        comment: primary fails hard, the configured zai rung's CLIENT
+        RESOLVES (real credentials, well-formed — not the unresolvable-client
+        case other tests already cover) but its live call 401s exactly like
+        the real z.ai outage, and the task must still complete via the
+        Anthropic rung rather than aborting."""
+        chain = self._two_rung_chain()
+        monkeypatch.setattr(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            lambda t: {"fallback_chain": chain} if t == "monitor" else {},
+        )
+
+        primary_client = MagicMock()
+        primary_client.chat.completions.create.side_effect = _GeminiInvalidKeyError()
+
+        zai_client = MagicMock()
+        zai_client.base_url = "https://api.z.ai/api/coding/paas/v4"
+        zai_client.chat.completions.create.side_effect = _ZaiExpiredTokenError()
+
+        anthropic_client = MagicMock()
+        anthropic_client.base_url = "https://api.anthropic.com"
+        anthropic_client.chat.completions.create.return_value = _DummyResponse(
+            "monitor score via anthropic rung")
+
+        def fake_resolve(entry):
+            if entry["provider"] == "zai":
+                return zai_client, entry["model"]
+            return anthropic_client, entry["model"]
+
+        with patch("agent.auxiliary_client._get_cached_client",
+                   return_value=(primary_client, "gemini-3.5-flash")), \
+             patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("auto", "gemini-3.5-flash", None, None, None)), \
+             patch("agent.auxiliary_client._resolve_fallback_entry", side_effect=fake_resolve):
+            result = call_llm(task="monitor", messages=[{"role": "user", "content": "score this"}])
+
+        assert result.choices[0].message.content == "monitor score via anthropic rung"
+        assert zai_client.chat.completions.create.called, (
+            "the resolved zai rung must actually be attempted (live-call escalation, "
+            "not skipped as if unresolvable)"
+        )
+        assert anthropic_client.chat.completions.create.called
+
+    @pytest.mark.asyncio
+    async def test_async_end_to_end_escalates_when_zai_resolves_but_401s(self, monkeypatch):
+        """Async twin of the end-to-end test above."""
+        chain = self._two_rung_chain()
+        monkeypatch.setattr(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            lambda t: {"fallback_chain": chain} if t == "monitor" else {},
+        )
+
+        primary_client = MagicMock()
+        primary_client.chat.completions.create = AsyncMock(side_effect=_GeminiInvalidKeyError())
+
+        zai_client = MagicMock()
+        zai_client.base_url = "https://api.z.ai/api/coding/paas/v4"
+
+        async_zai_client = MagicMock()
+        async_zai_client.chat.completions.create = AsyncMock(side_effect=_ZaiExpiredTokenError())
+
+        anthropic_client = MagicMock()
+        anthropic_client.base_url = "https://api.anthropic.com"
+
+        async_anthropic_client = MagicMock()
+        async_anthropic_client.chat.completions.create = AsyncMock(
+            return_value=_DummyResponse("monitor score via anthropic rung (async)"))
+
+        def fake_resolve(entry):
+            if entry["provider"] == "zai":
+                return zai_client, entry["model"]
+            return anthropic_client, entry["model"]
+
+        def fake_to_async(sync_client, model, is_vision=False):
+            if sync_client is zai_client:
+                return async_zai_client, model
+            return async_anthropic_client, model
+
+        with patch("agent.auxiliary_client._get_cached_client",
+                   return_value=(primary_client, "gemini-3.5-flash")), \
+             patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("auto", "gemini-3.5-flash", None, None, None)), \
+             patch("agent.auxiliary_client._resolve_fallback_entry", side_effect=fake_resolve), \
+             patch("agent.auxiliary_client._to_async_client", side_effect=fake_to_async):
+            result = await async_call_llm(
+                task="monitor", messages=[{"role": "user", "content": "score this"}])
+
+        assert result.choices[0].message.content == "monitor score via anthropic rung (async)"
+        assert async_zai_client.chat.completions.create.called
+        assert async_anthropic_client.chat.completions.create.called

@@ -912,6 +912,13 @@ def _ensure_hermes_home_managed(home: Path):
 # =============================================================================
 
 DEFAULT_CONFIG = {
+    # Interactive Hermes chat default model — intentionally NOT hardcoded
+    # here. The real default is a per-install value in the live
+    # ~/.hermes/config.yaml (top-level model.default/provider), set via
+    # `hermes model` or the setup wizard, so it's resolved at runtime rather
+    # than baked into the repo. See docs/chat-default-model.md for the
+    # current recommended default/fallback/mini strategy and where that
+    # policy is validated (tests/hermes_cli/test_codex_models.py).
     "model": "",
     "providers": {},
     "fallback_providers": [],
@@ -1877,11 +1884,24 @@ DEFAULT_CONFIG = {
             # ...)); a dead primary provider previously meant the entire
             # important-mail monitor catalog silently stopped scoring items.
             # Text-only scoring, so glm-4.7 is a safe fallback model.
-            "fallback": {
-                "provider": "zai",
-                "model": "glm-4.7",
-                "base_url": "https://api.z.ai/api/coding/paas/v4",
-            },
+            # Converted to fallback_chain (rung 3 = Anthropic, see
+            # auxiliary.web_extract.fallback_chain above) 86e29q8ng: this task
+            # was named explicitly in that task's own Files/locations list but
+            # was left on the single-rung zai-only fallback — a dead Gemini +
+            # a dead zai (both observed live 2026-07-22) left important-mail
+            # scoring with zero working fallback, the exact SPOF the task
+            # existed to close.
+            "fallback_chain": [
+                {
+                    "provider": "zai",
+                    "model": "glm-4.7",
+                    "base_url": "https://api.z.ai/api/coding/paas/v4",
+                },
+                {
+                    "provider": "anthropic",
+                    "model": "claude-haiku-4-5-20251001",
+                },
+            ],
         },
         # Background review — the post-turn self-improvement fork that decides
         # whether to save a memory / patch a skill. "auto" (default) = run on
