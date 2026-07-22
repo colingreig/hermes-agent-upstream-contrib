@@ -269,6 +269,7 @@ def _git_contexts(bare_root, repo_match=None):
     yield ("cwd", None)
     if not repo_match or not bare_root or not os.path.isdir(bare_root):
         return
+    matched = 0
     try:
         for name in sorted(os.listdir(bare_root)):
             path = os.path.join(bare_root, name)
@@ -277,9 +278,21 @@ def _git_contexts(bare_root, repo_match=None):
             if os.path.isdir(path) and (
                 name == f"{repo_match}.git" or name.endswith(f"__{repo_match}.git")
             ):
+                matched += 1
                 yield (name, path)
     except OSError as e:
         print(f"[orphan-sweep] could not list bare root {bare_root}: {e!r}", file=sys.stderr)
+        return
+    if matched == 0:
+        # Silent zero-match is indistinguishable from "nothing stranded" in the sweep's output —
+        # surface it so a future repo-name/mirror-naming drift (e.g. a mirror renamed to
+        # <owner>__<repo>-upstream-contrib.git) is visible in cron logs instead of the
+        # bare-mirror half of the scan going dark with no signal.
+        print(
+            f"[orphan-sweep] check-unpushed: 0 bare mirrors matched repo_match={repo_match!r} "
+            f"under {bare_root} — bare-mirror scan covers 0 branches",
+            file=sys.stderr,
+        )
 
 
 def _local_branch_tips(gitdir, prefixes):
