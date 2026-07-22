@@ -336,6 +336,14 @@ async def _resolve_all(refs: dict[str, str]) -> dict[str, str]:
         try:
             live = await _with_retry(_resolve_by_ref, to_fetch)
         except Exception as exc:
+            if not _is_transient_error(exc):
+                # Non-transient (auth/invalid-token/etc.) failure must not be
+                # swallowed into an empty/stale result — propagate so main()'s
+                # `except Exception` still produces the FATAL/exit-1 page.
+                # Only a transient error that has exhausted _with_retry's
+                # bounded attempts falls through to the serve-stale-or-empty
+                # path below (HERMES-PATCH 31 resilience behavior).
+                raise
             sys.stderr.write(
                 f"[op_sdk_resolve] live batch resolve failed ({exc!r}); "
                 f"falling back to per-ref stale cache\n"

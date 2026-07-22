@@ -31,6 +31,7 @@ from typing import Dict, Any, List, Optional, Tuple
 
 from tools.registry import discover_builtin_tools, registry
 from toolsets import resolve_toolset, validate_toolset
+from utils import env_var_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -325,12 +326,15 @@ def get_tool_definitions(
             cfg_fp = (cfg_stat.st_mtime_ns, cfg_stat.st_size)
         except (FileNotFoundError, OSError, ImportError):
             cfg_fp = None
+        from tools.approval import _get_cron_approval_mode
+        cron_deny = env_var_enabled("HERMES_CRON_SESSION") and _get_cron_approval_mode() == "deny"
         cache_key = (
             frozenset(enabled_toolsets) if enabled_toolsets is not None else None,
             frozenset(disabled_toolsets) if disabled_toolsets else None,
             registry._generation,
             cfg_fp,
             bool(os.environ.get("HERMES_KANBAN_TASK")),
+            bool(cron_deny),
             bool(skip_tool_search_assembly),
         )
         cached = _tool_defs_cache.get(cache_key)
@@ -455,6 +459,22 @@ def _compute_tool_definitions(
     # other tools by name — otherwise the model sees tools mentioned in
     # descriptions that don't actually exist, and hallucinates calls to them.
     available_tool_names = {t["function"]["name"] for t in filtered_tools}
+
+    # Omit execute_code from the advertised schema entirely in cron sessions
+    # where approvals.cron_mode is deny. check_execute_code_guard()
+    # (tools/approval.py) unconditionally blocks execute_code under this
+    # condition, so advertising the tool just costs a wasted round-trip
+    # before the model falls back to terminal() (#86e2cpmjc). The
+    # approval-gate itself is left untouched as the defense-in-depth
+    # backstop; this is a pure schema-visibility efficiency win.
+    if "execute_code" in available_tool_names and env_var_enabled("HERMES_CRON_SESSION"):
+        from tools.approval import _get_cron_approval_mode
+        if _get_cron_approval_mode() == "deny":
+            filtered_tools = [
+                t for t in filtered_tools
+                if t.get("function", {}).get("name") != "execute_code"
+            ]
+            available_tool_names.discard("execute_code")
 
     # Rebuild execute_code schema to only list sandbox tools that are actually
     # available.  Without this, the model sees "web_search is available in

@@ -1546,11 +1546,33 @@ DEFAULT_CONFIG = {
             # the mechanism. (If a future caller feeds web_extract image
             # payloads, this text fallback only engages on a hard primary error
             # and at worst fails the same as no fallback — never worse.)
-            "fallback": {
-                "provider": "zai",
-                "model": "glm-4.7",
-                "base_url": "https://api.z.ai/api/coding/paas/v4",
-            },
+            #
+            # fallback_chain (list, not the singular ``fallback`` dict): rung
+            # 2 is zai/glm-4.7 as before; rung 3 is Anthropic so a
+            # simultaneous primary+zai outage still has a working, provider-
+            # diverse rung instead of every auxiliary task going dark at once.
+            # See _try_configured_fallback_chain in agent/auxiliary_client.py.
+            "fallback_chain": [
+                {
+                    "provider": "zai",
+                    "model": "glm-4.7",
+                    "base_url": "https://api.z.ai/api/coding/paas/v4",
+                },
+                {
+                    "provider": "anthropic",
+                    # claude-haiku-4-5 is Hermes' own built-in default aux
+                    # model for the anthropic provider (see
+                    # _API_KEY_PROVIDER_AUX_MODELS_FALLBACK in
+                    # agent/auxiliary_client.py) — fast/cheap and appropriate
+                    # for a degraded-mode rung, not top-tier quality.
+                    "model": "claude-haiku-4-5-20251001",
+                    # No base_url/api_key here: resolve_provider_client()'s
+                    # "anthropic" branch resolves credentials itself via
+                    # _try_anthropic() (1Password pool, then ANTHROPIC_API_KEY
+                    # env var) and does not consume an explicit base_url
+                    # override for this provider.
+                },
+            ],
         },
         "compression": {
             "provider": "auto",
@@ -1568,11 +1590,21 @@ DEFAULT_CONFIG = {
             # session), so it ships with a working default: zai/glm-4.7 is the
             # same provider already proven in prod for kanban_decomposer. Clear
             # this block (or set provider: "") to disable.
-            "fallback": {
-                "provider": "zai",
-                "model": "glm-4.7",
-                "base_url": "https://api.z.ai/api/coding/paas/v4",
-            },
+            #
+            # Rung 3: Anthropic. See auxiliary.web_extract.fallback_chain
+            # above for the full rationale (provider-diverse third rung so a
+            # simultaneous primary+zai outage doesn't take every aux task down).
+            "fallback_chain": [
+                {
+                    "provider": "zai",
+                    "model": "glm-4.7",
+                    "base_url": "https://api.z.ai/api/coding/paas/v4",
+                },
+                {
+                    "provider": "anthropic",
+                    "model": "claude-haiku-4-5-20251001",
+                },
+            ],
         },
         # Note: session_search no longer uses an auxiliary LLM (PR #27590 —
         # single-shape tool returns DB content directly). The old
@@ -1588,12 +1620,19 @@ DEFAULT_CONFIG = {
             # See auxiliary.compression.fallback above — same opt-in hard-error
             # failover, applied here because skill selection is the other
             # highest-value aux task (a stuck skills_hub call silently drops
-            # skill routing for the turn).
-            "fallback": {
-                "provider": "zai",
-                "model": "glm-4.7",
-                "base_url": "https://api.z.ai/api/coding/paas/v4",
-            },
+            # skill routing for the turn). Rung 3 is Anthropic — see
+            # auxiliary.web_extract.fallback_chain above for the rationale.
+            "fallback_chain": [
+                {
+                    "provider": "zai",
+                    "model": "glm-4.7",
+                    "base_url": "https://api.z.ai/api/coding/paas/v4",
+                },
+                {
+                    "provider": "anthropic",
+                    "model": "claude-haiku-4-5-20251001",
+                },
+            ],
         },
         "approval": {
             "provider": "auto",
@@ -1609,11 +1648,19 @@ DEFAULT_CONFIG = {
             # gate silently degraded to always-prompt/deny instead of
             # recovering. glm-4.7 is a capable text-only model — fine here
             # since this is a short text classification, not multimodal.
-            "fallback": {
-                "provider": "zai",
-                "model": "glm-4.7",
-                "base_url": "https://api.z.ai/api/coding/paas/v4",
-            },
+            # Rung 3 is Anthropic — see auxiliary.web_extract.fallback_chain
+            # above for the rationale.
+            "fallback_chain": [
+                {
+                    "provider": "zai",
+                    "model": "glm-4.7",
+                    "base_url": "https://api.z.ai/api/coding/paas/v4",
+                },
+                {
+                    "provider": "anthropic",
+                    "model": "claude-haiku-4-5-20251001",
+                },
+            ],
         },
         "mcp": {
             "provider": "auto",
@@ -1625,12 +1672,19 @@ DEFAULT_CONFIG = {
             # See auxiliary.compression.fallback above — same opt-in hard-error
             # failover, for MCP sampling requests (tools/mcp_tool.py calls
             # call_llm(task="mcp", ...)). Text-only traffic, so glm-4.7 is a
-            # safe fallback model.
-            "fallback": {
-                "provider": "zai",
-                "model": "glm-4.7",
-                "base_url": "https://api.z.ai/api/coding/paas/v4",
-            },
+            # safe fallback model. Rung 3 is Anthropic — see
+            # auxiliary.web_extract.fallback_chain above for the rationale.
+            "fallback_chain": [
+                {
+                    "provider": "zai",
+                    "model": "glm-4.7",
+                    "base_url": "https://api.z.ai/api/coding/paas/v4",
+                },
+                {
+                    "provider": "anthropic",
+                    "model": "claude-haiku-4-5-20251001",
+                },
+            ],
         },
         "title_generation": {
             "provider": "auto",
@@ -1643,12 +1697,19 @@ DEFAULT_CONFIG = {
             # See auxiliary.compression.fallback above — same opt-in hard-error
             # failover (agent/title_generator.py calls call_llm(task=
             # "title_generation", ...)). Text-only summarisation, so glm-4.7
-            # is a safe fallback model.
-            "fallback": {
-                "provider": "zai",
-                "model": "glm-4.7",
-                "base_url": "https://api.z.ai/api/coding/paas/v4",
-            },
+            # is a safe fallback model. Rung 3 is Anthropic — see
+            # auxiliary.web_extract.fallback_chain above for the rationale.
+            "fallback_chain": [
+                {
+                    "provider": "zai",
+                    "model": "glm-4.7",
+                    "base_url": "https://api.z.ai/api/coding/paas/v4",
+                },
+                {
+                    "provider": "anthropic",
+                    "model": "claude-haiku-4-5-20251001",
+                },
+            ],
         },
         # No auxiliary.tts_audio_tags.fallback default: this is a
         # Gemini-TTS-specific feature (rewriting text with Gemini's audio
@@ -1668,12 +1729,20 @@ DEFAULT_CONFIG = {
             # generateContent endpoint and has no auxiliary fallback). The
             # rewrite is a plain text transformation routed through call_llm, so
             # a text fallback restores it after a hard primary-provider error.
-            # See auxiliary.compression.fallback for the mechanism.
-            "fallback": {
-                "provider": "zai",
-                "model": "glm-4.7",
-                "base_url": "https://api.z.ai/api/coding/paas/v4",
-            },
+            # See auxiliary.compression.fallback for the mechanism. Rung 3 is
+            # Anthropic — see auxiliary.web_extract.fallback_chain above for
+            # the rationale.
+            "fallback_chain": [
+                {
+                    "provider": "zai",
+                    "model": "glm-4.7",
+                    "base_url": "https://api.z.ai/api/coding/paas/v4",
+                },
+                {
+                    "provider": "anthropic",
+                    "model": "claude-haiku-4-5-20251001",
+                },
+            ],
         },
         # Triage specifier — flesh out a rough one-liner in the Kanban
         # Triage column into a concrete spec, then promote it to ``todo``.
@@ -1700,11 +1769,20 @@ DEFAULT_CONFIG = {
             # The spec expansion is a plain text task routed through call_llm
             # (hermes_cli/kanban_specify.py), so a text fallback keeps a triage
             # task from stranding when the primary aux provider dies hard.
-            "fallback": {
-                "provider": "zai",
-                "model": "glm-4.7",
-                "base_url": "https://api.z.ai/api/coding/paas/v4",
-            },
+            # Converted to fallback_chain (rung 3 = Anthropic, see
+            # auxiliary.web_extract.fallback_chain above) for consistency with
+            # the other auxiliary tasks.
+            "fallback_chain": [
+                {
+                    "provider": "zai",
+                    "model": "glm-4.7",
+                    "base_url": "https://api.z.ai/api/coding/paas/v4",
+                },
+                {
+                    "provider": "anthropic",
+                    "model": "claude-haiku-4-5-20251001",
+                },
+            ],
         },
         # Kanban decomposer — decomposes a triage task into a graph of
         # child tasks routed to specialist profiles by description.
@@ -1740,12 +1818,21 @@ DEFAULT_CONFIG = {
             # Opt-in hard-error failover (see auxiliary.compression.fallback).
             # Short text description generation routed through call_llm
             # (hermes_cli/profile_describer.py); a text fallback restores it
-            # after a hard primary-provider error.
-            "fallback": {
-                "provider": "zai",
-                "model": "glm-4.7",
-                "base_url": "https://api.z.ai/api/coding/paas/v4",
-            },
+            # after a hard primary-provider error. Converted to
+            # fallback_chain (rung 3 = Anthropic, see
+            # auxiliary.web_extract.fallback_chain above) for consistency
+            # with the other auxiliary tasks.
+            "fallback_chain": [
+                {
+                    "provider": "zai",
+                    "model": "glm-4.7",
+                    "base_url": "https://api.z.ai/api/coding/paas/v4",
+                },
+                {
+                    "provider": "anthropic",
+                    "model": "claude-haiku-4-5-20251001",
+                },
+            ],
         },
         # Curator — skill-usage review fork. Timeout is generous because the
         # review pass can take several minutes on reasoning models (umbrella
