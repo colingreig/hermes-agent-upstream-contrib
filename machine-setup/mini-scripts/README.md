@@ -52,3 +52,11 @@ vs this copy) to catch drift — nothing currently automates that check.
   git-apply re-application path. Before this fix the script exited at `cd
   "$REPO"` before reaching ANY of its ~30 other checks — those were silently
   unverifiable since 2026-07-19, not merely "assumed green".
+- `offbox_restic_backup.py` — nightly restic backup of `~/.hermes` to
+  Cloudflare R2. `BACKUP_TARGETS` added `~/.hermes/memories` 2026-07-22
+  (ClickUp 86e2e870p) after discovering it had never been in scope — the
+  2026-07-19 wipe permanently lost Hermes's entire MEMORY.md/USER.md
+  personalization with zero restic snapshot history to restore from, at any
+  point. This closes the gap for future incidents; it does not recover what
+  was already lost (see 86e2e870p for the reseed decision, separately pending
+  Colin's input).
