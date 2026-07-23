@@ -202,6 +202,7 @@ class CodexAppServerSession:
         self,
         *,
         cwd: Optional[str] = None,
+        model: Optional[str] = None,
         codex_bin: str = "codex",
         codex_home: Optional[str] = None,
         permission_profile: Optional[str] = None,
@@ -211,6 +212,11 @@ class CodexAppServerSession:
         client_factory: Optional[Callable[..., CodexAppServerClient]] = None,
     ) -> None:
         self._cwd = cwd or os.getcwd()
+        # `thread/start.model` is part of the stable app-server protocol.  It
+        # makes Hermes' already-resolved per-profile model authoritative for
+        # this Codex thread, rather than silently falling back to whatever
+        # model happens to be configured in ~/.codex/config.toml.
+        self._model = model.strip() if isinstance(model, str) and model.strip() else None
         self._codex_bin = codex_bin
         self._codex_home = codex_home
         self._permission_profile = (
@@ -268,6 +274,8 @@ class CodexAppServerSession:
         # Users who want a write-capable profile configure it in their
         # ~/.codex/config.toml the same way they would for any codex usage.
         params: dict[str, Any] = {"cwd": self._cwd}
+        if self._model:
+            params["model"] = self._model
         result = self._client.request("thread/start", params, timeout=15)
         # Cross-fill thread.id/sessionId — different codex versions have
         # serialized this under either key. Mirrors openclaw beta.8's
@@ -290,10 +298,11 @@ class CodexAppServerSession:
             )
         self._thread_id = thread_id
         logger.info(
-            "codex app-server thread started: id=%s profile=%s cwd=%s",
+            "codex app-server thread started: id=%s profile=%s cwd=%s model=%s",
             self._thread_id[:8],
             self._permission_profile,
             self._cwd,
+            self._model or "codex-default",
         )
         return self._thread_id
 
@@ -367,6 +376,7 @@ class CodexAppServerSession:
         self,
         user_input: Any,
         *,
+        model: Optional[str] = None,
         turn_timeout: float = 600.0,
         notification_poll_timeout: float = 0.25,
         post_tool_quiet_timeout: float = 90.0,
@@ -381,6 +391,12 @@ class CodexAppServerSession:
         Mirrors openclaw beta.8's post-tool completion watchdog (#81697)
         so a wedged codex doesn't burn the full turn deadline.
         """
+        # A retained session must follow Hermes' live /model state. Codex's
+        # stable turn/start.model override updates this thread without
+        # replacing it or reconstructing its existing conversation history.
+        if isinstance(model, str) and model.strip():
+            self._model = model.strip()
+
         # Pre-create the result so startup failures (codex subprocess can't
         # spawn, initialize handshake rejects, thread/start blows up) surface
         # the same way per-turn failures do — with a TurnResult.error string
@@ -405,15 +421,19 @@ class CodexAppServerSession:
 
         user_input_text = _coerce_turn_input_text(user_input)
 
-        # Send turn/start with the user input. Text-only for now (codex
-        # supports rich content but Hermes' text path is the common case).
+        # Send turn/start with the user input and current Hermes model.
+        # Text-only for now (codex supports rich content but Hermes' text
+        # path is the common case).
         try:
+            turn_params: dict[str, Any] = {
+                "threadId": self._thread_id,
+                "input": [{"type": "text", "text": user_input_text}],
+            }
+            if self._model:
+                turn_params["model"] = self._model
             ts = self._client.request(
                 "turn/start",
-                {
-                    "threadId": self._thread_id,
-                    "input": [{"type": "text", "text": user_input_text}],
-                },
+                turn_params,
                 timeout=10,
             )
         except CodexAppServerError as exc:

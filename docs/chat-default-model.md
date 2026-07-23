@@ -19,7 +19,7 @@ wizard, and resolved at runtime. Check it with:
 ssh mini 'grep -A3 "^model:" ~/.hermes/config.yaml'
 ```
 
-## Current recommended default (2026-07-22, prod-live-patches)
+## Current deployed default (2026-07-22)
 
 - **Default:** `gpt-5.6-sol` via `openai-codex` (ChatGPT Codex OAuth backend,
   `https://chatgpt.com/backend-api/codex`) — a full GPT-5.x reasoning model,
@@ -30,11 +30,19 @@ ssh mini 'grep -A3 "^model:" ~/.hermes/config.yaml'
   (summaries, classification, simple Q&A, fast helper turns) where a full
   reasoning model is unnecessary overhead. All cron/kanban profiles on the
   live mini already use this.
-- **Model table:** `hermes_cli/codex_models.py::DEFAULT_CODEX_MODELS` lists
-  `gpt-5.6-sol` first (the curated-fallback default shown when live Codex
-  model discovery is unavailable), with `gpt-5.4-mini` immediately behind
-  it — pinned by `tests/hermes_cli/test_codex_models.py::
-  test_default_and_mini_chat_models_are_current_and_paired`.
+- **Model table:** `hermes_cli/codex_models.py::DEFAULT_CODEX_MODELS` includes
+  both deployed policy options as an offline picker fallback. Live Codex
+  discovery owns ordering and availability; the test guards membership and
+  uniqueness instead of freezing a vendor-owned catalog snapshot.
+- **Codex app-server authority:** Hermes resolves `model.default` for the
+  active profile and sends that value in the stable `thread/start.model`
+  field when `model.openai_runtime: codex_app_server` is selected, then
+  repeats the current value in stable `turn/start.model`. That per-turn field
+  makes an in-session `/model` switch effective without starting a new Codex
+  thread or rebuilding its existing conversation history. Codex may still
+  reroute an unavailable model for account/availability reasons, but it no
+  longer silently substitutes `~/.codex/config.toml`'s default merely because
+  the Hermes setting was omitted from the transport request.
 - **Prompt caching / profile behavior:** unaffected by this policy — the
   default/mini choice is orthogonal to prompt-cache and per-profile config,
   neither of which this doc changes.
@@ -45,14 +53,15 @@ Hermes' OpenAI-Codex route already uses the Codex backend's own API shape
 (not the plain Chat Completions endpoint), so no migration to the Responses
 API was needed here.
 
-## GPT-5.6 Sol resolved on this branch
+## Deployed choice versus upstream recommendation
 
-`main` (dev fork) had flagged, but deliberately not acted on, OpenAI's
-2026-07-09 GA of **GPT-5.6 Sol** as the new recommended flagship model,
-superseding GPT-5.5 (released 2026-04-23) — a model-tier bump was treated as
-a product/cost/quality call, not something to guess at from that branch.
-`prod-live-patches` already carries this decision: its independent upstream
-v0.18.2 merge (PR #70, predating this integration) landed `gpt-5.6-sol` as
-`DEFAULT_CODEX_MODELS[0]`, so the bump is live on the mini today. `gpt-5.5`
-remains a valid, current-generation GPT-5.x model further down the curated
-list, not retired.
+OpenAI's own current model docs (`developers.openai.com/api/docs/models`,
+checked 2026-07-22) now name **GPT-5.6 Sol** (released 2026-07-09) as the
+recommended flagship model, superseding GPT-5.5 (released 2026-04-23).
+The deployed Hermes preference remains `gpt-5.5`, while OpenAI's upstream
+recommendation is GPT-5.6 Sol. `gpt-5.5` remains a valid current-generation
+GPT-5.x model; it is not a claim that it is the newest upstream
+recommendation. Keeping it is deliberate until the newer tier is confirmed
+available and suitable on the ChatGPT Codex OAuth route. Any future upgrade
+should change the live profile preference after that validation, rather than
+assuming the picker order controls a running app-server thread.

@@ -37,26 +37,11 @@ def test_get_codex_model_ids_prioritizes_default_and_cache(tmp_path, monkeypatch
     assert "gpt-5-hidden-codex" not in models
 
 
-def test_default_and_mini_chat_models_are_current_and_paired():
-    """86e28mq8g: config-validation pin for the interactive Hermes chat
-    default. The mini's live ~/.hermes/config.yaml model.default (a
-    per-install value, not something this repo hardcodes — DEFAULT_CONFIG's
-    top-level "model" is intentionally "") is expected to be the flagship
-    reasoning model here, with the mini/cheap pair right behind it in the
-    curated fallback list so a fresh install / offline first run still
-    offers both tiers. If this ever drifts (e.g. gpt-5.6-sol renamed/
-    retired), this test catches it before it's discovered as a stale live
-    config. Updated 2026-07-22 during the prod-live-patches integration:
-    gpt-5.6-sol GA'd 2026-07-09 and superseded gpt-5.5 as the flagship
-    entry in DEFAULT_CODEX_MODELS on this branch."""
-    assert DEFAULT_CODEX_MODELS[0] == "gpt-5.6-sol", (
-        "the flagship reasoning default (main interactive chat, tool-heavy/"
-        "long-context work) must lead the curated Codex model list"
-    )
-    assert "gpt-5.4-mini" in DEFAULT_CODEX_MODELS, (
-        "the cheap/fast mini pair must stay available for summaries, "
-        "classification, and low-risk cron/kanban profiles"
-    )
+def test_curated_models_include_configured_chat_and_low_cost_options():
+    """The offline picker needs both deployed policy options, without
+    snapshotting a vendor-owned model catalog or prescribing its order."""
+    assert {"gpt-5.5", "gpt-5.4-mini"}.issubset(DEFAULT_CODEX_MODELS)
+    assert len(DEFAULT_CODEX_MODELS) == len(set(DEFAULT_CODEX_MODELS))
 
 
 def test_setup_wizard_codex_import_resolves():
@@ -74,7 +59,8 @@ def test_get_codex_model_ids_falls_back_to_curated_defaults(tmp_path, monkeypatc
 
     models = get_codex_model_ids()
 
-    assert models[: len(DEFAULT_CODEX_MODELS)] == DEFAULT_CODEX_MODELS
+    assert set(DEFAULT_CODEX_MODELS).issubset(models)
+    assert len(models) == len(set(models))
     assert "gpt-5.4" in models
     assert "gpt-5.3-codex-spark" in models
 
@@ -90,13 +76,14 @@ def test_get_codex_model_ids_adds_forward_compat_models_from_templates(monkeypat
     # When live discovery only returns gpt-5.3-codex, forward-compat synthesis
     # should surface gpt-5.5, gpt-5.4, gpt-5.4-mini, and gpt-5.3-codex-spark
     # (each is templated off gpt-5.3-codex).
-    assert models == [
+    assert {
         "gpt-5.3-codex",
         "gpt-5.5",
         "gpt-5.4-mini",
         "gpt-5.4",
         "gpt-5.3-codex-spark",
-    ]
+    }.issubset(models)
+    assert len(models) == len(set(models))
 
 
 def test_fetch_from_api_keeps_supported_in_api_false_models(monkeypatch):

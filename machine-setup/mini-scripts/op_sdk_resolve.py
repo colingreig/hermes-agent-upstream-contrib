@@ -49,6 +49,7 @@ import asyncio
 import hashlib
 import json
 import os
+import random
 import re
 import sys
 import time
@@ -63,8 +64,8 @@ INTEGRATION_VERSION = "v1.0.0"
 # --- HERMES-PATCH 31: cache + retry/backoff + serve-stale -------------------
 CACHE_DIR = os.path.expanduser("~/.cache/op-run")
 CACHE_TTL_SECONDS = 300
-_RETRY_ATTEMPTS = 3
-_RETRY_BASE_DELAY = 0.5  # seconds; doubles each attempt
+_RETRY_DELAYS = (5.0, 15.0, 45.0)
+_RETRY_JITTER_FRACTION = 0.20
 
 TRANSIENT_ERROR_MARKERS = (
     "rate limit",
@@ -85,6 +86,15 @@ TRANSIENT_ERROR_MARKERS = (
     "service unavailable",
 )
 
+AUTH_ERROR_MARKERS = (
+    "auth",
+    "unauthorized",
+    "invalid",
+    "forbidden",
+    "expired",
+    "token",
+)
+
 _OP_ID_RE = re.compile(r"^[a-z0-9]{26}$")
 
 
@@ -94,27 +104,44 @@ def _looks_like_op_id(value: str) -> bool:
     return bool(_OP_ID_RE.match(value))
 
 
+def _is_auth_error(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return any(marker in msg for marker in AUTH_ERROR_MARKERS)
+
+
 def _is_transient_error(exc: BaseException) -> bool:
     msg = str(exc).lower()
+    # Authentication failures are permanent until credentials change. Check
+    # them first because SDK messages can contain both an auth marker and a
+    # transient-looking marker such as "timeout".
+    if _is_auth_error(exc):
+        return False
     return any(marker in msg for marker in TRANSIENT_ERROR_MARKERS)
 
 
-async def _with_retry(coro_fn, *args, retries: int = _RETRY_ATTEMPTS,
-                       base_delay: float = _RETRY_BASE_DELAY, **kwargs):
+async def _with_retry(coro_fn, *args, retry_delays: tuple[float, ...] = _RETRY_DELAYS,
+                      jitter_fraction: float = _RETRY_JITTER_FRACTION, **kwargs):
     """Call an async fn with bounded retry/backoff, retrying only errors that
     look transient (rate-limit/timeout/5xx). Non-transient errors (auth
     failure, not-found) raise immediately without burning retries."""
     last_exc: BaseException | None = None
-    for attempt in range(retries):
+    attempts = len(retry_delays) + 1
+    for attempt in range(attempts):
         try:
             return await coro_fn(*args, **kwargs)
         except Exception as exc:  # noqa: BLE001 - re-raised once retries exhaust
             last_exc = exc
-            if not _is_transient_error(exc) or attempt == retries - 1:
+            if not _is_transient_error(exc) or attempt == attempts - 1:
                 raise
-            delay = base_delay * (2 ** attempt)
+            nominal_delay = retry_delays[attempt]
+            jitter = nominal_delay * max(0.0, jitter_fraction)
+            delay = random.uniform(
+                max(0.0, nominal_delay - jitter),
+                nominal_delay + jitter,
+            )
             sys.stderr.write(
-                f"[op_sdk_resolve] transient error ({exc!r}), retry {attempt + 1}/{retries} in {delay:.1f}s\n"
+                f"[op_sdk_resolve] transient error ({exc!r}), "
+                f"retry {attempt + 1}/{len(retry_delays)} in {delay:.1f}s\n"
             )
             await asyncio.sleep(delay)
     if last_exc is not None:
@@ -173,6 +200,25 @@ def _read_cache_any_age(key: str):
         return raw["ts"], raw["data"]
     except (OSError, ValueError, KeyError):
         return None
+
+
+def _cached_secret_value(data) -> str | None:
+    """Return a usable cached secret, rejecting empty/malformed cache data."""
+    if not isinstance(data, dict):
+        return None
+    value = data.get("value")
+    if not isinstance(value, str) or not value:
+        return None
+    return value
+
+
+def _usable_fields_payload(data) -> bool:
+    """A fields cache is safe only when it contains complete usable values."""
+    return (
+        isinstance(data, dict)
+        and bool(data)
+        and all(isinstance(value, str) and bool(value) for value in data.values())
+    )
 # --- end HERMES-PATCH 31 -----------------------------------------------------
 
 
@@ -186,7 +232,11 @@ def resolve_refs(refs: list[str]) -> dict[str, str]:
     (missing/invalid token) — callers should catch and fail open the same way
     the old code did around a hung/erroring `op` call.
     """
-    return asyncio.run(_resolve_by_ref(list(dict.fromkeys(refs))))
+    unique_refs = list(dict.fromkeys(refs))
+    # Route importable callers through the same cache/retry/fail-closed batch
+    # path as the CLI. Using each ref as its own key preserves the public
+    # {ref: secret} return shape.
+    return asyncio.run(_resolve_all({ref: ref for ref in unique_refs}))
 
 
 async def _resolve_by_ref(unique_refs: list[str]) -> dict[str, str]:
@@ -275,14 +325,14 @@ def resolve_all_fields(vault_ref: str, item_ref: str) -> dict[str, str]:
     """
     key = _cache_key("fields", vault_ref, item_ref)
     fresh = _read_cache_fresh(key)
-    if fresh is not None:
+    if _usable_fields_payload(fresh):
         return fresh
 
     try:
         result = asyncio.run(_with_retry(_resolve_all_fields_async, vault_ref, item_ref))
     except Exception as exc:
         stale = _read_cache_any_age(key)
-        if stale is not None:
+        if stale is not None and _usable_fields_payload(stale[1]):
             _, data = stale
             sys.stderr.write(
                 f"[op_sdk_resolve] live resolve failed for {vault_ref}/{item_ref} "
@@ -327,8 +377,9 @@ async def _resolve_all(refs: dict[str, str]) -> dict[str, str]:
     to_fetch: list[str] = []
     for ref in unique_refs:
         fresh = _read_cache_fresh(_cache_key("ref", ref))
-        if fresh is not None and "value" in fresh:
-            secret_by_ref[ref] = fresh["value"]
+        cached_value = _cached_secret_value(fresh)
+        if cached_value is not None:
+            secret_by_ref[ref] = cached_value
         else:
             to_fetch.append(ref)
 
@@ -341,24 +392,39 @@ async def _resolve_all(refs: dict[str, str]) -> dict[str, str]:
                 # swallowed into an empty/stale result — propagate so main()'s
                 # `except Exception` still produces the FATAL/exit-1 page.
                 # Only a transient error that has exhausted _with_retry's
-                # bounded attempts falls through to the serve-stale-or-empty
-                # path below (HERMES-PATCH 31 resilience behavior).
+                # bounded attempts may use a complete stale fallback.
                 raise
+            stale_values: dict[str, str] = {}
+            for ref in to_fetch:
+                stale = _read_cache_any_age(_cache_key("ref", ref))
+                cached_value = _cached_secret_value(stale[1]) if stale is not None else None
+                if cached_value is None:
+                    sys.stderr.write(
+                        f"[op_sdk_resolve] live batch resolve failed ({exc!r}); "
+                        f"no complete usable stale cache for ref {ref}\n"
+                    )
+                    raise
+                stale_values[ref] = cached_value
             sys.stderr.write(
                 f"[op_sdk_resolve] live batch resolve failed ({exc!r}); "
-                f"falling back to per-ref stale cache\n"
+                f"serving complete stale cache\n"
             )
-            live = {}
-        for ref in to_fetch:
-            if ref in live:
-                secret_by_ref[ref] = live[ref]
-                _write_cache(_cache_key("ref", ref), {"value": live[ref]})
-            else:
-                stale = _read_cache_any_age(_cache_key("ref", ref))
-                if stale is not None:
-                    _, data = stale
-                    if "value" in data:
-                        secret_by_ref[ref] = data["value"]
+            for ref, value in stale_values.items():
+                secret_by_ref[ref] = value
+                sys.stderr.write(
+                    f"[op_sdk_resolve] serving stale cache for ref {ref}\n"
+                )
+        else:
+            for ref in to_fetch:
+                live_value = live.get(ref)
+                if isinstance(live_value, str) and live_value:
+                    secret_by_ref[ref] = live_value
+                    _write_cache(_cache_key("ref", ref), {"value": live_value})
+                else:
+                    stale = _read_cache_any_age(_cache_key("ref", ref))
+                    cached_value = _cached_secret_value(stale[1]) if stale is not None else None
+                    if cached_value is not None:
+                        secret_by_ref[ref] = cached_value
                         sys.stderr.write(
                             f"[op_sdk_resolve] serving stale cache for ref {ref}\n"
                         )

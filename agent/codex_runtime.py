@@ -679,6 +679,7 @@ def run_codex_app_server_turn(
         # Supersedes the narrower item/started-only bridge from #38835.
         agent._codex_session = CodexAppServerSession(
             cwd=cwd,
+            model=agent.model,
             approval_callback=approval_callback,
             request_routing=_ServerRequestRouting(
                 auto_approve_exec=auto_approve_requests,
@@ -692,7 +693,10 @@ def run_codex_app_server_turn(
     # return reaches us. Do NOT append again — that would duplicate.
 
     try:
-        turn = agent._codex_session.run_turn(user_input=user_message)
+        turn = agent._codex_session.run_turn(
+            user_input=user_message,
+            model=agent.model,
+        )
     except Exception as exc:
         logger.exception("codex app-server turn failed")
         # Crash → unconditionally drop the session so the next turn

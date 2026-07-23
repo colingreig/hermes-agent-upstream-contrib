@@ -38,6 +38,28 @@ vs this copy) to catch drift — nothing currently automates that check.
   retry/backoff, serve-stale, id-fast-path) re-added from the original spec
   in ClickUp 86e2a99q9 after the 2026-07-19 loss; live-verified (142/142
   secrets resolved, cache hit confirmed on a second run, 0700/0600 perms).
+  Hardened for ClickUp 86e2a2paz on 2026-07-23: auth/unauthorized/invalid/
+  forbidden/expired/token markers take precedence over transient-looking text;
+  transient failures use three bounded jittered retries around 5/15/45 seconds;
+  exhausted transient failures serve stale only when every requested value has
+  complete usable cache data, otherwise they retain the CLI's exact FATAL/exit-1
+  contract. Importable `resolve_refs()` consumers now use the same retry/cache
+  path, while stdout remains byte-compatible `KEY="value"` shell input.
+- `sentinel_run.sh` — launchd runner for Ignite Sentinel. De-clusters its
+  1Password resolve with a random delay in the inclusive 0–120 second window.
+  `SENTINEL_START_DELAY_MAX_SECONDS=0 SENTINEL_SMOKE_ONLY=1` performs the
+  secrets-resolution smoke without running the monitor or emitting Slack.
+- `degraded_secrets_monitor.py` — detects repeated secret-resolution failures
+  and unresolved placeholders. Its SDK subprocess uses the immutable
+  `~/.hermes/runtime-current/venv/bin/python` path, not the removed mutable
+  `~/.hermes/hermes-agent/venv/bin/python` checkout.
+- `tests/test_op_sdk_resolve.py` — fully mocked resolver contract harness:
+  transient-then-success, exhausted transient without stale, mixed auth +
+  timeout precedence, complete stale fallback, and stdout quoting bytes.
+- `tests/test_sentinel_run.sh` — validates the 0–120 second delay contract and
+  executes a fake-HOME, Slack-silent sentinel smoke.
+- `tests/test_op_sdk_consumers.sh` — verifies canonical/live resolver byte
+  identity plus the sentinel, degraded-monitor, and marketplace consumer paths.
 - `verify-hermes-patches.sh` — idempotent guard/health-check for the 12 legacy
   hand-patches (now all formally merged to main) plus ~30 other live-deploy
   sentinels (GH App token, marketplace sync cron, validator model chain,
