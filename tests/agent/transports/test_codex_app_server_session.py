@@ -149,17 +149,31 @@ class TestLifecycle:
         method_calls = [m for (m, _) in client.requests if m == "thread/start"]
         assert len(method_calls) == 1
 
-    def test_thread_start_passes_cwd_only(self):
-        """thread/start carries cwd. We intentionally do NOT pass `permissions`
+    def test_thread_start_passes_cwd_and_configured_model(self):
+        """thread/start carries the resolved Hermes model, but not permissions.
+
+        `model` is a stable app-server field. We intentionally do NOT pass `permissions`
         on this codex version (experimentalApi-gated + requires matching
         config.toml [permissions] table). Letting codex use its default
         (read-only unless user configures otherwise) is the documented path."""
         client = FakeClient()
-        s = make_session(client, permission_profile="workspace-write")
+        s = make_session(
+            client,
+            model="gpt-test-configured",
+            permission_profile="workspace-write",
+        )
         s.ensure_started()
         method, params = next(r for r in client.requests if r[0] == "thread/start")
         assert params["cwd"] == "/tmp"
+        assert params["model"] == "gpt-test-configured"
         assert "permissions" not in params  # see session.ensure_started() comment
+
+    def test_thread_start_uses_codex_default_without_a_hermes_model(self):
+        client = FakeClient()
+        s = make_session(client, model="   ")
+        s.ensure_started()
+        _, params = next(r for r in client.requests if r[0] == "thread/start")
+        assert "model" not in params
 
     def test_close_idempotent(self):
         client = FakeClient()
@@ -173,6 +187,37 @@ class TestLifecycle:
 # ---- turn loop ----
 
 class TestRunTurn:
+    def test_model_override_updates_retained_thread_without_restarting(self):
+        client = FakeClient()
+        s = make_session(client, model="gpt-initial")
+
+        client.queue_notification(
+            "turn/completed",
+            threadId="thread-fake-001",
+            turn={"id": "turn-1", "status": "completed", "error": None},
+        )
+        first = s.run_turn("first", turn_timeout=2.0)
+
+        client.queue_notification(
+            "turn/completed",
+            threadId="thread-fake-001",
+            turn={"id": "turn-2", "status": "completed", "error": None},
+        )
+        second = s.run_turn("second", model="gpt-switched", turn_timeout=2.0)
+
+        thread_starts = [
+            params for method, params in client.requests if method == "thread/start"
+        ]
+        turn_starts = [
+            params for method, params in client.requests if method == "turn/start"
+        ]
+        assert len(thread_starts) == 1
+        assert first.thread_id == second.thread_id == "thread-fake-001"
+        assert [params["model"] for params in turn_starts] == [
+            "gpt-initial",
+            "gpt-switched",
+        ]
+
     def test_simple_text_turn_returns_final_message(self):
         client = FakeClient()
         client.queue_notification("turn/started", threadId="t", turn={"id": "tu1"})
