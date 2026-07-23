@@ -13,7 +13,7 @@ import pytest
 import hermes_cli.doctor as doctor
 import hermes_cli.gateway as gateway_cli
 from hermes_cli import doctor as doctor_mod
-from hermes_cli.doctor import _has_provider_env_config
+from hermes_cli.doctor import _has_provider_env_config, _detects_stale_agent_ready_instruction
 
 
 class TestDoctorPlatformHints:
@@ -346,6 +346,146 @@ class TestDoctorMemoryProviderSection:
         out = self._run_doctor_and_capture(monkeypatch, tmp_path, provider="mem0")
         assert "Memory Provider" in out
         assert "Built-in memory active" not in out
+
+
+class TestStaleAgentReadyInstructionDetection:
+    """Direct unit tests for the `_detects_stale_agent_ready_instruction` helper."""
+
+    def test_detects_paraphrased_self_tag_instruction(self):
+        content = "New Slack work should be captured as a ClickUp task tagged agent-ready."
+        result = _detects_stale_agent_ready_instruction(content)
+        assert result is not None
+        assert "agent-ready" in result.lower()
+
+    def test_detects_tag_it_agent_ready_phrasing(self):
+        content = "When you create a new task from Slack, tag it agent-ready."
+        assert _detects_stale_agent_ready_instruction(content) is not None
+
+    def test_ignores_sentence_that_already_references_the_prep_gate(self):
+        content = (
+            "Do not self-tag it agent-ready — that tag is only added by ignite-prep "
+            "after it writes a canonical Execution Brief, resolves every product "
+            "decision, confirms any predecessor task is complete, and sets exactly "
+            "one model:* floor tag."
+        )
+        assert _detects_stale_agent_ready_instruction(content) is None
+
+    def test_ignores_incidental_definition_mention(self):
+        content = "The agent-ready tag means a task has cleared Prep review."
+        assert _detects_stale_agent_ready_instruction(content) is None
+
+    def test_returns_none_for_empty_or_unrelated_content(self):
+        assert _detects_stale_agent_ready_instruction("") is None
+        assert _detects_stale_agent_ready_instruction("Colin prefers dark mode.") is None
+        assert _detects_stale_agent_ready_instruction(None) is None
+
+    def test_ignores_negated_self_tag_instruction(self):
+        # This is cautionary/compliant wording ("never do this"), not a stale
+        # violation, even though it doesn't also reference the prep gate.
+        content = "Never self-tag a captured task agent-ready without human sign-off."
+        assert _detects_stale_agent_ready_instruction(content) is None
+
+    def test_detects_plural_tasks_self_tag_instruction(self):
+        # "tasks" (plural) must match, not just singular "task".
+        content = "Always tag new tasks agent-ready immediately."
+        result = _detects_stale_agent_ready_instruction(content)
+        assert result is not None
+        assert "agent-ready" in result.lower()
+
+    def test_detects_violation_with_unrelated_prep_mention(self):
+        # A bare, unrelated use of "prep" elsewhere in the sentence must not
+        # suppress a real stale self-tag instruction.
+        content = (
+            "Whenever you capture a new task from Slack tag it agent-ready "
+            "right away, then prep the client deck."
+        )
+        result = _detects_stale_agent_ready_instruction(content)
+        assert result is not None
+        assert "agent-ready" in result.lower()
+
+
+class TestDoctorStaleAgentReadyMemoryCheck:
+    """The Directory Structure section should warn when MEMORY.md/USER.md tell
+    the agent to self-tag freshly-captured tasks agent-ready, bypassing the
+    ignite-prep -> Execution Brief -> model-floor gate."""
+
+    def _make_hermes_home(self, tmp_path, memory_text=None, user_text=None):
+        home = tmp_path / ".hermes"
+        home.mkdir(parents=True, exist_ok=True)
+        import yaml
+        (home / "config.yaml").write_text(yaml.dump({"memory": {}}))
+        memories_dir = home / "memories"
+        memories_dir.mkdir(parents=True, exist_ok=True)
+        if memory_text is not None:
+            (memories_dir / "MEMORY.md").write_text(memory_text, encoding="utf-8")
+        if user_text is not None:
+            (memories_dir / "USER.md").write_text(user_text, encoding="utf-8")
+        return home
+
+    def _run_doctor_and_capture(self, monkeypatch, tmp_path, memory_text=None, user_text=None):
+        home = self._make_hermes_home(tmp_path, memory_text, user_text)
+        monkeypatch.setattr(doctor_mod, "HERMES_HOME", home)
+        monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", tmp_path / "project")
+        monkeypatch.setattr(doctor_mod, "_DHH", str(home))
+        (tmp_path / "project").mkdir(exist_ok=True)
+
+        fake_model_tools = types.SimpleNamespace(
+            check_tool_availability=lambda *a, **kw: ([], []),
+            TOOLSET_REQUIREMENTS={},
+        )
+        monkeypatch.setitem(sys.modules, "model_tools", fake_model_tools)
+
+        try:
+            from hermes_cli import auth as _auth_mod
+            monkeypatch.setattr(_auth_mod, "get_nous_auth_status", lambda: {})
+            monkeypatch.setattr(_auth_mod, "get_codex_auth_status", lambda: {})
+            monkeypatch.setattr(_auth_mod, "get_xai_oauth_auth_status", lambda: {})
+        except Exception:
+            pass
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            doctor_mod.run_doctor(Namespace(fix=False))
+        return buf.getvalue()
+
+    def test_warns_on_stale_self_tag_instruction_in_memory_md(self, monkeypatch, tmp_path):
+        out = self._run_doctor_and_capture(
+            monkeypatch,
+            tmp_path,
+            memory_text=(
+                "New Slack work should be captured as a ClickUp task tagged agent-ready.\n"
+            ),
+        )
+        assert "instructs self-tagging agent-ready" in out
+        assert "MEMORY.md" in out
+
+    def test_warns_on_stale_self_tag_instruction_in_user_md(self, monkeypatch, tmp_path):
+        out = self._run_doctor_and_capture(
+            monkeypatch,
+            tmp_path,
+            user_text="When you create a new task from Slack, tag it agent-ready.\n",
+        )
+        assert "instructs self-tagging agent-ready" in out
+        assert "USER.md" in out
+
+    def test_no_warning_for_replacement_gate_aware_wording(self, monkeypatch, tmp_path):
+        # This is the intended eventual replacement wording for USER.md/MEMORY.md —
+        # proves the new gate-aware phrasing does NOT trigger the diagnostic.
+        clean_text = (
+            "New Slack work should be captured as a ClickUp to-do task (no status-skipping). Do not\n"
+            "self-tag it agent-ready — that tag is only added by ignite-prep after it writes a\n"
+            "canonical Execution Brief, resolves every product decision, confirms any predecessor\n"
+            "task is complete, and sets exactly one model:* floor tag. Keep doing the useful\n"
+            "\"capture the work, don't live-code it\" behavior; just don't self-tag.\n"
+        )
+        out = self._run_doctor_and_capture(monkeypatch, tmp_path, user_text=clean_text)
+        assert "instructs self-tagging agent-ready" not in out
+
+    def test_no_warning_when_memories_have_no_agent_ready_mention(self, monkeypatch, tmp_path):
+        out = self._run_doctor_and_capture(
+            monkeypatch, tmp_path, memory_text="Colin prefers dark mode.\n"
+        )
+        assert "instructs self-tagging agent-ready" not in out
 
 
 def test_run_doctor_termux_treats_docker_and_browser_warnings_as_expected(monkeypatch, tmp_path):

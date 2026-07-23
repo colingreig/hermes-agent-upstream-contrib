@@ -610,6 +610,24 @@ def _print_setup_summary(config: dict, hermes_home):
         print_warning(f"or edit {_dhh()}/.env directly to add the missing API keys.")
         print()
 
+    # Runtime readiness — same shared, read-only resolver used by
+    # `hermes config check`, `hermes doctor`, gateway startup, and cron job
+    # creation, so the setup-completion banner reflects the same effective
+    # route chain. Log-only: no network calls, never blocks/raises setup.
+    try:
+        from hermes_cli.route_health import (
+            resolve_route_health,
+            summarize_route_health_verbose,
+        )
+
+        route_health = resolve_route_health(config=config)
+        print_header("Runtime Readiness")
+        for line in summarize_route_health_verbose(route_health):
+            print(f"   {line}")
+        print()
+    except Exception as exc:
+        logger.debug("resolve_route_health failed during setup summary: %s", exc)
+
     # Done banner
     print()
     print(

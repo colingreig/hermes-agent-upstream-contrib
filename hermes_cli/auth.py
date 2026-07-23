@@ -676,9 +676,26 @@ def _resolve_api_key_provider_secret(
             return "", ""
         entry = pool.peek()
         if not entry:
+            # peek() applies the pool's general availability filter (cooldowns,
+            # DEAD status, and — in some releases — an eager-runtime-key
+            # requirement meant for borrowed-credential dedup). That filter can
+            # exclude a fingerprint-only entry before lazy resolution ever gets
+            # a chance to run, even though the entry itself is perfectly valid
+            # and 1Password-resolvable (86e29q8mz: exactly this excluded a
+            # valid gemini key from ever loading in production). Retry lazy
+            # resolution directly against the raw, unfiltered entries before
+            # giving up.
+            from agent.credential_pool import STATUS_DEAD
+            for raw_entry in pool.entries():
+                if getattr(raw_entry, "last_status", None) == STATUS_DEAD:
+                    continue
+                lazy_key = _resolve_pool_entry_lazy(provider_id, pconfig, raw_entry)
+                if has_usable_secret(lazy_key):
+                    return lazy_key, f"credential_pool_lazy:{provider_id}"
             logger.warning(
                 "resolve_api_key_provider_secret: %s pool has credentials but "
-                "peek() returned none (all entries exhausted/dead?)", provider_id)
+                "peek() returned none (all entries exhausted/dead?), and no "
+                "raw entry lazy-resolved either", provider_id)
             return "", ""
         key = getattr(entry, "access_token", "") or getattr(entry, "runtime_api_key", "")
         key = str(key).strip()

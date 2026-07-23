@@ -267,6 +267,8 @@ def _provider_health(provider: str) -> RouteHealthSummary:
 
 def _fallback_route_health(
     fallback_entries: Iterable[dict[str, Any]],
+    *,
+    config: Optional[dict[str, Any]] = None,
 ) -> list[RouteHealthSummary]:
     results: list[RouteHealthSummary] = []
     for entry in fallback_entries:
@@ -274,15 +276,14 @@ def _fallback_route_health(
         if not provider:
             continue
         model = _text(entry.get("model")) or None
-        route = _provider_health(provider)
-        route = RouteHealthSummary(
-            provider=route.provider,
-            model=model,
-            health=route.health,
-            configured=route.configured,
-            credential_source=route.credential_source,
-            details=route.details,
-        )
+        # Route through the same pool-aware check used for the primary route
+        # (_surface_health), not the bare env-presence check (_provider_health
+        # alone). api_key providers like zai/gemini are seeded into the
+        # credential pool from their env var, and the pool tracks real
+        # exhausted/dead outcomes from prior traffic — a fallback entry whose
+        # only credential has already failed must not be reported "healthy"
+        # just because the env var is still set.
+        route = _surface_health(provider, model, config=config)
         results.append(route)
     return results
 
@@ -351,7 +352,7 @@ def resolve_route_health(
     primary_dict = primary.to_dict()
     primary_dict["role"] = "primary"
 
-    fallback_routes = _fallback_route_health(fallback_chain)
+    fallback_routes = _fallback_route_health(fallback_chain, config=config)
     fallback_dicts: list[dict[str, Any]] = []
     for idx, route in enumerate(fallback_routes, start=1):
         payload = route.to_dict()

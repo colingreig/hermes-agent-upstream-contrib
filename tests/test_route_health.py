@@ -140,6 +140,7 @@ def test_resolve_route_health_reports_total_chain_exhaustion(monkeypatch):
         last_status_at="2026-07-18T00:00:00Z",
     )
     fake_pool = _FakePool(entries=[entry], available=[])
+    empty_pool = _FakePool(entries=[], available=[])
 
     monkeypatch.setattr(
         rh,
@@ -149,7 +150,16 @@ def test_resolve_route_health_reports_total_chain_exhaustion(monkeypatch):
             "fallback_providers": [{"provider": "openrouter", "model": "openai/gpt-4.1"}],
         },
     )
-    monkeypatch.setattr(rh, "load_pool", lambda provider: fake_pool)
+    # Provider-aware pool: the primary (anthropic) route is chain-exhausted;
+    # the fallback (openrouter) has no pool entries at all. Fallback routes
+    # now consult pool state the same way the primary does (see
+    # _fallback_route_health), so this must be keyed by provider rather than
+    # returning the same fake pool for every provider.
+    monkeypatch.setattr(
+        rh,
+        "load_pool",
+        lambda provider: fake_pool if provider == "anthropic" else empty_pool,
+    )
     # No cooldown window remaining anywhere in the pool -> terminal "exhausted",
     # not a still-ticking "cooldown".
     monkeypatch.setattr(rh, "_exhausted_until", lambda entry: None)
@@ -232,6 +242,62 @@ def test_resolve_route_health_no_fallback_suppresses_fallback_chain(monkeypatch)
     assert result["primary"]["health"] == "healthy"
     assert result["fallbacks"] == []
     assert result["fallback_chain"] == []
+
+
+def test_resolve_route_health_fallback_reports_pool_unusable_api_key_provider(monkeypatch):
+    # zai/gemini are auth_type="api_key" providers: a bare env-presence check
+    # (_generic_provider_health/get_auth_status) reports "healthy" the moment
+    # ZAI_API_KEY is set, even if every real call against that key has failed.
+    # The credential pool records that outcome (STATUS_EXHAUSTED here), and
+    # the shared resolver must consult it for fallback routes too — not just
+    # the primary route — so a present-but-pool-flagged-unusable key is
+    # reported unhealthy instead of silently "healthy".
+    zai_entry = SimpleNamespace(
+        id="zai-cred-1",
+        label="env:ZAI_API_KEY",
+        source="env:ZAI_API_KEY",
+        access_token="zai-key-that-always-401s",
+        last_status=STATUS_EXHAUSTED,
+        last_status_at="2026-07-18T00:00:00Z",
+        last_error_code=429,
+    )
+    zai_pool = _FakePool(entries=[zai_entry], available=[])
+
+    monkeypatch.setattr(
+        rh,
+        "load_config",
+        lambda: {
+            "model": {"provider": "anthropic", "default": "claude-sonnet-4"},
+            "fallback_providers": [{"provider": "zai", "model": "glm-4.6"}],
+        },
+    )
+
+    def _load_pool(provider):
+        if provider == "zai":
+            return zai_pool
+        raise RuntimeError(f"no fake pool configured for provider={provider!r}")
+
+    monkeypatch.setattr(rh, "load_pool", _load_pool)
+    # Terminal exhaustion (no active cooldown window remaining).
+    monkeypatch.setattr(rh, "_exhausted_until", lambda entry: None)
+    # Bare env-presence check would say "healthy" for zai if it were ever
+    # consulted here (the key is "present") — this proves the pool state,
+    # not the env check, wins for the fallback route.
+    monkeypatch.setattr(
+        rh,
+        "get_auth_status",
+        lambda provider: {"configured": True, "logged_in": True, "source": "oauth"}
+        if provider == "anthropic"
+        else {"configured": True, "api_key": "zai-key-that-always-401s"},
+    )
+
+    result = rh.resolve_route_health()
+
+    assert result["fallbacks"]
+    zai_route = result["fallbacks"][0]
+    assert zai_route["provider"] == "zai"
+    assert zai_route["health"] != "healthy"
+    assert zai_route["health"] == "exhausted"
 
 
 def test_summarize_route_health_verbose_lists_primary_and_each_fallback(monkeypatch):

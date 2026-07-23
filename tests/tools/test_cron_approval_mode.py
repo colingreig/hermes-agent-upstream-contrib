@@ -432,3 +432,75 @@ class TestCronWithGatewayOrigin:
                 assert result.get("status") != "approval_required"
         finally:
             clear_session_vars(tokens)
+
+
+# ---------------------------------------------------------------------------
+# execute_code tool-schema omission (#86e2cpmjc)
+# ---------------------------------------------------------------------------
+#
+# check_execute_code_guard() above unconditionally blocks execute_code when
+# HERMES_CRON_SESSION is set and cron_mode == deny. Advertising the tool in
+# the schema anyway wastes a round-trip: the model tries it, gets BLOCKED,
+# then falls back to terminal(). model_tools._compute_tool_definitions()
+# omits execute_code from the schema entirely under that same condition so
+# the model never sees it.
+
+@pytest.fixture()
+def _clear_tool_defs_caches():
+    """Invalidate check_fn and tool-definitions caches so monkeypatched env
+    vars / mocked cron_mode take effect on each call."""
+    from tools.registry import invalidate_check_fn_cache
+    from model_tools import _clear_tool_defs_cache
+    invalidate_check_fn_cache()
+    _clear_tool_defs_cache()
+    yield
+    invalidate_check_fn_cache()
+    _clear_tool_defs_cache()
+
+
+class TestExecuteCodeSchemaOmittedInCronDeny:
+    def test_absent_when_cron_deny(self, monkeypatch, _clear_tool_defs_caches):
+        from model_tools import get_tool_definitions
+
+        monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+        from unittest.mock import patch as mock_patch
+        with mock_patch("tools.approval._get_cron_approval_mode", return_value="deny"):
+            tools = get_tool_definitions(enabled_toolsets=["code_execution"], quiet_mode=True)
+        names = {t["function"]["name"] for t in tools}
+        assert "execute_code" not in names
+
+    def test_present_when_cron_approve(self, monkeypatch, _clear_tool_defs_caches):
+        from model_tools import get_tool_definitions
+
+        monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+        from unittest.mock import patch as mock_patch
+        with mock_patch("tools.approval._get_cron_approval_mode", return_value="approve"):
+            tools = get_tool_definitions(enabled_toolsets=["code_execution"], quiet_mode=True)
+        names = {t["function"]["name"] for t in tools}
+        assert "execute_code" in names
+
+    def test_present_when_not_cron_session(self, monkeypatch, _clear_tool_defs_caches):
+        from model_tools import get_tool_definitions
+
+        monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
+        from unittest.mock import patch as mock_patch
+        with mock_patch("tools.approval._get_cron_approval_mode", return_value="deny"):
+            tools = get_tool_definitions(enabled_toolsets=["code_execution"], quiet_mode=True)
+        names = {t["function"]["name"] for t in tools}
+        assert "execute_code" in names
+
+    def test_check_execute_code_guard_unaffected(self, monkeypatch):
+        """The runtime approval gate (defense-in-depth) stays unchanged: it
+        still blocks execute_code calls in cron+deny regardless of whether
+        the schema advertised the tool."""
+        from tools.approval import check_execute_code_guard
+
+        monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+        monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+        monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+        monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
+
+        from unittest.mock import patch as mock_patch
+        with mock_patch("tools.approval._get_cron_approval_mode", return_value="deny"):
+            result = check_execute_code_guard("print('hi')", "local")
+            assert not result["approved"]

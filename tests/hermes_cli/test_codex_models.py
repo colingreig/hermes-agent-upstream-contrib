@@ -37,6 +37,28 @@ def test_get_codex_model_ids_prioritizes_default_and_cache(tmp_path, monkeypatch
     assert "gpt-5-hidden-codex" not in models
 
 
+def test_default_and_mini_chat_models_are_current_and_paired():
+    """86e28mq8g: config-validation pin for the interactive Hermes chat
+    default. The mini's live ~/.hermes/config.yaml model.default (a
+    per-install value, not something this repo hardcodes — DEFAULT_CONFIG's
+    top-level "model" is intentionally "") is expected to be the flagship
+    reasoning model here, with the mini/cheap pair right behind it in the
+    curated fallback list so a fresh install / offline first run still
+    offers both tiers. If this ever drifts (e.g. gpt-5.6-sol renamed/
+    retired), this test catches it before it's discovered as a stale live
+    config. Updated 2026-07-22 during the prod-live-patches integration:
+    gpt-5.6-sol GA'd 2026-07-09 and superseded gpt-5.5 as the flagship
+    entry in DEFAULT_CODEX_MODELS on this branch."""
+    assert DEFAULT_CODEX_MODELS[0] == "gpt-5.6-sol", (
+        "the flagship reasoning default (main interactive chat, tool-heavy/"
+        "long-context work) must lead the curated Codex model list"
+    )
+    assert "gpt-5.4-mini" in DEFAULT_CODEX_MODELS, (
+        "the cheap/fast mini pair must stay available for summaries, "
+        "classification, and low-risk cron/kanban profiles"
+    )
+
+
 def test_setup_wizard_codex_import_resolves():
     """Regression test for #712: setup.py must import the correct function name."""
     # This mirrors the exact import used in hermes_cli/setup.py line 873.
