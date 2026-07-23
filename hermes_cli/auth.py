@@ -621,6 +621,26 @@ def _resolve_pool_entry_lazy(provider_id: str, pconfig: "ProviderConfig", entry:
     return ""
 
 
+def _pool_entry_allows_lazy_resolution(entry: Any) -> bool:
+    """Return whether a pool entry may bypass eager-key filtering for lazy lookup.
+
+    Fingerprint-only entries need a lazy secret lookup because ``CredentialPool``
+    normally excludes API-key entries without an eager ``runtime_api_key``.  That
+    narrow bypass must not also bypass the pool's DEAD and exhaustion-cooldown
+    gates, or an exhausted key is retried on every provider resolution.
+    """
+    from agent.credential_pool import STATUS_DEAD, STATUS_EXHAUSTED, _exhausted_until
+
+    status = getattr(entry, "last_status", None)
+    if status == STATUS_DEAD:
+        return False
+    if status == STATUS_EXHAUSTED:
+        exhausted_until = _exhausted_until(entry)
+        if exhausted_until is not None and time.time() < exhausted_until:
+            return False
+    return True
+
+
 def _resolve_api_key_provider_secret(
     provider_id: str, pconfig: ProviderConfig
 ) -> tuple[str, str]:
@@ -680,9 +700,8 @@ def _resolve_api_key_provider_secret(
             # valid gemini key from ever loading in production). Retry lazy
             # resolution directly against the raw, unfiltered entries before
             # giving up.
-            from agent.credential_pool import STATUS_DEAD
             for raw_entry in pool.entries():
-                if getattr(raw_entry, "last_status", None) == STATUS_DEAD:
+                if not _pool_entry_allows_lazy_resolution(raw_entry):
                     continue
                 lazy_key = _resolve_pool_entry_lazy(provider_id, pconfig, raw_entry)
                 if has_usable_secret(lazy_key):
