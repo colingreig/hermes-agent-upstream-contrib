@@ -5,7 +5,7 @@
 
 ## TL;DR
 
-`ignite-ship` reports `PLATFORM=unknown` / `DEPLOY_ON_PUSH=false` for `hermes-agent`.
+`ignite-ship` reports `PLATFORM=manual` / `DEPLOY_ON_PUSH=false` for `hermes-agent`.
 That is **correct and expected** — `hermes-agent` is not a Vercel / Cloudflare /
 WordPress web project. It is a launchd service running on a physical Mac mini, and
 it is **not** deployed by pushing to `main`.
@@ -20,7 +20,8 @@ it is **not** deployed by pushing to `main`.
 A matching platform hint in `ignite-skills`
 (`skills/ignite-ship/references/platform-hints.json`, key `hermes-agent`) classifies
 this repo as `PLATFORM=manual` (`DEPLOY_ON_PUSH=false`) so `ignite-ship` surfaces this
-exemption instead of a bare `unknown`.
+exemption instead of the bare `unknown` classification reported before that hint
+was added.
 
 ## How production actually runs
 
