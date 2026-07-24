@@ -28,6 +28,7 @@ HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
 RELEASES_DIR="$HERMES_HOME/releases"
 CURRENT_LINK="$HERMES_HOME/runtime-current"
 PREV_FILE="$RELEASES_DIR/.previous"
+CUT_LOCK_DIR="$RELEASES_DIR/.mini-release-cut.lock"
 GATEWAY_LOG="$HERMES_HOME/logs/gateway.log"
 
 UID_NUM="$(id -u)"
@@ -109,16 +110,62 @@ run() {
   "$@"
 }
 
-# HARD SAFETY INVARIANT (enforced in code): every path the build touches must
-# live under $RELEASES_DIR. Refuse anything else. The ONLY permitted writes
-# outside releases/ are the runtime-current symlink repoint and the launchctl
-# restart — both funnelled through dedicated functions below.
-assert_under_releases() {
-  local p="${1:-}"
-  case "$p" in
-    "$RELEASES_DIR"/*) : ;;
-    *) die "SAFETY: refusing to touch a path outside $RELEASES_DIR: $p" ;;
+# Resolve an existing directory without relying on GNU-only realpath flags.
+# RELEASES_DIR itself must be a real directory before the script is allowed to
+# create a release beneath it, so resolving its parent is sufficient to make
+# targets that do not exist yet safe as well.
+canonical_existing_dir() {
+  local dir="${1:-}"
+  [ -n "$dir" ] && [ -d "$dir" ] || return 1
+  (cd -P -- "$dir" && pwd -P)
+}
+
+# A release target is one direct child of the canonical releases directory.
+# This rejects traversal (including a deceptively harmless-looking `foo/..`)
+# before any create/remove, then reconstructs the target from the canonical
+# parent and basename. Call this immediately before every such operation.
+assert_release_target() {
+  local target="${1:-}" parent base resolved_parent
+  [ -n "$target" ] || die "SAFETY: empty release target"
+  parent="$(dirname -- "$target")"
+  base="$(basename -- "$target")"
+  case "$base" in
+    ''|.|..) die "SAFETY: invalid release target component: $target" ;;
   esac
+  resolved_parent="$(canonical_existing_dir "$parent")" \
+    || die "SAFETY: release target parent does not exist: $target"
+  [ "$resolved_parent" = "$RELEASES_DIR" ] \
+    || die "SAFETY: release target parent is not releases dir: $target (resolved: $resolved_parent)"
+  [ "$target" = "$RELEASES_DIR/$base" ] \
+    || die "SAFETY: release target is not canonical: $target"
+}
+
+release_target() {
+  local component="${1:-}"
+  case "$component" in
+    ''|.|..|*/*) die "SAFETY: release name must be exactly one path component: $component" ;;
+  esac
+  printf '%s/%s\n' "$RELEASES_DIR" "$component"
+}
+
+# Versions are consumed as a filesystem component, so accept only the
+# ASCII subset used by PEP 440: it must begin with a decimal release digit and
+# may then contain letters, digits, dot, plus, underscore, hyphen, or epoch
+# bang. This excludes whitespace/control bytes, shell punctuation, slashes,
+# and option-looking values before they ever reach a path or command.
+valid_release_version() {
+  local version="${1:-}"
+  [[ "$version" =~ ^[0-9][0-9A-Za-z.!+_-]*$ ]]
+}
+
+# A release-owned file may be replaced, but never through a symlink. This
+# prevents a stale or malicious .previous link from redirecting a write out of
+# releases/ after its parent was checked.
+assert_regular_release_file() {
+  local target="${1:-}"
+  assert_release_target "$target"
+  [ ! -L "$target" ] \
+    || die "SAFETY: refusing to overwrite symlinked release file: $target"
 }
 
 # HARD SAFETY INVARIANT: forbidden live-state paths must never be written by
@@ -164,7 +211,7 @@ http_ok() {
 repoint_symlink() {
   local target="${1:-}"
   [ -n "$target" ] || die "repoint_symlink: empty target"
-  assert_under_releases "$target"
+  assert_release_target "$target"
   local tmp="${CURRENT_LINK}.swap.$$"
   if [ "$DRY_RUN" -eq 1 ]; then
     # The build was dry-run-skipped, so $target won't exist yet — don't assert.
@@ -197,6 +244,32 @@ kickstart() {
   local target="${1:-}"
   log "restart: launchctl kickstart -k $target"
   run launchctl kickstart -k "$target"
+}
+
+# mkdir is atomic, unlike checking then creating a pid file. The lock covers
+# cuts, explicit rollbacks, and pruning so two operators cannot race the
+# runtime-current switch or delete one another's release.
+LOCK_HELD=0
+acquire_cut_lock() {
+  assert_release_target "$CUT_LOCK_DIR"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '\033[35m[DRY-RUN]\033[0m mkdir %s (single-instance cut lock)\n' "$CUT_LOCK_DIR"
+    return 0
+  fi
+  if ! mkdir "$CUT_LOCK_DIR"; then
+    die "another mini-release-cut is already running (lock: $CUT_LOCK_DIR)"
+  fi
+  LOCK_HELD=1
+  ok "acquired single-instance release-cut lock"
+}
+
+# shellcheck disable=SC2329 # called by the EXIT trap installed below
+release_cut_lock() {
+  [ "$LOCK_HELD" -eq 1 ] || return 0
+  # Prove the resolved parent again immediately before removing the lock.
+  assert_release_target "$CUT_LOCK_DIR"
+  rmdir "$CUT_LOCK_DIR" || warn "could not remove release-cut lock: $CUT_LOCK_DIR"
+  LOCK_HELD=0
 }
 
 # ---------------------------------------------------------------------------
@@ -285,7 +358,7 @@ rollback_to_previous() {
   local prev
   prev="$(cat "$PREV_FILE")"
   [ -n "$prev" ] || die "cannot rollback: $PREV_FILE is empty"
-  assert_under_releases "$prev"
+  assert_release_target "$prev"
   [ -d "$prev" ] || die "cannot rollback: previous release missing: $prev"
   warn "ROLLBACK ($reason) → $prev"
   local offset
@@ -294,7 +367,7 @@ rollback_to_previous() {
   kickstart "$GATEWAY_TARGET"
   if verify_gateway "$prev" "$offset"; then
     kickstart "$DASHBOARD_TARGET"
-    verify_dashboard || warn "dashboard did not confirm healthy after rollback"
+    verify_dashboard || die "rollback dashboard did NOT verify healthy — MANUAL INTERVENTION REQUIRED (release: $prev)"
     ok "rollback complete → $prev"
     return 0
   fi
@@ -323,16 +396,59 @@ prune_releases() {
     fi
     kept=$((kept + 1))
     if [ "$kept" -ge "$KEEP_RELEASES" ]; then
-      assert_under_releases "$d"
+      # `find` output is not trusted as a deletion target. Resolve and prove
+      # its parent immediately before rm so a traversal/symlink surprise
+      # cannot turn pruning into a live-state delete.
+      assert_release_target "$d"
       log "prune: removing old release $d"
       run rm -rf "$d"
     fi
   done
 }
 
+# The focused shell harness sources only the helpers above. This is deliberately
+# an opt-in no-op for a production invocation: it cannot cause a release cut.
+if [ "${MINI_RELEASE_CUT_TEST_LIB:-0}" = "1" ]; then
+  if [ "${BASH_SOURCE[0]}" != "$0" ]; then
+    return 0
+  fi
+  exit 0
+fi
+
 # ===========================================================================
 # MODE: rollback
 # ===========================================================================
+[ -d "$RELEASES_DIR" ] || die "releases dir missing: $RELEASES_DIR"
+RELEASES_DIR="$(canonical_existing_dir "$RELEASES_DIR")" \
+  || die "could not canonicalize releases dir: $RELEASES_DIR"
+PREV_FILE="$RELEASES_DIR/.previous"
+CUT_LOCK_DIR="$RELEASES_DIR/.mini-release-cut.lock"
+
+# This trap owns both failure cleanup and lock release. NEW_DIR remains empty
+# for an explicit rollback, so that mode only releases its lock.
+NEW_DIR=""
+# shellcheck disable=SC2329 # registered as an EXIT trap immediately below
+cleanup_on_exit() {
+  local status=$?
+  if [ "$status" -ne 0 ] && [ "$DRY_RUN" -ne 1 ] && [ -n "$NEW_DIR" ] && [ -e "$NEW_DIR" ]; then
+    local live=""
+    [ -L "$CURRENT_LINK" ] && live="$(readlink "$CURRENT_LINK")"
+    if [ "$live" != "$NEW_DIR" ]; then
+      # Prove the resolved parent immediately before removal, even on an
+      # error path where values may have been partially initialized.
+      assert_release_target "$NEW_DIR"
+      warn "cleanup: removing partially-built release dir: $NEW_DIR"
+      rm -rf "$NEW_DIR"
+    fi
+  fi
+  release_cut_lock
+  trap - EXIT
+  exit "$status"
+}
+
+acquire_cut_lock
+trap cleanup_on_exit EXIT
+
 if [ "$DO_ROLLBACK" -eq 1 ]; then
   [ -L "$CURRENT_LINK" ] || die "no runtime-current symlink at $CURRENT_LINK"
   rollback_to_previous "explicit --rollback"
@@ -354,7 +470,6 @@ fi
 # MODE: cut a new release
 # ===========================================================================
 [ -L "$CURRENT_LINK" ] || die "no runtime-current symlink at $CURRENT_LINK — refusing to bootstrap a layout from scratch"
-[ -d "$RELEASES_DIR" ] || die "releases dir missing: $RELEASES_DIR"
 command -v git  >/dev/null || die "git not found"
 command -v npm  >/dev/null || die "npm not found on PATH (expected /opt/homebrew/bin)"
 command -v uv   >/dev/null || warn "uv not found — will fall back to python venv+pip if needed"
@@ -383,37 +498,19 @@ SHORT_SHA="${SHA:0:12}"
 VERSION="$(git_current show "${SHA}:pyproject.toml" 2>/dev/null \
              | grep -m1 -E '^version = "' | sed -E 's/^version = "([^"]+)".*/\1/')"
 [ -n "$VERSION" ] || die "could not read [project] version from pyproject.toml at $SHA"
+valid_release_version "$VERSION" \
+  || die "invalid project version (must be an ASCII PEP 440-safe path component): $VERSION"
 log "version at target ref: $VERSION"
 
-NEW_DIR="$RELEASES_DIR/v${VERSION}-${SHORT_SHA}"
-assert_under_releases "$NEW_DIR"
+NEW_DIR="$(release_target "v${VERSION}-${SHORT_SHA}")"
+assert_release_target "$NEW_DIR"
 assert_not_forbidden "$NEW_DIR"
 
 # HARD SAFETY INVARIANT: never mutate an existing release in place.
-[ -e "$NEW_DIR" ] && die "target release dir already exists: $NEW_DIR (refusing in-place mutation)"
+{ [ -e "$NEW_DIR" ] || [ -L "$NEW_DIR" ]; } \
+  && die "target release dir already exists: $NEW_DIR (refusing in-place mutation)"
 
 log "new release dir: $NEW_DIR"
-
-# --- Failure cleanup: remove this run's partially-built release dir --------
-# If anything below fails (or the script is interrupted) before the cut
-# completes, remove ONLY the release dir this run created — and only if
-# runtime-current does not point at it (i.e. the cut never went live) — so a
-# failed run doesn't leave a half-built directory that blocks a retry (the
-# "already exists" in-place-mutation guard above would otherwise trip on the
-# same version+sha).
-cleanup_on_failure() {
-  local status=$?
-  if [ "$status" -ne 0 ] && [ "$DRY_RUN" -ne 1 ] && [ -e "$NEW_DIR" ]; then
-    local live=""
-    [ -L "$CURRENT_LINK" ] && live="$(readlink "$CURRENT_LINK")"
-    if [ "$live" != "$NEW_DIR" ]; then
-      warn "cleanup: removing partially-built release dir: $NEW_DIR"
-      rm -rf "$NEW_DIR"
-    fi
-  fi
-  return "$status"
-}
-trap cleanup_on_failure EXIT
 
 # --- Build ENTIRELY in the new dir before any switch -----------------------
 
@@ -446,6 +543,8 @@ clone_and_checkout() {
   fi
 
   log "clone ($desc): git clone --no-checkout $src $NEW_DIR"
+  # git clone creates NEW_DIR: prove its canonical parent immediately first.
+  assert_release_target "$NEW_DIR"
   run git clone --no-checkout "$src" "$NEW_DIR" || return 1
 
   if [ "$OFFLINE" -eq 1 ]; then
@@ -489,7 +588,8 @@ clone_and_checkout() {
 
 if ! clone_and_checkout; then
   warn "clone/checkout failed (possible git maintenance race, or a genuine object gap) — retrying once"
-  assert_under_releases "$NEW_DIR"
+  # Prove the resolved parent immediately before deleting the failed clone.
+  assert_release_target "$NEW_DIR"
   run rm -rf "$NEW_DIR"
   sleep 5
   clone_and_checkout \
@@ -565,11 +665,13 @@ fi
 
 # --- Record previous target for rollback (lives under releases/, allowed) --
 PREV_TARGET="$(readlink "$CURRENT_LINK")"
-assert_under_releases "$PREV_TARGET"
+assert_release_target "$PREV_TARGET"
 log "recording previous release for rollback: $PREV_TARGET → $PREV_FILE"
 if [ "$DRY_RUN" -eq 1 ]; then
   printf '\033[35m[DRY-RUN]\033[0m printf %%s %s > %s\n' "$PREV_TARGET" "$PREV_FILE"
 else
+  # .previous is a release-owned file; never let a malformed path escape it.
+  assert_regular_release_file "$PREV_FILE"
   printf '%s\n' "$PREV_TARGET" > "$PREV_FILE"
 fi
 

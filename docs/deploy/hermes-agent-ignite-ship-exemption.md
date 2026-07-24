@@ -58,7 +58,7 @@ What a cut does (see `scripts/MINI-RELEASE.md` for the authoritative detail):
    Refuses to run if the target dir already exists (no in-place mutation).
 2. **Verify importable** before any switch: `python -c "import hermes_cli.main"` and
    `hermes_cli/web_dist/index.html` present.
-3. **Atomic symlink flip** of `runtime-current` (`ln -sfn` temp + `mv -f`), recording
+3. **Atomic symlink flip** of `runtime-current` (`ln -sfn` temp + `mv -fh`), recording
    the prior target to `releases/.previous`.
 4. **Gateway restart + verify** (up to 60s): process running from the new release
    path, `Gateway running with N platform(s)` (N ≥ 2), `:8642` listening, then the

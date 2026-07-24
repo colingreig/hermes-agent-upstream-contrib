@@ -57,16 +57,17 @@ which is not on a non-interactive ssh PATH — the script extends PATH itself.
    `[project]` version from `pyproject.toml` **at that commit**.
 3. Name the new dir `releases/v<version>-<12charsha>`. **Refuse if it already
    exists** (no in-place mutation).
-4. Build **entirely in the new dir**: local clone from `runtime-current`
-   (offline-friendly — all fetched objects are already local), point `origin`
-   at the real remote URL, detached-checkout the sha, build the venv
+4. Build **entirely in the new dir**: full network clone from the real
+   `origin` URL (the default; it avoids inheriting missing blobs from the
+   blobless `runtime-current` clone), detached-checkout the sha, build the venv
    (`uv sync --extra all --locked`, falling back to `uv venv` + editable pip),
    build the web dist (`npm install && npm run build --workspace web` →
-   `hermes_cli/web_dist/`).
+   `hermes_cli/web_dist/`). `--offline` is the explicit, best-effort local
+   clone fallback; its integrity check must pass before it can be activated.
 5. **Verify the build before any switch**: `venv/bin/python -c "import
    hermes_cli.main"` and `hermes_cli/web_dist/index.html` present.
 6. Record the current symlink target to `releases/.previous`.
-7. **Atomic switch**: `ln -sfn` a temp symlink + `mv -f` over
+7. **Atomic switch**: `ln -sfn` a temp symlink + `mv -fh` over
    `runtime-current`, then `launchctl kickstart -k` the gateway.
 8. **Verify (up to 60s)**: gateway process running from the new release path,
    `Gateway running with N platform(s)` with N ≥ 2 in `gateway.log`, and
@@ -76,11 +77,20 @@ which is not on a non-interactive ssh PATH — the script extends PATH itself.
 
 ## Hard safety invariants (enforced in code, not comments)
 
-1. The build only ever writes **under `~/.hermes/releases/`**. Every candidate
-   path is asserted with `assert_under_releases` before use.
-2. The **only** writes outside `releases/` are (a) the atomic `runtime-current`
-   symlink repoint and (b) the `launchctl` restart — each funnelled through one
-   dedicated function.
+1. The build only ever writes **under `~/.hermes/releases/`**. Each release
+   target is reconstructed from a canonical `releases/` parent, and immediately
+   before every create or removal that resolved parent must equal `releases/`.
+   Version strings must be ASCII PEP 440-safe components: they begin with a
+   decimal digit and may contain only letters, digits, `.`, `!`, `+`, `_`, and
+   `-`; whitespace, controls, slashes, shell punctuation, and option-looking
+   values are rejected.
+2. Before a cut, `git fetch --prune origin` deliberately updates **Git metadata
+   only** in the existing `runtime-current` clone; this is the one operational
+   write outside `releases/` needed to resolve the requested ref. It never
+   changes that clone's checked-out worktree or live runtime state. The other
+   out-of-`releases/` actions are (a) the atomic `runtime-current` symlink
+   repoint and (b) the `launchctl` restart, each funnelled through dedicated
+   functions.
 3. It **never** touches `~/.hermes/{config.yaml,*.db,cron/,scripts/,logs/,
    recovery/}`, `~/.config`, or `~/Library/LaunchAgents` (guarded by
    `assert_not_forbidden`; `logs/` is read-only for verification only).
@@ -88,13 +98,17 @@ which is not on a non-interactive ssh PATH — the script extends PATH itself.
    mutates a release in place.
 5. It **refuses to bootstrap** a missing `runtime-current` symlink or
    `releases/` dir from scratch (that improvisation is what caused the incident).
-6. The symlink swap is **atomic** (`ln -sfn` temp + `mv -f` rename).
+6. The symlink swap is **atomic** (`ln -sfn` temp + `mv -fh` rename). `-h`
+   prevents BSD `mv` from following an existing symlink-to-directory.
 7. `.previous` (under `releases/`) records the rollback target; failed
    verification auto-rolls-back to it.
 8. Pruning keeps the newest **3** releases and **only runs on explicit
    `--prune`** — never by default, and never removes the active or previous
    release.
 9. `--dry-run` prints every mutating action and performs none.
+10. A `releases/.mini-release-cut.lock` directory is acquired atomically for
+    the full cut, rollback, or prune operation, so concurrent operators cannot
+    race a switch or cleanup.
 
 ## Rollback
 
@@ -104,5 +118,5 @@ which is not on a non-interactive ssh PATH — the script extends PATH itself.
 
 Repoints `runtime-current` to the release recorded in `releases/.previous`,
 restarts both services, and re-verifies. No build. If the rollback restart does
-not verify healthy it exits non-zero and asks for manual intervention rather
-than looping.
+not verify **both** gateway and dashboard health it exits non-zero and asks for
+manual intervention rather than looping.
