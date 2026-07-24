@@ -449,6 +449,19 @@ rollback_to_previous() {
   die "rollback restart did NOT verify healthy — MANUAL INTERVENTION REQUIRED (release: $prev)"
 }
 
+# A post-switch restart failure must be handled explicitly: under `set -e`, a
+# bare kickstart would otherwise exit before the new runtime target can be
+# rolled back. This helper always leaves a failed cut on the previous release
+# and still terminates nonzero after a successful rollback.
+kickstart_after_switch() {
+  local target="${1:-}" service="${2:-service}"
+  if ! kickstart "$target"; then
+    warn "$service did not restart on new release — rolling back"
+    rollback_to_previous "$service kickstart failed"
+    die "cut aborted and rolled back to previous release ($service kickstart failed)"
+  fi
+}
+
 # ---------------------------------------------------------------------------
 # Prune: keep the newest KEEP_RELEASES; never remove active or previous.
 # ---------------------------------------------------------------------------
@@ -753,7 +766,7 @@ fi
 # --- Switch: atomic symlink swap + restart + verify ------------------------
 GW_OFFSET="$(log_offset)"
 repoint_symlink "$NEW_DIR"
-kickstart "$GATEWAY_TARGET"
+kickstart_after_switch "$GATEWAY_TARGET" "gateway"
 
 if ! verify_gateway "$NEW_DIR" "$GW_OFFSET"; then
   warn "gateway did not verify healthy on new release — rolling back"
@@ -761,7 +774,7 @@ if ! verify_gateway "$NEW_DIR" "$GW_OFFSET"; then
   die "cut aborted and rolled back to previous release"
 fi
 
-kickstart "$DASHBOARD_TARGET"
+kickstart_after_switch "$DASHBOARD_TARGET" "dashboard"
 if ! verify_dashboard; then
   warn "dashboard did not verify healthy on new release — rolling back"
   rollback_to_previous "dashboard verify failed"

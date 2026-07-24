@@ -102,4 +102,33 @@ if (
   fail 'rollback returned success despite dashboard health failure'
 fi
 
+# Either service can fail to kickstart immediately after runtime-current is
+# switched. Both failures must restore the recorded previous target and still
+# report a failed cut after rollback succeeds.
+NEW_RELEASE="$RELEASES_DIR/v1.2.4-abcdef123456"
+mkdir "$NEW_RELEASE"
+for failed_service in gateway dashboard; do
+  repoint_symlink "$NEW_RELEASE" >/dev/null
+  failed_target="$GATEWAY_TARGET"
+  [ "$failed_service" = dashboard ] && failed_target="$DASHBOARD_TARGET"
+  if (
+    kickstart_calls=0
+    # Fail only the post-switch restart; rollback restarts then succeed.
+    # shellcheck disable=SC2329 # invoked by kickstart_after_switch/rollback_to_previous.
+    kickstart() {
+      kickstart_calls=$((kickstart_calls + 1))
+      [ "$kickstart_calls" -ne 1 ]
+    }
+    # shellcheck disable=SC2329 # invoked indirectly by rollback_to_previous.
+    verify_gateway() { return 0; }
+    # shellcheck disable=SC2329 # invoked indirectly by rollback_to_previous.
+    verify_dashboard() { return 0; }
+    kickstart_after_switch "$failed_target" "$failed_service"
+  ) >/dev/null 2>&1; then
+    fail "$failed_service kickstart failure returned success after rollback"
+  fi
+  [ "$(readlink "$CURRENT_LINK")" = "$PREVIOUS_RELEASE" ] \
+    || fail "$failed_service kickstart failure left runtime-current on the new release"
+done
+
 printf 'mini-release-cut safety checks passed\n'
