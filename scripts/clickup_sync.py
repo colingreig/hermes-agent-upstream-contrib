@@ -56,7 +56,16 @@ _BLOCKLIST_CACHE: Optional[Dict[str, Any]] = None
 
 
 def _token() -> str:
-    token = os.environ.get("CLICKUP_API_TOKEN", "").strip()
+    value = None
+    try:
+        from agent import lazy_secret_resolver
+
+        value = lazy_secret_resolver.get("CLICKUP_API_TOKEN")
+    except Exception:
+        value = None
+    if not value:
+        value = os.environ.get("CLICKUP_API_TOKEN", "")
+    token = value.strip()
     if not token:
         print("ERROR: CLICKUP_API_TOKEN not set in env", file=sys.stderr)
         raise RuntimeError("CLICKUP_API_TOKEN missing")

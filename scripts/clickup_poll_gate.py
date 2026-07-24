@@ -265,7 +265,16 @@ RECOVERY_MAX = 10                  # max direct GETs per empty-scan recovery
 
 
 def _token():
-    return os.environ.get("CLICKUP_API_TOKEN", "").strip()
+    value = None
+    try:
+        from agent import lazy_secret_resolver
+
+        value = lazy_secret_resolver.get("CLICKUP_API_TOKEN")
+    except Exception:
+        value = None
+    if not value:
+        value = os.environ.get("CLICKUP_API_TOKEN", "")
+    return value.strip()
 
 
 def _get(url):
