@@ -42,7 +42,7 @@ from hermes_constants import display_hermes_home, get_hermes_home  # noqa: E402
 
 API = "https://api.clickup.com/api/v2"
 DEFAULT_TEAM_ID = "9017245888"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 REFRESH_TTL_SECONDS = 6 * 60 * 60
 TASK_LOOKBACK_DAYS = 7
 TASK_PAGE_LIMIT = 10
@@ -315,9 +315,18 @@ def fetch_list_fields(list_id: str) -> list[dict[str, Any]]:
     return _LIST_FIELDS_CACHE[list_id]
 
 
-def fetch_recent_task_tags(team_id: str, lookback_days: int = TASK_LOOKBACK_DAYS) -> tuple[Counter, int]:
+def fetch_recent_task_tags(
+    team_id: str, lookback_days: int = TASK_LOOKBACK_DAYS
+) -> tuple[Counter, int, list[dict[str, Any]]]:
+    """Return the recent tag sample plus observed per-list assignment patterns.
+
+    The workspace endpoint already returns task assignees and list metadata, so
+    capture the assignment view during the existing bounded task walk rather
+    than spending another API budget on a second, duplicate scan.
+    """
     counter: Counter = Counter()
     total_seen = 0
+    assignment_counts: dict[str, dict[str, Any]] = {}
     cutoff_ms = int((_now_utc().timestamp() - lookback_days * 86400) * 1000)
     for page in range(TASK_PAGE_LIMIT):
         data = _get(
@@ -333,9 +342,45 @@ def fetch_recent_task_tags(team_id: str, lookback_days: int = TASK_LOOKBACK_DAYS
                 name = tag.get("name")
                 if name:
                     counter[name] += 1
+            list_data = task.get("list") or {}
+            list_id = str(list_data.get("id") or "unknown")
+            pattern = assignment_counts.setdefault(
+                list_id,
+                {
+                    "list_id": list_id,
+                    "list_name": list_data.get("name") or "(unknown list)",
+                    "sampled_task_count": 0,
+                    "assignees": Counter(),
+                },
+            )
+            pattern["sampled_task_count"] += 1
+            assignees = task.get("assignees") or []
+            if assignees:
+                for assignee in assignees:
+                    name = assignee.get("username") or assignee.get("email") or assignee.get("id")
+                    if name:
+                        pattern["assignees"][str(name)] += 1
+            else:
+                pattern["assignees"]["(unassigned)"] += 1
         if data.get("last_page"):
             break
-    return counter, total_seen
+    patterns = [
+        {
+            "list_id": pattern["list_id"],
+            "list_name": pattern["list_name"],
+            "sampled_task_count": pattern["sampled_task_count"],
+            "assignees": [
+                {"name": name, "count": count}
+                for name, count in sorted(
+                    pattern["assignees"].items(), key=lambda item: (-item[1], item[0])
+                )
+            ],
+        }
+        for pattern in assignment_counts.values()
+    ]
+    return counter, total_seen, sorted(
+        patterns, key=lambda item: (item["list_name"], item["list_id"])
+    )
 
 
 def _normalize_status(status: dict[str, Any]) -> dict[str, Any]:
@@ -488,7 +533,9 @@ def build_workspace_map(team_id: str) -> dict[str, Any]:
     _LIST_FIELDS_CACHE.clear()
 
     spaces_raw = sorted(fetch_spaces(team_id), key=lambda item: (item.get("name", ""), str(item.get("id", ""))))
-    recent_tags, recent_task_count = fetch_recent_task_tags(team_id)
+    task_sample = fetch_recent_task_tags(team_id)
+    recent_tags, recent_task_count = task_sample[:2]
+    assignment_patterns = task_sample[2] if len(task_sample) > 2 else []
 
     spaces: list[dict[str, Any]] = []
     folders: list[dict[str, Any]] = []
@@ -612,6 +659,18 @@ def build_workspace_map(team_id: str) -> dict[str, Any]:
                 for name, count in sorted(recent_tags.items(), key=lambda item: (-item[1], item[0]))
             ],
         },
+        "assignment_patterns": assignment_patterns,
+        "write_boundaries": [
+            {
+                "list_id": list_row["id"],
+                "list_name": list_row["name"],
+                "permission_level": list_row.get("permission_level") or "unknown",
+                "evidence": "GET /list/{id} permission_level (read-only snapshot)".format(
+                    id=list_row["id"]
+                ),
+            }
+            for list_row in lists
+        ],
         "clients_aliases": build_clients_aliases(spaces, folders, lists),
     }
 
@@ -642,6 +701,8 @@ def render_markdown_mirror(workspace_map: dict[str, Any]) -> str:
     generated_iso = workspace_map.get("generated_at_iso") or _iso_utc(workspace_map.get("generated_at"))
     out.append(f"# ClickUp workspace map (auto-generated {generated_iso})")
     out.append("")
+    out.append("## Header")
+    out.append("")
     out.append(f"**Team ID:** `{workspace_map['team_id']}`  ")
     out.append(f"**Schema version:** `{workspace_map['schema_version']}`  ")
     out.append(f"**Refresh cadence:** {_format_cadence_text(workspace_map)}  ")
@@ -649,6 +710,14 @@ def render_markdown_mirror(workspace_map: dict[str, Any]) -> str:
     out.append("")
     out.append(f"**Root cause note ({_ROOT_CAUSE_DATE}):** {workspace_map.get('root_cause_note_2026_07_09', ROOT_CAUSE_NOTE_2026_07_09)}")
     out.append("")
+    aliases = workspace_map.get("clients_aliases") or {}
+    if aliases:
+        out.append(
+            "**Known client aliases:** "
+            + ", ".join(sorted(aliases))
+            + ""
+        )
+        out.append("")
 
     out.append("## Spaces")
     out.append("")
@@ -697,7 +766,11 @@ def render_markdown_mirror(workspace_map: dict[str, Any]) -> str:
         )
         out.append(f"- Archived: {list_row.get('archived')}")
         out.append("")
-        out.append("**Statuses:**")
+
+    out.append("## Statuses per list")
+    out.append("")
+    for list_row in workspace_map.get("lists", []):
+        out.append(f"### {list_row.get('name')} (`{list_row.get('id')}`)")
         out.append("")
         out.append("| status | type | orderindex | color |")
         out.append("|--------|------|------------|-------|")
@@ -705,8 +778,14 @@ def render_markdown_mirror(workspace_map: dict[str, Any]) -> str:
             out.append(
                 f"| {status.get('status')} | {status.get('type')} | {status.get('orderindex')} | {status.get('color')} |"
             )
+        if not list_row.get("statuses"):
+            out.append("| _(none returned)_ |  |  |  |")
         out.append("")
-        out.append("**Custom fields:**")
+
+    out.append("## Custom fields per list")
+    out.append("")
+    for list_row in workspace_map.get("lists", []):
+        out.append(f"### {list_row.get('name')} (`{list_row.get('id')}`)")
         out.append("")
         out.append("| name | type | required | metadata |")
         out.append("|------|------|----------|----------|")
@@ -720,7 +799,7 @@ def render_markdown_mirror(workspace_map: dict[str, Any]) -> str:
         out.append("")
 
     tags = workspace_map.get("task_tags") or {}
-    out.append("## Task tags")
+    out.append("## Tag taxonomy")
     out.append("")
     out.append(
         f"_Sampled {tags.get('sampled_task_count', 0)} task(s) updated in the last {tags.get('lookback_days', TASK_LOOKBACK_DAYS)} days._"
@@ -735,13 +814,46 @@ def render_markdown_mirror(workspace_map: dict[str, Any]) -> str:
         out.append("_(no tags observed in the sample window)_")
     out.append("")
 
-    out.append("## Client aliases")
+    out.append("## Assignment patterns")
     out.append("")
-    out.append("| alias | refs |")
-    out.append("|-------|------|")
-    for alias, refs in workspace_map.get("clients_aliases", {}).items():
-        rendered_refs = "; ".join(f"{ref['kind']}:{ref['name']}" for ref in refs)
-        out.append(f"| {alias} | {rendered_refs} |")
+    out.append("_Observed in the same recent task sample as the tag taxonomy; this is descriptive, not an assignment policy._")
+    out.append("")
+    out.append("| list | sampled tasks | observed assignees |")
+    out.append("|------|---------------|--------------------|")
+    for pattern in workspace_map.get("assignment_patterns") or []:
+        rendered_assignees = ", ".join(
+            f"{assignee.get('name')} ({assignee.get('count')})"
+            for assignee in pattern.get("assignees") or []
+        ) or "(none)"
+        out.append(
+            f"| {pattern.get('list_name')} (`{pattern.get('list_id')}`) | "
+            f"{pattern.get('sampled_task_count')} | {rendered_assignees} |"
+        )
+    if not workspace_map.get("assignment_patterns"):
+        out.append("| _(no recent tasks sampled)_ | 0 |  |")
+    out.append("")
+
+    out.append("## Last-known write boundaries")
+    out.append("")
+    out.append("_Read-only observation from the ClickUp list metadata; this refresh does not attempt writes._")
+    out.append("")
+    out.append("| list | permission level | evidence |")
+    out.append("|------|------------------|----------|")
+    for boundary in workspace_map.get("write_boundaries") or []:
+        out.append(
+            f"| {boundary.get('list_name')} (`{boundary.get('list_id')}`) | "
+            f"{boundary.get('permission_level')} | {boundary.get('evidence')} |"
+        )
+    if not workspace_map.get("write_boundaries"):
+        out.append("| _(no lists returned)_ | unknown |  |")
+    out.append("")
+
+    out.append("## Refresh notes")
+    out.append("")
+    out.append(f"- Generated at: `{generated_iso}`")
+    out.append(f"- Cron source: `{workspace_map.get('refresh_cadence_source', 'unknown')}`")
+    out.append(f"- Drift log: `{display_hermes_home()}/state/clickup_topology_drift.jsonl`")
+    out.append("- This job is read-only against ClickUp; it only updates the local cache and this canonical note.")
     out.append("")
     return "\n".join(out)
 
