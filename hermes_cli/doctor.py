@@ -155,6 +155,19 @@ _NEGATION_CUE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# A durable policy can state the initial state without spelling out the whole
+# Prep gate: "New/captured tasks have no agent-ready or prepped tag."  This is
+# a factual no-tag rule, not an instruction to add the tag.  Keep this narrow
+# and anchored so a sentence that goes on to tell the agent to add
+# ``agent-ready`` is still reported as stale.
+_FRESH_TASK_NO_READY_TAG_PATTERN = re.compile(
+    r"(?:new|captured)(?:\s*/\s*(?:new|captured))?\s+tasks?\s+"
+    r"(?:have|has|start(?:s)?)\s+(?:with\s+)?(?:no|neither)\s+"
+    r"(?:(?:agent-ready|prepped)\s+(?:or|nor)\s+(?:agent-ready|prepped)"
+    r"|(?:agent-ready|prepped))(?:\s+tags?)?\s*[.!?]?",
+    re.IGNORECASE,
+)
+
 
 def _detects_stale_agent_ready_instruction(content: str) -> str | None:
     """Return the offending sentence if ``content`` instructs self-tagging a
@@ -165,10 +178,11 @@ def _detects_stale_agent_ready_instruction(content: str) -> str | None:
     sentence is flagged only when it mentions BOTH the literal "agent-ready"
     tag AND task-creation/capture language, AND does NOT also reference the
     gating concept (Execution Brief / ignite-prep / model floor /
-    predecessor) in that same sentence, AND does NOT contain a negation cue
-    (never / don't / shouldn't / must not / no longer) that indicates the
-    sentence is telling the agent NOT to self-tag. This favors a low
-    false-positive rate over perfect recall.
+    predecessor) in that same sentence, AND is not a bare factual initial-tag
+    policy ("new/captured tasks have no agent-ready or prepped tag"), AND does
+    NOT contain a negation cue (never / don't / shouldn't / must not / no
+    longer) that indicates the sentence is telling the agent NOT to self-tag.
+    This favors a low false-positive rate over perfect recall.
     """
     if not content or "agent-ready" not in content.lower():
         return None
@@ -178,6 +192,8 @@ def _detects_stale_agent_ready_instruction(content: str) -> str | None:
     for sentence in sentences:
         sentence = sentence.strip()
         if not sentence:
+            continue
+        if _FRESH_TASK_NO_READY_TAG_PATTERN.fullmatch(sentence):
             continue
         if (
             _AGENT_READY_MENTION_PATTERN.search(sentence)
