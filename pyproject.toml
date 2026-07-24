@@ -82,6 +82,17 @@ dependencies = [
   # — so a lock-based `uv sync --locked` venv rebuild silently dropped it and
   # put both services into the same boot-crash loop again (2026-07-08).
   "onepassword-sdk==0.4.0",
+  # 1Password Connect SDK (scripts/op_sdk_resolve.py, imported as
+  # `onepasswordconnectsdk`). Added 2026-07-24: the resolver now prefers a
+  # locally-run Connect server (OP_CONNECT_HOST/token) over the cloud
+  # service-account SDK above, because Connect serves from a locally-synced
+  # vault copy and is NOT subject to the cloud account's daily rate limit (the
+  # ~13h lockout HERMES-PATCH 31 was built to survive). Like onepassword-sdk it
+  # is on every gateway boot path, so it belongs in core deps — declaring it
+  # here (and in uv.lock) is what stops a `uv sync --locked` release rebuild
+  # from silently dropping it and reverting every boot to the rate-limited
+  # cloud path (the exact failure the onepassword-sdk comment above records).
+  "onepasswordconnectsdk==2.1.0",
   # Markdown -> HTML conversion for rich message delivery (Matrix
   # `formatted_body`, and the `send_message` tool's HTML path). Now on the
   # DEFAULT delivery path, not matrix-specific: without it both

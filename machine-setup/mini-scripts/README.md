@@ -32,8 +32,14 @@ vs this copy) to catch drift — nothing currently automates that check.
 
 ## Files
 
-- `op_sdk_resolve.py` — resolves `op://` secret references via the 1Password
-  service-account SDK for `gateway_secrets_wrap.sh` and cron/sentinel scripts.
+- `op_sdk_resolve.py` — resolves `op://` secret references for
+  `gateway_secrets_wrap.sh` and cron/sentinel scripts. **Connect-first since
+  2026-07-24**: prefers a locally-run 1Password Connect server (see
+  `op-connect/`) and falls back to the cloud service-account SDK only when
+  Connect is down or a ref is outside the Connect token's vault scope — this
+  moves routine resolution off the rate-limited cloud account. Verified live:
+  the gateway boot fetches all 142 secrets from both vaults through Connect
+  (`127.0.0.1:8080`) with zero cloud calls.
   Restored 2026-07-21 with the HERMES-PATCH 31 resilience layer (cache,
   retry/backoff, serve-stale, id-fast-path) re-added from the original spec
   in ClickUp 86e2a99q9 after the 2026-07-19 loss; live-verified (142/142

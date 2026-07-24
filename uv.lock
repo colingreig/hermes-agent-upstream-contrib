@@ -1529,6 +1529,7 @@ dependencies = [
     { name = "jinja2" },
     { name = "markdown" },
     { name = "onepassword-sdk" },
+    { name = "onepasswordconnectsdk" },
     { name = "openai" },
     { name = "packaging" },
     { name = "pathspec" },
@@ -1808,6 +1809,7 @@ requires-dist = [
     { name = "nemo-relay", marker = "extra == 'nemo-relay'", specifier = "==0.3" },
     { name = "numpy", marker = "extra == 'voice'", specifier = "==2.4.3" },
     { name = "onepassword-sdk", specifier = "==0.4.0" },
+    { name = "onepasswordconnectsdk", specifier = "==2.1.0" },
     { name = "openai", specifier = "==2.24.0" },
     { name = "packaging", specifier = "==26.0" },
     { name = "parallel-web", marker = "extra == 'parallel-web'", specifier = "==0.4.2" },
@@ -2770,6 +2772,19 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/c4/d4/404da62326bea04ade970dc88c7b556b756edb79f51b49a017f33b3ecfe8/onepassword_sdk-0.4.0-cp313-cp313-manylinux_2_32_aarch64.whl", hash = "sha256:1ff3a24575f0489a9f51bf6900df69ab902b08f35158e6fd3bdfb9d3ca63b131", size = 7083607, upload-time = "2026-02-10T11:51:49.651Z" },
     { url = "https://files.pythonhosted.org/packages/d7/f8/5be5ee156456d88903f5ac965ce5d00cbfbb06643bbdad305311f97e8f1a/onepassword_sdk-0.4.0-cp313-cp313-manylinux_2_32_x86_64.whl", hash = "sha256:6e1775ec247401e8be5c8e31b334d01948c543312e0cbdcbcb49dab03e526d19", size = 7285841, upload-time = "2026-02-10T11:51:51.8Z" },
     { url = "https://files.pythonhosted.org/packages/ca/9c/d5e95cfa7495127f962f171ab8e0fd7daaa91c7c0c9281b500d3c0af74bc/onepassword_sdk-0.4.0-cp313-cp313-win_amd64.whl", hash = "sha256:35ba70572af64f0b5736f4673120e7931e58c7c7008fc1fc8f27b21923bdf65d", size = 6115146, upload-time = "2026-02-10T11:51:53.628Z" },
+]
+
+[[package]]
+name = "onepasswordconnectsdk"
+version = "2.1.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "httpx" },
+    { name = "python-dateutil" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/30/4c/584888d2966e40f79ffbdc2a7295bfdca56ee17f34c9be4f146a718882a3/onepasswordconnectsdk-2.1.0.tar.gz", hash = "sha256:63f0037b4272416bc8a0d1f31a2d56dcce64ac111705c0826adc201da76ce33c", size = 18681, upload-time = "2026-05-06T13:14:00.061Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/c4/7d/3e4b7da9c6b5ca59091ed2fb585a650423314c165423ecaa1dc443747f1b/onepasswordconnectsdk-2.1.0-py3-none-any.whl", hash = "sha256:6e7816546ac1bb2d1b3ee5353b6e599932f098bedf1f211935ca8e3f8f9a8684", size = 34750, upload-time = "2026-05-06T13:13:58.852Z" },
 ]
 
 [[package]]

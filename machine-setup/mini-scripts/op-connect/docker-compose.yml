@@ -1,0 +1,25 @@
+# 1Password Connect — local secrets server for the Hermes Mac mini.
+# Bound to 127.0.0.1 only (never exposed on the network). Provides local,
+# no-approval, no-cloud-rate-limit secret resolution as the primary path;
+# op_sdk_resolve.py falls back to the cloud service account if this is down.
+services:
+  op-connect-api:
+    image: 1password/connect-api:latest
+    container_name: op-connect-api
+    restart: always
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - "./1password-credentials.json:/home/opuser/.op/1password-credentials.json"
+      - "op-connect-data:/home/opuser/.op/data"
+
+  op-connect-sync:
+    image: 1password/connect-sync:latest
+    container_name: op-connect-sync
+    restart: always
+    volumes:
+      - "./1password-credentials.json:/home/opuser/.op/1password-credentials.json"
+      - "op-connect-data:/home/opuser/.op/data"
+
+volumes:
+  op-connect-data:
