@@ -310,6 +310,42 @@ class TestAuthCredentialPoolFallback:
         # dead_entry is skipped outright — lazy resolution is never even tried on it
         mock_lazy.assert_not_called()
 
+    def test_peek_excludes_future_exhausted_fingerprint_entry_does_not_lazy_resolve(
+        self, isolated_hermes_home
+    ):
+        """86e29q8mz: raw fallback must retain the pool's exhaustion cooldown.
+
+        A fingerprint-only entry is intentionally absent from ``peek()`` because
+        it lacks an eager runtime key.  That exclusion permits the lazy path,
+        but a future provider reset time still makes the entry unavailable.
+        """
+        import time
+
+        exhausted_entry = MagicMock()
+        exhausted_entry.last_status = "exhausted"
+        exhausted_entry.last_error_reset_at = time.time() + 3600
+        exhausted_entry.last_status_at = time.time()
+        exhausted_entry.last_error_code = 429
+
+        mock_pool = MagicMock()
+        mock_pool.has_credentials.return_value = True
+        mock_pool.peek.return_value = None
+        mock_pool.entries.return_value = [exhausted_entry]
+
+        from hermes_cli.auth import _resolve_api_key_provider_secret
+        with patch("agent.credential_pool.load_pool", return_value=mock_pool):
+            with patch(
+                "hermes_cli.auth._resolve_pool_entry_lazy",
+                return_value="lazy-resolved-gemini-key",
+            ) as mock_lazy:
+                key, source = _resolve_api_key_provider_secret(
+                    provider_id="gemini",
+                    pconfig=_make_pconfig(provider_id="gemini"),
+                )
+
+        assert (key, source) == ("", "")
+        mock_lazy.assert_not_called()
+
 
 class TestAnthropicEnvAuthTypeClassification:
     """_seed_from_env must classify Anthropic env tokens by the sk-ant-oat prefix.

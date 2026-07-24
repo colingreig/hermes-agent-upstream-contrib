@@ -1,7 +1,20 @@
 import json
+from pathlib import Path
 from unittest.mock import patch
 
+import yaml
+
 from hermes_cli.codex_models import DEFAULT_CODEX_MODELS, get_codex_model_ids
+
+
+_CHAT_DEFAULT_FIXTURE = (
+    Path(__file__).parents[1] / "fixtures" / "chat-default-model.yaml"
+)
+
+
+def _load_chat_default_fixture():
+    config = yaml.safe_load(_CHAT_DEFAULT_FIXTURE.read_text(encoding="utf-8"))
+    return config["model"]
 
 
 def test_get_codex_model_ids_prioritizes_default_and_cache(tmp_path, monkeypatch):
@@ -38,9 +51,11 @@ def test_get_codex_model_ids_prioritizes_default_and_cache(tmp_path, monkeypatch
 
 
 def test_curated_models_include_configured_chat_and_low_cost_options():
-    """The offline picker needs both deployed policy options, without
+    """The offline picker needs the versioned full and cheap policy options, without
     snapshotting a vendor-owned model catalog or prescribing its order."""
-    assert {"gpt-5.5", "gpt-5.4-mini"}.issubset(DEFAULT_CODEX_MODELS)
+    configured_default = _load_chat_default_fixture()["default"]
+    cheap_option = "gpt-5.4-mini"
+    assert {configured_default, cheap_option}.issubset(DEFAULT_CODEX_MODELS)
     assert len(DEFAULT_CODEX_MODELS) == len(set(DEFAULT_CODEX_MODELS))
 
 
