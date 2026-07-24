@@ -1,0 +1,7 @@
+# A representative interactive Hermes profile used by the default-model
+# regression tests. It is deliberately versioned in the repository rather
+# than copied from a running installation, whose model availability and
+# configuration can change independently of a release.
+model:
+  default: gpt-5.5
+  provider: openai-codex

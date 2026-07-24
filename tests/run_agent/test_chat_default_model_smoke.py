@@ -1,19 +1,50 @@
-"""Local chat-turn verification for the interactive Hermes chat default
-model (86e28mq8g, docs/chat-default-model.md).
+"""Local chat-turn verification for the interactive Hermes chat baseline
+(86e28mq8g, docs/chat-default-model.md).
 
-Drives a real AIAgent turn configured exactly like the mini's live
-~/.hermes/config.yaml (model=gpt-5.5, provider=openai-codex,
-api_mode=codex_app_server), using a wire-level fake Codex client rather than
-stubbing CodexAppServerSession.run_turn. This proves the configured model
-reaches the stable app-server thread/start request and a turn completes end
-to end without live credentials or network access.
+Drives a real AIAgent turn from the versioned profile fixture
+(``tests/fixtures/chat-default-model.yaml``) using a wire-level fake Codex
+client rather than stubbing CodexAppServerSession.run_turn. This proves the
+configured model reaches the stable app-server thread/start request and a turn
+completes end to end without live credentials or network access.
 """
 
 from __future__ import annotations
 
+from pathlib import Path
+import re
 from unittest.mock import patch
 
 import run_agent
+import yaml
+
+
+_CHAT_DEFAULT_FIXTURE = (
+    Path(__file__).parents[1] / "fixtures" / "chat-default-model.yaml"
+)
+_CHAT_DEFAULT_DOC = (
+    Path(__file__).parents[2] / "docs" / "chat-default-model.md"
+)
+
+
+def _load_chat_default_fixture():
+    config = yaml.safe_load(_CHAT_DEFAULT_FIXTURE.read_text(encoding="utf-8"))
+    model_config = config["model"]
+    return model_config["default"], model_config["provider"]
+
+
+def test_documented_chat_baseline_matches_versioned_fixture():
+    """The documented baseline must track the testable configuration fixture."""
+    model, provider = _load_chat_default_fixture()
+    document = _CHAT_DEFAULT_DOC.read_text(encoding="utf-8")
+    match = re.search(
+        r"<!-- chat-default-fixture:start -->\s*```yaml\s*(.*?)\s*```\s*"
+        r"<!-- chat-default-fixture:end -->",
+        document,
+        flags=re.DOTALL,
+    )
+    assert match is not None
+    documented = yaml.safe_load(match.group(1))
+    assert documented["model"] == {"default": model, "provider": provider}
 
 
 class RecordingCodexClient:
@@ -89,15 +120,14 @@ class RecordingCodexClient:
 
 
 def test_chat_turn_sends_the_configured_default_to_codex_app_server(monkeypatch):
-    """gpt-5.5 / openai-codex / codex_app_server — the exact live mini
-    configuration (docs/chat-default-model.md) — completes a real chat
-    turn through AIAgent.run_conversation()."""
+    """The versioned profile fixture completes a real Codex chat turn."""
+    model, provider = _load_chat_default_fixture()
     agent = run_agent.AIAgent(
         api_key="stub",
         base_url="https://chatgpt.com/backend-api/codex",
-        provider="openai-codex",
+        provider=provider,
         api_mode="codex_app_server",
-        model="gpt-5.5",
+        model=model,
         quiet_mode=True,
         skip_context_files=True,
         skip_memory=True,
@@ -105,8 +135,8 @@ def test_chat_turn_sends_the_configured_default_to_codex_app_server(monkeypatch)
 
     # The configured default survives construction (and provider normalization)
     # unchanged, then must reach the real session's thread/start request.
-    assert agent.model == "gpt-5.5"
-    assert agent.provider == "openai-codex"
+    assert agent.model == model
+    assert agent.provider == provider
 
     RecordingCodexClient.instances.clear()
     monkeypatch.setattr(
