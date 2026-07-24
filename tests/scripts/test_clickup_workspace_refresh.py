@@ -79,6 +79,8 @@ def test_build_workspace_map_captures_schema_and_aliases(monkeypatch):
     assert list_by_id["list-1"]["statuses"][0]["type"] == "open"
     assert list_by_id["list-1"]["custom_fields"][0]["metadata"]["options"][0]["name"] == "Content"
     assert workspace_map["task_tags"]["tags"][0] == {"name": "agent-ready", "count": 1}
+    assert workspace_map["assignment_patterns"] == []
+    assert workspace_map["write_boundaries"][0]["permission_level"] == "edit"
     assert "advantive-com" in workspace_map["clients_aliases"]
 
 
@@ -398,6 +400,58 @@ def test_render_markdown_mirror_reflects_a_changed_cadence_and_keeps_root_cause_
     assert "every 6 hours" not in markdown
     assert "2026-07-09" in markdown
     assert refresh_mod.ROOT_CAUSE_NOTE_2026_07_09 in markdown
+    for section in (
+        "Header",
+        "Spaces",
+        "Folders",
+        "Lists",
+        "Statuses per list",
+        "Custom fields per list",
+        "Tag taxonomy",
+        "Assignment patterns",
+        "Last-known write boundaries",
+        "Refresh notes",
+    ):
+        assert f"## {section}" in markdown
+
+
+def test_recent_task_sample_includes_assignment_patterns(monkeypatch):
+    monkeypatch.setattr(refresh_mod, "_now_utc", lambda: refresh_mod.dt.datetime.fromtimestamp(123, tz=refresh_mod.dt.timezone.utc))
+    monkeypatch.setattr(
+        refresh_mod,
+        "_get",
+        lambda _path: {
+            "tasks": [
+                {
+                    "list": {"id": "list-1", "name": "Product Build"},
+                    "tags": [{"name": "agent-ready"}],
+                    "assignees": [{"username": "Colin"}],
+                },
+                {
+                    "list": {"id": "list-1", "name": "Product Build"},
+                    "tags": [],
+                    "assignees": [],
+                },
+            ],
+            "last_page": True,
+        },
+    )
+
+    tags, task_count, patterns = refresh_mod.fetch_recent_task_tags("team-1")
+
+    assert tags == {"agent-ready": 1}
+    assert task_count == 2
+    assert patterns == [
+        {
+            "list_id": "list-1",
+            "list_name": "Product Build",
+            "sampled_task_count": 2,
+            "assignees": [
+                {"name": "(unassigned)", "count": 1},
+                {"name": "Colin", "count": 1},
+            ],
+        }
+    ]
 
 
 class TestResolveClickupToken:
