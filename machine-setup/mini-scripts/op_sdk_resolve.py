@@ -61,6 +61,102 @@ TOKEN_FILE = os.path.expanduser("~/.config/op-runtime-token")
 INTEGRATION_NAME = "hermes-gateway"
 INTEGRATION_VERSION = "v1.0.0"
 
+# --- 1Password Connect (local server) primary backend ------------------------
+# Prefer a locally-run Connect server over the cloud service-account SDK. Connect
+# serves secrets from a locally-synced copy of the granted vaults, so it is NOT
+# subject to the cloud service account's daily rate limit — the ~13h lockout that
+# HERMES-PATCH 31's cache/retry/serve-stale layer was built to survive. Connect
+# is detected via OP_CONNECT_HOST/OP_CONNECT_TOKEN (or the token file below); when
+# it is unavailable, or a ref falls outside the Connect token's vault scope, the
+# cloud service-account path is used automatically as a fallback. Deployed for
+# ClickUp 86e2… (2026-07-24): server "hermes-mini", vaults Dev Toolbox +
+# hermes-agent, bound to 127.0.0.1:8080 via ~/.config/op-connect/docker-compose.yml.
+CONNECT_TOKEN_FILE = os.path.expanduser("~/.config/op-connect/connect-token")
+CONNECT_DEFAULT_HOST = "http://localhost:8080"
+
+
+def _connect_creds() -> "tuple[str, str] | None":
+    """Return (host, token) if a local Connect server looks configured, else None.
+
+    Reads OP_CONNECT_TOKEN from the environment first (the gateway plist/wrapper
+    sets it), then falls back to the on-disk token file so an interactive shell
+    or cron job with neither env var still uses Connect. Host defaults to
+    localhost:8080 when only the token is present."""
+    token = os.environ.get("OP_CONNECT_TOKEN")
+    if not token:
+        try:
+            token = open(CONNECT_TOKEN_FILE, encoding="utf-8").read().strip()
+        except OSError:
+            token = None
+    if not token:
+        return None
+    host = os.environ.get("OP_CONNECT_HOST") or CONNECT_DEFAULT_HOST
+    return host, token
+
+
+def _resolve_by_ref_connect(host: str, token: str, refs: list[str]) -> dict[str, str]:
+    """Resolve op:// refs against a local Connect server.
+
+    Groups refs by (vault, item) so each item is fetched exactly once (the
+    Dev Toolbox "dev" item alone backs ~120 refs), then matches each ref's final
+    segment against a field's id or label. Refs Connect can't serve — outside the
+    token's vault scope, missing item/field, or empty value — are simply omitted
+    from the result so the caller can fall the remainder back to the cloud path.
+    Runs synchronously (the Connect SDK is sync); call via asyncio.to_thread."""
+    from collections import defaultdict
+    from onepasswordconnectsdk.client import new_client
+
+    client = new_client(host, token)
+    vmap: dict[str, str] = {}
+    for v in client.get_vaults():
+        vid = getattr(v, "id", None)
+        if vid is None:
+            continue
+        vmap[vid] = vid
+        name = getattr(v, "name", None)
+        if name:
+            vmap[name] = vid
+
+    groups: "dict[tuple[str, str], list[tuple[str, str]]]" = defaultdict(list)
+    for ref in refs:
+        rest = ref[len("op://"):] if ref.startswith("op://") else ref
+        parts = rest.split("/")
+        if len(parts) < 3:
+            continue
+        vault, item, field = parts[0], parts[1], "/".join(parts[2:])
+        groups[(vault, item)].append((ref, field))
+
+    out: dict[str, str] = {}
+    for (vault, item), members in groups.items():
+        vault_id = vmap.get(vault, vault)
+        try:
+            obj = client.get_item(item, vault_id)
+        except Exception as exc:  # noqa: BLE001 — per-item fail-open; cloud covers it
+            sys.stderr.write(
+                f"[op_sdk_resolve] Connect get_item failed for {vault}/{item} ({exc!r})\n"
+            )
+            continue
+        by_id: dict[str, str] = {}
+        by_label: dict[str, str] = {}
+        for f in getattr(obj, "fields", None) or []:
+            val = getattr(f, "value", None)
+            if not isinstance(val, str) or not val:
+                continue
+            fid = getattr(f, "id", None)
+            lab = getattr(f, "label", None)
+            if fid is not None:
+                by_id.setdefault(fid, val)
+            if lab is not None:
+                by_label.setdefault(lab, val)
+        for ref, field in members:
+            val = by_id.get(field)
+            if val is None:
+                val = by_label.get(field)
+            if isinstance(val, str) and val:
+                out[ref] = val
+    return out
+# --- end 1Password Connect ---------------------------------------------------
+
 # --- HERMES-PATCH 31: cache + retry/backoff + serve-stale -------------------
 CACHE_DIR = os.path.expanduser("~/.cache/op-run")
 CACHE_TTL_SECONDS = 300
@@ -240,6 +336,33 @@ def resolve_refs(refs: list[str]) -> dict[str, str]:
 
 
 async def _resolve_by_ref(unique_refs: list[str]) -> dict[str, str]:
+    """Connect-first resolver. Resolve as many refs as possible via the local
+    Connect server, then fall the remainder back to the cloud service-account
+    SDK (Connect down, or refs outside the Connect token's vault scope). When
+    Connect serves everything, the cloud path — and its rate-limited API — is
+    never touched."""
+    out: dict[str, str] = {}
+    remaining = list(unique_refs)
+    creds = _connect_creds()
+    if creds:
+        try:
+            got = await asyncio.to_thread(
+                _resolve_by_ref_connect, creds[0], creds[1], remaining
+            )
+            out.update(got)
+            remaining = [r for r in remaining if r not in out]
+        except Exception as exc:  # noqa: BLE001 — any Connect error → cloud fallback
+            sys.stderr.write(
+                f"[op_sdk_resolve] Connect backend unavailable ({exc!r}); "
+                f"using cloud service account\n"
+            )
+    if remaining:
+        cloud = await _resolve_by_ref_cloud(remaining)
+        out.update(cloud)
+    return out
+
+
+async def _resolve_by_ref_cloud(unique_refs: list[str]) -> dict[str, str]:
     token = open(TOKEN_FILE, encoding="utf-8").read().strip()
     client = await Client.authenticate(
         auth=token,
