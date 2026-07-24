@@ -116,6 +116,20 @@ def _tool_result_payload(content: str) -> dict:
     return json.loads(content[start : end + 1])
 
 
+def _assert_prompt_contains_lifecycle_gates(system_prompt: str) -> None:
+    """Assert lifecycle semantics, not incidental wording in the fixture."""
+    normalized = " ".join(system_prompt.lower().split())
+    assert re.search(
+        r"(?:new|captured)(?:\s*/\s*(?:new|captured))?\s+tasks?\s+have\s+no\s+"
+        r"agent-ready\s+or\s+prepped\s+tag",
+        normalized,
+    )
+    assert re.search(r"prep.*?add\s+agent-ready.*?execution-ready:\s*yes", normalized)
+    assert "product decision" in normalized
+    assert "predecessor task" in normalized
+    assert re.search(r"exactly one.*?model:\*\s+tag", normalized)
+
+
 class _PolicyEvaluatingClickUpModel:
     """Small deterministic stand-in for the external model.
 
@@ -135,6 +149,7 @@ class _PolicyEvaluatingClickUpModel:
         system_prompt = messages[0]["content"]
         assert "You are in a Slack workspace" in system_prompt
         assert "Task lifecycle contract:" in system_prompt
+        _assert_prompt_contains_lifecycle_gates(system_prompt)
         assert kwargs["tools"] == CLICKUP_TOOL_SCHEMAS
 
         if messages[-1]["role"] == "tool":
@@ -196,15 +211,6 @@ class _PolicyEvaluatingClickUpModel:
                     "call_create",
                 )
             )
-
-        required_prompt_gates = (
-            "canonical `## ⚙️ Execution Brief`",
-            "ending exactly `Execution-ready: YES`",
-            "every product decision is resolved",
-            "all native predecessor tasks are complete",
-            "exactly one colon-form model floor",
-        )
-        assert all(gate in system_prompt for gate in required_prompt_gates)
 
         return _response(
             tool_call=_tool_call(

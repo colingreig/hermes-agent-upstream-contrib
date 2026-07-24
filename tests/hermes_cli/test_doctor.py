@@ -6,6 +6,7 @@ import types
 import io
 import contextlib
 from argparse import Namespace
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -14,6 +15,13 @@ import hermes_cli.doctor as doctor
 import hermes_cli.gateway as gateway_cli
 from hermes_cli import doctor as doctor_mod
 from hermes_cli.doctor import _has_provider_env_config, _detects_stale_agent_ready_instruction
+
+
+LIFECYCLE_CONTRACT_PATH = (
+    Path(__file__).parents[1]
+    / "fixtures"
+    / "hermes_memory_task_lifecycle_contract.md"
+)
 
 
 class TestDoctorPlatformHints:
@@ -385,6 +393,17 @@ class TestStaleAgentReadyInstructionDetection:
         content = "Never self-tag a captured task agent-ready without human sign-off."
         assert _detects_stale_agent_ready_instruction(content) is None
 
+    def test_ignores_bare_fresh_task_no_tag_policy(self):
+        content = "New/captured tasks have no agent-ready or prepped tag."
+        assert _detects_stale_agent_ready_instruction(content) is None
+
+    def test_bare_no_tag_policy_does_not_exempt_a_following_self_tag_instruction(self):
+        content = (
+            "New/captured tasks have no agent-ready or prepped tag; "
+            "tag new tasks agent-ready immediately."
+        )
+        assert _detects_stale_agent_ready_instruction(content) is not None
+
     def test_detects_plural_tasks_self_tag_instruction(self):
         # "tasks" (plural) must match, not just singular "task".
         content = "Always tag new tasks agent-ready immediately."
@@ -468,16 +487,8 @@ class TestDoctorStaleAgentReadyMemoryCheck:
         assert "instructs self-tagging agent-ready" in out
         assert "USER.md" in out
 
-    def test_no_warning_for_replacement_gate_aware_wording(self, monkeypatch, tmp_path):
-        # This is the intended eventual replacement wording for USER.md/MEMORY.md —
-        # proves the new gate-aware phrasing does NOT trigger the diagnostic.
-        clean_text = (
-            "New Slack work should be captured as a ClickUp to-do task (no status-skipping). Do not\n"
-            "self-tag it agent-ready — that tag is only added by ignite-prep after it writes a\n"
-            "canonical Execution Brief, resolves every product decision, confirms any predecessor\n"
-            "task is complete, and sets exactly one model:* floor tag. Keep doing the useful\n"
-            "\"capture the work, don't live-code it\" behavior; just don't self-tag.\n"
-        )
+    def test_no_warning_for_deployed_lifecycle_contract(self, monkeypatch, tmp_path):
+        clean_text = LIFECYCLE_CONTRACT_PATH.read_text(encoding="utf-8")
         out = self._run_doctor_and_capture(monkeypatch, tmp_path, user_text=clean_text)
         assert "instructs self-tagging agent-ready" not in out
 
