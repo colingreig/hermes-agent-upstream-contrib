@@ -316,7 +316,7 @@ def _load_backup_state() -> dict:
     # Fail open: unreadable/corrupt state means no prior alert, so a real
     # failure remains eligible for delivery.
     try:
-        with open(BACKUP_STATE_PATH) as f:
+        with open(BACKUP_STATE_PATH, encoding="utf-8") as f:
             state = json.load(f)
     except Exception:
         return {}
@@ -326,7 +326,7 @@ def _load_backup_state() -> dict:
 def _save_backup_state(state: dict) -> None:
     tmp = BACKUP_STATE_PATH + ".tmp"
     os.makedirs(os.path.dirname(BACKUP_STATE_PATH), exist_ok=True)
-    with open(tmp, "w") as f:
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2)
     os.replace(tmp, BACKUP_STATE_PATH)
 
