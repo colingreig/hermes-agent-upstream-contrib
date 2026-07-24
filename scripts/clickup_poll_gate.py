@@ -127,28 +127,24 @@ AGENT_REVIEW_TAG = "agent-review"
 # of every wake/snapshot bucket as if it were not in the queue. Fully reversible:
 # the operator removes agent-avoid to let Hermes resume normal selection.
 AVOID_TAG = "agent-avoid"
-# "No measurement infrastructure exists" / "external-dependency-blocked"
-# failure class (2026-07-22, ClickUp 86e29q8qd / Audit M6). Some objectives
-# can NEVER be confirmed by the autonomous loop — no CI/Lighthouse to measure
-# LCP, or the task depends on external/hardware state the agent can't reach.
-# Before this tag, such tasks re-entered the executor<->validator loop
-# indefinitely instead of parking for a human on the FIRST fail (86e22876h,
-# an LCP-no-CI task, looped >=5 executor/validator rounds; 86e1uxqmr,
-# hardware-blocked, was re-probed repeatedly). A validator (local
-# ignite-validate or the mini's hermes-pr-validate/clickup_review_sla path)
-# stamps this tag the moment it determines the objective is structurally
-# unmeasurable/externally blocked — a genuinely fixable defect still gets a
-# normal FAIL and keeps cycling through agent-review/needs-validation as
-# before; only the structurally-unmeasurable case gets this tag. Shared tag
-# name across both validator surfaces (avoids repeating the 2026-06-30
-# marker-collision incident, where each validator's own marker store fell out
-# of sync).
+# Human-action fence shared by both validator surfaces. The no-measurement /
+# external-dependency-blocked failure class (2026-07-22, ClickUp 86e29q8qd /
+# Audit M6) is one producer of this tag: ignite-validate ESCALATEs the task on
+# the first structurally-unmeasurable FAIL and writes `needs-human`. The mini's
+# review_poll_gate and clickup_review_sla consumers use this same tag.
+#
+# The first implementation incorrectly assumed the validator would also write
+# a `no-measurement` ClickUp tag. It only wrote that value as comment metadata,
+# so the poll gate's exclusion had no producer and the task could re-enter the
+# executor loop. `needs-human` is the durable action tag that actually crosses
+# validator boundaries; consume it here too. Keep the older no-measurement tag
+# as a backwards-compatible fence for tasks stamped during rollout.
 # HARD EXCLUSION: checked FIRST, right after AVOID_TAG and before the
 # agent-ready gate, so the poll gate immediately and permanently stops
-# waking, claiming, or continuing a so-tagged task — i.e. it short-circuits
+# waking, claiming, or continuing a human-fenced task — i.e. it short-circuits
 # on attempt 1, not after MAX_FIX_ATTEMPTS retries. Only a human removing the
-# tag (after resolving the underlying measurement/external gap) resumes
-# Hermes on the task.
+# fence after resolving the underlying blocker resumes Hermes on the task.
+NEEDS_HUMAN_TAG = "needs-human"
 NO_MEASUREMENT_TAG = "no-measurement"
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -385,15 +381,15 @@ def _classify(task):
     touch a task the operator has fenced off. main() does NO side effect on
     these (no tag mutation): leave an operator-fenced task exactly as found.
 
-    HARD EXCLUSION (2026-07-22, ClickUp 86e29q8qd): a task carrying
-    NO_MEASUREMENT_TAG — a validator's "no measurement infrastructure exists"
-    / "external-dependency-blocked" verdict — is excluded at the same
-    top-priority level as agent-avoid, and for the same reason: no amount of
-    re-waking or re-continuing can ever produce the missing measurement, so
-    the gate must stop probing it on the very first sighting of the tag
-    (short-circuit at attempt 1), not after a retry budget is exhausted. Like
-    agent-avoid, main() takes no side effect here (no tag mutation) — a human
-    clears the tag to resume Hermes on the task.
+    HARD EXCLUSION (2026-07-22, repaired 2026-07-23, ClickUp 86e29q8qd): a
+    task carrying NEEDS_HUMAN_TAG is excluded at the same top-priority level
+    as agent-avoid. This is the shared action tag actually written by both
+    validator surfaces when the no-measurement/external-blocked class
+    ESCALATEs on its first FAIL. NO_MEASUREMENT_TAG remains a legacy alias
+    during rollout. No amount of re-waking can produce the missing
+    measurement, so the gate stops on the first sighting of either fence.
+    Like agent-avoid, main() takes no side effect here — a human clears the
+    fence to resume Hermes on the task.
 
     NEW 2026-06-20 (ClickUp 86e1z1fy0): localization / i18n / translation
     tasks are excluded at the SAME level as agent-avoid — they're a category
@@ -419,7 +415,7 @@ def _classify(task):
         return None
     if _has_tag(task, AVOID_TAG):
         return None
-    if _has_tag(task, NO_MEASUREMENT_TAG):
+    if _has_tag(task, NEEDS_HUMAN_TAG) or _has_tag(task, NO_MEASUREMENT_TAG):
         return None
     if not _has_ready_tag(task):
         return None

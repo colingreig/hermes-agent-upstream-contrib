@@ -26,6 +26,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -304,14 +305,45 @@ def resolve_slack_bot_token() -> str | None:
     return token
 
 
-def send_failure_alert(message: str) -> None:
+# --- Durable signature-based alert dedup (86e2abmmj) ------------------------
+# Dedup on the distinct failure signature (not calendar day) so unchanged
+# backup failures do not re-page every launchd run. State advances only after
+# confirmed Slack delivery and survives process restarts on disk.
+BACKUP_STATE_PATH = os.path.expanduser("~/.hermes/state/offbox-backup-monitor.json")
+
+
+def _load_backup_state() -> dict:
+    # Fail open: unreadable/corrupt state means no prior alert, so a real
+    # failure remains eligible for delivery.
+    try:
+        with open(BACKUP_STATE_PATH, encoding="utf-8") as f:
+            state = json.load(f)
+    except Exception:
+        return {}
+    return state if isinstance(state, dict) else {}
+
+
+def _save_backup_state(state: dict) -> None:
+    tmp = BACKUP_STATE_PATH + ".tmp"
+    os.makedirs(os.path.dirname(BACKUP_STATE_PATH), exist_ok=True)
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2)
+    os.replace(tmp, BACKUP_STATE_PATH)
+
+
+def _backup_failure_signature(host: str, exc: BaseException) -> str:
+    return f"{host}:{type(exc).__name__}:{exc}"
+
+
+def send_failure_alert(message: str) -> bool:
+    """Send through Hermes and return whether delivery was confirmed."""
     if os.environ.get("HERMES_BACKUP_NO_ALERT"):
         eprint("alerts disabled via HERMES_BACKUP_NO_ALERT")
-        return
+        return False
     hermes = Path(HERMES_BIN)
     if not hermes.exists():
         eprint(f"hermes binary missing; cannot send Slack alert: {hermes}")
-        return
+        return False
     env = dict(os.environ)
     slack_token = resolve_slack_bot_token()
     if slack_token:
@@ -320,6 +352,44 @@ def send_failure_alert(message: str) -> None:
         run([str(hermes), "send", "--to", SLACK_TARGET, message], env=env, check=True)
     except Exception as exc:  # noqa: BLE001 - alerting must not mask backup failure
         eprint(f"failed to send Slack alert: {exc}")
+        return False
+    return True
+
+
+def maybe_send_failure_alert(host: str, exc: BaseException) -> bool:
+    """Send a new failure once and persist only confirmed delivery."""
+    sig = _backup_failure_signature(host, exc)
+    state = _load_backup_state()
+    if sig == state.get("last_alert_signature"):
+        log(f"backup failure alert suppressed (unchanged signature, dedup state={BACKUP_STATE_PATH})")
+        return True
+    if not send_failure_alert(f"🚨 Hermes off-box backup failed on {host}: {exc}"):
+        return False
+    try:
+        state["last_alert_signature"] = sig
+        state["last_alert_at"] = time.time()
+        _save_backup_state(state)
+    except Exception as save_exc:  # noqa: BLE001 - alert already sent
+        eprint(f"failed to persist backup-alert dedup state: {save_exc!r}")
+        return False
+    return True
+
+
+def maybe_send_recovery_alert(host: str) -> bool:
+    """Send one recovery and clear failure state after confirmed delivery."""
+    state = _load_backup_state()
+    if not state.get("last_alert_signature"):
+        return True
+    if not send_failure_alert(f"✅ Hermes off-box backup on {host} recovered."):
+        return False
+    try:
+        state["last_alert_signature"] = None
+        state["recovered_at"] = time.time()
+        _save_backup_state(state)
+    except Exception as save_exc:  # noqa: BLE001
+        eprint(f"failed to persist backup-alert recovery state: {save_exc!r}")
+        return False
+    return True
 
 
 def main(argv: Iterable[str] | None = None) -> int:
@@ -351,12 +421,11 @@ def main(argv: Iterable[str] | None = None) -> int:
 
         ensure_repo(env)
         backup(env, host=args.host)
+        maybe_send_recovery_alert(args.host)
         return 0
     except Exception as exc:  # noqa: BLE001 - surface full failure detail
         eprint(str(exc))
-        send_failure_alert(
-            f"🚨 Hermes off-box backup failed on {args.host}: {exc}"
-        )
+        maybe_send_failure_alert(args.host, exc)
         return 1
 
 

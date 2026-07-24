@@ -81,4 +81,9 @@ vs this copy) to catch drift — nothing currently automates that check.
   personalization with zero restic snapshot history to restore from, at any
   point. This closes the gap for future incidents; it does not recover what
   was already lost (see 86e2e870p for the reseed decision, separately pending
-  Colin's input).
+  Colin's input). Failure alerts are signature-deduplicated in
+  `~/.hermes/state/offbox-backup-monitor.json`; the initial failure and
+  recovery advance that state only after Hermes confirms Slack delivery, so
+  an unavailable transport remains retryable.
+- `tests/test_offbox_restic_backup.py` — verifies delivery-aware failure and
+  recovery persistence through the real Hermes-send boundary.

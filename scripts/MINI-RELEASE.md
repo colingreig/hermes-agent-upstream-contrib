@@ -24,6 +24,10 @@ Tracked in ClickUp `86e2ddah5`.
 - `~/.hermes/releases/.previous` records the prior symlink target for rollback.
 - Gateway: launchd `gui/501/ai.hermes.gateway` (API on `:8642`).
 - Dashboard: launchd `gui/501/com.colingreig.hermes-dashboard` (`:9119`).
+- `~/.local/bin/cu-clickup` is a release-managed, stable wrapper around the
+  protected live `~/.hermes/scripts/clickup_workspace_refresh.py`;
+  `/opt/homebrew/bin/cu-clickup` links to it so clean non-interactive shells
+  can discover the command without depending on dotfile PATH setup.
 
 ## Usage
 
@@ -72,7 +76,10 @@ which is not on a non-interactive ssh PATH — the script extends PATH itself.
 8. **Verify (up to 60s)**: gateway process running from the new release path,
    `Gateway running with N platform(s)` with N ≥ 2 in `gateway.log`, and
    `:8642` listening. Then restart + verify the dashboard (`:9119` → HTTP 200).
-9. On **any** verification failure: **automatic rollback** (repoint to
+9. Atomically install (or repair) the executable `~/.local/bin/cu-clickup`
+   wrapper from the verified release and its `/opt/homebrew/bin/cu-clickup`
+   PATH link.
+10. On **any** verification failure: **automatic rollback** (repoint to
    `.previous`, restart, re-verify) and exit non-zero.
 
 ## Hard safety invariants (enforced in code, not comments)
@@ -89,8 +96,11 @@ which is not on a non-interactive ssh PATH — the script extends PATH itself.
    write outside `releases/` needed to resolve the requested ref. It never
    changes that clone's checked-out worktree or live runtime state. The other
    out-of-`releases/` actions are (a) the atomic `runtime-current` symlink
-   repoint and (b) the `launchctl` restart, each funnelled through dedicated
-   functions.
+   repoint, (b) the `launchctl` restart, and (c) the atomic replacement of the
+   managed command `~/.local/bin/cu-clickup` plus its
+   `/opt/homebrew/bin/cu-clickup` discovery link, each funnelled through
+   dedicated functions. The wrapper contains no token and reads credentials
+   from the environment only when it invokes the existing refresh script.
 3. It **never** touches `~/.hermes/{config.yaml,*.db,cron/,scripts/,logs/,
    recovery/}`, `~/.config`, or `~/Library/LaunchAgents` (guarded by
    `assert_not_forbidden`; `logs/` is read-only for verification only).

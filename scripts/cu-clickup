@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Stable ClickUp workspace CLI for the Hermes Mac mini.
+set -euo pipefail
+
+HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
+REFRESH_SCRIPT="$HERMES_HOME/scripts/clickup_workspace_refresh.py"
+RUNTIME_PYTHON="$HERMES_HOME/runtime-current/venv/bin/python"
+
+case "${1:-}" in
+  --version|-V)
+    printf 'cu-clickup 1.0.0 (Hermes workspace-map CLI)\n'
+    exit 0
+    ;;
+esac
+
+if [ ! -f "$REFRESH_SCRIPT" ]; then
+  printf 'cu-clickup: refresh script not found: %s\n' "$REFRESH_SCRIPT" >&2
+  exit 1
+fi
+if [ ! -x "$RUNTIME_PYTHON" ]; then
+  printf 'cu-clickup: Hermes runtime Python not found: %s\n' "$RUNTIME_PYTHON" >&2
+  exit 1
+fi
+
+exec "$RUNTIME_PYTHON" "$REFRESH_SCRIPT" "$@"

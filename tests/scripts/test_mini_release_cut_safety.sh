@@ -29,8 +29,30 @@ HERMES_HOME="$TEST_ROOT/home/.hermes" MINI_RELEASE_CUT_TEST_LIB=1 source "$SCRIP
 RELEASES_DIR="$(canonical_existing_dir "$TEST_ROOT/home/.hermes/releases")"
 PREV_FILE="$RELEASES_DIR/.previous"
 CUT_LOCK_DIR="$RELEASES_DIR/.mini-release-cut.lock"
+LOCAL_BIN_DIR="$TEST_ROOT/home/.local/bin"
+CLICKUP_CLI_PATH_DIR="$TEST_ROOT/home/homebrew-bin"
 # shellcheck disable=SC2034 # referenced by helpers sourced from SCRIPT.
 DRY_RUN=0
+
+# The managed ClickUp wrapper is installed atomically, is executable, and a
+# later cut repairs a stale or missing command with the release-owned source.
+mkdir -p "$LOCAL_BIN_DIR" "$CLICKUP_CLI_PATH_DIR"
+CLI_RELEASE="$RELEASES_DIR/v1.0.0-clickup"
+mkdir -p "$CLI_RELEASE/scripts"
+printf '#!/usr/bin/env bash\nprintf first\n' > "$CLI_RELEASE/scripts/cu-clickup"
+chmod 0755 "$CLI_RELEASE/scripts/cu-clickup"
+install_clickup_cli "$CLI_RELEASE"
+[ -x "$LOCAL_BIN_DIR/cu-clickup" ] || fail "managed ClickUp CLI was not installed executable"
+cmp -s "$CLI_RELEASE/scripts/cu-clickup" "$LOCAL_BIN_DIR/cu-clickup" \
+  || fail "managed ClickUp CLI differs from release source"
+[ -L "$CLICKUP_CLI_PATH_DIR/cu-clickup" ] \
+  || fail "managed ClickUp CLI PATH link was not installed"
+[ "$(readlink "$CLICKUP_CLI_PATH_DIR/cu-clickup")" = "$(canonical_existing_dir "$LOCAL_BIN_DIR")/cu-clickup" ] \
+  || fail "managed ClickUp CLI PATH link has the wrong target"
+printf '#!/usr/bin/env bash\nprintf stale\n' > "$LOCAL_BIN_DIR/cu-clickup"
+install_clickup_cli "$CLI_RELEASE"
+cmp -s "$CLI_RELEASE/scripts/cu-clickup" "$LOCAL_BIN_DIR/cu-clickup" \
+  || fail "managed ClickUp CLI was not repaired from release source"
 
 # The version grammar accepts ordinary PEP 440-compatible values and rejects
 # paths, control/whitespace, shell punctuation, and option-looking values.

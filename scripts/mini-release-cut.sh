@@ -30,6 +30,9 @@ CURRENT_LINK="$HERMES_HOME/runtime-current"
 PREV_FILE="$RELEASES_DIR/.previous"
 CUT_LOCK_DIR="$RELEASES_DIR/.mini-release-cut.lock"
 GATEWAY_LOG="$HERMES_HOME/logs/gateway.log"
+LOCAL_BIN_DIR="$HOME/.local/bin"
+CLICKUP_CLI_PATH_DIR="/opt/homebrew/bin"
+CLICKUP_CLI_NAME="cu-clickup"
 
 UID_NUM="$(id -u)"
 GUI_DOMAIN="gui/${UID_NUM}"
@@ -192,6 +195,78 @@ assert_not_forbidden() {
 }
 
 git_current() { git -C "$CURRENT_LINK" "$@"; }
+
+# Install the release-owned ClickUp wrapper as a stable user command.  The
+# wrapper itself calls the protected live refresh script, so it remains valid
+# across runtime-current switches and rollbacks.  Reinstalling it after every
+# successful cut repairs accidental deletion without mutating cron, secrets,
+# or any other protected live state.
+install_clickup_cli() {
+  local release_dir="${1:-}"
+  local source="$release_dir/scripts/$CLICKUP_CLI_NAME"
+  local bin_dir path_dir target path_target tmp path_swap_dir path_tmp
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '\033[35m[DRY-RUN]\033[0m install -m 0755 %s %s/%s; link %s/%s (atomic replace)\n' \
+      "$source" "$LOCAL_BIN_DIR" "$CLICKUP_CLI_NAME" \
+      "$CLICKUP_CLI_PATH_DIR" "$CLICKUP_CLI_NAME"
+    return 0
+  fi
+
+  [ -f "$source" ] || {
+    warn "managed ClickUp CLI source missing: $source"
+    return 1
+  }
+  bin_dir="$(canonical_existing_dir "$LOCAL_BIN_DIR")" || {
+    warn "managed command directory missing: $LOCAL_BIN_DIR"
+    return 1
+  }
+  path_dir="$(canonical_existing_dir "$CLICKUP_CLI_PATH_DIR")" || {
+    warn "managed PATH directory missing: $CLICKUP_CLI_PATH_DIR"
+    return 1
+  }
+  target="$bin_dir/$CLICKUP_CLI_NAME"
+  path_target="$path_dir/$CLICKUP_CLI_NAME"
+  tmp="$(mktemp "$bin_dir/.${CLICKUP_CLI_NAME}.swap.XXXXXX")" || return 1
+
+  if ! cp "$source" "$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  chmod 0755 "$tmp" || {
+    rm -f "$tmp"
+    return 1
+  }
+  if ! mv -fh "$tmp" "$target"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  [ -x "$target" ] || {
+    warn "managed ClickUp CLI is not executable after install: $target"
+    return 1
+  }
+  cmp -s "$source" "$target" || {
+    warn "managed ClickUp CLI verification failed: $target differs from release source"
+    return 1
+  }
+  path_swap_dir="$(mktemp -d "$path_dir/.${CLICKUP_CLI_NAME}.swap.XXXXXX")" || return 1
+  path_tmp="$path_swap_dir/$CLICKUP_CLI_NAME"
+  ln -s "$target" "$path_tmp" || {
+    rmdir "$path_swap_dir"
+    return 1
+  }
+  if ! mv -fh "$path_tmp" "$path_target"; then
+    rm -f "$path_tmp"
+    rmdir "$path_swap_dir"
+    return 1
+  fi
+  rmdir "$path_swap_dir" || warn "could not remove managed CLI swap dir: $path_swap_dir"
+  [ -L "$path_target" ] && [ "$(readlink "$path_target")" = "$target" ] || {
+    warn "managed ClickUp CLI PATH link verification failed: $path_target"
+    return 1
+  }
+  ok "managed ClickUp CLI installed: $target (PATH link: $path_target)"
+}
 
 port_listening() {
   local port="${1:-}"
@@ -692,6 +767,9 @@ if ! verify_dashboard; then
   rollback_to_previous "dashboard verify failed"
   die "cut aborted and rolled back to previous release"
 fi
+
+install_clickup_cli "$NEW_DIR" \
+  || die "release is healthy, but managed ClickUp CLI install failed"
 
 ok "release cut complete: runtime-current → $NEW_DIR (v${VERSION}-${SHORT_SHA})"
 

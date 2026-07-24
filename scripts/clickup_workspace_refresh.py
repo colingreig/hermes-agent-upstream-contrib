@@ -161,13 +161,13 @@ _CLICKUP_TOKEN_CACHE: str | None = None
 def _resolve_clickup_token() -> str:
     """Resolve the ClickUp API token.
 
-    Resolution order (matches the repo's standing pattern, see
-    ``wp_publish.py:resolve_credential``):
-      1. ``agent.lazy_secret_resolver.get("CLICKUP_API_TOKEN")`` — per-call
-         lazy 1Password resolution. Import/lookup failures are swallowed
-         here exactly like that module's own fail-open contract — they just
-         mean "not resolvable this way, try the next".
-      2. ``os.environ["CLICKUP_API_TOKEN"]`` — plain env var fallback.
+    Resolution order:
+      1. ``os.environ["CLICKUP_API_TOKEN"]`` — the normal scheduler path.
+         This keeps the common case fast and avoids an unnecessary 1Password
+         lookup while the gateway environment is healthy.
+      2. ``agent.lazy_secret_resolver.get("CLICKUP_API_TOKEN")`` — per-call
+         restart-race fallback. Import/lookup failures are swallowed here
+         exactly like that module's own fail-open contract.
 
     Never logs the resolved value. Result is cached in-process so repeated
     calls to ``_fallback_req`` don't re-resolve on every request.
@@ -176,6 +176,11 @@ def _resolve_clickup_token() -> str:
     if _CLICKUP_TOKEN_CACHE:
         return _CLICKUP_TOKEN_CACHE
 
+    token = (os.environ.get("CLICKUP_API_TOKEN") or "").strip()
+    if token:
+        _CLICKUP_TOKEN_CACHE = token
+        return token
+
     value: str | None = None
     try:
         from agent import lazy_secret_resolver
@@ -183,9 +188,6 @@ def _resolve_clickup_token() -> str:
         value = lazy_secret_resolver.get("CLICKUP_API_TOKEN")
     except Exception:
         value = None
-
-    if not value:
-        value = os.environ.get("CLICKUP_API_TOKEN")
 
     token = (value or "").strip()
     if token:

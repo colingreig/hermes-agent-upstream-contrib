@@ -259,8 +259,8 @@ def test_render_markdown_mirror_reflects_a_changed_cadence_and_keeps_root_cause_
 
 
 class TestResolveClickupToken:
-    """Token resolution order: lazy 1Password resolver first, plain env
-    fallback second (matches wp_publish.py:resolve_credential house style).
+    """Token resolution order: plain env first, lazy 1Password resolver only
+    as a restart-race fallback.
 
     _CLICKUP_TOKEN_CACHE is reset before/after each test so a resolved
     token from one case can't leak into the next.
@@ -282,17 +282,32 @@ class TestResolveClickupToken:
 
         assert token == "lazy-clickup-token"
 
-    def test_env_fallback_used_when_lazy_resolver_empty(self, monkeypatch):
+    def test_env_token_skips_lazy_resolver(self, monkeypatch):
         import agent.lazy_secret_resolver as lsr
 
-        monkeypatch.setattr(lsr, "get", lambda name: None)
+        resolver_calls = []
+
+        def _unexpected_resolver(name):
+            resolver_calls.append(name)
+            raise AssertionError("env-present path must not call the lazy resolver")
+
+        monkeypatch.setattr(lsr, "get", _unexpected_resolver)
         monkeypatch.setenv("CLICKUP_API_TOKEN", "env-clickup-token")
 
         token = refresh_mod._resolve_clickup_token()
 
         assert token == "env-clickup-token"
+        assert resolver_calls == []
 
-    def test_both_empty_raises_system_exit_via_fallback_req(self, monkeypatch):
+    def test_empty_env_uses_lazy_resolver(self, monkeypatch):
+        import agent.lazy_secret_resolver as lsr
+
+        monkeypatch.setattr(lsr, "get", lambda name: "lazy-clickup-token")
+        monkeypatch.setenv("CLICKUP_API_TOKEN", "   ")
+
+        assert refresh_mod._resolve_clickup_token() == "lazy-clickup-token"
+
+    def test_both_empty_raises_sanitized_system_exit_via_fallback_req(self, monkeypatch, capsys):
         import agent.lazy_secret_resolver as lsr
 
         monkeypatch.setattr(lsr, "get", lambda name: None)
@@ -304,3 +319,6 @@ class TestResolveClickupToken:
             refresh_mod._fallback_req("GET", "/team")
 
         assert exc_info.value.code == 2
+        stderr = capsys.readouterr().err
+        assert "could not be resolved via 1Password" in stderr
+        assert "Authorization" not in stderr
