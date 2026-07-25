@@ -66,7 +66,7 @@ class ClaimStoreHistoryTests(unittest.TestCase):
     def test_window_rolls_off_stale_entries(self):
         path = self.cs._history_path("taskA")
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w") as f:
+        with open(path, "w", encoding="utf-8") as f:
             json.dump([
                 {"ts": time.time() - (DAY + 3600), "run": "old", "outcome": "fail", "note": ""},
                 {"ts": time.time() - 60, "run": "recent", "outcome": "fail", "note": ""},
@@ -80,7 +80,7 @@ class ClaimStoreHistoryTests(unittest.TestCase):
     def test_corrupt_history_file_fails_open_to_zero(self):
         path = self.cs._history_path("taskA")
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w") as f:
+        with open(path, "w", encoding="utf-8") as f:
             f.write("{not valid json,,,")
         self.assertEqual(self.cs.count_attempts("taskA", DAY), 0)
         # record_attempt must also survive a corrupt file rather than raising.
@@ -92,7 +92,7 @@ class ClaimStoreHistoryTests(unittest.TestCase):
         # raises — proves record_attempt/count_attempts/last_failure_note never
         # propagate that error to the caller.
         bad_dir = os.path.join(self.tmp.name, "not_a_directory")
-        with open(bad_dir, "w") as f:
+        with open(bad_dir, "w", encoding="utf-8") as f:
             f.write("x")
         self.cs.CLAIM_HISTORY_DIR = bad_dir
         self.assertEqual(self.cs.count_attempts("taskA", DAY), 0)
@@ -153,7 +153,7 @@ class ClaimNextAttemptCapTests(unittest.TestCase):
     def test_corrupt_history_fails_open_under_cap(self):
         path = self.cs._history_path("taskA")
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w") as f:
+        with open(path, "w", encoding="utf-8") as f:
             f.write("not json at all")
         self.assertFalse(self.cn._over_attempt_cap("taskA", cap=5))
 
@@ -204,7 +204,7 @@ class ClaimNextAttemptCapTests(unittest.TestCase):
             ]
         }
         snap_path = os.path.join(self.tmp.name, "queue_snapshot.json")
-        with open(snap_path, "w") as f:
+        with open(snap_path, "w", encoding="utf-8") as f:
             json.dump(snap, f)
 
         candidate_path = os.path.join(self.tmp.name, "first_claim_candidate.json")
@@ -219,7 +219,7 @@ class ClaimNextAttemptCapTests(unittest.TestCase):
             mock_subprocess.run.return_value = subprocess.CompletedProcess([], 0, stdout="", stderr="")
             self.cn.main()
 
-        with open(candidate_path) as f:
+        with open(candidate_path, encoding="utf-8") as f:
             chosen = json.load(f)
         self.assertEqual(chosen["id"], "fresh-task")
 

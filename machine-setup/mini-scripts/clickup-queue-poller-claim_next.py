@@ -193,7 +193,7 @@ def main():
     if not os.path.exists(SNAP):
         print("snapshot not found:", SNAP)
         return 2
-    d = json.load(open(SNAP))
+    d = json.load(open(SNAP, encoding="utf-8"))
     now = int(time.time())
     candidates = [
         t for t in d.get("tasks", [])
@@ -272,9 +272,9 @@ def main():
 
     chosen = dict(chosen)
     chosen["_claim_run"] = run
-    with open("/tmp/first_claim_candidate.json", "w") as f:
+    with open("/tmp/first_claim_candidate.json", "w", encoding="utf-8") as f:
         f.write(json.dumps(chosen))
-    with open("/tmp/first_claim_run.txt", "w") as f:
+    with open("/tmp/first_claim_run.txt", "w", encoding="utf-8") as f:
         f.write(run)
     print(f"  [claim_next] LOCKED {chosen.get('id')} run={run}")
     print("\n---JSON-CANDIDATE-0---")

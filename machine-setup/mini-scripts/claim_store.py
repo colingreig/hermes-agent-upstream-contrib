@@ -91,7 +91,7 @@ def _payload(task_id: str, run: str | None) -> bytes:
 
 def _read(path: str) -> dict | None:
     try:
-        with open(path, "r") as f:
+        with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return None
@@ -173,7 +173,7 @@ def acquire(task_id: str, run: str | None = None) -> bool:
     # File exists — serialise the inspect/reclaim with a brief flock so two
     # processes can't both reclaim a stale lock.
     try:
-        with open(path, "r+") as f:
+        with open(path, "r+", encoding="utf-8") as f:
             try:
                 fcntl.flock(f, fcntl.LOCK_EX)
             except OSError:
@@ -264,7 +264,7 @@ def reap_stale() -> list:
             continue
         try:
             if fcntl is not None:
-                with open(path, "r+") as f:
+                with open(path, "r+", encoding="utf-8") as f:
                     try:
                         fcntl.flock(f, fcntl.LOCK_EX)
                     except OSError:
@@ -316,7 +316,7 @@ def _load_history(task_id: str) -> list:
         path = _history_path(task_id)
         if not os.path.exists(path):
             return []
-        with open(path, "r") as f:
+        with open(path, "r", encoding="utf-8") as f:
             history = json.load(f)
         return history if isinstance(history, list) else []
     except Exception:
@@ -344,7 +344,7 @@ def record_attempt(task_id: str, outcome: str, note: str = "", run: str | None =
         history = history[-MAX_HISTORY_ENTRIES:]
         path = _history_path(task_id)
         tmp = path + f".tmp{os.getpid()}"
-        with open(tmp, "w") as f:
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(history, f)
         os.replace(tmp, path)  # atomic rename — no torn reads
     except Exception:

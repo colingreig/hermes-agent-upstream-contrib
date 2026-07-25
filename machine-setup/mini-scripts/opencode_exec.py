@@ -130,7 +130,7 @@ def _load_decomposer_cascade_from_config():
         return _KANBAN_DECOMPOSER_CASCADE_FALLBACK
     try:
         config_path = os.path.expanduser("~/.hermes/config.yaml")
-        with open(config_path) as f:
+        with open(config_path, encoding="utf-8") as f:
             config = yaml.safe_load(f) or {}
         decomposer = ((config.get("auxiliary") or {}).get("kanban_decomposer")) or {}
         entries = []
@@ -264,7 +264,7 @@ def _run_once(model, variant, child_env, workdir, opencode_bin, timeout, log_pat
     watchdog_thread = threading.Thread(target=_watchdog, daemon=True)
     watchdog_thread.start()
 
-    with open(log_path, "w") as logf:
+    with open(log_path, "w", encoding="utf-8") as logf:
         try:
             for line in proc.stdout:
                 logf.write(line)
@@ -349,7 +349,7 @@ def _record_served(result, armed):
             "ok":                   result.get("ok", False),
         }
         os.makedirs(os.path.dirname(_LIVENESS_LEDGER), exist_ok=True)
-        with open(_LIVENESS_LEDGER, "a") as _lf:
+        with open(_LIVENESS_LEDGER, "a", encoding="utf-8") as _lf:
             _lf.write(json.dumps(record) + "\n")
             _lf.flush()
         # Always visible (not just on DEGRADED) — the whole point is that
@@ -387,7 +387,7 @@ def _emit_fallback_receipt(task_id, primary, next_model, reason, rc, stderr_tail
             "stderr_tail":  (stderr_tail or "")[-400:],
         }
         os.makedirs(os.path.dirname(_FALLBACK_RECEIPTS), exist_ok=True)
-        with open(_FALLBACK_RECEIPTS, "a") as _rf:
+        with open(_FALLBACK_RECEIPTS, "a", encoding="utf-8") as _rf:
             _rf.write(json.dumps(record) + "\n")
             _rf.flush()
         eprint(f"[opencode_exec] FALLBACK-RECEIPT: {primary} {reason} → serving via {next_model} "
@@ -530,7 +530,7 @@ def main():
     if not os.path.isfile(prompt_file):
         print(json.dumps({"ok": False, "error": f"prompt-file not found: {prompt_file}"}))
         return 4
-    with open(prompt_file, "r") as f:
+    with open(prompt_file, "r", encoding="utf-8") as f:
         prompt = f.read()
     if not prompt.strip():
         print(json.dumps({"ok": False, "error": "prompt-file is empty"}))
