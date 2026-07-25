@@ -113,8 +113,11 @@ vs this copy) to catch drift — nothing currently automates that check.
   `content_pipeline.research.enabled` switch in `~/.hermes/config.yaml`
   defaults on; any key/API/paywall/bot/analyzer failure is flag-and-ship and
   leaves the writer able to continue.
-  Execution receipts go to `~/.hermes/logs/research-served.jsonl` without the
-  API key, query text, fetched content, or generated brief.
+  A page that is thin without JavaScript may receive one JS-rendered retry,
+  capped at two retries per run. Execution receipts expose
+  `js_render_retries` and `grounded_pages_recovered_by_js` to measure the
+  grounding gain attributable to those retries, without recording the API
+  key, query text, fetched content, or generated brief.
 - `research_stage_monitor.py` — independent served-ledger liveness check. It
   reports recent enabled attempts, successful serves, degraded attempts, and
   served rate. Exit codes: `0` healthy or disabled-or-smoke-only, `2`

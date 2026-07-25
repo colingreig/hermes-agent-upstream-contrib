@@ -504,6 +504,50 @@ def test_hardened_thin_body_floor_accepts_600_plus_chars():
     assert len(text) >= research.MIN_GROUNDED_TEXT_CHARS
 
 
+def test_thin_pages_get_one_capped_js_retry_and_record_grounding_gain(monkeypatch, tmp_path, capsys):
+    work, prompt, config, ledger = _setup_enabled_run(tmp_path)
+    monkeypatch.setattr(research, "resolve_runtime_value", lambda _name: "fake-key")
+    monkeypatch.setattr(research, "MAX_JS_RENDER_RETRIES_PER_RUN", 2)
+    results = [
+        {"title": f"Page {index}", "url": f"https://{index}.test", "description": ""}
+        for index in range(3)
+    ]
+    monkeypatch.setattr(research, "search_web", lambda *_a, **_k: (results, None))
+    fetches: list[tuple[str, bool]] = []
+
+    def fake_fetch(url, _api_key, *, render_js=False, **_kwargs):
+        fetches.append((url, render_js))
+        if render_js:
+            return "x" * research.MIN_GROUNDED_TEXT_CHARS, None
+        return None, research.PAGE_THIN_REASON
+
+    monkeypatch.setattr(research, "fetch_page", fake_fetch)
+    monkeypatch.setattr(
+        research,
+        "run_safe_analyzer",
+        lambda *_a, **_k: ("# Brief\nAnalyzer text.", {"ok": True, "served_by": "test"}),
+    )
+
+    rc = research.main(_main_args(work, prompt, config, ledger, "t-js-retry"))
+    emitted = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    # The first two thin pages are retried exactly once; the third reaches the
+    # run-wide cap and is not retried with JS at all.
+    assert fetches == [
+        ("https://0.test", False),
+        ("https://0.test", True),
+        ("https://1.test", False),
+        ("https://1.test", True),
+        ("https://2.test", False),
+    ]
+
+    record = json.loads(ledger.read_text().strip().splitlines()[-1])
+    assert record["grounded_pages"] == 2
+    assert record["js_render_retries"] == 2
+    assert record["grounded_pages_recovered_by_js"] == 2
+    assert emitted["grounded_pages_recovered_by_js"] == 2
+
+
 def test_body_to_text_dict_json_without_known_text_key_is_not_grounded():
     """A JSON object envelope with none of the known text keys must resolve to
     empty text, not the raw JSON string masquerading as page content."""
