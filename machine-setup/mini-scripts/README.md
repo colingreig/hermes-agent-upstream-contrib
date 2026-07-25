@@ -155,10 +155,24 @@ vs this copy) to catch drift — nothing currently automates that check.
   including the audited 1/3 content-gate execution rate and the historical
   0/29 Sonnet serve comparator, with unknown historical metrics explicitly
   marked uninstrumented rather than inferred.
+- `research_outcome_metrics.py` — content-outcome instrumentation and report.
+  Every successful `opencode_exec.py --content` run automatically writes a
+  content-free receipt to `~/.hermes/logs/content-outcomes.jsonl`: piece count,
+  unique explicit external Markdown/HTML citation-link count, mean links per
+  piece, share of pieces with a citation, and a hash of the measured path set.
+  Prose, URLs, and filenames are never logged. `report` joins the latest receipt
+  to `research-served.jsonl` (`grounded_pages`, `severity`) and the validator
+  verdict store by ClickUp task ID. It reports citation coverage and validator
+  fail rate by severity, but remains `insufficient-data` until both degraded
+  and healthy cohorts have five validator-observed tasks. The dated rollout
+  baseline is in `reports/research-outcome-validity-2026-07-25.md`.
 - `tests/test_research_stage.py` — verifies secret-safe auth, strict untrusted
   data boundaries, the analyzer request's zero-tool surface, refusal to
   interpret tool-use responses, bounded HTTP reads, flag-and-ship fallback,
   cannibalization context, content-free receipts, and monitor thresholds.
+- `tests/test_research_outcome_metrics.py` — verifies citation counting, path
+  containment, content-free receipts, task-ID joins, legacy-ledger handling,
+  latest-verdict selection, cohort floors, and the rendered report.
 - `claim_store.py`, `clickup-queue-poller-claim_next.py`, `opencode_exec.py` —
   the executor claim/dispatch chain (`claim_next.py` picks a candidate task and
   atomically locks it via `claim_store.py`; `opencode_exec.py` then runs the
