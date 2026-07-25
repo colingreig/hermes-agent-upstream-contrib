@@ -27,6 +27,14 @@ scp machine-setup/mini-scripts/<file> mac-mini-h.tail51ec1b.ts.net:~/.hermes/scr
 mini-run -- 'python3 -m py_compile ~/.hermes/scripts/<file>'  # sanity check
 ```
 
+**Destination path note:** every file below deploys to `~/.hermes/scripts/<file>`
+EXCEPT `clickup-queue-poller-claim_next.py`, whose mini destination is
+`~/.hermes/skills/clickup-queue-poller/scripts/claim_next.py` (a different
+directory tree, the skill's own scripts dir — the filename here is prefixed
+`clickup-queue-poller-` only to keep it collision-free in this flat repo
+directory; drop the prefix when copying to the mini). See "Claim retry cap"
+below for the exact copy commands.
+
 Diff against the live file periodically (`ssh mini cat ~/.hermes/scripts/<file>`
 vs this copy) to catch drift — nothing currently automates that check.
 
@@ -118,3 +126,60 @@ vs this copy) to catch drift — nothing currently automates that check.
   data boundaries, the analyzer request's zero-tool surface, refusal to
   interpret tool-use responses, bounded HTTP reads, flag-and-ship fallback,
   cannibalization context, content-free receipts, and monitor thresholds.
+- `claim_store.py`, `clickup-queue-poller-claim_next.py`, `opencode_exec.py` —
+  the executor claim/dispatch chain (`claim_next.py` picks a candidate task and
+  atomically locks it via `claim_store.py`; `opencode_exec.py` then runs the
+  writer model against it). Vendored here 2026-07-24 (ClickUp 86e2ddcpb spend-
+  guard trip postmortem) as the canonical git home for what had been mini-only,
+  untracked files — see "Claim retry cap" below for the incident and the fix
+  layered on top in the next commit.
+- `tests/test_claim_history.py` — covers the per-task attempt-cap logic added
+  on top of the vendored claim chain (see "Claim retry cap" below).
+
+## Claim retry cap (ClickUp 86e2ddcpb, 2026-07-24)
+
+Root cause: `claim_next.py` fails open on any error (by design — a claim-store
+bug must never block legitimate work) and had NO cap on how many times the
+same task could be reclaimed. Two tasks (`86e2dda93`, `86e2cpdgh`) looped
+12 and ~6 sessions respectively, each one ending "opencode finished but made
+no file changes" / "no commit or push" (never reaching a PR), tripping the
+$50/day spend guard and blocking all executor work for the rest of the day.
+
+Fix (implemented across `claim_store.py` + `clickup-queue-poller-claim_next.py`
++ `opencode_exec.py`):
+- `opencode_exec.py` calls `claim_store.record_attempt(task_id, outcome, note)`
+  at session end (`success` / `fail` / `crash`), appending to a per-task
+  history file at `~/.hermes/state/claim_history/<task_id>.json` (list
+  capped at `HERMES_CLAIM_HISTORY_MAX_ENTRIES`, default 50).
+- `claim_next.py`'s per-candidate loop now excludes any task with MORE than
+  `HERMES_CLAIM_MAX_ATTEMPTS` (default 5) recorded attempts in the trailing
+  24h (`COOLDOWN_SECONDS`) window — counted by **task id**, not claim run, so
+  a reclaim of a still-fresh task never double-counts. An excluded task has
+  its `agent-ready` tag stripped, gets tagged `attempt-cap-exceeded-<ts>`, and
+  gets a ClickUp comment with the attempt count and last recorded failure.
+- Every new code path fails OPEN: a missing/corrupt/unreadable history file,
+  or any other error, is treated as "under cap" and the claim proceeds
+  normally. A bug in the cap logic must never block the queue — this mirrors
+  the existing `claim_store.py` acquire/release fail-open contract.
+
+Deploy (copy commands — run from the repo root; `mac-mini-h.tail51ec1b.ts.net`
+is the mini's Tailscale name):
+
+```bash
+scp machine-setup/mini-scripts/claim_store.py \
+    mac-mini-h.tail51ec1b.ts.net:~/.hermes/scripts/claim_store.py
+scp machine-setup/mini-scripts/opencode_exec.py \
+    mac-mini-h.tail51ec1b.ts.net:~/.hermes/scripts/opencode_exec.py
+scp machine-setup/mini-scripts/clickup-queue-poller-claim_next.py \
+    mac-mini-h.tail51ec1b.ts.net:~/.hermes/skills/clickup-queue-poller/scripts/claim_next.py
+mini-run -- 'python3 -m py_compile ~/.hermes/scripts/claim_store.py \
+    ~/.hermes/scripts/opencode_exec.py \
+    ~/.hermes/skills/clickup-queue-poller/scripts/claim_next.py'  # sanity check
+```
+
+**WARNING — do NOT rsync `~/.hermes/scripts/` wholesale.** That directory is
+hand-maintained on the mini and holds ~203 live-only scripts with no git
+backing (see the top of this file). Only ever `scp` these three specific
+files by name. The same caution applies to
+`~/.hermes/skills/clickup-queue-poller/scripts/` — copy only `claim_next.py`,
+never the directory.
