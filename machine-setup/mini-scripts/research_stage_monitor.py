@@ -15,6 +15,8 @@ that only checks process exit status can still tell the conditions apart:
 
     status                 exit  meaning
     ----------------------------------------------------------------------
+    persistently-inconclusive 6 not-observed / insufficient-data has
+                                  continued for more than 72 hours
     not-observed             3   stage never ran / ledger missing or stale
     disabled-or-smoke-only    0  nothing enabled, or every enabled attempt
                                   in the window was smoke/test traffic
@@ -54,6 +56,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -61,6 +64,9 @@ from typing import Any
 
 
 DEFAULT_LEDGER = Path("~/.hermes/logs/research-served.jsonl").expanduser()
+DEFAULT_STATE = Path("~/.hermes/state/research-stage-monitor.json").expanduser()
+DEFAULT_INCONCLUSIVE_ESCALATION_HOURS = 72.0
+_INCONCLUSIVE_STATUSES = frozenset(("not-observed", "insufficient-data"))
 
 # task_id substrings (case-insensitive) that mark smoke/test traffic, e.g.
 # "86e25xww8-fetch-smoke" or "ignite-smoke-86e25xww8-recovery-1". This is
@@ -165,6 +171,82 @@ def read_records(path: Path) -> list[dict[str, Any]]:
         if isinstance(record, dict):
             records.append(record)
     return records
+
+
+def _load_state(path: Path) -> dict[str, Any]:
+    """Load cross-run state, failing open on missing/corrupt state."""
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return state if isinstance(state, dict) else {}
+
+
+def _save_state(path: Path, state: dict[str, Any]) -> str | None:
+    """Atomically persist state; return an actionable error on failure."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        tmp.write_text(
+            json.dumps(state, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(tmp, path)
+    except OSError as exc:
+        return f"failed to persist monitor state at {path}: {exc}"
+    return None
+
+
+def apply_inconclusive_escalation(
+    result: dict[str, Any],
+    *,
+    state_path: Path,
+    now: float,
+    escalation_hours: float = DEFAULT_INCONCLUSIVE_ESCALATION_HOURS,
+) -> dict[str, Any]:
+    """Escalate one continuous inconclusive window after its time budget.
+
+    ``not-observed`` and ``insufficient-data`` are deliberately one state
+    family: moving between them does not reset the timer. Any conclusive
+    status resets it. The threshold is strict (``>``), so exactly 72 hours
+    remains the underlying status and the next tick escalates.
+    """
+    underlying_status = result.get("status")
+    checked_at = datetime.fromtimestamp(now, timezone.utc).isoformat()
+    state = _load_state(state_path)
+
+    if underlying_status in _INCONCLUSIVE_STATUSES:
+        persisted_since = state.get("first_inconclusive_at")
+        first_inconclusive_at = (
+            _parse_ts(persisted_since) if isinstance(persisted_since, str) else None
+        )
+        if first_inconclusive_at is None or first_inconclusive_at > now:
+            first_inconclusive_at = now
+        inconclusive_hours = max(0.0, (now - first_inconclusive_at) / 3600.0)
+        result["inconclusive_since"] = datetime.fromtimestamp(
+            first_inconclusive_at, timezone.utc
+        ).isoformat()
+        result["inconclusive_hours"] = round(inconclusive_hours, 4)
+        result["inconclusive_escalation_hours"] = escalation_hours
+        if inconclusive_hours > escalation_hours:
+            result["underlying_status"] = underlying_status
+            result["status"] = "persistently-inconclusive"
+        next_state = {
+            "first_inconclusive_at": result["inconclusive_since"],
+            "last_inconclusive_status": underlying_status,
+            "last_checked_at": checked_at,
+        }
+    else:
+        next_state = {
+            "first_inconclusive_at": None,
+            "last_status": underlying_status,
+            "last_checked_at": checked_at,
+        }
+
+    state_error = _save_state(state_path, next_state)
+    if state_error:
+        result["state_error"] = state_error
+    return result
 
 
 def evaluate(
@@ -327,6 +409,7 @@ _EXIT_CODES = {
     "not-observed": 3,
     "insufficient-data": 4,
     "fetch-degraded": 5,
+    "persistently-inconclusive": 6,
 }
 
 
@@ -338,6 +421,9 @@ def main(argv: list[str] | None = None) -> int:
         ),
         epilog=(
             "Status / exit code table (most-urgent precedence first):\n"
+            "  persistently-inconclusive (6) -- not-observed / insufficient-data has\n"
+            f"                                 continued for more than "
+            f"{DEFAULT_INCONCLUSIVE_ESCALATION_HOURS:g} hours\n"
             "  not-observed (3)          -- stage never ran / ledger missing or stale\n"
             "  disabled-or-smoke-only (0) -- nothing enabled, or every enabled attempt\n"
             "                                 in the window was smoke/test traffic\n"
@@ -363,6 +449,14 @@ def main(argv: list[str] | None = None) -> int:
         formatter_class=argparse.RawTextHelpFormatter,
     )
     parser.add_argument("--ledger", default=str(DEFAULT_LEDGER))
+    parser.add_argument(
+        "--state",
+        default=str(DEFAULT_STATE),
+        help=(
+            "Durable JSON state used to track one continuous not-observed/"
+            "insufficient-data window across cron runs. Default: %(default)s."
+        ),
+    )
     parser.add_argument("--lookback-hours", type=float, default=48)
     parser.add_argument("--min-served-rate", type=float, default=0.8)
     parser.add_argument(
@@ -405,6 +499,16 @@ def main(argv: list[str] | None = None) -> int:
             "Default: %(default)s."
         ),
     )
+    parser.add_argument(
+        "--inconclusive-escalation-hours",
+        type=float,
+        default=DEFAULT_INCONCLUSIVE_ESCALATION_HOURS,
+        help=(
+            "Escalate to 'persistently-inconclusive' after the monitor has "
+            "remained not-observed/insufficient-data for strictly more than "
+            "this many hours across runs. Default: %(default)s."
+        ),
+    )
     parser.add_argument("--now", help="ISO8601 test override")
     parser.add_argument(
         "--quiet-when-healthy",
@@ -434,11 +538,18 @@ def main(argv: list[str] | None = None) -> int:
         search_window_hours=max(0.01, args.search_window_hours),
     )
     result["checked_at"] = datetime.fromtimestamp(now, timezone.utc).isoformat()
+    apply_inconclusive_escalation(
+        result,
+        state_path=Path(args.state).expanduser(),
+        now=now,
+        escalation_hours=max(0.0, args.inconclusive_escalation_hours),
+    )
     exit_code = _EXIT_CODES.get(result["status"], 2)
     quiet = (
         args.quiet_when_healthy
         and result["status"] in ("healthy", "disabled-or-smoke-only")
         and result["fetch_success_band"] != "warn"
+        and "state_error" not in result
     )
     if not quiet:
         print(json.dumps(result, sort_keys=True))

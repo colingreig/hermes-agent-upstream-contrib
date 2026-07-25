@@ -132,7 +132,13 @@ vs this copy) to catch drift — nothing currently automates that check.
   suppresses stdout (still exits 0) when status is `healthy` or
   `disabled-or-smoke-only`, except that a `warn` fetch band remains visible
   so the Mini cron/Slack delivery is actionable without changing status or
-  exit codes. Every non-success status still prints the full JSON.
+  exit codes. Every non-success status still prints the full JSON. Cross-run
+  state is written atomically to
+  `~/.hermes/state/research-stage-monitor.json`; one continuous
+  `not-observed` / `insufficient-data` window escalates after more than 72
+  hours to `status=persistently-inconclusive` with exit `6`. Moving between
+  the two inconclusive statuses preserves the timer, while any conclusive
+  status resets it.
 - `research-stage-monitor-cron.py` — thin `no_agent` cron wrapper for the
   monitor above. Mini cron jobs can't pass script arguments (`argv` is
   hardcoded to `[interpreter, path]` in `cron/scheduler.py`), so this
@@ -140,10 +146,11 @@ vs this copy) to catch drift — nothing currently automates that check.
   `research_stage_monitor.py` as a sibling file (resolved via
   `Path(__file__).resolve().with_name(...)`, never a hardcoded absolute
   path). The cron job delivers every non-success status and also delivers a
-  `status=healthy` payload when `fetch_success_band=warn`; genuinely healthy
-  non-warning results remain silent. It propagates the monitor's stdout,
-  stderr, and exit code verbatim; if the sibling script is missing it prints
-  an error to stdout (so the cron job surfaces it) and exits `1`.
+  `status=healthy` payload when `fetch_success_band=warn`, plus the
+  `persistently-inconclusive` escalation after more than 72 hours; genuinely
+  healthy non-warning results remain silent. It propagates the monitor's
+  stdout, stderr, and exit code verbatim; if the sibling script is missing it
+  prints an error to stdout (so the cron job surfaces it) and exits `1`.
 - `content-research-baseline.json` — phase-1 pre-rollout metrics snapshot,
   including the audited 1/3 content-gate execution rate and the historical
   0/29 Sonnet serve comparator, with unknown historical metrics explicitly
