@@ -44,6 +44,7 @@ import sys
 import threading
 import time
 import urllib.request
+from pathlib import Path
 
 
 # GLM/reasoning models leak <think>...</think> tags into OpenCode's --format json
@@ -312,6 +313,60 @@ LOG_DIR = os.path.expanduser("~/.hermes/logs/opencode")
 
 def eprint(*a):
     print(*a, file=sys.stderr, flush=True)
+
+
+def _changed_content_paths(workdir, committed_files, deliverables):
+    """Resolve the files eligible for outcome measurement after a content run."""
+    paths = set(committed_files or [])
+    paths.update(deliverables or [])
+    try:
+        diff = subprocess.run(
+            ["git", "-C", workdir, "diff", "--name-only", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if diff.returncode == 0:
+            paths.update(line.strip() for line in diff.stdout.splitlines() if line.strip())
+        untracked = subprocess.run(
+            ["git", "-C", workdir, "ls-files", "--others", "--exclude-standard"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if untracked.returncode == 0:
+            paths.update(line.strip() for line in untracked.stdout.splitlines() if line.strip())
+    except Exception as exc:
+        eprint(f"[opencode_exec] content outcome path scan failed (fail-open): {exc!r}")
+    return sorted(paths)
+
+
+def _record_content_outcome(task_id, workdir, committed_files, deliverables):
+    """Append citation counts for an eligible content run. Never block writing."""
+    try:
+        import importlib.util
+
+        module_path = os.path.join(os.path.dirname(__file__), "research_outcome_metrics.py")
+        spec = importlib.util.spec_from_file_location("research_outcome_metrics", module_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        paths = _changed_content_paths(workdir, committed_files, deliverables)
+        record = module.append_content_outcome(
+            task_id=task_id,
+            workdir=Path(workdir),
+            relative_files=paths,
+        )
+        eprint(
+            "[opencode_exec] content-outcome: "
+            f"pieces={record['content_pieces']} "
+            f"citation_links={record['citation_links']} "
+            f"links_per_piece={record['citation_link_coverage_per_piece']} "
+            f"(task={task_id})"
+        )
+        return record
+    except Exception as exc:
+        eprint(f"[opencode_exec] content outcome record failed (fail-open): {exc!r}")
+        return None
 
 
 # WRITER-LIVENESS (2026-06-25): persist served-tier record every run so a silent
@@ -915,6 +970,13 @@ def main():
     # executor should just PUSH the branch — it does NOT need to re-commit. If the
     # worktree is dirty, the executor commits then pushes as before.
     result["ok"] = True
+    if args.content:
+        # Citation-link coverage is observed at the writer choke point while the
+        # changed piece still exists locally.  The content-free receipt is later
+        # joined to research severity + validator verdict by ClickUp task id.
+        result["content_outcome"] = _record_content_outcome(
+            args.task_id, workdir, committed_files, deliverables
+        )
     _record_served(result, _writer_armed)  # WRITER-LIVENESS (2026-06-25)
     _record_attempt(args.task_id, "success")  # 86e2ddcpb retry cap
     print(json.dumps(result))

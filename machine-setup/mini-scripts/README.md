@@ -123,29 +123,56 @@ vs this copy) to catch drift — nothing currently automates that check.
   served rate. Exit codes: `0` healthy or disabled-or-smoke-only, `2`
   degraded (provider genuinely failing on real traffic), `3` not-observed
   (stage never ran / ledger missing or stale), `4` insufficient-data (fewer
-  than `--min-attempts` real, non-smoke attempts in the lookback window) —
-  the JSON `status` field is authoritative, the exit code exists for
-  consumers that only check process exit status. `--quiet-when-healthy`
+  than `--min-attempts` real, non-smoke attempts in the lookback window), and
+  `5` fetch-degraded (`fetch_success_rate < 0.50`) — the JSON `status` field
+  is authoritative, and the exit code exists for consumers that only check
+  process exit status. The JSON also exposes
+  `fetch_success_band` as `alarm`, `warn`, `healthy`, or `null`; the warning
+  band is `0.50 <= fetch_success_rate < 0.70`. `--quiet-when-healthy`
   suppresses stdout (still exits 0) when status is `healthy` or
-  `disabled-or-smoke-only`; every other status still prints the full JSON.
+  `disabled-or-smoke-only`, except that a `warn` fetch band remains visible
+  so the Mini cron/Slack delivery is actionable without changing status or
+  exit codes. Every non-success status still prints the full JSON. Cross-run
+  state is written atomically to
+  `~/.hermes/state/research-stage-monitor.json`; one continuous
+  `not-observed` / `insufficient-data` window escalates after more than 72
+  hours to `status=persistently-inconclusive` with exit `6`. Moving between
+  the two inconclusive statuses preserves the timer, while any conclusive
+  status resets it.
 - `research-stage-monitor-cron.py` — thin `no_agent` cron wrapper for the
   monitor above. Mini cron jobs can't pass script arguments (`argv` is
   hardcoded to `[interpreter, path]` in `cron/scheduler.py`), so this
   wrapper bakes in `--quiet-when-healthy` and calls
   `research_stage_monitor.py` as a sibling file (resolved via
   `Path(__file__).resolve().with_name(...)`, never a hardcoded absolute
-  path) so the cron job only delivers a message when the research stage is
-  NOT healthy. Propagates the monitor's stdout, stderr, and exit code
-  verbatim; if the sibling script is missing it prints an error to stdout
-  (so the cron job surfaces it) and exits `1`.
+  path). The cron job delivers every non-success status and also delivers a
+  `status=healthy` payload when `fetch_success_band=warn`, plus the
+  `persistently-inconclusive` escalation after more than 72 hours; genuinely
+  healthy non-warning results remain silent. It propagates the monitor's
+  stdout, stderr, and exit code verbatim; if the sibling script is missing it
+  prints an error to stdout (so the cron job surfaces it) and exits `1`.
 - `content-research-baseline.json` — phase-1 pre-rollout metrics snapshot,
   including the audited 1/3 content-gate execution rate and the historical
   0/29 Sonnet serve comparator, with unknown historical metrics explicitly
   marked uninstrumented rather than inferred.
+- `research_outcome_metrics.py` — content-outcome instrumentation and report.
+  Every successful `opencode_exec.py --content` run automatically writes a
+  content-free receipt to `~/.hermes/logs/content-outcomes.jsonl`: piece count,
+  unique explicit external Markdown/HTML citation-link count, mean links per
+  piece, share of pieces with a citation, and a hash of the measured path set.
+  Prose, URLs, and filenames are never logged. `report` joins the latest receipt
+  to `research-served.jsonl` (`grounded_pages`, `severity`) and the validator
+  verdict store by ClickUp task ID. It reports citation coverage and validator
+  fail rate by severity, but remains `insufficient-data` until both degraded
+  and healthy cohorts have five validator-observed tasks. The dated rollout
+  baseline is in `reports/research-outcome-validity-2026-07-25.md`.
 - `tests/test_research_stage.py` — verifies secret-safe auth, strict untrusted
   data boundaries, the analyzer request's zero-tool surface, refusal to
   interpret tool-use responses, bounded HTTP reads, flag-and-ship fallback,
   cannibalization context, content-free receipts, and monitor thresholds.
+- `tests/test_research_outcome_metrics.py` — verifies citation counting, path
+  containment, content-free receipts, task-ID joins, legacy-ledger handling,
+  latest-verdict selection, cohort floors, and the rendered report.
 - `claim_store.py`, `clickup-queue-poller-claim_next.py`, `opencode_exec.py` —
   the executor claim/dispatch chain (`claim_next.py` picks a candidate task and
   atomically locks it via `claim_store.py`; `opencode_exec.py` then runs the
