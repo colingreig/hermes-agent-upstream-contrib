@@ -6,19 +6,26 @@ Why this exists: mini `no_agent` cron jobs cannot pass script arguments —
 `argv` is hardcoded to `[interpreter, path]` in `cron/scheduler.py` (~line
 2029), with no way to append flags. `research_stage_monitor.py` only
 suppresses stdout on a healthy result when called with
-`--quiet-when-healthy` (see its own docstring: those cron jobs deliver a
-message on ANY non-empty stdout, so without that flag every tick would post
-regardless of health). This wrapper bakes the flag in so the cron job can
-invoke a bare, argument-free script and still get quiet-on-healthy behavior.
+`--quiet-when-healthy`, except that an actionable `fetch_success_band=warn`
+result remains visible (see the monitor's own docstring: those cron jobs
+deliver a message on ANY non-empty stdout, so without that flag every tick
+would post regardless of health). This wrapper bakes the flag in so the cron
+job can invoke a bare, argument-free script and still get quiet-on-healthy
+behavior with warning-band delivery.
 
-It does nothing else: it resolves the monitor as a sibling file next to
+The monitor also persists its inconclusive-window timer at
+`~/.hermes/state/research-stage-monitor.json`; after more than 72 continuous
+hours of `not-observed` / `insufficient-data`, this wrapper propagates the
+`persistently-inconclusive` JSON and exit `6` so cron delivery escalates it.
+
+Otherwise this wrapper does nothing else: it resolves the monitor as a sibling file next to
 this wrapper (both are deployed side by side to `~/.hermes/scripts/` on the
 mini and live side by side in `machine-setup/mini-scripts/` in this repo —
 never hardcode an absolute path here), runs it with `--quiet-when-healthy`,
 and propagates its stdout, stderr, and exit code verbatim. All actual
-monitor logic (ledger evaluation, exit-code mapping) lives in
+monitor logic (ledger evaluation, state tracking, exit-code mapping) lives in
 `research_stage_monitor.py`; see that file's docstring for the full
-0/2/3/4 exit-code contract.
+0/2/3/4/5/6 exit-code contract.
 """
 from __future__ import annotations
 
