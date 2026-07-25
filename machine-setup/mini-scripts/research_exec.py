@@ -54,6 +54,12 @@ MIN_GROUNDED_TEXT_CHARS = 600
 # without re-parsing free text.
 PAGE_THIN_REASON = "empty or too-short response"
 
+# A thin non-JS response can be a client-rendered article rather than a
+# genuinely unavailable source. Retry only a small number of those pages with
+# ScrapingBee rendering enabled: rendering is materially more expensive, and a
+# page receives at most one such retry in a run.
+MAX_JS_RENDER_RETRIES_PER_RUN = 2
+
 # Bounded retry for transient ScrapingBee failures (HTTP 5xx/429, transport
 # errors). Deterministic 4xx (400/401/402/403/404, ...) is never retried — it
 # will not improve on a second attempt. Module-level so tests can monkeypatch
@@ -422,6 +428,7 @@ def fetch_page(
     url: str,
     api_key: str,
     *,
+    render_js: bool = False,
     opener: Callable[..., Any] = urllib.request.urlopen,
 ) -> tuple[str | None, str | None]:
     parsed = urllib.parse.urlparse(url)
@@ -432,7 +439,7 @@ def fetch_page(
             FETCH_ENDPOINT,
             {
                 "url": url,
-                "render_js": "false",
+                "render_js": "true" if render_js else "false",
                 "block_ads": "true",
                 "block_resources": "true",
                 "return_page_text": "true",
@@ -582,9 +589,8 @@ def classify_degradation(
         409/423/429/451, a generic non-2xx, or a transport failure). Durable —
         retrying the same fetch will not help.
       - "page-thin": the fetch got a 2xx response but the extracted text didn't clear
-        the grounding floor. `render_js` is hardcoded "false" in `fetch_page`, so a
-        JS-rendered page returns a stub here — this is a FIXABLE config class and must
-        never be written off as origin blocking.
+        the grounding floor. The caller may retry this class once with JS rendering
+        under a run-wide cap, so it must never be written off as origin blocking.
     Returns (None, None) when neither happened (healthy).
     """
     if search_error:
@@ -811,6 +817,12 @@ def write_ledger(path: Path, record: dict[str, Any]) -> None:
             "blocked_pages": int(record.get("blocked_pages", 0)),
             "grounded_pages": int(record.get("grounded_pages", 0)),
             "attempted_fetches": int(record.get("attempted_fetches", 0)),
+            # These make the gain from the bounded JS-render retry directly
+            # observable without conflating it with ordinary grounded pages.
+            "js_render_retries": int(record.get("js_render_retries", 0)),
+            "grounded_pages_recovered_by_js": int(
+                record.get("grounded_pages_recovered_by_js", 0)
+            ),
             "stripped_trust_lines": int(record.get("stripped_trust_lines", 0)),
             "smoke": bool(record.get("smoke", False)),
             "elapsed_s": round(float(record.get("elapsed_s", 0.0)), 2),
@@ -902,6 +914,8 @@ def main(argv: list[str] | None = None) -> int:
             "severity": "none",
             "grounded_pages": 0,
             "attempted_fetches": 0,
+            "js_render_retries": 0,
+            "grounded_pages_recovered_by_js": 0,
             "smoke": args.smoke,
             "elapsed_s": time.monotonic() - started,
             "baseline_id": baseline_id,
@@ -960,6 +974,8 @@ def main(argv: list[str] | None = None) -> int:
             "severity": severity,
             "grounded_pages": 0,
             "attempted_fetches": 0,
+            "js_render_retries": 0,
+            "grounded_pages_recovered_by_js": 0,
             "stripped_trust_lines": stripped_count,
             "search_failed": False,
             "failure_reason": "SCRAPINGBEE_API_KEY unavailable",
@@ -987,12 +1003,22 @@ def main(argv: list[str] | None = None) -> int:
     search_failed = bool(search_error)
     max_fetches = max(0, min(args.max_fetches, 5))
     attempted_fetches = min(len(results), max_fetches)
+    js_render_retries = 0
+    grounded_pages_recovered_by_js = 0
     if search_error:
         blocked: list[dict[str, str]] = [{"url": "ScrapingBee Google API", "reason": search_error}]
     else:
         blocked = page_blocked
         for item in results[:max_fetches]:
             page_text, error = fetch_page(item["url"], api_key)
+            if error == PAGE_THIN_REASON and js_render_retries < MAX_JS_RENDER_RETRIES_PER_RUN:
+                # This is intentionally the only JS retry for this item. A
+                # second thin result (or any other retry error) is recorded as
+                # unavailable, and the run-wide cap bounds total render cost.
+                js_render_retries += 1
+                page_text, error = fetch_page(item["url"], api_key, render_js=True)
+                if page_text is not None:
+                    grounded_pages_recovered_by_js += 1
             if page_text is None:
                 page_blocked.append({"url": item["url"], "reason": error or "unavailable"})
             else:
@@ -1028,6 +1054,8 @@ def main(argv: list[str] | None = None) -> int:
             "blocked_pages": len(page_blocked),
             "grounded_pages": grounded_pages,
             "attempted_fetches": attempted_fetches,
+            "js_render_retries": js_render_retries,
+            "grounded_pages_recovered_by_js": grounded_pages_recovered_by_js,
             "search_failed": search_failed,
             "failure_reason": failure_reason,
             "failure_class": failure_class,
@@ -1147,6 +1175,8 @@ def main(argv: list[str] | None = None) -> int:
         "blocked_pages": len(page_blocked),
         "grounded_pages": grounded_pages,
         "attempted_fetches": attempted_fetches,
+        "js_render_retries": js_render_retries,
+        "grounded_pages_recovered_by_js": grounded_pages_recovered_by_js,
         "stripped_trust_lines": stripped_count,
         "search_failed": search_failed,
         "failure_reason": failure_reason,
