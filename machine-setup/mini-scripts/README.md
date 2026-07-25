@@ -27,6 +27,14 @@ scp machine-setup/mini-scripts/<file> mac-mini-h.tail51ec1b.ts.net:~/.hermes/scr
 mini-run -- 'python3 -m py_compile ~/.hermes/scripts/<file>'  # sanity check
 ```
 
+**Destination path note:** every file below deploys to `~/.hermes/scripts/<file>`
+EXCEPT `clickup-queue-poller-claim_next.py`, whose mini destination is
+`~/.hermes/skills/clickup-queue-poller/scripts/claim_next.py` (a different
+directory tree, the skill's own scripts dir — the filename here is prefixed
+`clickup-queue-poller-` only to keep it collision-free in this flat repo
+directory; drop the prefix when copying to the mini). See "Claim retry cap"
+below for the exact copy commands.
+
 Diff against the live file periodically (`ssh mini cat ~/.hermes/scripts/<file>`
 vs this copy) to catch drift — nothing currently automates that check.
 
@@ -105,11 +113,31 @@ vs this copy) to catch drift — nothing currently automates that check.
   `content_pipeline.research.enabled` switch in `~/.hermes/config.yaml`
   defaults on; any key/API/paywall/bot/analyzer failure is flag-and-ship and
   leaves the writer able to continue.
-  Execution receipts go to `~/.hermes/logs/research-served.jsonl` without the
-  API key, query text, fetched content, or generated brief.
+  A page that is thin without JavaScript may receive one JS-rendered retry,
+  capped at two retries per run. Execution receipts expose
+  `js_render_retries` and `grounded_pages_recovered_by_js` to measure the
+  grounding gain attributable to those retries, without recording the API
+  key, query text, fetched content, or generated brief.
 - `research_stage_monitor.py` — independent served-ledger liveness check. It
   reports recent enabled attempts, successful serves, degraded attempts, and
-  served rate; it exits 2 for a missing/degraded enabled-stage window.
+  served rate. Exit codes: `0` healthy or disabled-or-smoke-only, `2`
+  degraded (provider genuinely failing on real traffic), `3` not-observed
+  (stage never ran / ledger missing or stale), `4` insufficient-data (fewer
+  than `--min-attempts` real, non-smoke attempts in the lookback window) —
+  the JSON `status` field is authoritative, the exit code exists for
+  consumers that only check process exit status. `--quiet-when-healthy`
+  suppresses stdout (still exits 0) when status is `healthy` or
+  `disabled-or-smoke-only`; every other status still prints the full JSON.
+- `research-stage-monitor-cron.py` — thin `no_agent` cron wrapper for the
+  monitor above. Mini cron jobs can't pass script arguments (`argv` is
+  hardcoded to `[interpreter, path]` in `cron/scheduler.py`), so this
+  wrapper bakes in `--quiet-when-healthy` and calls
+  `research_stage_monitor.py` as a sibling file (resolved via
+  `Path(__file__).resolve().with_name(...)`, never a hardcoded absolute
+  path) so the cron job only delivers a message when the research stage is
+  NOT healthy. Propagates the monitor's stdout, stderr, and exit code
+  verbatim; if the sibling script is missing it prints an error to stdout
+  (so the cron job surfaces it) and exits `1`.
 - `content-research-baseline.json` — phase-1 pre-rollout metrics snapshot,
   including the audited 1/3 content-gate execution rate and the historical
   0/29 Sonnet serve comparator, with unknown historical metrics explicitly
@@ -118,3 +146,113 @@ vs this copy) to catch drift — nothing currently automates that check.
   data boundaries, the analyzer request's zero-tool surface, refusal to
   interpret tool-use responses, bounded HTTP reads, flag-and-ship fallback,
   cannibalization context, content-free receipts, and monitor thresholds.
+- `claim_store.py`, `clickup-queue-poller-claim_next.py`, `opencode_exec.py` —
+  the executor claim/dispatch chain (`claim_next.py` picks a candidate task and
+  atomically locks it via `claim_store.py`; `opencode_exec.py` then runs the
+  writer model against it). Vendored here 2026-07-24 (ClickUp 86e2ddcpb spend-
+  guard trip postmortem) as the canonical git home for what had been mini-only,
+  untracked files — see "Claim retry cap" below for the incident and the fix
+  layered on top in the next commit.
+- `tests/test_claim_history.py` — covers the per-task attempt-cap logic added
+  on top of the vendored claim chain (see "Claim retry cap" below).
+- `pr_staleness_alert.py` — Slack-delivered cron wrapper (mini job
+  `pr-staleness-alert`, id `3043a00e6df8`) for open PRs stuck without a fresh
+  validator verdict. Vendored 2026-07-24 (byte-identical, commit 1) then
+  fixed (commit 2) for the 15-minute repost bug — see "PR staleness dedupe"
+  below.
+- `tests/test_pr_staleness_alert.py` — covers the dedupe fingerprint, decide
+  logic (unchanged/new/dropped/bucket-crossing/heartbeat), and fail-open
+  state loading, both as pure functions and end to end through `run()`.
+
+## Claim retry cap (ClickUp 86e2ddcpb, 2026-07-24)
+
+Root cause: `claim_next.py` fails open on any error (by design — a claim-store
+bug must never block legitimate work) and had NO cap on how many times the
+same task could be reclaimed. Two tasks (`86e2dda93`, `86e2cpdgh`) looped
+12 and ~6 sessions respectively, each one ending "opencode finished but made
+no file changes" / "no commit or push" (never reaching a PR), tripping the
+$50/day spend guard and blocking all executor work for the rest of the day.
+
+Fix (implemented across `claim_store.py` + `clickup-queue-poller-claim_next.py`
++ `opencode_exec.py`):
+- `opencode_exec.py` calls `claim_store.record_attempt(task_id, outcome, note)`
+  at session end (`success` / `fail` / `crash`), appending to a per-task
+  history file at `~/.hermes/state/claim_history/<task_id>.json` (list
+  capped at `HERMES_CLAIM_HISTORY_MAX_ENTRIES`, default 50).
+- `claim_next.py`'s per-candidate loop now excludes any task with MORE than
+  `HERMES_CLAIM_MAX_ATTEMPTS` (default 5) recorded attempts in the trailing
+  24h (`COOLDOWN_SECONDS`) window — counted by **task id**, not claim run, so
+  a reclaim of a still-fresh task never double-counts. An excluded task has
+  its `agent-ready` tag stripped, gets tagged `attempt-cap-exceeded-<ts>`, and
+  gets a ClickUp comment with the attempt count and last recorded failure.
+- Every new code path fails OPEN: a missing/corrupt/unreadable history file,
+  or any other error, is treated as "under cap" and the claim proceeds
+  normally. A bug in the cap logic must never block the queue — this mirrors
+  the existing `claim_store.py` acquire/release fail-open contract.
+
+Deploy (copy commands — run from the repo root; `mac-mini-h.tail51ec1b.ts.net`
+is the mini's Tailscale name):
+
+```bash
+scp machine-setup/mini-scripts/claim_store.py \
+    mac-mini-h.tail51ec1b.ts.net:~/.hermes/scripts/claim_store.py
+scp machine-setup/mini-scripts/opencode_exec.py \
+    mac-mini-h.tail51ec1b.ts.net:~/.hermes/scripts/opencode_exec.py
+scp machine-setup/mini-scripts/clickup-queue-poller-claim_next.py \
+    mac-mini-h.tail51ec1b.ts.net:~/.hermes/skills/clickup-queue-poller/scripts/claim_next.py
+mini-run -- 'python3 -m py_compile ~/.hermes/scripts/claim_store.py \
+    ~/.hermes/scripts/opencode_exec.py \
+    ~/.hermes/skills/clickup-queue-poller/scripts/claim_next.py'  # sanity check
+```
+
+## PR staleness dedupe (mini cron job pr-staleness-alert, 2026-07-24)
+
+Root cause: `pr_pipeline_improvements.check_staleness_and_alert()` (a
+separate, also mini-only, not-yet-vendored module) fingerprinted each stale
+PR on `round(age_hours, 2)` — a value that changes on almost every
+15-minute tick — so its `.pr_pipeline_state.json` comparison never matched
+two runs in a row. Confirmed byte-identical Slack payload across six
+consecutive runs (20:02-21:16 on 2026-07-23), 257 runs since 2026-07-22, for
+the same 6 unresolved stale PRs. The signal was real; the dedupe granularity
+was the defect.
+
+Fix: `pr_staleness_alert.py` no longer calls that function at all. It calls
+the lower-level scan/staleness primitives (`GitHubClient`, `scan_repos`,
+`stale_without_verdict`, `utcnow`, `notify` — all re-exported by
+`pr_pipeline_improvements`) directly, then owns its own dedupe:
+- Fingerprints the current stale set on `(repo, PR number) -> coarse age
+  bucket` (`PR_STALENESS_AGE_BUCKET_HOURS`, default `24,72,168`), persisted
+  at `PR_STALENESS_STATE_PATH` (default `~/.hermes/state/pr_staleness_last.json`
+  — a new path, independent of the old broken `.pr_pipeline_state.json`).
+- Posts to Slack only when that fingerprint changes (a PR enters/leaves the
+  stale set, or crosses a bucket boundary), plus a heartbeat at most once
+  per `PR_STALENESS_DIGEST_HOURS` (default `24`) so an
+  unchanged-but-still-broken state resurfaces daily instead of going quiet
+  forever.
+- Fails OPEN on state-file errors: a missing/corrupt/wrong-shaped
+  `pr_staleness_last.json` is treated as "no prior state," so the current
+  stale set looks new and gets posted rather than silently suppressed —
+  same fail-open contract as `claim_store.py`.
+
+A separate agent applied an immediate cadence reduction on the mini cron
+schedule (`*/15` -> daily) as a stopgap while this fix was in flight; that
+cadence change is cron-config only and lives on the mini, not in this repo.
+
+Deploy (run from the repo root; `mac-mini-h.tail51ec1b.ts.net` is the
+mini's Tailscale name):
+
+```bash
+scp machine-setup/mini-scripts/pr_staleness_alert.py \
+    mac-mini-h.tail51ec1b.ts.net:~/.hermes/scripts/pr_staleness_alert.py
+mini-run -- 'python3 -m py_compile ~/.hermes/scripts/pr_staleness_alert.py'  # sanity check
+```
+
+**WARNING — do NOT rsync `~/.hermes/scripts/` wholesale.** That directory is
+hand-maintained on the mini and holds ~203 live-only scripts with no git
+backing (see the top of this file). Only ever `scp` the exact file(s) named
+in the deploy command for the section you're working from (e.g. just
+`claim_store.py`, `opencode_exec.py`, and `clickup-queue-poller-claim_next.py`
+for "Claim retry cap" above, or just `pr_staleness_alert.py` for "PR
+staleness dedupe" above) — never the directory. The same caution applies to
+`~/.hermes/skills/clickup-queue-poller/scripts/` — copy only `claim_next.py`,
+never the directory.
