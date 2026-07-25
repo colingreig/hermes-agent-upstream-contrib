@@ -48,6 +48,73 @@ PRI = {"urgent": 0, "high": 1, "normal": 2, "low": 3, None: 4}
 _BLOCKED_OPERATOR_RE = re.compile(r"^blocked-operator-(\d+)$")
 COOLDOWN_SECONDS = 24 * 60 * 60
 
+# Attempt-retry cap (ClickUp 86e2ddcpb, 2026-07-24): claim_next.py fails open
+# by design (any error grants the claim, never blocks legit work), and until
+# now had NO cap on how many times the same task could be reclaimed. Two
+# tasks (86e2dda93: 12 sessions, 86e2cpdgh: ~6 sessions) each looped forever
+# ending "no commit or push" — never reaching a PR, so they were reclaimed
+# indefinitely — and together tripped the $50/day spend guard, blocking all
+# executor work for the rest of the day. HERMES_CLAIM_MAX_ATTEMPTS caps the
+# number of attempts (per TASK ID, not claim run — see claim_store.record_
+# attempt) counted in the trailing COOLDOWN_SECONDS (24h) window. Reuses
+# COOLDOWN_SECONDS rather than a second constant per the design brief.
+_DEFAULT_MAX_ATTEMPTS = 5
+
+
+def _max_attempts():
+    try:
+        return int(os.environ.get("HERMES_CLAIM_MAX_ATTEMPTS", str(_DEFAULT_MAX_ATTEMPTS)))
+    except (TypeError, ValueError):
+        return _DEFAULT_MAX_ATTEMPTS
+
+
+def _over_attempt_cap(task_id, cap):
+    """True iff task_id has MORE than `cap` recorded attempts in the trailing
+    24h window. FAIL-OPEN on any error (claim_store unavailable, missing/
+    corrupt/unreadable history file, ...): never treat a task as over-cap
+    when we can't prove it — a bug here must never block the queue."""
+    if claim_store is None:
+        return False
+    try:
+        return claim_store.count_attempts(task_id, COOLDOWN_SECONDS) > cap
+    except Exception:
+        return False
+
+
+def _handle_attempt_cap_exceeded(task_id, cap):
+    """Best-effort ClickUp side-effects for a task that exceeded the attempt
+    cap: strip agent-ready (so it stops being auto-picked), tag
+    attempt-cap-exceeded-<ts> (timestamped, visible for triage), and post a
+    comment with the attempt count + last recorded failure. Never raises —
+    a notification failure must not block the scan (the task is still
+    excluded from `claimable` regardless of whether this succeeds)."""
+    try:
+        ts = int(time.time())
+        clickup = os.path.expanduser("~/.hermes/scripts/clickup/clickup.mjs")
+        subprocess.run(["node", clickup, "untag", task_id, "agent-ready"],
+                        capture_output=True, text=True, timeout=15)
+        subprocess.run(["node", clickup, "tag", task_id, f"attempt-cap-exceeded-{ts}"],
+                        capture_output=True, text=True, timeout=15)
+        try:
+            count = claim_store.count_attempts(task_id, COOLDOWN_SECONDS) if claim_store else "?"
+        except Exception:
+            count = "?"
+        try:
+            last_note = claim_store.last_failure_note(task_id) if claim_store else ""
+        except Exception:
+            last_note = ""
+        comment = (
+            f"ignite-claim-cap: {task_id} exceeded the attempt cap "
+            f"({count} attempts in the last 24h, cap={cap}) — removed agent-ready "
+            "and tagged attempt-cap-exceeded. Needs a human look before re-queuing."
+        )
+        if last_note:
+            comment += f" Last recorded failure: {last_note}"
+        subprocess.run(["node", clickup, "comment", task_id, comment],
+                        capture_output=True, text=True, timeout=15)
+    except Exception as e:
+        print(f"  [claim_next] attempt-cap side-effects failed for {task_id} (fail-open): {e}")
+
 
 def _tags(t):
     out = []
@@ -138,12 +205,19 @@ def main():
     claimable = []
     cooling_down = []
     merged_lifecycle = []
+    attempt_capped = []
+    cap = _max_attempts()
     for t in candidates:
         tags = _tags(t)
+        tid = t.get("id")
         if "merged" in tags:
             # A merged task must be reconciled by the merged-before-claim
             # handler; it is never safe to send it through fresh execution.
-            merged_lifecycle.append(t.get("id"))
+            merged_lifecycle.append(tid)
+            continue
+        if _over_attempt_cap(tid, cap):
+            attempt_capped.append(tid)
+            _handle_attempt_cap_exceeded(tid, cap)
             continue
         blocked_ts = _blocked_operator_ts(tags)
         if blocked_ts is None:
@@ -155,7 +229,10 @@ def main():
         if _has_newer_human_comment(t.get("id"), blocked_ts):
             claimable.append(t)  # Colin responded — cooldown cleared early
             continue
-        cooling_down.append(t.get("id"))
+        cooling_down.append(tid)
+    if attempt_capped:
+        print(f"  [claim_next] {len(attempt_capped)} task(s) excluded — attempt cap ({cap}) exceeded: "
+              f"{', '.join(attempt_capped)}")
     if cooling_down:
         print(f"  [claim_next] {len(cooling_down)} task(s) skipped — operator-disqualify cooldown active: "
               f"{', '.join(cooling_down)}")

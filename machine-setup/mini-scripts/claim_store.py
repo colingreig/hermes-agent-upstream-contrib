@@ -283,6 +283,111 @@ def reap_stale() -> list:
     return reaped
 
 
+# ── Attempt history / retry cap (ClickUp 86e2ddcpb, 2026-07-24) ────────────
+#
+# claim_next.py fails open by design: any error in the claim machinery grants
+# the claim rather than blocking legitimate work. But that meant there was NO
+# upper bound on how many times the SAME task could be reclaimed after
+# repeated failures — two tasks looped 12 and ~6 executor sessions
+# respectively, each one ending "no commit or push" (never reaching a PR),
+# and together tripped the $50/day spend guard, blocking all executor work.
+#
+# record_attempt()/count_attempts() below give claim_next.py a per-task,
+# 24h-rolling attempt count so it can stop reclaiming a task past a cap. This
+# is STRICTLY ADDITIVE and preserves the fail-open contract above: every
+# function here returns a safe "as if under cap" value on any error — a bug
+# in this history bookkeeping must never block a legitimate claim.
+CLAIM_HISTORY_DIR = os.path.expanduser("~/.hermes/state/claim_history")
+# Cap the number of records kept per task so a pathologically long-lived task
+# (already over any sane attempt cap) can't grow its history file unbounded.
+MAX_HISTORY_ENTRIES = int(os.environ.get("HERMES_CLAIM_HISTORY_MAX_ENTRIES", "50"))
+
+
+def _history_path(task_id: str) -> str:
+    os.makedirs(CLAIM_HISTORY_DIR, exist_ok=True)
+    return os.path.join(CLAIM_HISTORY_DIR, f"{task_id}.json")
+
+
+def _load_history(task_id: str) -> list:
+    """Return the task's attempt history as a list, or [] on ANY error
+    (missing file, corrupt JSON, wrong shape, permission error, ...). Never
+    raises — callers rely on this to fail open."""
+    try:
+        path = _history_path(task_id)
+        if not os.path.exists(path):
+            return []
+        with open(path, "r") as f:
+            history = json.load(f)
+        return history if isinstance(history, list) else []
+    except Exception:
+        return []
+
+
+def record_attempt(task_id: str, outcome: str, note: str = "", run: str | None = None) -> None:
+    """Append one attempt record for task_id: {"ts", "run", "outcome", "note"}.
+
+    outcome is a short label — "success" | "fail" | "crash" — set by the
+    caller (opencode_exec.py) at session end. Counting is by TASK ID, not
+    claim run, so a reclaim of a still-fresh task never double-counts (the
+    caller passes the same task_id across every reclaim of that task).
+
+    Never raises: any error (disk full, permission, race) is swallowed. A
+    history-logging bug must never abort the caller's session-end path."""
+    try:
+        history = _load_history(task_id)
+        history.append({
+            "ts": time.time(),
+            "run": run or os.environ.get("HERMES_EXECUTOR_RUN_ID", ""),
+            "outcome": outcome,
+            "note": (note or "")[:500],
+        })
+        history = history[-MAX_HISTORY_ENTRIES:]
+        path = _history_path(task_id)
+        tmp = path + f".tmp{os.getpid()}"
+        with open(tmp, "w") as f:
+            json.dump(history, f)
+        os.replace(tmp, path)  # atomic rename — no torn reads
+    except Exception:
+        pass  # FAIL-OPEN: a logging bug must never break the caller
+
+
+def count_attempts(task_id: str, window_seconds: int) -> int:
+    """Count attempts recorded for task_id within the trailing window_seconds.
+
+    FAIL-OPEN: any error (missing/corrupt/unreadable history file) returns 0,
+    so a caller comparing this against a cap always resolves to "under cap"
+    on failure — the cap logic can never block the queue on its own bug."""
+    try:
+        history = _load_history(task_id)
+        cutoff = time.time() - window_seconds
+        count = 0
+        for rec in history:
+            if not isinstance(rec, dict):
+                continue
+            try:
+                ts = float(rec.get("ts", 0))
+            except (TypeError, ValueError):
+                continue
+            if ts >= cutoff:
+                count += 1
+        return count
+    except Exception:
+        return 0  # FAIL-OPEN
+
+
+def last_failure_note(task_id: str) -> str:
+    """Best-effort: the note from the most recent non-success attempt (for the
+    ClickUp over-cap comment). Empty string on any error or if none found."""
+    try:
+        history = _load_history(task_id)
+        for rec in reversed(history):
+            if isinstance(rec, dict) and rec.get("outcome") != "success":
+                return str(rec.get("note") or "")[:500]
+    except Exception:
+        pass
+    return ""
+
+
 def _main(argv: list) -> int:
     if not argv:
         print(__doc__)

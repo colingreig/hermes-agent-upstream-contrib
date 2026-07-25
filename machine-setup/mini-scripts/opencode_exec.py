@@ -410,6 +410,25 @@ _WORKED_BY_HERMES_OPTION_ID = (
 )
 
 
+# ── Attempt history (ClickUp 86e2ddcpb, 2026-07-24) ─────────────────────────
+# Session-end hook for claim_next.py's retry cap: record every real delegation
+# outcome (success/fail/crash) to claim_store's per-task history so the next
+# claim_next.py scan can see how many times this task has been attempted in
+# the trailing 24h and refuse to reclaim it past HERMES_CLAIM_MAX_ATTEMPTS.
+# Fail-open: any error here is eprint-logged and swallowed — history logging
+# must never affect delegation success/failure or its return code.
+def _record_attempt(task_id, outcome, note=""):
+    try:
+        import importlib.util as _ilu
+        _cs_path = os.path.join(os.path.dirname(__file__), "claim_store.py")
+        _cs_spec = _ilu.spec_from_file_location("claim_store", _cs_path)
+        _cs = _ilu.module_from_spec(_cs_spec)
+        _cs_spec.loader.exec_module(_cs)
+        _cs.record_attempt(task_id, outcome, note=note)
+    except Exception as e:
+        eprint(f"[opencode_exec] record_attempt failed (fail-open): {e!r}")
+
+
 def _stamp_worked_by_hermes(task_id):
     """Best-effort: set the ClickUp Worked By field to Hermes for an unclaimed pick."""
     token = os.environ.get("CLICKUP_API_TOKEN", "").strip()
@@ -865,17 +884,20 @@ def main():
     if timed_out:
         result["error"] = f"timeout after {args.timeout}s"
         _record_served(result, _writer_armed)  # WRITER-LIVENESS (2026-06-25)
+        _record_attempt(args.task_id, "crash", result["error"])  # 86e2ddcpb retry cap
         print(json.dumps(result))
         return 3
     if saw_error is not None:
         # Strip any leaked <think> tags before this becomes a ClickUp diagnostic (H1).
         result["error"] = _strip_think(json.dumps(saw_error))[:1500]
         _record_served(result, _writer_armed)  # WRITER-LIVENESS (2026-06-25)
+        _record_attempt(args.task_id, "crash", result["error"])  # 86e2ddcpb retry cap
         print(json.dumps(result))
         return 3
     if rc not in (0, None):
         result["error"] = f"opencode exited rc={rc}; stderr_tail={stderr_tail[-800:]}"
         _record_served(result, _writer_armed)  # WRITER-LIVENESS (2026-06-25)
+        _record_attempt(args.task_id, "crash", result["error"])  # 86e2ddcpb retry cap
         print(json.dumps(result))
         return 3
     if not wrote_changes:
@@ -885,6 +907,7 @@ def main():
             result["error"] = ("opencode finished but wrote no deliverable file in the non-git workdir "
                                "(expected fields.json or another non-empty output) — nothing to publish")
         _record_served(result, _writer_armed)  # WRITER-LIVENESS (2026-06-25)
+        _record_attempt(args.task_id, "fail", result["error"])  # 86e2ddcpb retry cap
         print(json.dumps(result))
         return 2
 
@@ -893,6 +916,7 @@ def main():
     # worktree is dirty, the executor commits then pushes as before.
     result["ok"] = True
     _record_served(result, _writer_armed)  # WRITER-LIVENESS (2026-06-25)
+    _record_attempt(args.task_id, "success")  # 86e2ddcpb retry cap
     print(json.dumps(result))
     return 0
 
