@@ -117,7 +117,24 @@ vs this copy) to catch drift — nothing currently automates that check.
   API key, query text, fetched content, or generated brief.
 - `research_stage_monitor.py` — independent served-ledger liveness check. It
   reports recent enabled attempts, successful serves, degraded attempts, and
-  served rate; it exits 2 for a missing/degraded enabled-stage window.
+  served rate. Exit codes: `0` healthy or disabled-or-smoke-only, `2`
+  degraded (provider genuinely failing on real traffic), `3` not-observed
+  (stage never ran / ledger missing or stale), `4` insufficient-data (fewer
+  than `--min-attempts` real, non-smoke attempts in the lookback window) —
+  the JSON `status` field is authoritative, the exit code exists for
+  consumers that only check process exit status. `--quiet-when-healthy`
+  suppresses stdout (still exits 0) when status is `healthy` or
+  `disabled-or-smoke-only`; every other status still prints the full JSON.
+- `research-stage-monitor-cron.py` — thin `no_agent` cron wrapper for the
+  monitor above. Mini cron jobs can't pass script arguments (`argv` is
+  hardcoded to `[interpreter, path]` in `cron/scheduler.py`), so this
+  wrapper bakes in `--quiet-when-healthy` and calls
+  `research_stage_monitor.py` as a sibling file (resolved via
+  `Path(__file__).resolve().with_name(...)`, never a hardcoded absolute
+  path) so the cron job only delivers a message when the research stage is
+  NOT healthy. Propagates the monitor's stdout, stderr, and exit code
+  verbatim; if the sibling script is missing it prints an error to stdout
+  (so the cron job surfaces it) and exits `1`.
 - `content-research-baseline.json` — phase-1 pre-rollout metrics snapshot,
   including the audited 1/3 content-gate execution rate and the historical
   0/29 Sonnet serve comparator, with unknown historical metrics explicitly
