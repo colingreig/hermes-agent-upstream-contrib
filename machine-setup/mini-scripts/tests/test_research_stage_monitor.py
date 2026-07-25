@@ -290,6 +290,7 @@ def test_fetch_success_rate_alarm_below_0_50():
     filler = [_record(f"prod-ok-{i}", served=True, degraded=False) for i in range(19)]
     result = monitor.evaluate([coverage_record] + filler, **_healthy_defaults())
     assert result["fetch_success_rate"] == 0.49
+    assert result["fetch_success_band"] == "alarm"
     assert result["status"] == "fetch-degraded"
     assert monitor._EXIT_CODES[result["status"]] == 5
 
@@ -301,10 +302,11 @@ def test_fetch_success_rate_exactly_at_alarm_boundary_is_not_alarmed():
     filler = [_record(f"prod-ok-{i}", served=True, degraded=False) for i in range(19)]
     result = monitor.evaluate([coverage_record] + filler, **_healthy_defaults())
     assert result["fetch_success_rate"] == 0.5
+    assert result["fetch_success_band"] == "warn"
     assert result["status"] == "healthy"
 
 
-def test_fetch_success_rate_warn_band_does_not_change_status():
+def test_fetch_success_rate_warn_band_is_explicit_without_changing_status():
     # 0.60 sits in the documented warn band (below 0.70, at/above 0.50) --
     # it must remain informational only, never its own status/exit code.
     coverage_record = _record(
@@ -313,6 +315,18 @@ def test_fetch_success_rate_warn_band_does_not_change_status():
     filler = [_record(f"prod-ok-{i}", served=True, degraded=False) for i in range(19)]
     result = monitor.evaluate([coverage_record] + filler, **_healthy_defaults())
     assert result["fetch_success_rate"] == 0.6
+    assert result["fetch_success_band"] == "warn"
+    assert result["status"] == "healthy"
+
+
+def test_fetch_success_rate_exactly_at_warn_boundary_is_healthy_band():
+    coverage_record = _record(
+        "prod-cov-0", served=True, degraded=False, attempted_fetches=100, grounded_pages=70
+    )
+    filler = [_record(f"prod-ok-{i}", served=True, degraded=False) for i in range(19)]
+    result = monitor.evaluate([coverage_record] + filler, **_healthy_defaults())
+    assert result["fetch_success_rate"] == 0.7
+    assert result["fetch_success_band"] == "healthy"
     assert result["status"] == "healthy"
 
 
@@ -321,7 +335,56 @@ def test_fetch_success_rate_skips_cleanly_when_no_attempted_fetches():
     result = monitor.evaluate(records, **_healthy_defaults())
     assert result["attempted_fetches_total"] == 0
     assert result["fetch_success_rate"] is None
+    assert result["fetch_success_band"] is None
     assert result["status"] == "healthy"
+
+
+def test_quiet_when_healthy_prints_warn_band_without_changing_exit(tmp_path, capsys):
+    ledger = tmp_path / "fetch-warning.jsonl"
+    coverage_record = _record(
+        "prod-cov-0", served=True, degraded=False, attempted_fetches=100, grounded_pages=60
+    )
+    filler = [_record(f"prod-ok-{i}", served=True, degraded=False) for i in range(19)]
+    ledger.write_text(
+        "\n".join(monitor.json.dumps(r) for r in [coverage_record] + filler) + "\n"
+    )
+
+    rc = monitor.main(
+        [
+            "--ledger",
+            str(ledger),
+            "--now",
+            "2026-07-24T18:00:00Z",
+            "--quiet-when-healthy",
+        ]
+    )
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert '"status": "healthy"' in out
+    assert '"fetch_success_band": "warn"' in out
+
+
+def test_quiet_when_healthy_still_suppresses_healthy_fetch_band(tmp_path, capsys):
+    ledger = tmp_path / "fetch-healthy.jsonl"
+    coverage_record = _record(
+        "prod-cov-0", served=True, degraded=False, attempted_fetches=100, grounded_pages=70
+    )
+    filler = [_record(f"prod-ok-{i}", served=True, degraded=False) for i in range(19)]
+    ledger.write_text(
+        "\n".join(monitor.json.dumps(r) for r in [coverage_record] + filler) + "\n"
+    )
+
+    rc = monitor.main(
+        [
+            "--ledger",
+            str(ledger),
+            "--now",
+            "2026-07-24T18:00:00Z",
+            "--quiet-when-healthy",
+        ]
+    )
+    assert rc == 0
+    assert capsys.readouterr().out == ""
 
 
 def test_ungrounded_rate_alarm_above_0_10():

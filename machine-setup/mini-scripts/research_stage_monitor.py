@@ -42,12 +42,13 @@ that only checks process exit status can still tell the conditions apart:
 ``--quiet-when-healthy``: mini ``no_agent`` cron jobs deliver a message on
 ANY non-empty stdout (see website/docs/guides/cron-script-only.md), so
 wiring this monitor to a cron/Slack watchdog without this flag would post
-on every single tick regardless of health. When this flag is passed AND
-the result maps to a success exit code (``healthy`` or
-``disabled-or-smoke-only``), stdout is suppressed entirely (still exits 0)
-so only genuine problems produce a delivered message. Every other
-status still prints the full JSON exactly as without the flag. Omitting
-the flag leaves behavior unchanged (always prints).
+on every single tick regardless of health. When this flag is passed, stdout
+is suppressed for a genuinely healthy result (still exits 0), but a
+``fetch_success_band`` of ``warn`` remains visible so the documented 0.70
+warning threshold is actionable without changing the established status or
+exit-code contract. Every non-success status also prints the full JSON exactly
+as without the flag. Omitting the flag leaves behavior unchanged (always
+prints).
 """
 from __future__ import annotations
 
@@ -198,6 +199,14 @@ def evaluate(
         if attempted_fetches_total > 0
         else None
     )
+    if fetch_success_rate is None:
+        fetch_success_band = None
+    elif fetch_success_rate < FETCH_SUCCESS_ALARM:
+        fetch_success_band = "alarm"
+    elif fetch_success_rate < FETCH_SUCCESS_WARN:
+        fetch_success_band = "warn"
+    else:
+        fetch_success_band = "healthy"
     ungrounded_count = sum(
         1 for r in enabled if _safe_int_or_none(r.get("grounded_pages")) == 0
     )
@@ -288,6 +297,7 @@ def evaluate(
         "fetch_success_rate": (
             round(fetch_success_rate, 4) if fetch_success_rate is not None else None
         ),
+        "fetch_success_band": fetch_success_band,
         "ungrounded_rate": (
             round(ungrounded_rate, 4) if ungrounded_rate is not None else None
         ),
@@ -342,7 +352,8 @@ def main(argv: list[str] | None = None) -> int:
             f"{UNGROUNDED_RATE_ALARM} of production attempts have grounded_pages == 0\n"
             "  fetch-degraded (5)        -- fetch_success_rate "
             "(grounded_pages / attempted_fetches) < "
-            f"{FETCH_SUCCESS_ALARM} (warn below {FETCH_SUCCESS_WARN}, no status change)\n"
+            f"{FETCH_SUCCESS_ALARM} (warn below {FETCH_SUCCESS_WARN}; warning JSON "
+            "remains visible with --quiet-when-healthy, but status/exit stay healthy/0)\n"
             "  insufficient-data (4)     -- fewer than --min-attempts real, non-smoke "
             "attempts in the lookback window\n"
             "  healthy (0)               -- everything above is within bounds\n"
@@ -400,11 +411,12 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help=(
             "Print nothing to stdout (and still exit 0) when status is "
-            "'healthy' or 'disabled-or-smoke-only'. For every other status "
-            "the full JSON is printed exactly as without this flag. Use "
-            "this when wiring the monitor to a mini no_agent cron job: "
-            "those deliver on ANY non-empty stdout, so without this flag "
-            "every tick would post regardless of health."
+            "'healthy' or 'disabled-or-smoke-only', except that a "
+            "fetch_success_band of 'warn' remains visible and actionable. "
+            "For every other status the full JSON is printed exactly as "
+            "without this flag. Use this when wiring the monitor to a mini "
+            "no_agent cron job: those deliver on ANY non-empty stdout, so "
+            "without this flag every tick would post regardless of health."
         ),
     )
     args = parser.parse_args(argv)
@@ -423,9 +435,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     result["checked_at"] = datetime.fromtimestamp(now, timezone.utc).isoformat()
     exit_code = _EXIT_CODES.get(result["status"], 2)
-    quiet = args.quiet_when_healthy and result["status"] in (
-        "healthy",
-        "disabled-or-smoke-only",
+    quiet = (
+        args.quiet_when_healthy
+        and result["status"] in ("healthy", "disabled-or-smoke-only")
+        and result["fetch_success_band"] != "warn"
     )
     if not quiet:
         print(json.dumps(result, sort_keys=True))
