@@ -135,6 +135,14 @@ vs this copy) to catch drift — nothing currently automates that check.
   layered on top in the next commit.
 - `tests/test_claim_history.py` — covers the per-task attempt-cap logic added
   on top of the vendored claim chain (see "Claim retry cap" below).
+- `pr_staleness_alert.py` — Slack-delivered cron wrapper (mini job
+  `pr-staleness-alert`, id `3043a00e6df8`) for open PRs stuck without a fresh
+  validator verdict. Vendored 2026-07-24 (byte-identical, commit 1) then
+  fixed (commit 2) for the 15-minute repost bug — see "PR staleness dedupe"
+  below.
+- `tests/test_pr_staleness_alert.py` — covers the dedupe fingerprint, decide
+  logic (unchanged/new/dropped/bucket-crossing/heartbeat), and fail-open
+  state loading, both as pure functions and end to end through `run()`.
 
 ## Claim retry cap (ClickUp 86e2ddcpb, 2026-07-24)
 
@@ -177,9 +185,54 @@ mini-run -- 'python3 -m py_compile ~/.hermes/scripts/claim_store.py \
     ~/.hermes/skills/clickup-queue-poller/scripts/claim_next.py'  # sanity check
 ```
 
+## PR staleness dedupe (mini cron job pr-staleness-alert, 2026-07-24)
+
+Root cause: `pr_pipeline_improvements.check_staleness_and_alert()` (a
+separate, also mini-only, not-yet-vendored module) fingerprinted each stale
+PR on `round(age_hours, 2)` — a value that changes on almost every
+15-minute tick — so its `.pr_pipeline_state.json` comparison never matched
+two runs in a row. Confirmed byte-identical Slack payload across six
+consecutive runs (20:02-21:16 on 2026-07-23), 257 runs since 2026-07-22, for
+the same 6 unresolved stale PRs. The signal was real; the dedupe granularity
+was the defect.
+
+Fix: `pr_staleness_alert.py` no longer calls that function at all. It calls
+the lower-level scan/staleness primitives (`GitHubClient`, `scan_repos`,
+`stale_without_verdict`, `utcnow`, `notify` — all re-exported by
+`pr_pipeline_improvements`) directly, then owns its own dedupe:
+- Fingerprints the current stale set on `(repo, PR number) -> coarse age
+  bucket` (`PR_STALENESS_AGE_BUCKET_HOURS`, default `24,72,168`), persisted
+  at `PR_STALENESS_STATE_PATH` (default `~/.hermes/state/pr_staleness_last.json`
+  — a new path, independent of the old broken `.pr_pipeline_state.json`).
+- Posts to Slack only when that fingerprint changes (a PR enters/leaves the
+  stale set, or crosses a bucket boundary), plus a heartbeat at most once
+  per `PR_STALENESS_DIGEST_HOURS` (default `24`) so an
+  unchanged-but-still-broken state resurfaces daily instead of going quiet
+  forever.
+- Fails OPEN on state-file errors: a missing/corrupt/wrong-shaped
+  `pr_staleness_last.json` is treated as "no prior state," so the current
+  stale set looks new and gets posted rather than silently suppressed —
+  same fail-open contract as `claim_store.py`.
+
+A separate agent applied an immediate cadence reduction on the mini cron
+schedule (`*/15` -> daily) as a stopgap while this fix was in flight; that
+cadence change is cron-config only and lives on the mini, not in this repo.
+
+Deploy (run from the repo root; `mac-mini-h.tail51ec1b.ts.net` is the
+mini's Tailscale name):
+
+```bash
+scp machine-setup/mini-scripts/pr_staleness_alert.py \
+    mac-mini-h.tail51ec1b.ts.net:~/.hermes/scripts/pr_staleness_alert.py
+mini-run -- 'python3 -m py_compile ~/.hermes/scripts/pr_staleness_alert.py'  # sanity check
+```
+
 **WARNING — do NOT rsync `~/.hermes/scripts/` wholesale.** That directory is
 hand-maintained on the mini and holds ~203 live-only scripts with no git
-backing (see the top of this file). Only ever `scp` these three specific
-files by name. The same caution applies to
+backing (see the top of this file). Only ever `scp` the exact file(s) named
+in the deploy command for the section you're working from (e.g. just
+`claim_store.py`, `opencode_exec.py`, and `clickup-queue-poller-claim_next.py`
+for "Claim retry cap" above, or just `pr_staleness_alert.py` for "PR
+staleness dedupe" above) — never the directory. The same caution applies to
 `~/.hermes/skills/clickup-queue-poller/scripts/` — copy only `claim_next.py`,
 never the directory.
