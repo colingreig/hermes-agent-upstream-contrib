@@ -22,11 +22,13 @@
     },
     "citation_link_coverage_per_piece": {
       "value": null,
-      "status": "not historically instrumented"
+      "status": "not historically instrumented",
+      "post_rollout_instrumentation": "~/.hermes/logs/content-outcomes.jsonl"
     },
     "validator_fail_rate_for_content": {
       "value": null,
-      "status": "not historically instrumented"
+      "status": "not historically instrumented",
+      "post_rollout_instrumentation": "~/.hermes/scripts/.validator_verdicts.json joined by task_id"
     },
     "research_cost_per_piece_usd": {
       "value": 0,
@@ -36,6 +38,7 @@
   "post_rollout_sources": {
     "stage_execution_and_fallback_rate": "~/.hermes/logs/research-served.jsonl",
     "served_model_mix_and_llm_cost": "~/.hermes/logs/writer-served.jsonl",
-    "citation_coverage_and_validator_fail_rate": "validator content-run receipts"
+    "citation_coverage_and_validator_fail_rate": "~/.hermes/scripts/research_outcome_metrics.py report",
+    "initial_outcome_validity_report": "reports/research-outcome-validity-2026-07-25.md"
   }
 }

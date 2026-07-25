@@ -4,6 +4,8 @@ import importlib.util
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -20,6 +22,12 @@ monitor = _load("research_stage_monitor")
 
 
 NOW = datetime(2026, 7, 24, 18, tzinfo=timezone.utc).timestamp()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_monitor_state(tmp_path, monkeypatch):
+    """CLI tests must never touch the operator's real cross-run state."""
+    monkeypatch.setattr(monitor, "DEFAULT_STATE", tmp_path / "monitor-state.json")
 
 
 def _record(
@@ -150,6 +158,102 @@ def test_empty_or_missing_ledger_is_not_observed():
         min_attempts=20,
     )
     assert result_missing["status"] == "not-observed"
+
+
+def test_persistently_inconclusive_escalates_after_72_hours_across_statuses(
+    tmp_path,
+):
+    state_path = tmp_path / "monitor-state.json"
+    first = monitor.apply_inconclusive_escalation(
+        {"status": "not-observed"},
+        state_path=state_path,
+        now=NOW,
+    )
+    assert first["status"] == "not-observed"
+    assert first["inconclusive_hours"] == 0.0
+
+    at_boundary = monitor.apply_inconclusive_escalation(
+        {"status": "insufficient-data"},
+        state_path=state_path,
+        now=NOW + 72 * 3600,
+    )
+    assert at_boundary["status"] == "insufficient-data"
+    assert at_boundary["inconclusive_hours"] == 72.0
+
+    escalated = monitor.apply_inconclusive_escalation(
+        {"status": "insufficient-data"},
+        state_path=state_path,
+        now=NOW + 72 * 3600 + 1,
+    )
+    assert escalated["status"] == "persistently-inconclusive"
+    assert escalated["underlying_status"] == "insufficient-data"
+    assert escalated["inconclusive_hours"] > 72.0
+    assert monitor._EXIT_CODES[escalated["status"]] == 6
+
+
+def test_conclusive_status_resets_persistently_inconclusive_timer(tmp_path):
+    state_path = tmp_path / "monitor-state.json"
+    monitor.apply_inconclusive_escalation(
+        {"status": "not-observed"},
+        state_path=state_path,
+        now=NOW,
+    )
+    monitor.apply_inconclusive_escalation(
+        {"status": "healthy"},
+        state_path=state_path,
+        now=NOW + 80 * 3600,
+    )
+    restarted = monitor.apply_inconclusive_escalation(
+        {"status": "insufficient-data"},
+        state_path=state_path,
+        now=NOW + 81 * 3600,
+    )
+    assert restarted["status"] == "insufficient-data"
+    assert restarted["inconclusive_hours"] == 0.0
+    assert restarted["inconclusive_since"] == datetime.fromtimestamp(
+        NOW + 81 * 3600, timezone.utc
+    ).isoformat()
+
+
+def test_corrupt_state_fails_open_and_restarts_timer(tmp_path):
+    state_path = tmp_path / "monitor-state.json"
+    state_path.write_text("{not-json", encoding="utf-8")
+    result = monitor.apply_inconclusive_escalation(
+        {"status": "not-observed"},
+        state_path=state_path,
+        now=NOW,
+    )
+    assert result["status"] == "not-observed"
+    assert result["inconclusive_hours"] == 0.0
+    persisted = monitor.json.loads(state_path.read_text(encoding="utf-8"))
+    assert persisted["first_inconclusive_at"] == result["inconclusive_since"]
+
+
+def test_cli_emits_persistently_inconclusive_escalation_and_exit_6(
+    tmp_path,
+    capsys,
+):
+    ledger = tmp_path / "missing.jsonl"
+    state_path = tmp_path / "monitor-state.json"
+    base_args = [
+        "--ledger",
+        str(ledger),
+        "--state",
+        str(state_path),
+        "--quiet-when-healthy",
+    ]
+
+    first_rc = monitor.main(base_args + ["--now", "2026-07-20T00:00:00Z"])
+    first = monitor.json.loads(capsys.readouterr().out)
+    assert first_rc == 3
+    assert first["status"] == "not-observed"
+
+    escalated_rc = monitor.main(base_args + ["--now", "2026-07-23T00:00:01Z"])
+    escalated = monitor.json.loads(capsys.readouterr().out)
+    assert escalated_rc == 6
+    assert escalated["status"] == "persistently-inconclusive"
+    assert escalated["underlying_status"] == "not-observed"
+    assert escalated["inconclusive_hours"] > 72.0
 
 
 def test_disabled_or_smoke_only_window():
@@ -290,6 +394,7 @@ def test_fetch_success_rate_alarm_below_0_50():
     filler = [_record(f"prod-ok-{i}", served=True, degraded=False) for i in range(19)]
     result = monitor.evaluate([coverage_record] + filler, **_healthy_defaults())
     assert result["fetch_success_rate"] == 0.49
+    assert result["fetch_success_band"] == "alarm"
     assert result["status"] == "fetch-degraded"
     assert monitor._EXIT_CODES[result["status"]] == 5
 
@@ -301,10 +406,11 @@ def test_fetch_success_rate_exactly_at_alarm_boundary_is_not_alarmed():
     filler = [_record(f"prod-ok-{i}", served=True, degraded=False) for i in range(19)]
     result = monitor.evaluate([coverage_record] + filler, **_healthy_defaults())
     assert result["fetch_success_rate"] == 0.5
+    assert result["fetch_success_band"] == "warn"
     assert result["status"] == "healthy"
 
 
-def test_fetch_success_rate_warn_band_does_not_change_status():
+def test_fetch_success_rate_warn_band_is_explicit_without_changing_status():
     # 0.60 sits in the documented warn band (below 0.70, at/above 0.50) --
     # it must remain informational only, never its own status/exit code.
     coverage_record = _record(
@@ -313,6 +419,18 @@ def test_fetch_success_rate_warn_band_does_not_change_status():
     filler = [_record(f"prod-ok-{i}", served=True, degraded=False) for i in range(19)]
     result = monitor.evaluate([coverage_record] + filler, **_healthy_defaults())
     assert result["fetch_success_rate"] == 0.6
+    assert result["fetch_success_band"] == "warn"
+    assert result["status"] == "healthy"
+
+
+def test_fetch_success_rate_exactly_at_warn_boundary_is_healthy_band():
+    coverage_record = _record(
+        "prod-cov-0", served=True, degraded=False, attempted_fetches=100, grounded_pages=70
+    )
+    filler = [_record(f"prod-ok-{i}", served=True, degraded=False) for i in range(19)]
+    result = monitor.evaluate([coverage_record] + filler, **_healthy_defaults())
+    assert result["fetch_success_rate"] == 0.7
+    assert result["fetch_success_band"] == "healthy"
     assert result["status"] == "healthy"
 
 
@@ -321,7 +439,56 @@ def test_fetch_success_rate_skips_cleanly_when_no_attempted_fetches():
     result = monitor.evaluate(records, **_healthy_defaults())
     assert result["attempted_fetches_total"] == 0
     assert result["fetch_success_rate"] is None
+    assert result["fetch_success_band"] is None
     assert result["status"] == "healthy"
+
+
+def test_quiet_when_healthy_prints_warn_band_without_changing_exit(tmp_path, capsys):
+    ledger = tmp_path / "fetch-warning.jsonl"
+    coverage_record = _record(
+        "prod-cov-0", served=True, degraded=False, attempted_fetches=100, grounded_pages=60
+    )
+    filler = [_record(f"prod-ok-{i}", served=True, degraded=False) for i in range(19)]
+    ledger.write_text(
+        "\n".join(monitor.json.dumps(r) for r in [coverage_record] + filler) + "\n"
+    )
+
+    rc = monitor.main(
+        [
+            "--ledger",
+            str(ledger),
+            "--now",
+            "2026-07-24T18:00:00Z",
+            "--quiet-when-healthy",
+        ]
+    )
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert '"status": "healthy"' in out
+    assert '"fetch_success_band": "warn"' in out
+
+
+def test_quiet_when_healthy_still_suppresses_healthy_fetch_band(tmp_path, capsys):
+    ledger = tmp_path / "fetch-healthy.jsonl"
+    coverage_record = _record(
+        "prod-cov-0", served=True, degraded=False, attempted_fetches=100, grounded_pages=70
+    )
+    filler = [_record(f"prod-ok-{i}", served=True, degraded=False) for i in range(19)]
+    ledger.write_text(
+        "\n".join(monitor.json.dumps(r) for r in [coverage_record] + filler) + "\n"
+    )
+
+    rc = monitor.main(
+        [
+            "--ledger",
+            str(ledger),
+            "--now",
+            "2026-07-24T18:00:00Z",
+            "--quiet-when-healthy",
+        ]
+    )
+    assert rc == 0
+    assert capsys.readouterr().out == ""
 
 
 def test_ungrounded_rate_alarm_above_0_10():
