@@ -111,15 +111,24 @@ class PipelineDeploymentTests(unittest.TestCase):
     def test_verify_reports_unmanaged_pipeline_extras_without_touching_them(self):
         self._install()
         root_extra = self.destination / "pr_unlisted.py"
+        excluded_non_pipeline_script = self.destination / "validator_autonomy.py"
+        validator_extra = self.destination / "validator_unlisted.py"
         package_extra = self.destination / "pr_pipeline" / "unlisted.py"
         root_extra.write_text("# unexpected\n", encoding="utf-8")
+        excluded_non_pipeline_script.write_text("# separate manual ledger\n", encoding="utf-8")
+        validator_extra.write_text("# unexpected\n", encoding="utf-8")
         package_extra.write_text("# unexpected\n", encoding="utf-8")
 
         report = self.mod.verify(self.destination, expected_source_commit=self.source_commit)
 
         self.assertFalse(report["ok"])
-        self.assertEqual(report["extra"], ["pr_pipeline/unlisted.py", "pr_unlisted.py"])
+        self.assertEqual(
+            report["extra"],
+            ["pr_pipeline/unlisted.py", "pr_unlisted.py", "validator_unlisted.py"],
+        )
         self.assertTrue(root_extra.exists())
+        self.assertTrue(excluded_non_pipeline_script.exists())
+        self.assertTrue(validator_extra.exists())
         self.assertTrue(package_extra.exists())
 
     def test_verify_reports_hash_and_recorded_commit_mismatches(self):

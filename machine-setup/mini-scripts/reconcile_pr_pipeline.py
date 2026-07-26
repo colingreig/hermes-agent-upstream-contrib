@@ -51,6 +51,7 @@ class ResolvedManifest:
     sha256: str
     files: tuple[ResolvedFile, ...]
     root_patterns: tuple[str, ...]
+    unmanaged_root_exclusions: tuple[str, ...]
     package_destination: str
 
 
@@ -104,6 +105,17 @@ def resolve_manifest(path: Path = DEFAULT_MANIFEST) -> ResolvedManifest:
     if not isinstance(root_patterns_raw, list) or not all(isinstance(item, str) and item for item in root_patterns_raw):
         raise ManifestError("managed_root_patterns must be a non-empty string list")
     root_patterns = tuple(root_patterns_raw)
+    exclusions_raw = data.get("unmanaged_root_exclusions", [])
+    if not isinstance(exclusions_raw, list):
+        raise ManifestError("unmanaged_root_exclusions must be a string list")
+    unmanaged_root_exclusions = tuple(
+        _safe_filename(name, field="unmanaged_root_exclusions item")
+        for name in exclusions_raw
+    )
+    if tuple(sorted(unmanaged_root_exclusions)) != unmanaged_root_exclusions or len(set(unmanaged_root_exclusions)) != len(unmanaged_root_exclusions):
+        raise ManifestError("unmanaged_root_exclusions must be unique and sorted")
+    if any(not any(fnmatch.fnmatchcase(name, pattern) for pattern in root_patterns) for name in unmanaged_root_exclusions):
+        raise ManifestError("unmanaged_root_exclusions must match managed_root_patterns")
 
     resolved: list[ResolvedFile] = []
     destination_names: set[Path] = set()
@@ -137,6 +149,7 @@ def resolve_manifest(path: Path = DEFAULT_MANIFEST) -> ResolvedManifest:
         sha256=_sha256_path(path),
         files=tuple(sorted(resolved, key=lambda item: item.destination.as_posix())),
         root_patterns=root_patterns,
+        unmanaged_root_exclusions=unmanaged_root_exclusions,
         package_destination=package_destination,
     )
 
@@ -227,6 +240,8 @@ def _extra_root_files(destination: Path, manifest: ResolvedManifest, expected: s
             continue
         if any(fnmatch.fnmatchcase(candidate.name, pattern) for pattern in manifest.root_patterns):
             relative = candidate.name
+            if relative in manifest.unmanaged_root_exclusions:
+                continue
             if relative not in expected:
                 extras.add(relative)
     package_root = destination / manifest.package_destination
