@@ -40,6 +40,7 @@ def _record(
     grounded_pages: int | None = None,
     attempted_fetches: int | None = None,
     smoke: bool | None = None,
+    search_provider: str | None = None,
 ) -> dict:
     ts = datetime.fromtimestamp(NOW - minutes_ago * 60, timezone.utc).isoformat().replace(
         "+00:00", "Z"
@@ -63,7 +64,112 @@ def _record(
         record["attempted_fetches"] = attempted_fetches
     if smoke is not None:
         record["smoke"] = smoke
+    if search_provider is not None:
+        record["search_provider"] = search_provider
     return record
+
+
+def test_provider_incidents_are_attributed_and_aggregated_for_30_days():
+    records = [
+        _record(
+            f"scrapingbee-failure-{index}",
+            served=False,
+            degraded=True,
+            minutes_ago=20 - index,
+            search_failed=True,
+            search_provider="scrapingbee",
+        )
+        for index in range(3)
+    ] + [
+        _record(
+            f"tavily-failure-{index}",
+            served=False,
+            degraded=True,
+            minutes_ago=8 * 60 + 20 - index,
+            search_failed=True,
+            search_provider="tavily",
+        )
+        for index in range(3)
+    ] + [
+        _record(
+            "legacy-failure",
+            served=False,
+            degraded=True,
+            minutes_ago=30,
+            search_failed=True,
+        )
+    ]
+
+    result = monitor.evaluate(records, **_healthy_defaults())
+
+    assert result["provider_search_outage_incident_counts_30d"] == {
+        "scrapingbee": 1,
+        "tavily": 1,
+    }
+    assert result["unattributed_search_failures_30d"] == 1
+    incidents = result["provider_search_outage_incidents_30d"]
+    assert [(incident["provider"], incident["search_failure_receipts"]) for incident in incidents] == [
+        ("scrapingbee", 3),
+        ("tavily", 3),
+    ]
+
+
+def test_provider_incident_clusters_do_not_double_count_one_outage():
+    records = [
+        _record(
+            f"failure-{index}",
+            served=False,
+            degraded=True,
+            minutes_ago=90 - index * 30,
+            search_failed=True,
+            search_provider="scrapingbee",
+        )
+        for index in range(4)
+    ]
+
+    result = monitor.evaluate(records, **_healthy_defaults())
+
+    assert result["provider_search_outage_incident_counts_30d"] == {"scrapingbee": 1}
+    assert result["provider_search_outage_incidents_30d"][0]["search_failure_receipts"] == 4
+
+
+def test_ungrounded_or_fetch_degraded_receipts_are_not_provider_outages():
+    records = [
+        {
+            **_record(
+                f"ungrounded-{index}",
+                served=False,
+                degraded=True,
+                minutes_ago=20 - index,
+                search_failed=False,
+                search_provider="scrapingbee",
+            ),
+            "grounded_pages": 0,
+            "attempted_fetches": 2,
+            "failure_class": "page-blocked-http",
+        }
+        for index in range(3)
+    ] + [
+        {
+            **_record(
+                f"fetch-degraded-{index}",
+                served=True,
+                degraded=False,
+                minutes_ago=40 - index,
+                search_failed=False,
+                search_provider="scrapingbee",
+            ),
+            "grounded_pages": 0,
+            "attempted_fetches": 3,
+            "failure_class": "page-blocked-http",
+        }
+        for index in range(3)
+    ]
+
+    result = monitor.evaluate(records, **_healthy_defaults())
+
+    assert result["provider_search_outage_incidents_30d"] == []
+    assert result["provider_search_outage_incident_counts_30d"] == {}
 
 
 def test_below_min_attempts_reports_insufficient_data_not_degraded():
