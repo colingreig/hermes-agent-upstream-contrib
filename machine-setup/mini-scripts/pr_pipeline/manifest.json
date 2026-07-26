@@ -26,6 +26,7 @@
     "validator_model.py",
     "validator_panel.py",
     "validator_policy.json",
+    "validator_repo_guard.py",
     "validator_verdict.py"
   ],
   "package_glob": "*.py",
