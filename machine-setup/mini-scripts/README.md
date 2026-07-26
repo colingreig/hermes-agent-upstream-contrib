@@ -39,7 +39,7 @@ A second exception: `repo-aliases.json` deploys to
 `~/.hermes/config/repo-aliases.json` (not the scripts dir). See "Validator
 repository identity" below.
 
-## Validator repository identity (`validator_repo_guard.py`, `repo-aliases.json`)
+## Validator repository identity (`pr_pipeline/validator_repo_guard.py`, `repo-aliases.json`)
 
 Guards the `hermes-pr-validate` cron (id `5a76e290811d`) against spurious
 `class=wrong-repo` FAIL verdicts. Two root causes, both fixed 2026-07-26:
@@ -96,7 +96,12 @@ Two supporting notes:
   when `gh` is unreachable).
 
 ```bash
-scp machine-setup/mini-scripts/validator_repo_guard.py mini:~/.hermes/scripts/validator_repo_guard.py
+# The guard's canonical source is machine-setup/mini-scripts/pr_pipeline/validator_repo_guard.py.
+# It is manifest-managed — do NOT scp it by hand; deploy the whole boundary:
+python3 machine-setup/mini-scripts/reconcile_pr_pipeline.py install --host mini --source-commit <sha>
+# (installs both ~/.hermes/scripts/validator_repo_guard.py and
+#  ~/.hermes/scripts/pr_pipeline/validator_repo_guard.py — the CLI paths above
+#  are unchanged.)
 scp machine-setup/mini-scripts/repo-aliases.json      mini:~/.hermes/config/repo-aliases.json
 python3 machine-setup/mini-scripts/tests/test_validator_repo_guard.py            # hermetic
 HERMES_REPO_GUARD_LIVE=1 python3 machine-setup/mini-scripts/tests/test_validator_repo_guard.py  # + real gh

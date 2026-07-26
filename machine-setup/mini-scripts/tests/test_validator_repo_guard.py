@@ -25,7 +25,7 @@ import unittest
 from pathlib import Path
 
 MINI_SCRIPTS_DIR = Path(__file__).resolve().parent.parent
-GUARD_PATH = MINI_SCRIPTS_DIR / "validator_repo_guard.py"
+GUARD_PATH = MINI_SCRIPTS_DIR / "pr_pipeline" / "validator_repo_guard.py"
 
 # Keep every test off the operator's real identity cache / alias file.
 _ISOLATED = tempfile.mkdtemp(prefix="repo-guard-test-")

@@ -51,7 +51,17 @@ class PipelineDeploymentTests(unittest.TestCase):
         for relative in report["expected_files"]:
             self.assertTrue((self.destination / relative).is_file(), relative)
         self.assertTrue((self.destination / "verify-hermes-patches.sh").is_file())
+        self.assertTrue((self.destination / "validator_repo_guard.py").is_file())
+        self.assertTrue((self.destination / "pr_pipeline" / "validator_repo_guard.py").is_file())
         self.assertTrue((self.destination / ".pr_pipeline_deployment.json").is_file())
+
+    def test_manifest_includes_validator_repo_guard_in_flat_and_package_surfaces(self):
+        manifest = self.mod.resolve_manifest()
+        destinations = {item.destination.as_posix() for item in manifest.files}
+
+        self.assertIn("validator_repo_guard.py", destinations)
+        self.assertIn("pr_pipeline/validator_repo_guard.py", destinations)
+        self.assertIn("validator_repo_guard.py", self.mod._expected_hashes(manifest))
 
     def test_installed_merge_surface_loads_as_a_standalone_entrypoint(self):
         self._install()
@@ -73,6 +83,14 @@ class PipelineDeploymentTests(unittest.TestCase):
             self.assertEqual(
                 Path(autonomous_merge.validator_verdict.__file__).resolve(),
                 (self.destination / "validator_verdict.py").resolve(),
+            )
+            validator_repo_guard = _load(
+                self.destination / "validator_repo_guard.py",
+                "installed_validator_repo_guard",
+            )
+            self.assertEqual(
+                validator_repo_guard.parse_repo_ref("https://github.com/acme/widget/pull/7"),
+                "acme/widget",
             )
             action, detail = autonomous_merge.evaluate(
                 "acme/widget",
