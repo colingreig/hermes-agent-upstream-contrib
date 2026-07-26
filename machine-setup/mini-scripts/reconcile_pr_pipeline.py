@@ -90,6 +90,15 @@ def resolve_manifest(path: Path = DEFAULT_MANIFEST) -> ResolvedManifest:
     path = path.resolve()
     data = _read_manifest(path)
     root = path.parent
+    source_root = root.parent
+    raw_source_root = data.get("source_root_entrypoints")
+    if not isinstance(raw_source_root, list) or not raw_source_root:
+        raise ManifestError("source_root_entrypoints must be a non-empty list")
+    source_root_entrypoints = tuple(
+        _safe_filename(name, field="source_root_entrypoints item") for name in raw_source_root
+    )
+    if tuple(sorted(source_root_entrypoints)) != source_root_entrypoints or len(set(source_root_entrypoints)) != len(source_root_entrypoints):
+        raise ManifestError("source_root_entrypoints must be unique and sorted")
     raw_flat = data.get("legacy_flat_entrypoints")
     if not isinstance(raw_flat, list) or not raw_flat:
         raise ManifestError("legacy_flat_entrypoints must be a non-empty list")
@@ -134,6 +143,9 @@ def resolve_manifest(path: Path = DEFAULT_MANIFEST) -> ResolvedManifest:
                 mode=source.stat().st_mode & 0o777,
             )
         )
+
+    for name in source_root_entrypoints:
+        add(source_root / name, Path(name))
 
     for name in flat:
         add(root / name, Path(name))
@@ -316,14 +328,25 @@ def _copy_remote_stage(host: str, manifest: ResolvedManifest) -> tuple[str, list
         raise ManifestError("--host must contain only a hostname, optional user, and optional port separator")
     stage = f"/tmp/hermes-pr-pipeline-{secrets.token_hex(12)}"
     subprocess.run(["ssh", "-o", "BatchMode=yes", host, "mkdir", "-p", f"{stage}/pr_pipeline"], check=True)
-    local_files = [SCRIPT_DIR / "reconcile_pr_pipeline.py", manifest.path, *(item.source for item in manifest.files)]
+    package_sources = [
+        SCRIPT_DIR / "reconcile_pr_pipeline.py", manifest.path,
+        *(item.source for item in manifest.files if item.source.parent == manifest.path.parent),
+    ]
+    source_root_sources = [
+        item.source for item in manifest.files if item.source.parent == SCRIPT_DIR
+    ]
     # Sources appear once as flat entrypoints and once as package members; scp's
     # input is deduplicated while the remote manifest still controls deployment.
-    unique_files = list(dict.fromkeys(local_files))
+    unique_files = list(dict.fromkeys([*package_sources, *source_root_sources]))
     subprocess.run(
-        ["scp", "-q", *(str(path) for path in unique_files), f"{host}:{stage}/pr_pipeline/"],
+        ["scp", "-q", *(str(path) for path in dict.fromkeys(package_sources)), f"{host}:{stage}/pr_pipeline/"],
         check=True,
     )
+    if source_root_sources:
+        subprocess.run(
+            ["scp", "-q", *(str(path) for path in dict.fromkeys(source_root_sources)), f"{host}:{stage}/"],
+            check=True,
+        )
     # The reconciler belongs beside the staged package, not inside it.
     subprocess.run(
         ["ssh", "-o", "BatchMode=yes", host, "mv", f"{stage}/pr_pipeline/reconcile_pr_pipeline.py", f"{stage}/reconcile_pr_pipeline.py"],

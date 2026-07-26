@@ -39,6 +39,7 @@ class PipelineVerifierTests(unittest.TestCase):
 
         self.assertTrue(report["ok"])
         self.assertEqual(report["deployment_mode"], "shadow")
+        self.assertIn("verify-hermes-patches.sh", self.reconciler.verify(self.destination)["expected_files"])
         self.assertIn("sqlite-wal-fence", report["checks"])
         self.assertIn("sandbox-default-deny", report["checks"])
 

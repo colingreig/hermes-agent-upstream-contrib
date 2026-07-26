@@ -31,7 +31,7 @@ _MANAGED_ROOT = (
 _UNMANAGED_ROOT = frozenset({"validator_autonomy.py"})
 _REQUIRED_FILES = frozenset({
     "autonomous_merge.py", "hermes_validate_ops.py", "merge_guard.py",
-    "pr_wake_and_sweep.py", "validate_pr.py", "validator_verdict.py",
+    "pr_wake_and_sweep.py", "validate_pr.py", "validator_verdict.py", "verify-hermes-patches.sh",
     "pr_pipeline/__init__.py", "pr_pipeline/identity.py", "pr_pipeline/merge_actor.py",
     "pr_pipeline/policy.py", "pr_pipeline/review_runner.py", "pr_pipeline/sandbox.py",
     "pr_pipeline/store.py", "pr_pipeline/pipeline_verify.py",
