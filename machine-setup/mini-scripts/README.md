@@ -268,6 +268,50 @@ under `pr_pipeline/`. Do not compare or copy those files one at a time.
   every deployed SHA-256 in `.pr_pipeline_deployment.json`, and reports
   missing, extra, or drifted pipeline files. The snapshot is hard-shadowed:
   this deployment surface never enables or invokes a live merge.
+- `github_app_cred.sh` — git credential helper for the Hermes Dev Assistant
+  GitHub App, wired up by `~/.hermes/gitconfig` (`GIT_CONFIG_GLOBAL`). Mints a
+  short-lived installation token per request via `op-run` +
+  `github_app_token.py`; never stores one.
+- `hermes-bin-gh` — **deploys to `~/.hermes/bin/gh`, not `~/.hermes/scripts/`.**
+  The `gh` wrapper that exports a freshly-minted `GH_TOKEN` before exec'ing the
+  real Homebrew `gh`.
+- `dot-profile` — **deploys to `~/.profile`.** Sourced by every `bash -l` the
+  terminal tool spawns for its session-env snapshot; hoists `~/.hermes/bin`
+  back to the front of `PATH` after `/etc/profile`'s `path_helper` demotes it.
+
+## Cron-context GitHub auth (2026-07-26)
+
+Symptom: every executor cron session logged
+`no oauth token found for github.com`; zero autonomous branches/PRs for ~2
+days, while interactive sessions worked fine.
+
+Root cause — one PATH fault with two independent effects. The terminal tool
+builds its session env from a `bash -l` login shell
+(`tools/environments/local.py::_resolve_shell_init_files`). `/etc/profile`
+runs `/usr/libexec/path_helper`, which rebuilds `PATH` as
+`/etc/paths` + `/etc/paths.d/*` first and appends the inherited entries after,
+so the gateway's leading `~/.hermes/bin` and release `venv/bin` were both
+demoted below `/usr/local/bin` and `/opt/homebrew/bin`. Therefore:
+
+1. `gh` resolved to `/opt/homebrew/bin/gh` — the real, unauthenticated CLI —
+   instead of the App-token wrapper.
+2. Even when the wrapper *was* invoked by absolute path, its bare `python3`
+   resolved to the python.org `/usr/local/bin/python3` 3.13 build, which has no
+   CA bundle: `URLError(SSL: CERTIFICATE_VERIFY_FAILED … unable to get local
+   issuer certificate)` against `api.github.com`. `2>/dev/null || true`
+   swallowed it, so `GH_TOKEN` was silently empty. `github_app_cred.sh` hit the
+   same interpreter fault and returned empty credentials, breaking `git push`
+   over HTTPS as well.
+
+Fix:
+
+- `dot-profile` re-hoists `~/.hermes/bin` to the front of `PATH` (removing any
+  demoted occurrence first, so a present-but-late entry is actually promoted).
+- `hermes-bin-gh` and `github_app_cred.sh` resolve the interpreter absolutely
+  (`~/.hermes/runtime-current/venv/bin/python`, falling back to
+  `/usr/bin/python3`) instead of trusting `PATH`.
+- Both log mint failures to `~/.hermes/logs/github-app-token.log` rather than
+  discarding stderr — the silent swallow is what hid this for two days.
 
 ## Claim retry cap (ClickUp 86e2ddcpb, 2026-07-24)
 
