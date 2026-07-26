@@ -82,7 +82,7 @@ def load_served_ledger(path, window_min):
     cutoff = now - datetime.timedelta(minutes=window_min)
     rows = []
     try:
-        with open(path, errors="replace") as f:
+        with open(path, encoding="utf-8", errors="replace") as f:
             for line in f:
                 line = line.strip()
                 if not line:
@@ -751,7 +751,7 @@ def main():
     header = {}
     if args.header_file and os.path.exists(args.header_file):
         try:
-            header = json.load(open(args.header_file))
+            header = json.load(open(args.header_file, encoding="utf-8"))
         except Exception as e:
             print(f"WARN: header-file unreadable ({e}); using empty header", file=sys.stderr)
 
@@ -799,11 +799,11 @@ def main():
     text_body = build_text(header, scoreboard, spend, alerts, hermes_rows, hermes_meta, work_rows,
                             args.window_min)
 
-    with open(args.out_html, "w") as f:
+    with open(args.out_html, "w", encoding="utf-8") as f:
         f.write(html_body)
-    with open(args.out_text, "w") as f:
+    with open(args.out_text, "w", encoding="utf-8") as f:
         f.write(text_body)
-    with open(args.out_subject, "w") as f:
+    with open(args.out_subject, "w", encoding="utf-8") as f:
         f.write(subject)
 
     summary = {

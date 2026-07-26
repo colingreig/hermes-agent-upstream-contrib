@@ -306,7 +306,7 @@ def _alias_path():
 
 def _load_cache():
     try:
-        with open(_cache_path(), "r") as handle:
+        with open(_cache_path(), "r", encoding="utf-8") as handle:
             data = json.load(handle)
         return data if isinstance(data, dict) else {}
     except Exception:
@@ -320,7 +320,7 @@ def _save_cache(cache):
         if parent:
             os.makedirs(parent, exist_ok=True)
         tmp = path + ".tmp"
-        with open(tmp, "w") as handle:
+        with open(tmp, "w", encoding="utf-8") as handle:
             json.dump(cache, handle, indent=1, sort_keys=True)
         os.replace(tmp, path)
     except Exception:
@@ -423,7 +423,7 @@ def canonical_identity(ref, default_owner=DEFAULT_OWNER, cache=None):
 
 def _alias_groups():
     try:
-        with open(_alias_path(), "r") as handle:
+        with open(_alias_path(), "r", encoding="utf-8") as handle:
             data = json.load(handle)
     except Exception:
         return []

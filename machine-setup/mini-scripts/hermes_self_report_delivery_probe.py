@@ -55,7 +55,7 @@ def main():
         return 2
 
     try:
-        with open(args.receipt_path) as f:
+        with open(args.receipt_path, encoding="utf-8") as f:
             rec = json.load(f)
     except Exception as e:
         print(json.dumps({"status": "unreadable", "detail": f"{args.receipt_path}: {e}"}))

@@ -64,7 +64,7 @@ def _seed_cache(path: Path, entries: dict) -> None:
     path.write_text(json.dumps(
         {slug: {"node_id": node, "full_name": full, "ts": now}
          for slug, (node, full) in entries.items()}
-    ))
+    ), encoding="utf-8")
 
 
 def _offline_env(cache: Path = None, aliases: Path = None) -> dict:

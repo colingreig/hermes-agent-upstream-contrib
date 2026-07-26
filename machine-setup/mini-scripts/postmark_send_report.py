@@ -134,7 +134,7 @@ def _write_receipt(channel, status, detail):
     }
     try:
         os.makedirs(os.path.dirname(RECEIPT_PATH), exist_ok=True)
-        with open(RECEIPT_PATH, "w") as f:
+        with open(RECEIPT_PATH, "w", encoding="utf-8") as f:
             json.dump(rec, f)
     except Exception:
         pass
@@ -217,14 +217,14 @@ def main():
     args = p.parse_args()
 
     if args.body_file:
-        with open(args.body_file, "r") as f:
+        with open(args.body_file, "r", encoding="utf-8") as f:
             text_body = f.read()
     else:
         text_body = sys.stdin.read()
 
     html_body = None
     if args.html_file:
-        with open(args.html_file, "r") as f:
+        with open(args.html_file, "r", encoding="utf-8") as f:
             html_body = f.read()
 
     token = _resolve_token()
