@@ -169,6 +169,26 @@ class CronPromptInjectionBlocked(Exception):
     """
 
 
+class CronSkillUnresolvable(Exception):
+    """Raised by _build_job_prompt when a job names a skill/bundle in its
+    ``skill``/``skills`` fields that cannot be resolved on disk. Caught in
+    run_job so the job fails loudly (error status, no model turn) instead of
+    silently free-lancing on whatever prompt text happens to be left.
+
+    HERMES audit finding: a job with ``skill: "email-triage"`` (no such
+    skill anywhere on disk) and ``prompt: ""`` ran 135 times reporting
+    ``last_status: ok`` — the old code just logged a warning, appended a
+    "skill not found" notice to the (empty) prompt, and dispatched the
+    model turn anyway. The model free-lanced with zero task-specific
+    criteria and produced plausible-looking output every time, so nothing
+    ever alarmed. A job whose declared skill(s) don't resolve has nothing
+    reliable to instruct the model with and must not run at all — this is
+    distinct from a job that legitimately declares no skill (``skill:
+    None`` / ``skills: []``), which is normal and continues to run
+    unchanged.
+    """
+
+
 def _resolve_cron_disabled_toolsets(cfg: dict) -> list[str]:
     """Toolsets a cron-spawned agent must never receive.
 
@@ -2683,8 +2703,13 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
     from agent.skill_bundles import build_bundle_invocation_message, resolve_bundle_command_key
     from agent.skill_utils import normalize_skill_lookup_name
 
-    parts = []
+    # First pass: resolve every named skill/bundle WITHOUT any side effects
+    # (no bump_use, no prompt assembly) so we know up front whether the job
+    # is safe to run at all. `entries` replays the resolved content in the
+    # original order once we've confirmed nothing is missing.
+    entries: list[tuple[str, str, str]] = []  # (kind, skill_name, payload)
     skipped: list[str] = []
+    skipped_reasons: dict[str, str] = {}
     for skill_name in skill_names:
         # Cron jobs historically accepted only skill names here, but the CLI/gateway
         # slash-command path lets bundles shadow skills with the same slug. Mirror
@@ -2699,9 +2724,7 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
             )
             if bundle_payload:
                 bundle_message, _loaded_bundle_skills, _missing_bundle_skills = bundle_payload
-                if parts:
-                    parts.append("")
-                parts.append(bundle_message)
+                entries.append(("bundle", skill_name, bundle_message))
                 continue
             logger.warning(
                 "Cron job '%s': bundle '%s' could not load any skills, skipping",
@@ -2709,6 +2732,7 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
                 skill_name,
             )
             skipped.append(skill_name)
+            skipped_reasons[skill_name] = f"bundle '{skill_name}' could not load any skills"
             continue
 
         try:
@@ -2716,11 +2740,71 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
         except (json.JSONDecodeError, TypeError):
             logger.warning("Cron job '%s': skill '%s' returned invalid JSON, skipping", job.get("name", job.get("id")), skill_name)
             skipped.append(skill_name)
+            skipped_reasons[skill_name] = "skill_view() returned invalid JSON"
             continue
         if not loaded.get("success"):
             error = loaded.get("error") or f"Failed to load skill '{skill_name}'"
             logger.warning("Cron job '%s': skill not found, skipping — %s", job.get("name", job.get("id")), error)
             skipped.append(skill_name)
+            skipped_reasons[skill_name] = error
+            continue
+
+        content = str(loaded.get("content") or "").strip()
+        entries.append(("skill", skill_name, content))
+
+    if skipped:
+        # Fail loudly instead of silently free-lancing off whatever prompt
+        # text is left over. HERMES audit finding: this exact branch — log
+        # a warning, append a "not found" notice, and dispatch the model
+        # turn anyway — let a job with skill="email-triage" (no such skill
+        # anywhere on disk) and prompt="" run 135 times reporting
+        # last_status: ok. The model had zero task-specific instructions,
+        # free-lanced, and produced plausible-looking output every run, so
+        # nothing ever alarmed.
+        #
+        # Any unresolvable entry in `skill`/`skills` voids the whole job —
+        # even if other listed skills DID resolve, a job missing part of
+        # its declared instructions is not safe to run on the rest. This
+        # fires regardless of whether `prompt` is empty or populated: an
+        # unresolvable skill reference is a config error either way, not
+        # something the presence of prompt text can excuse. (A job that
+        # legitimately declares no skill at all — `skill: null` and empty
+        # `skills` — never reaches this branch; that case returns above,
+        # unchanged, even when its prompt is also empty. We deliberately do
+        # NOT add a new "empty prompt + no skill at all" error: that
+        # combination isn't the defect pattern here, and the existing
+        # empty-final-response guard in run_one_job already turns a
+        # genuinely instruction-less run into a failure after the fact.)
+        searched_dirs: list[str] = []
+        try:
+            from tools.skills_tool import _skills_dir as _cron_active_skills_dir
+            _active_dir = _cron_active_skills_dir()
+            if _active_dir:
+                searched_dirs.append(str(_active_dir))
+        except Exception:
+            logger.debug("Cron job: failed to resolve active skills dir for error message", exc_info=True)
+        try:
+            from agent.skill_utils import get_external_skills_dirs
+            searched_dirs.extend(str(d) for d in get_external_skills_dirs())
+        except Exception:
+            logger.debug("Cron job: failed to resolve external skills dirs for error message", exc_info=True)
+        searched = ", ".join(dict.fromkeys(searched_dirs)) or "(no skill search directories configured)"
+        detail = "; ".join(f"'{name}' — {skipped_reasons.get(name, 'not found')}" for name in skipped)
+        raise CronSkillUnresolvable(
+            f"Cron job '{job.get('name', job.get('id'))}' (id={job.get('id')}) names skill(s)/bundle(s) "
+            f"in its 'skill'/'skills' config that could not be resolved: {detail}. "
+            f"Searched: {searched}. Refusing to run the model — fix the skill "
+            f"reference (typo, moved/deleted/renamed skill) or remove it from this job's config."
+        )
+
+    # Second pass: nothing was missing — replay in original order, now with
+    # the bump_use side effect (identical to prior behavior).
+    parts = []
+    for kind, skill_name, payload in entries:
+        if kind == "bundle":
+            if parts:
+                parts.append("")
+            parts.append(payload)
             continue
 
         # Bump usage so the curator sees this skill as actively used.
@@ -2729,25 +2813,15 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
         except Exception:
             logger.debug("Cron job: failed to bump skill usage for '%s'", skill_name, exc_info=True)
 
-        content = str(loaded.get("content") or "").strip()
         if parts:
             parts.append("")
         parts.extend(
             [
                 f'[IMPORTANT: The user has invoked the "{skill_name}" skill, indicating they want you to follow its instructions. The full skill content is loaded below.]',
                 "",
-                content,
+                payload,
             ]
         )
-
-    if skipped:
-        notice = (
-            f"[IMPORTANT: The following skill(s) were listed for this job but could not be found "
-            f"and were skipped: {', '.join(skipped)}. "
-            f"Start your response with a brief notice so the user is aware, e.g.: "
-            f"'⚠️ Skill(s) not found and skipped: {', '.join(skipped)}']"
-        )
-        parts.insert(0, notice)
 
     if prompt:
         parts.extend(["", f"The user has provided the following instruction alongside the skill invocation: {prompt}"])
@@ -3174,6 +3248,27 @@ def run_job(
             "the threat pattern (`tools/cronjob_tools.py::_CRON_THREAT_PATTERNS`)."
         )
         return False, blocked_doc, "", str(block_exc)
+    except CronSkillUnresolvable as skill_exc:
+        # Job names a skill/bundle that doesn't resolve on disk. Refuse to
+        # dispatch the model turn and surface a clear failure so the
+        # operator sees WHY the job didn't run instead of the job silently
+        # free-lancing off an empty/degraded prompt and reporting
+        # last_status: ok forever (the email-triage defect).
+        logger.error(
+            "Job '%s' (ID: %s): skill(s) unresolvable — %s",
+            job_name, job_id, skill_exc,
+        )
+        skill_error_doc = (
+            f"# Cron Job: {job_name}\n\n"
+            f"**Job ID:** {job_id}\n"
+            f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"**Status:** ERROR — skill unresolvable\n\n"
+            f"{skill_exc}\n\n"
+            "The agent was NOT run. Fix the skill reference (or remove it "
+            "from this job's config) and the job will resume on its next "
+            "scheduled tick."
+        )
+        return False, skill_error_doc, "", str(skill_exc)
     if prompt is None:
         logger.info("Job '%s': script produced no output, skipping AI call.", job_name)
         return True, "", SILENT_MARKER, None
