@@ -35,6 +35,73 @@ directory tree, the skill's own scripts dir — the filename here is prefixed
 directory; drop the prefix when copying to the mini). See "Claim retry cap"
 below for the exact copy commands.
 
+A second exception: `repo-aliases.json` deploys to
+`~/.hermes/config/repo-aliases.json` (not the scripts dir). See "Validator
+repository identity" below.
+
+## Validator repository identity (`validator_repo_guard.py`, `repo-aliases.json`)
+
+Guards the `hermes-pr-validate` cron (id `5a76e290811d`) against spurious
+`class=wrong-repo` FAIL verdicts. Two root causes, both fixed 2026-07-26:
+
+- **RC1 — wrong workdir.** The job's `workdir` was hardcoded to
+  `/Users/colingreig/dev/thermal` while the job is chartered for the
+  hermes-agent board, so ignite-validate resolved the wrong board/repo.
+  Repointed in `jobs.json`; `--expect-repo` mode is the standing tripwire.
+- **RC2 — repo identity compared as a NAME STRING.** On 2026-07-23
+  `colingreig/hermes-agent` was renamed to
+  `colingreig/hermes-agent-upstream-contrib`. GitHub redirects the old name, so
+  both spellings address ONE repo — but the mini holds both simultaneously
+  (`~/dev/hermes-agent` origin uses the OLD name; the bare mirror and every
+  `wt-new` worktree use the NEW one; Execution Briefs say `Target repo:
+  hermes-agent`; handoff PR/CI URLs say `...-upstream-contrib`). Every literal
+  comparison of those two spellings produced a false `wrong-repo` FAIL against
+  correct, merged work (86e2gh04e, 86e2gdmfk, 86e25xww8, 86e2f7ukm — all
+  manually voided).
+
+The fix resolves every repo reference to its **canonical GitHub identity**
+(`gh api repos/<owner>/<name> --jq .node_id`, which follows renames) and
+compares identities, never names. That is deliberately generic: the *next*
+rename needs no code change and no alias entry.
+
+```bash
+# Mode A — is this checkout the repo this cron is chartered for?
+python3 ~/.hermes/scripts/validator_repo_guard.py --expect-repo hermes-agent --workdir "$(pwd)"
+# Mode B — is the evidence PR/CI URL the SAME repo as the task's target?
+python3 ~/.hermes/scripts/validator_repo_guard.py --compare hermes-agent <pr-or-ci-url>
+# Mode C — debug one reference
+python3 ~/.hermes/scripts/validator_repo_guard.py --identity hermes-agent
+```
+
+Exit codes — **0** same/OK, **3** ABORT (skip the task, write NO verdict and
+change NO status), **4** confirmed different repositories (a `wrong-repo` FAIL
+is authorized). Exit 3 is the fail-closed default whenever identity cannot be
+established: a spurious FAIL kicks real reviewed work back to `to do` and burns
+multi-day rework loops, while a skip costs one hourly cycle.
+
+Two supporting notes:
+
+- **Definite-404 inference.** The mini's App token (`hermes-dev-assistant[bot]`)
+  is installed per repository, so some real repos 404 for it (e.g.
+  `colingreig/hermes-ops-scripts`, the genuine wrong-repo in 86e2eu4fp). Since
+  both the rename redirect and installation access key on the repository *id*,
+  a definite HTTP 404 against a credential that just resolved the target LIVE
+  proves the evidence repo is not a rename alias of the target → `DIFFERENT`.
+  A non-404 `gh` failure proves nothing → `UNRESOLVED`/skip.
+- **`repo-aliases.json`** (`~/.hermes/config/repo-aliases.json`, override
+  `$HERMES_REPO_ALIASES`) is an offline **last resort only** — it short-circuits
+  the network for a known rename when the mini is offline with a cold identity
+  cache. Prefer letting `gh` follow the redirect. The identity cache lives at
+  `~/.hermes/state/repo_identity_cache.json` (7-day TTL, stale entries served
+  when `gh` is unreachable).
+
+```bash
+scp machine-setup/mini-scripts/validator_repo_guard.py mini:~/.hermes/scripts/validator_repo_guard.py
+scp machine-setup/mini-scripts/repo-aliases.json      mini:~/.hermes/config/repo-aliases.json
+python3 machine-setup/mini-scripts/tests/test_validator_repo_guard.py            # hermetic
+HERMES_REPO_GUARD_LIVE=1 python3 machine-setup/mini-scripts/tests/test_validator_repo_guard.py  # + real gh
+```
+
 The PR review/merge closure is the exception to the manual-copy convention:
 its canonical sources, deterministic manifest, and deployment reconciler live
 under `pr_pipeline/`. Do not compare or copy those files one at a time.
