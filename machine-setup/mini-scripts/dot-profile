@@ -1,0 +1,40 @@
+# MINI DESTINATION: ~/.profile  (NOT ~/.hermes/scripts/)
+#
+# Sourced by every `bash -l` the Hermes terminal tool spawns to build its
+# session env snapshot (tools/environments/local.py::_resolve_shell_init_files
+# sources ~/.profile, ~/.bash_profile, ~/.bashrc), and by login shells
+# generally.
+export PATH="$HOME/.local/bin:$PATH"
+
+# --- Hermes cron GitHub auth (2026-07-26 incident) -------------------------
+# ~/.hermes/bin holds the `gh` wrapper that mints a GitHub App installation
+# token per invocation. The gateway plist/wrapper puts ~/.hermes/bin FIRST on
+# PATH, but /etc/profile runs /usr/libexec/path_helper in every login shell,
+# which rebuilds PATH as (/etc/paths + /etc/paths.d) followed by the inherited
+# entries. That silently DEMOTED ~/.hermes/bin below /opt/homebrew/bin, so
+# every cron `gh` call hit the real, unauthenticated Homebrew gh and failed
+# with "no oauth token found for github.com" — no branch pushes, no PRs.
+# Re-hoist it here (this file runs after path_helper), removing any existing
+# occurrence first so a demoted entry is actually promoted rather than skipped.
+_hermes_bin="$HOME/.hermes/bin"
+case ":$PATH:" in
+  "$_hermes_bin:"*)
+    : # already first, nothing to do
+    ;;
+  *":$_hermes_bin:"*)
+    _hermes_newpath=""
+    _hermes_oldifs="$IFS"
+    IFS=":"
+    for _hermes_p in $PATH; do
+      [ "$_hermes_p" = "$_hermes_bin" ] && continue
+      _hermes_newpath="${_hermes_newpath:+$_hermes_newpath:}$_hermes_p"
+    done
+    IFS="$_hermes_oldifs"
+    PATH="$_hermes_bin:$_hermes_newpath"
+    ;;
+  *)
+    PATH="$_hermes_bin:$PATH"
+    ;;
+esac
+export PATH
+unset _hermes_bin _hermes_newpath _hermes_oldifs _hermes_p

@@ -17,6 +17,12 @@
 # result. Root cause was a copy/paste of a log-safe masked value into the
 # live code path, not a bad/expired/misrouted credential -- re-pasting or
 # rotating the token would not have fixed it.
+#
+# Second fix (2026-07-26, ClickUp RC3 + follow-on defect): load_blocklist()
+# wrapped its JSON-list fields in dict(...), assuming a token->reason mapping
+# the file never actually stored (it's plain lists), which raised a
+# ValueError and crashed every caller on top of the 401 above. See
+# load_blocklist()'s own docstring.
 """ClickUp task-index sync helpers.
 
 This module maintains per-list JSON caches under ~/.hermes/state/clickup-tasks/
@@ -143,24 +149,64 @@ def load_map() -> Dict[str, Any]:
 
 
 def load_blocklist() -> Dict[str, Any]:
+    """Load the shared project/domain blocklist policy file.
+
+    Both fields are plain lists of match tokens on disk (see blocklist.json's
+    own _comment, and _coerce_blocklist() below which treats every entry as
+    an opaque string) -- the live file has only ever stored
+    `["oeconnection", "partstech"]`-shaped lists. A previous version of this
+    loader wrapped the raw value in `dict(...)`, assuming a token->reason
+    mapping the file never actually used; `dict()` on a list of
+    multi-character strings raises `ValueError: dictionary update sequence
+    element #0 has length N; 2 is required`, which crashed every caller
+    (poll gate, review-SLA sync) on every single invocation. Fails soft per
+    field now: a missing/malformed field falls back to that field's
+    built-in default and logs why, instead of raising and taking the whole
+    sync down.
+    """
     global _BLOCKLIST_CACHE
     if _BLOCKLIST_CACHE is not None:
         return _BLOCKLIST_CACHE
     default = {
-        "clickup_project_blocklist": {"oeconnection": "OEC project board", "partstech": "PartsTech project board"},
-        "publish_domain_blocklist": {"tofinoelopement": "Client site with human-gated publish policy"},
+        "clickup_project_blocklist": ["oeconnection", "partstech"],
+        "publish_domain_blocklist": ["tofinoelopement"],
     }
+    loaded: Dict[str, Any] = {}
     try:
         with BLOCKLIST_PATH.open(encoding="utf-8") as fh:
-            loaded = json.load(fh) or {}
-        if not isinstance(loaded, dict):
-            loaded = {}
-    except Exception:
-        loaded = {}
-    merged = {
-        "clickup_project_blocklist": dict(loaded.get("clickup_project_blocklist") or default["clickup_project_blocklist"]),
-        "publish_domain_blocklist": dict(loaded.get("publish_domain_blocklist") or default["publish_domain_blocklist"]),
-    }
+            parsed = json.load(fh) or {}
+        if isinstance(parsed, dict):
+            loaded = parsed
+        else:
+            print(
+                f"WARNING: blocklist at {BLOCKLIST_PATH} is not a JSON object "
+                f"(got {type(parsed).__name__}); using built-in defaults",
+                file=sys.stderr,
+            )
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        print(
+            f"WARNING: could not read/parse blocklist at {BLOCKLIST_PATH}: {exc}; "
+            "using built-in defaults",
+            file=sys.stderr,
+        )
+
+    merged: Dict[str, Any] = {}
+    for key, fallback in default.items():
+        raw = loaded.get(key)
+        if raw is None:
+            merged[key] = list(fallback)
+            continue
+        try:
+            merged[key] = [str(v) for v in raw]
+        except TypeError:
+            print(
+                f"WARNING: blocklist field {key!r} in {BLOCKLIST_PATH} is not a "
+                f"list ({type(raw).__name__}); using built-in default",
+                file=sys.stderr,
+            )
+            merged[key] = list(fallback)
     _BLOCKLIST_CACHE = merged
     return merged
 

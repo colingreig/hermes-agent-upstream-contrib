@@ -448,17 +448,52 @@ def resolve_shadow_identity(repo: str, pr: int, task_id: str = "", expected_repo
     details = _gh_json(f"repos/{canonical}/pulls/{pr}")
     base = (details.get("base") or {})
     head = (details.get("head") or {})
-    base_sha, head_sha = base.get("sha"), head.get("sha")
+    head_sha = head.get("sha")
     tested_merge_sha = details.get("merge_commit_sha")
     base_ref = base.get("ref")
-    if not all(isinstance(value, str) and len(value) in (40, 64) for value in (base_sha, head_sha, tested_merge_sha)):
-        raise VerdictStoreError("GitHub PR lacks immutable base, head, or synthetic merge SHA")
+    if not all(isinstance(value, str) and len(value) in (40, 64) for value in (head_sha, tested_merge_sha)):
+        raise VerdictStoreError("GitHub PR lacks immutable head or synthetic merge SHA")
     if not isinstance(base_ref, str) or not base_ref:
         raise VerdictStoreError("GitHub PR lacks its protected base branch")
+    # BUG THIS REPLACES (2026-07-26).  ``pull.base.sha`` is the base tip recorded
+    # when the PR was opened; GitHub never advances it.  The synthetic merge, by
+    # contrast, is computed against a *live* base tip.  The previous check
+    # compared the two, so it could only ever succeed on a base branch that had
+    # not moved since the PR was created.  Every other PR was refused with
+    # "synthetic merge does not have the exact reviewed base/head parents", no
+    # identity could be minted, and therefore no verdict could ever reach the
+    # SQLite ledger.  Measured 2026-07-26: this rejected 100% of the open-PR
+    # fleet, including the only allowlisted PR with a protected base.
+    #
+    # The base that matters for trust is the one CI actually merged against —
+    # the synthetic merge's FIRST parent.  Bind that, and keep the boundary
+    # fail-closed by proving:
+    #   (a) the tested merge is an exact two-parent merge,
+    #   (b) its second parent is byte-identical to the reviewed PR head, and
+    #   (c) its first parent is genuine history of the protected base branch
+    #       (identical to, or an ancestor of, the live tip) — never an arbitrary
+    #       or forked commit.
+    # Being *behind* the live tip is deliberately not fatal here: the merge-time
+    # gates (mergeable_state, gating-CI-green on the live head, and branch
+    # protection's own "require branches up to date" setting) own that call, and
+    # merge ownership itself is still disabled by _shadow().  ACTIVATION REVIEW
+    # MUST RECONFIRM THIS: graduating out of shadow means deciding whether a
+    # behind-but-green base is acceptable to merge unattended.
     commit = _gh_json(f"repos/{canonical}/git/commits/{tested_merge_sha}")
     parents = tuple((item or {}).get("sha") for item in (commit.get("parents") or []))
-    if parents != (base_sha, head_sha):
-        raise VerdictStoreError("synthetic merge does not have the exact reviewed base/head parents")
+    if len(parents) != 2 or not all(isinstance(value, str) and len(value) in (40, 64) for value in parents):
+        raise VerdictStoreError("synthetic merge is not an exact two-parent base/head merge")
+    base_sha, merged_head_sha = parents
+    if merged_head_sha != head_sha:
+        raise VerdictStoreError("synthetic merge does not have the exact reviewed head parent")
+    live_base = _gh_json(f"repos/{canonical}/git/ref/heads/{base_ref}")
+    live_base_sha = ((live_base or {}).get("object") or {}).get("sha")
+    if not isinstance(live_base_sha, str) or len(live_base_sha) not in (40, 64):
+        raise VerdictStoreError("protected base branch has no readable immutable tip")
+    if base_sha != live_base_sha:
+        comparison = _gh_json(f"repos/{canonical}/compare/{base_sha}...{live_base_sha}")
+        if comparison.get("status") not in {"identical", "ahead"}:
+            raise VerdictStoreError("tested merge base is not an ancestor of the protected base branch")
 
     protection = _gh_json(f"repos/{canonical}/branches/{base_ref}/protection/required_status_checks")
     contexts = protection.get("contexts") or []

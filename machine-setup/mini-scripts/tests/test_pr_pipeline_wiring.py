@@ -58,6 +58,9 @@ class RuntimeWiringTests(unittest.TestCase):
             f"{path_prefix}/git/commits/{merge_sha}": {
                 "parents": [{"sha": base_sha}, {"sha": head_sha}],
             },
+            # The identity binds the base the synthetic merge was actually tested
+            # against, and requires it to still be the live protected-branch tip.
+            f"{path_prefix}/git/ref/heads/main": {"object": {"sha": base_sha}},
             f"{path_prefix}/branches/main/protection/required_status_checks": {"contexts": ["legacy-ci"]},
             f"{path_prefix}/commits/{merge_sha}/check-runs": {"check_runs": []},
         }
