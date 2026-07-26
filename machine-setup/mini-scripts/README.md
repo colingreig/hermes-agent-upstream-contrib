@@ -35,8 +35,9 @@ directory tree, the skill's own scripts dir — the filename here is prefixed
 directory; drop the prefix when copying to the mini). See "Claim retry cap"
 below for the exact copy commands.
 
-Diff against the live file periodically (`ssh mini cat ~/.hermes/scripts/<file>`
-vs this copy) to catch drift — nothing currently automates that check.
+The PR review/merge closure is the exception to the manual-copy convention:
+its canonical sources, deterministic manifest, and deployment reconciler live
+under `pr_pipeline/`. Do not compare or copy those files one at a time.
 
 ## Files
 
@@ -190,6 +191,16 @@ vs this copy) to catch drift — nothing currently automates that check.
 - `tests/test_pr_staleness_alert.py` — covers the dedupe fingerprint, decide
   logic (unchanged/new/dropped/bucket-crossing/heartbeat), and fail-open
   state loading, both as pure functions and end to end through `run()`.
+- `pr_pipeline/` — canonical Mini PR-review, validation, tripwire, CI, risk,
+  Slack, and merge-guard closure. `manifest.json` resolves its source hashes
+  at deployment time, including every `pr_pipeline/*.py` trust-boundary
+  component. The legacy flat entry points and the package namespace are both
+  generated Mini artifacts from these sources.
+- `reconcile_pr_pipeline.py` — the only deploy/verify path for that closure.
+  It installs only manifest paths, records the supplying source commit plus
+  every deployed SHA-256 in `.pr_pipeline_deployment.json`, and reports
+  missing, extra, or drifted pipeline files. The snapshot is hard-shadowed:
+  this deployment surface never enables or invokes a live merge.
 
 ## Claim retry cap (ClickUp 86e2ddcpb, 2026-07-24)
 
@@ -234,9 +245,9 @@ mini-run -- 'python3 -m py_compile ~/.hermes/scripts/claim_store.py \
 
 ## PR staleness dedupe (mini cron job pr-staleness-alert, 2026-07-24)
 
-Root cause: `pr_pipeline_improvements.check_staleness_and_alert()` (a
-separate, also mini-only, not-yet-vendored module) fingerprinted each stale
-PR on `round(age_hours, 2)` — a value that changes on almost every
+Root cause: `pr_pipeline_improvements.check_staleness_and_alert()` (then a
+separate Mini-only module, now included in the canonical PR-pipeline package)
+fingerprinted each stale PR on `round(age_hours, 2)` — a value that changes on almost every
 15-minute tick — so its `.pr_pipeline_state.json` comparison never matched
 two runs in a row. Confirmed byte-identical Slack payload across six
 consecutive runs (20:02-21:16 on 2026-07-23), 257 runs since 2026-07-22, for
@@ -273,6 +284,35 @@ scp machine-setup/mini-scripts/pr_staleness_alert.py \
     mac-mini-h.tail51ec1b.ts.net:~/.hermes/scripts/pr_staleness_alert.py
 mini-run -- 'python3 -m py_compile ~/.hermes/scripts/pr_staleness_alert.py'  # sanity check
 ```
+
+## PR-pipeline source and deployment integrity
+
+`machine-setup/mini-scripts/pr_pipeline/` is now the only authoritative
+source for the Mini PR-review/merge closure. The Mini copies at
+`~/.hermes/scripts/` and `~/.hermes/scripts/pr_pipeline/` are generated
+artifacts. The manifest includes the legacy flat entry points and every Python
+file in the package, so a newly added trust-boundary module cannot silently
+remain Mini-only.
+
+The focused verifier/reconciler is deliberately separate from the legacy
+patch checker: it stages the manifest sources to the Mini, writes only the
+manifest destinations and deployment marker, then checks SHA-256 parity and
+the recorded source commit. Supply the exact already-approved source commit;
+the tool never derives it from, or mutates, a Mini checkout.
+
+```bash
+python3 machine-setup/mini-scripts/reconcile_pr_pipeline.py reconcile \
+  --host mini --source-commit <approved-source-commit>
+
+python3 machine-setup/mini-scripts/reconcile_pr_pipeline.py verify \
+  --host mini --source-commit <approved-source-commit>
+```
+
+Both commands preserve shadow mode. They do not invoke `gh`, a merge command,
+or any PR pipeline cron; promotion to live merge behavior is a separate
+reviewed change. `verify` is read-only on the deployed scripts (apart from its
+temporary, removed source staging directory) and fails on a missing file,
+hash mismatch, recorded-commit mismatch, or unmanifested pipeline extra.
 
 **WARNING — do NOT rsync `~/.hermes/scripts/` wholesale.** That directory is
 hand-maintained on the mini and holds ~203 live-only scripts with no git

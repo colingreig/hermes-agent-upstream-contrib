@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "description": "Authoritative source manifest for the Hermes Mini PR pipeline.",
+  "source_commit_required": true,
+  "legacy_flat_entrypoints": [
+    "autonomous_merge.py",
+    "ci_base_fix_exempt.json",
+    "ci_health_watch.py",
+    "hermes_validate_ops.py",
+    "merge_guard.py",
+    "pr_pipeline_event_driven.py",
+    "pr_pipeline_improvements.py",
+    "pr_pipeline_no_pr_left_behind.py",
+    "pr_staleness_alert.py",
+    "pr_wake_and_sweep.py",
+    "review_poll_gate.py",
+    "risk_classify.py",
+    "slack_msg_builder.py",
+    "validate_pr.py",
+    "validate_tripwires.py",
+    "validator_common.py",
+    "validator_image_authenticity.py",
+    "validator_model.py",
+    "validator_panel.py",
+    "validator_policy.json",
+    "validator_verdict.py"
+  ],
+  "package_glob": "*.py",
+  "package_destination": "pr_pipeline",
+  "managed_root_patterns": [
+    "autonomous_merge.py",
+    "ci_base_fix_exempt.json",
+    "ci_health_watch.py",
+    "hermes_validate_ops.py",
+    "merge_guard.py",
+    "pr_*.py",
+    "review_poll_gate.py",
+    "risk_classify.py",
+    "slack_msg_builder.py",
+    "validate_*.py",
+    "validator_*.py"
+  ]
+}
