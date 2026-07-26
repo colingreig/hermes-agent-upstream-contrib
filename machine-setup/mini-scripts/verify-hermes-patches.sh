@@ -87,11 +87,16 @@ cd "$REPO" || { red "Repo not found: $REPO"; exit 2; }
 if [ "$PR_PIPELINE_ONLY" -eq 1 ]; then
   hdr "PR trust boundary (source-controlled, shadow-only)"
   PR_PIPELINE_VERIFY="$HOME/.hermes/scripts/pr_pipeline/pipeline_verify.py"
+  PR_PIPELINE_PY="$REPO/venv/bin/python"
   if [ ! -f "$PR_PIPELINE_VERIFY" ]; then
     red "verifier   MISSING $PR_PIPELINE_VERIFY — reconcile the source-controlled PR pipeline first"
     exit 1
   fi
-  if python3 "$PR_PIPELINE_VERIFY" --scripts-dir "$HOME/.hermes/scripts"; then
+  if [ ! -x "$PR_PIPELINE_PY" ]; then
+    red "verifier   MISSING $PR_PIPELINE_PY — the immutable Hermes runtime interpreter is required"
+    exit 1
+  fi
+  if "$PR_PIPELINE_PY" "$PR_PIPELINE_VERIFY" --scripts-dir "$HOME/.hermes/scripts"; then
     grn "boundary   deployed manifest, SQLite fence, strict CI, sandbox, and shadow-only merge checks passed"
     exit 0
   fi
