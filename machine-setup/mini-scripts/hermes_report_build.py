@@ -148,6 +148,19 @@ def summarize_spend(window_rows, today_rows, yesterday_rows):
     }
 
 
+def _cost_display(spend):
+    """Render spend['total_cost'] for the subject/headline lines.
+
+    A served-ledger READ FAILURE (spend['error'] set, total_cost=None) must
+    never render as "$0.00" — that is indistinguishable from a real quiet
+    period with zero spend and hides the failure from Colin. Only a genuine
+    zero (ledger read fine, nothing served in the window) prints as $0.00.
+    """
+    if spend.get("error"):
+        return "spend UNKNOWN (ledger unreadable)"
+    return f"${(spend.get('total_cost') or 0.0):.2f}"
+
+
 # ---------- alerts ----------
 
 def _epoch_ms_to_dt(ms_str):
@@ -311,7 +324,7 @@ def _alert_count_text(alert_summary):
 def build_subject(scoreboard, spend, alert_summary):
     subj = (
         f"Hermes: {scoreboard['shipped']} shipped · {_alert_count_text(alert_summary)} · "
-        f"${spend['total_cost']:.2f} · {scoreboard['ready']} ready"
+        f"{_cost_display(spend)} · {scoreboard['ready']} ready"
     )
     return subj[:78]
 
@@ -327,7 +340,7 @@ def build_headline_emoji_text(scoreboard, spend, alert_summary):
         f"{alert_summary['blocked_tasks']} blocked · "
         f"{'⚠️' if alert_summary['health_signals'] else '✓'} "
         f"{alert_summary['health_signals']} health · "
-        f"💸 ${spend['total_cost']:.2f} · {scoreboard['ready']} ready"
+        f"💸 {_cost_display(spend)} · {scoreboard['ready']} ready"
     )
 
 
@@ -548,7 +561,14 @@ def render_html(header, scoreboard, spend, alerts, hermes_rows, hermes_meta, wor
 
     # 4. Model & spend
     parts.append('<h2 style="margin:0 0 12px;font-size:16px;color:#1a1a1a">💸 Model &amp; spend</h2>')
-    if spend.get("empty"):
+    if spend.get("error"):
+        parts.append(
+            '<div style="padding:12px 14px;background:#fdecea;border:1px solid #b00020;'
+            'border-radius:4px;font-size:14px;color:#b00020;margin-bottom:24px">'
+            f'⚠️ Served ledger UNREADABLE ({_esc(str(spend["error"]))}) — spend this window is '
+            'UNKNOWN, not $0.00.</div>'
+        )
+    elif spend.get("empty"):
         parts.append(
             '<div style="padding:12px 14px;background:#f7f7f8;border-radius:4px;font-size:14px;'
             'color:#666;margin-bottom:24px">No served-by receipts in the window.</div>'
@@ -700,7 +720,10 @@ def build_text(header, scoreboard, spend, alerts, hermes_rows, hermes_meta, work
         "MODEL & SPEND",
         "=" * 40,
     ]
-    if spend.get("empty"):
+    if spend.get("error"):
+        lines.append(f"  WARNING: served ledger UNREADABLE ({spend['error']}) — "
+                      "spend this window is UNKNOWN, not $0.00.")
+    elif spend.get("empty"):
         lines.append("  No served-by receipts in the window.")
     else:
         delta = spend["cost_delta"]
@@ -766,17 +789,33 @@ def main():
     window_rows, today_rows, yesterday_rows, ledger_err = load_served_ledger(
         args.served_ledger, args.window_min
     )
-    if ledger_err or not window_rows:
+    if ledger_err:
+        # A genuine read failure is NOT a $0.00 spend day — total_cost stays
+        # None so every renderer (subject/headline/html/text/JSON summary) is
+        # forced to go through _cost_display()/explicit None-handling instead
+        # of silently formatting an unreadable ledger as "$0.00 spent."
         spend = {
             "empty": True,
+            "error": ledger_err,
+            "total_cost": None, "today_cost": None, "yesterday_cost": None, "cost_delta": None,
+            "provider_rows": [], "providers_n": 0, "runs_n": 0, "drift_n": 0, "top_drift_model": None,
+        }
+        print(f"WARN: served ledger issue: {ledger_err}", file=sys.stderr)
+        header = dict(header or {})
+        existing = str(header.get("needs_attention") or "").strip()
+        signal = f"served ledger unreadable ({ledger_err}) — spend figures unknown, not zero"
+        header["needs_attention"] = f"{existing}; {signal}".strip("; ") if existing else signal
+    elif not window_rows:
+        spend = {
+            "empty": True,
+            "error": None,
             "total_cost": 0.0, "today_cost": 0.0, "yesterday_cost": 0.0, "cost_delta": 0.0,
             "provider_rows": [], "providers_n": 0, "runs_n": 0, "drift_n": 0, "top_drift_model": None,
         }
-        if ledger_err:
-            print(f"WARN: served ledger issue: {ledger_err}", file=sys.stderr)
     else:
         spend = summarize_spend(window_rows, today_rows, yesterday_rows)
         spend["empty"] = False
+        spend["error"] = None
 
     scoreboard = build_scoreboard(hermes_rows, snap_tasks, hermes_meta, work_counts["completed"])
 
@@ -821,7 +860,8 @@ def main():
         "unresolved_task_ids": work_counts.get("unresolved_task_ids", []),
         "snapshot_generated": hermes_meta.get("generated"),
         "suggested_subject": subject,
-        "total_cost_usd": round(spend["total_cost"], 4),
+        "total_cost_usd": (round(spend["total_cost"], 4) if spend.get("total_cost") is not None else None),
+        "spend_ledger_error": spend.get("error"),
         **alert_summary,
         "providers_n": spend["providers_n"],
         "scoreboard_daily": scoreboard["daily"],
