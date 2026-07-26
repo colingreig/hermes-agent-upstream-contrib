@@ -11,6 +11,7 @@ from pathlib import Path
 SCRIPTS = Path(__file__).resolve().parent.parent
 RECONCILER = SCRIPTS / "reconcile_pr_pipeline.py"
 PIPELINE = SCRIPTS / "pr_pipeline"
+PATCH_VERIFIER = SCRIPTS / "verify-hermes-patches.sh"
 
 
 def _load(path: Path, name: str):
@@ -42,6 +43,12 @@ class PipelineVerifierTests(unittest.TestCase):
         self.assertIn("verify-hermes-patches.sh", self.reconciler.verify(self.destination)["expected_files"])
         self.assertIn("sqlite-wal-fence", report["checks"])
         self.assertIn("sandbox-default-deny", report["checks"])
+
+    def test_patch_verifier_uses_the_runtime_venv_not_host_python(self):
+        source = PATCH_VERIFIER.read_text(encoding="utf-8")
+
+        self.assertIn('PR_PIPELINE_PY="$REPO/venv/bin/python"', source)
+        self.assertIn('"$PR_PIPELINE_PY" "$PR_PIPELINE_VERIFY"', source)
 
     def test_deployed_pipeline_verifier_rejects_tampering_and_unmanaged_modules(self):
         (self.destination / "pr_pipeline" / "store.py").write_text("tampered\n", encoding="utf-8")
