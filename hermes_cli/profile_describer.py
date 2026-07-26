@@ -225,12 +225,10 @@ def describe_profile(
     )
 
     try:
-        # Route through call_llm (not a raw get_text_auxiliary_client +
-        # chat.completions.create) so the shared auxiliary recovery machinery
-        # applies — provider/model/extra_body come from
-        # ``auxiliary.profile_describer.*`` and a HARD primary-provider error
-        # (invalid key / unreachable endpoint / credit exhaustion) transparently
-        # retries the configured ``auxiliary.profile_describer.fallback``.
+        # Route through call_llm so auxiliary.profile_describer.* config
+        # (provider/model/base_url, extra_body, reasoning_effort, retries)
+        # all apply — the direct-create path dropped extra_body (#35566) — and
+        # the shared hard-error recovery path can retry the configured fallback.
         resp = call_llm(
             task="profile_describer",
             messages=[

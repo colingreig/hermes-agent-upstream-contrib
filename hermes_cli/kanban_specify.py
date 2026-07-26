@@ -174,13 +174,11 @@ def specify_task(
     )
 
     try:
-        # Route through call_llm (not a raw get_text_auxiliary_client +
-        # chat.completions.create) so the shared auxiliary recovery machinery
-        # applies — provider/model/extra_body come from
-        # ``auxiliary.triage_specifier.*`` and a HARD primary-provider error
-        # (invalid key / unreachable endpoint / credit exhaustion) transparently
-        # retries the configured ``auxiliary.triage_specifier.fallback`` instead
-        # of stranding the task in triage.
+        # Route through call_llm so auxiliary.triage_specifier.* config
+        # (provider/model/base_url, extra_body, reasoning_effort, retries)
+        # all apply — the direct-create path dropped extra_body (#35566) — and
+        # the shared hard-error recovery path can retry the configured fallback
+        # instead of stranding the task in triage.
         resp = call_llm(
             task="triage_specifier",
             messages=[

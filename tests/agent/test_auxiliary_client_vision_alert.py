@@ -61,7 +61,10 @@ class TestSyncVisionChainExhaustedAlert:
                 "agent.auxiliary_client.resolve_vision_provider_client",
                 return_value=("gemini", healthy_client, "gemini-3.5-flash"),
             ),
-            patch("agent.auxiliary_client._validate_llm_response", side_effect=lambda r, t: r),
+            patch(
+                "agent.auxiliary_client._validate_llm_response",
+                side_effect=lambda r, t, **_metadata: r,
+            ),
             patch.object(ops_alerts, "_send_slack") as mock_send,
         ):
             resp = ac.call_llm(

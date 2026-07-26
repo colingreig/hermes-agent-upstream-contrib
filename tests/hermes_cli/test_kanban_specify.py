@@ -165,7 +165,7 @@ def test_specify_task_no_aux_client_configured(kanban_home):
         outcome = spec.specify_task(tid)
 
     assert outcome.ok is False
-    assert "auxiliary client" in outcome.reason
+    assert "no auxiliary client configured" in outcome.reason
     # Task must stay in triage — we never touched it.
     with kb.connect() as conn:
         assert kb.get_task(conn, tid).status == "triage"

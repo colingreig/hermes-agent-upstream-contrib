@@ -89,6 +89,7 @@ DEFAULT_MIN_ATTEMPTS = 20
 # main-window rate mathematically cannot detect a ~12h outage (only ~25%
 # of the window), so this runs a second, much shorter window alongside it.
 DEFAULT_SEARCH_WINDOW_HOURS = 4.0
+DEFAULT_PROVIDER_INCIDENT_WINDOW_DAYS = 30.0
 
 # Minimum production attempts required within --search-window-hours before
 # the short-window search_failure_rate is trusted (below this it's None,
@@ -105,6 +106,12 @@ FETCH_SUCCESS_WARN = 0.70
 UNGROUNDED_RATE_ALARM = 0.10
 SEARCH_FAILURE_RATE_ALARM = 0.30
 SEARCH_FAILURE_STREAK_ALARM = 3
+# A provider incident is three or more provider-attributed search failures
+# whose adjacent receipts are no more than four hours apart. This mirrors the
+# minimum evidence used by the live search-outage detector, while keeping
+# historic incidents independently queryable from the content-free ledger.
+PROVIDER_INCIDENT_MIN_FAILURES = 3
+PROVIDER_INCIDENT_GAP_HOURS = 4.0
 
 
 def _parse_ts(value: str) -> float | None:
@@ -135,6 +142,82 @@ def _is_smoke(record: dict[str, Any]) -> bool:
     if isinstance(smoke_field, bool):
         return smoke_field
     return _is_smoke_task_id(record.get("task_id"))
+
+
+def _provider_id(value: Any) -> str | None:
+    """Return a stable provider identifier, excluding legacy/malformed values."""
+    if not isinstance(value, str):
+        return None
+    provider = value.strip().lower()
+    if not provider or len(provider) > 64:
+        return None
+    if not all(char.isalnum() or char in "._-" for char in provider):
+        return None
+    return provider
+
+
+def provider_search_incidents(
+    records: list[dict[str, Any]], *, now: float, window_days: float = DEFAULT_PROVIDER_INCIDENT_WINDOW_DAYS
+) -> tuple[list[dict[str, Any]], dict[str, int], int]:
+    """Return durable, provider-attributed search incidents from the ledger.
+
+    Only enabled, non-smoke, non-``fetch-only`` receipts with both
+    ``search_failed=true`` and a valid ``search_provider`` participate. Legacy
+    receipts remain visible through the unattributed count but can never be
+    assigned to a provider retroactively. A gap of more than four hours starts
+    a new incident, preventing one prolonged outage from being counted twice.
+    """
+    cutoff = now - max(0.0, window_days) * 24 * 3600
+    failures_by_provider: dict[str, list[float]] = {}
+    unattributed_failures = 0
+    for record in records:
+        timestamp = _parse_ts(str(record.get("ts", "")))
+        if (
+            timestamp is None
+            or timestamp < cutoff
+            or timestamp > now
+            or not record.get("enabled")
+            or record.get("outcome") == "fetch-only"
+            or _is_smoke(record)
+            or not record.get("search_failed")
+        ):
+            continue
+        provider = _provider_id(record.get("search_provider"))
+        if provider is None:
+            unattributed_failures += 1
+            continue
+        failures_by_provider.setdefault(provider, []).append(timestamp)
+
+    incidents: list[dict[str, Any]] = []
+    counts: dict[str, int] = {}
+    max_gap_seconds = PROVIDER_INCIDENT_GAP_HOURS * 3600
+    for provider, timestamps in sorted(failures_by_provider.items()):
+        cluster: list[float] = []
+        for timestamp in sorted(timestamps):
+            if cluster and timestamp - cluster[-1] > max_gap_seconds:
+                if len(cluster) >= PROVIDER_INCIDENT_MIN_FAILURES:
+                    incidents.append(
+                        {
+                            "provider": provider,
+                            "started_at": datetime.fromtimestamp(cluster[0], timezone.utc).isoformat(),
+                            "ended_at": datetime.fromtimestamp(cluster[-1], timezone.utc).isoformat(),
+                            "search_failure_receipts": len(cluster),
+                        }
+                    )
+                    counts[provider] = counts.get(provider, 0) + 1
+                cluster = []
+            cluster.append(timestamp)
+        if len(cluster) >= PROVIDER_INCIDENT_MIN_FAILURES:
+            incidents.append(
+                {
+                    "provider": provider,
+                    "started_at": datetime.fromtimestamp(cluster[0], timezone.utc).isoformat(),
+                    "ended_at": datetime.fromtimestamp(cluster[-1], timezone.utc).isoformat(),
+                    "search_failure_receipts": len(cluster),
+                }
+            )
+            counts[provider] = counts.get(provider, 0) + 1
+    return incidents, counts, unattributed_failures
 
 
 def _safe_int(value: Any) -> int:
@@ -337,6 +420,10 @@ def evaluate(
     search_outage_by_streak = search_failure_streak >= SEARCH_FAILURE_STREAK_ALARM
     search_outage = search_outage_by_rate or search_outage_by_streak
 
+    provider_incidents, provider_incident_counts, unattributed_search_failures = (
+        provider_search_incidents(records, now=now)
+    )
+
     served_rate_ok = rate is not None and rate >= min_served_rate
     degraded_rate_ok = degraded_rate is not None and degraded_rate <= max_degraded_rate
     ungrounded_alarm = ungrounded_rate is not None and ungrounded_rate > UNGROUNDED_RATE_ALARM
@@ -389,6 +476,14 @@ def evaluate(
             round(search_failure_rate, 4) if search_failure_rate is not None else None
         ),
         "search_failure_streak": search_failure_streak,
+        "provider_incident_window_days": DEFAULT_PROVIDER_INCIDENT_WINDOW_DAYS,
+        "provider_incident_definition": (
+            f"{PROVIDER_INCIDENT_MIN_FAILURES}+ provider-attributed search failures "
+            f"with no receipt gap over {PROVIDER_INCIDENT_GAP_HOURS:g}h"
+        ),
+        "provider_search_outage_incidents_30d": provider_incidents,
+        "provider_search_outage_incident_counts_30d": provider_incident_counts,
+        "unattributed_search_failures_30d": unattributed_search_failures,
         "last_outcome": recent[-1].get("outcome") if recent else None,
         "last_task_id": recent[-1].get("task_id") if recent else None,
     }
