@@ -50,6 +50,27 @@ HERMES_BIN_DIR = os.path.expanduser("~/.hermes/bin")
 PY = os.path.expanduser("~/.hermes/runtime-current/venv/bin/python3.11")
 VAL_OPS = os.path.join(SCRIPTS_DIR, "hermes_validate_ops.py")
 ALLOWLIST_PATH = os.path.expanduser("~/.hermes/allowed-repos.txt")
+# Same offline rename-equivalence file validator_repo_guard.py uses (its RC2
+# header). Expands a loaded allowlist to every alias spelling of a repo that
+# has been renamed, so a caller supplying either name still matches.
+REPO_ALIASES_PATH = os.path.expanduser("~/.hermes/config/repo-aliases.json")
+
+
+def _expand_repo_aliases(names, path=REPO_ALIASES_PATH):
+    """See hermes_validate_ops._expand_repo_aliases — same tolerant behavior,
+    duplicated here because this module does not import that one."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            groups = json.load(f).get("aliases") or []
+    except Exception:
+        return names
+    expanded = set(names)
+    for group in groups:
+        if isinstance(group, list) and expanded.intersection(group):
+            expanded.update(group)
+    return expanded
+
+
 GH_TIMEOUT = 60
 POST_CLICKUP_COMMENT = os.path.expanduser("~/.hermes/scripts/post_clickup_comment.py")
 _TRUTHY = {"1", "true", "yes", "on"}
@@ -109,7 +130,7 @@ def _load_allowlist(path=ALLOWLIST_PATH):
                     result.add(s)
     except FileNotFoundError:
         pass
-    return result
+    return _expand_repo_aliases(result)
 
 
 def _load_allowlist(path=ALLOWLIST_PATH):
@@ -122,7 +143,7 @@ def _load_allowlist(path=ALLOWLIST_PATH):
                     result.add(s)
     except FileNotFoundError:
         pass
-    return result
+    return _expand_repo_aliases(result)
 
 
 def _shim_env():

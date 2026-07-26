@@ -51,6 +51,12 @@ API = "https://api.clickup.com/api/v2"
 
 ATTEMPTS_PATH = os.path.expanduser("~/.hermes/scripts/.hermes_validate_state.json")
 ALLOWLIST_PATH = os.path.expanduser("~/.hermes/allowed-repos.txt")
+# Same offline rename-equivalence file validator_repo_guard.py uses (its RC2
+# header). A repo string here is expanded to every alias spelling before a
+# membership check, so an allowlist entry written under one name (e.g. the
+# pre-rename "colingreig/hermes-agent") still matches a caller that supplies
+# the post-rename name (or vice versa) without editing the allowlist itself.
+REPO_ALIASES_PATH = os.path.expanduser("~/.hermes/config/repo-aliases.json")
 
 # Slack target: `hermes send` resolves channel names or C… IDs.
 # The hermes channel (@hermes + @-mention Colin) is the pattern that actually
@@ -75,9 +81,28 @@ def repo_allowed(repo: str, allowed_set: set) -> bool:
     return repo in allowed_set
 
 
+def _expand_repo_aliases(names: set, path: str = REPO_ALIASES_PATH) -> set:
+    """Rename-tolerant expansion: for each known alias group (one GitHub repo
+    that has been reached under >1 owner/name spelling), if ANY spelling is
+    already in ``names``, add every spelling in that group. A missing/corrupt
+    alias file is tolerated exactly like a missing allowlist file — returns
+    ``names`` unchanged, never raises."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            groups = json.load(f).get("aliases") or []
+    except Exception:
+        return names
+    expanded = set(names)
+    for group in groups:
+        if isinstance(group, list) and expanded.intersection(group):
+            expanded.update(group)
+    return expanded
+
+
 def load_allowlist(path: str = ALLOWLIST_PATH) -> set:
     """Parse the allowlist file.  One repo per line; skip blank lines and #
-    comments.  Returns a set of 'owner/repo' strings."""
+    comments.  Returns a set of 'owner/repo' strings, expanded to include any
+    known rename-alias spellings (see _expand_repo_aliases)."""
     result: set = set()
     try:
         with open(path, encoding="utf-8") as f:
@@ -87,7 +112,7 @@ def load_allowlist(path: str = ALLOWLIST_PATH) -> set:
                     result.add(stripped)
     except FileNotFoundError:
         pass  # tolerate missing file — returns empty set
-    return result
+    return _expand_repo_aliases(result)
 
 
 def _load_ledger(path: str) -> dict:
