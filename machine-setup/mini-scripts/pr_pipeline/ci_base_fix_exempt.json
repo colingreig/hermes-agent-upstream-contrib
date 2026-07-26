@@ -1,0 +1,11 @@
+{
+  "_doc": "Explicit, audited exemptions to the ci_green_on_base tripwire. A PR listed here is one that REPAIRS the red base CI itself, so it cannot pass ci_green_on_base pre-merge (the classic 'fix can't self-green' deadlock). Keyed 'owner/repo#pr'. Adding an entry is a deliberate operator/caretaker act and is logged here. Removing the entry (or it never existing) restores the full block — fail-safe. The validate_tripwires check_ci_green() only honors an entry when invoked with --pr matching it.",
+  "exempt": {
+    "colingreig/elevatoruptime.com#17": {
+      "reason": "Repairs the red 'E2E Smoke — Report Outage' workflow on main (Turnstile client-side hard-gate from 8b8e1190; cherry-picks fix b809e78). The E2E smoke tests PRODUCTION, so this PR cannot turn the check green until it merges + Vercel redeploys -> ci_green_on_base deadlock.",
+      "authorized_by": "Colin (via ignite-babysit-hermes caretaker), 2026-06-19",
+      "head_sha": "7116007",
+      "expires_hint": "one-shot; remove after #17 merges and main goes green"
+    }
+  }
+}
