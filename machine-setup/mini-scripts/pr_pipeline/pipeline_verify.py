@@ -9,6 +9,7 @@ never contacts GitHub, reads credentials, checks out a PR, or invokes a merge.
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import hashlib
 import json
 import os
@@ -25,8 +26,8 @@ _SHA = re.compile(r"[0-9a-f]{64}\Z")
 _COMMIT = re.compile(r"[0-9a-f]{7,64}\Z")
 _MANAGED_ROOT = (
     "autonomous_merge.py", "ci_base_fix_exempt.json", "ci_health_watch.py",
-    "hermes_validate_ops.py", "merge_guard.py", "pr_", "review_poll_gate.py",
-    "risk_classify.py", "slack_msg_builder.py", "validate_", "validator_",
+    "hermes_validate_ops.py", "merge_guard.py", "pr_*.py", "review_poll_gate.py",
+    "risk_classify.py", "slack_msg_builder.py", "validate_*.py", "validator_*.py",
 )
 _UNMANAGED_ROOT = frozenset({"validator_autonomy.py"})
 _REQUIRED_FILES = frozenset({
@@ -60,7 +61,7 @@ def _safe_relative(value: object) -> str:
 
 
 def _managed_root(name: str) -> bool:
-    return any(name == prefix or name.startswith(prefix) for prefix in _MANAGED_ROOT)
+    return any(fnmatch.fnmatchcase(name, pattern) for pattern in _MANAGED_ROOT)
 
 
 def _load_marker(scripts_dir: Path) -> dict[str, Any]:
