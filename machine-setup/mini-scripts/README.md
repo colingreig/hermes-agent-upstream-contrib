@@ -283,6 +283,51 @@ under `pr_pipeline/`. Do not compare or copy those files one at a time.
 - `dot-profile` — **deploys to `~/.profile`.** Sourced by every `bash -l` the
   terminal tool spawns for its session-env snapshot; hoists `~/.hermes/bin`
   back to the front of `PATH` after `/etc/profile`'s `path_helper` demotes it.
+- `spend_guard.py` — hard $50/day spend cap gating every `opencode_exec.py`
+  delegation. Vendored 2026-07-26 as the canonical git home for what had been
+  a mini-only, untracked file; the live file already carried its fix, so
+  there is no separate vendor-verbatim base commit — see the module docstring
+  for the full before/after. Summary of the defect it fixes: `is_over_cap()`
+  used to catch every state.db/opencode-log read error and return `False`
+  ("not over cap"), identical to a genuinely healthy $0 day — the cap
+  silently stopped enforcing on any read hiccup. Fixed with a three-tier
+  policy: a clean read behaves exactly as before; a read failure within a
+  recent last-known-good window (`HERMES_SPEND_GUARD_STALENESS_SECONDS`,
+  default 900s) alarms loudly and decides from that cached figure; a read
+  failure with no usable cache alarms loudly and fails closed (blocks new
+  spend) rather than fail open indefinitely.
+- `spend_meter.py` — per-provider ($/provider/day) companion to
+  `spend_guard.py`'s global cap. Vendored 2026-07-26, live file already
+  fixed, same "no separate base commit" note as above. Fixes: a state.db
+  read failure used to be swallowed (`except Exception: return {}`), making
+  `is_over_threshold()` return `[]` — indistinguishable from "checked,
+  everyone's under cap." A read failure now raises `SpendDataUnavailable`,
+  which `main()` turns into a non-zero exit plus a loud message so the
+  `spend-meter` cron job's failure-delivery path actually fires instead of
+  going silent. This meter has no blocking power (unlike `spend_guard.py`),
+  so alarming loudly on "can't check" is the correct and sufficient fix.
+- `hermes_usage_alert.py` — zero-LLM Slack alarm for provider/credential
+  exhaustion, fallback-chain exhaustion, and cron jobs stuck or freshly
+  entered into an error `last_status`. Vendored 2026-07-26, live file already
+  fixed, same "no separate base commit" note as above. Two fixes: (RC1)
+  `_scan_cron_errors` used to alert only on a transition into error and
+  explicitly skip a job's first-ever observation, so a persistently-red job
+  alerted once and then went silent forever, and a state-file reset
+  re-silenced every already-red job by making "first observation" look like
+  "nothing to report." A job's first observed state is now itself
+  alert-worthy if it's `error`, and a standing-red job re-alerts on a bounded
+  cadence (`HERMES_CRON_ERROR_REALERT_MIN`, default 360min). (RC2)
+  `_scan_cron_errors` used to catch any `jobs.json` read/parse failure and
+  return `[]` — indistinguishable from "read fine, no errors." An unreadable
+  `jobs.json` now produces its own distinct `monitor_error` alert instead of
+  silently reporting all-clear.
+- `hermes_report_build.py` fix (2026-07-26): the status-email spend section
+  rendered a served-ledger read failure the same as a genuine $0.00 day —
+  `spend['total_cost']` stayed `None` on error but every formatter still ran
+  `f"${spend['total_cost']:.2f}"`. Added `_cost_display()` plus an explicit
+  `spend['error']` field threaded through the subject line, headline, HTML
+  render, text render, and JSON summary so an unreadable ledger renders as
+  "spend UNKNOWN (ledger unreadable)" and never as a silent zero.
 
 ## Cron-context GitHub auth (2026-07-26)
 
