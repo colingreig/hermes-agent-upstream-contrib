@@ -49,6 +49,14 @@ class PipelineVerifierTests(unittest.TestCase):
             self.verifier.verify(self.destination)
 
         self.reconciler.install(self.destination, source_commit="a" * 40)
+        (self.destination / "pr_pipeline_improvements.py.bak-pre-boundary").write_text("legacy backup\n", encoding="utf-8")
+        self.assertTrue(self.verifier.verify(self.destination)["ok"])
+
+        (self.destination / "pr_unlisted.py").write_text("# unsafe\n", encoding="utf-8")
+        with self.assertRaises(self.verifier.VerificationError):
+            self.verifier.verify(self.destination)
+
+        self.reconciler.install(self.destination, source_commit="a" * 40)
         (self.destination / "pr_pipeline" / "unmanaged.py").write_text("# unsafe\n", encoding="utf-8")
         with self.assertRaises(self.verifier.VerificationError):
             self.verifier.verify(self.destination)
