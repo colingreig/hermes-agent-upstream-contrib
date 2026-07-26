@@ -2,6 +2,9 @@
   "schema_version": 1,
   "description": "Authoritative source manifest for the Hermes Mini PR pipeline.",
   "source_commit_required": true,
+  "source_root_entrypoints": [
+    "verify-hermes-patches.sh"
+  ],
   "legacy_flat_entrypoints": [
     "autonomous_merge.py",
     "ci_base_fix_exempt.json",

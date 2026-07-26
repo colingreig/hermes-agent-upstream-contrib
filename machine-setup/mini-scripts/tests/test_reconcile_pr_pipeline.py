@@ -50,6 +50,7 @@ class PipelineDeploymentTests(unittest.TestCase):
         self.assertFalse(report["extra"])
         for relative in report["expected_files"]:
             self.assertTrue((self.destination / relative).is_file(), relative)
+        self.assertTrue((self.destination / "verify-hermes-patches.sh").is_file())
         self.assertTrue((self.destination / ".pr_pipeline_deployment.json").is_file())
 
     def test_installed_merge_surface_loads_as_a_standalone_entrypoint(self):

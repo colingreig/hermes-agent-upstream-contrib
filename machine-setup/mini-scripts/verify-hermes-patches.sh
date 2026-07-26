@@ -61,11 +61,12 @@ JOBS_JSON="$HOME/.hermes/cron/jobs.json"
 EXECUTOR_JOB_ID="${HERMES_EXECUTOR_JOB_ID:-62714b869845}"
 UID_NUM="$(id -u)"
 
-APPLY=0; RESTART=0
+APPLY=0; RESTART=0; PR_PIPELINE_ONLY=0
 for a in "$@"; do
   case "$a" in
     --apply)   APPLY=1 ;;
     --restart) RESTART=1 ;;
+    --pr-pipeline-only) PR_PIPELINE_ONLY=1 ;;
     --help|-h) sed -n '2,30p' "$0"; exit 0 ;;
   esac
 done
@@ -78,6 +79,25 @@ hdr()   { printf '\n\033[1m== %s ==\033[0m\n' "$*"; }
 FAIL=0; CHANGED=0
 
 cd "$REPO" || { red "Repo not found: $REPO"; exit 2; }
+
+# The historical checks below cover many unrelated, hand-maintained Mini
+# facilities.  The PR trust boundary has a separate source-controlled manifest
+# and must be independently verifiable while those older checks are repaired.
+# This mode never checks out PR code, contacts GitHub, or starts a service.
+if [ "$PR_PIPELINE_ONLY" -eq 1 ]; then
+  hdr "PR trust boundary (source-controlled, shadow-only)"
+  PR_PIPELINE_VERIFY="$HOME/.hermes/scripts/pr_pipeline/pipeline_verify.py"
+  if [ ! -f "$PR_PIPELINE_VERIFY" ]; then
+    red "verifier   MISSING $PR_PIPELINE_VERIFY — reconcile the source-controlled PR pipeline first"
+    exit 1
+  fi
+  if python3 "$PR_PIPELINE_VERIFY" --scripts-dir "$HOME/.hermes/scripts"; then
+    grn "boundary   deployed manifest, SQLite fence, strict CI, sandbox, and shadow-only merge checks passed"
+    exit 0
+  fi
+  red "boundary   PR trust-boundary verification failed; no merge authority was granted"
+  exit 1
+fi
 
 # --- 1. Patch application state -------------------------------------------
 hdr "1. Patch application state"
