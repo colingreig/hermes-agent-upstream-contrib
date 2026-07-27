@@ -4034,6 +4034,18 @@ def generate_launchd_plist() -> str:
             ]
         )
     prog_args_xml = "\n        ".join(prog_args)
+    # The canonical secrets wrapper intentionally exits 0 for permanent
+    # authentication failures so launchd parks instead of retrying forever.
+    # Bare gateway launches retain unconditional KeepAlive: clean exits there
+    # are normal replacement/restart signals and must respawn (#37388).
+    keepalive_xml = (
+        """<dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>"""
+        if wrapper
+        else "<true/>"
+    )
 
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -4070,7 +4082,7 @@ def generate_launchd_plist() -> str:
     <true/>
     
     <key>KeepAlive</key>
-    <true/>
+    {keepalive_xml}
 
     <!-- ThrottleInterval raises launchd's default 10s minimum respawn interval
          to 30s so a crash-looping gateway can't hammer launchd into a rapid

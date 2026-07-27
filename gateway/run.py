@@ -7043,6 +7043,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Returns True if at least one adapter connected successfully.
         """
         logger.info("Starting Hermes Gateway...")
+        from agent.prompt_builder import start_external_skills_generation_observer
+
+        start_external_skills_generation_observer()
         try:
             self._gateway_loop = asyncio.get_running_loop()
         except RuntimeError:

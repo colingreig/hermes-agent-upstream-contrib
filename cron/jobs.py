@@ -100,6 +100,13 @@ _jobs_lock_state = threading.local()
 _JOBS_LOCK_TIMEOUT_SECONDS = 30.0
 OUTPUT_DIR = CRON_DIR / "output"
 ONESHOT_GRACE_SECONDS = 120
+VALID_SKILL_SCOPES = (
+    "dev-executor",
+    "content-executor",
+    "seo-ppc-executor",
+    "validator",
+    "messaging-ops",
+)
 
 
 @dataclass(frozen=True)
@@ -476,6 +483,23 @@ def _normalize_job_record(job: Dict[str, Any]) -> Dict[str, Any]:
         state = "scheduled" if normalized.get("enabled", True) else "paused"
     normalized["state"] = state
 
+    return normalized
+
+
+def normalize_skill_scope(value: Any) -> Optional[str]:
+    """Normalize a cron skill-catalog role, rejecting typos fail-closed."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("skill_scope must be a string role name")
+    normalized = value.strip()
+    if not normalized:
+        return None
+    if normalized not in VALID_SKILL_SCOPES:
+        raise ValueError(
+            f"Unsupported skill_scope {normalized!r}; expected one of: "
+            f"{', '.join(VALID_SKILL_SCOPES)}"
+        )
     return normalized
 
 
@@ -1109,6 +1133,7 @@ def create_job(
     no_agent: bool = False,
     no_fallback: bool = False,
     attach_to_session: Optional[bool] = None,
+    skill_scope: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -1153,6 +1178,8 @@ def create_job(
                 and deliver its stdout directly. Empty stdout = silent (no
                 delivery). Requires ``script`` to be set. Ideal for classic
                 watchdogs and periodic alerts that don't need LLM reasoning.
+        skill_scope: Optional role-based external skill catalog scope. Omitted
+                     preserves the historical unfiltered catalog.
 
     Returns:
         The created job dict
@@ -1185,6 +1212,7 @@ def create_job(
     normalized_workdir = _normalize_workdir(workdir)
     normalized_no_agent = bool(no_agent)
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
+    normalized_skill_scope = normalize_skill_scope(skill_scope)
 
     # no_agent jobs are meaningless without a script — the script IS the job.
     # Surface this as a clear ValueError at create time so bad configs never
@@ -1297,6 +1325,8 @@ def create_job(
     # global cron.mirror_delivery config, default off).
     if normalized_attach is not None:
         job["attach_to_session"] = normalized_attach
+    if normalized_skill_scope is not None:
+        job["skill_scope"] = normalized_skill_scope
 
     with _jobs_lock():
         jobs = load_jobs()
@@ -1399,6 +1429,8 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
             # "true"/"false" string doesn't persist as a truthy string.
             if "no_fallback" in updates:
                 updates["no_fallback"] = _coerce_job_bool(updates["no_fallback"], default=False)
+            if "skill_scope" in updates:
+                updates["skill_scope"] = normalize_skill_scope(updates["skill_scope"])
 
             previous_inference_axes = _normalized_inference_axes(job)
             updated = _apply_skill_fields({**job, **updates})

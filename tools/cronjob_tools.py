@@ -600,6 +600,8 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         result["enabled_toolsets"] = job["enabled_toolsets"]
     if job.get("workdir"):
         result["workdir"] = job["workdir"]
+    if job.get("skill_scope"):
+        result["skill_scope"] = job["skill_scope"]
     return result
 
 
@@ -680,6 +682,7 @@ def cronjob(
     no_agent: Optional[bool] = None,
     no_fallback: Optional[bool] = None,
     attach_to_session: Optional[bool] = None,
+    skill_scope: Optional[str] = None,
     task_id: str = None,
 ) -> str:
     """Unified cron job management tool."""
@@ -754,6 +757,7 @@ def cronjob(
                 no_agent=_no_agent,
                 no_fallback=bool(no_fallback),
                 attach_to_session=attach_to_session,
+                skill_scope=skill_scope,
             )
             _notify_provider_jobs_changed_safe()
             _create_message = f"Cron job '{job['name']}' created."
@@ -927,6 +931,8 @@ def cronjob(
                 updates["enabled_toolsets"] = enabled_toolsets or None
             if attach_to_session is not None:
                 updates["attach_to_session"] = bool(attach_to_session)
+            if skill_scope is not None:
+                updates["skill_scope"] = skill_scope
             if no_fallback is not None:
                 # Fail-closed pin (86e2bjac3): opt this job out of the global
                 # provider fallback chain so it fails closed on its pinned model.
@@ -1096,6 +1102,18 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
                 "items": {"type": "string"},
                 "description": "Optional list of toolset names to restrict the job's agent to (e.g. [\"web\", \"terminal\", \"file\", \"delegation\"]). When set, only tools from these toolsets are loaded, significantly reducing input token overhead. When omitted, all default tools are loaded. Infer from the job's prompt — e.g. use \"web\" if it calls web_search, \"terminal\" if it runs scripts, \"file\" if it reads files, \"delegation\" if it calls delegate_task. On update, pass an empty array to clear."
             },
+            "skill_scope": {
+                "type": "string",
+                "enum": [
+                    "dev-executor",
+                    "content-executor",
+                    "seo-ppc-executor",
+                    "validator",
+                    "messaging-ops",
+                    ""
+                ],
+                "description": "Optional role-based external skill catalog scope for this cron job. Omit for the backward-compatible unfiltered catalog. On update, pass an empty string to clear.",
+            },
             "workdir": {
                 "type": "string",
                 "description": "Optional absolute path to run the job from. When set, AGENTS.md / CLAUDE.md / .cursorrules from that directory are injected into the system prompt, and the terminal/file/code_exec tools use it as their working directory — useful for running a job inside a specific project repo. Must be an absolute path that exists. When unset (default), preserves the original behaviour: no project context files, tools use the scheduler's cwd. On update, pass an empty string to clear. Jobs with workdir run sequentially (not parallel) to keep per-job directories isolated."
@@ -1159,6 +1177,9 @@ registry.register(
         enabled_toolsets=args.get("enabled_toolsets"),
         workdir=args.get("workdir"),
         no_agent=args.get("no_agent"),
+        no_fallback=args.get("no_fallback"),
+        attach_to_session=args.get("attach_to_session"),
+        skill_scope=args.get("skill_scope"),
         task_id=kw.get("task_id"),
     ))(),
     check_fn=check_cronjob_requirements,

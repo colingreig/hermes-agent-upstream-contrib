@@ -83,7 +83,7 @@ class ResolverContractTests(unittest.TestCase):
         self.assertEqual(jitter_bounds, [(4.0, 6.0), (12.0, 18.0), (36.0, 54.0)])
         self.assertIn("retry 3/3 in 45.0s", stderr.getvalue())
 
-    def test_exhausted_transient_without_complete_stale_is_fatal_exit_one(self):
+    def test_exhausted_transient_without_complete_stale_is_transient_exit(self):
         calls = 0
 
         async def always_timeout(_refs):
@@ -108,11 +108,11 @@ class ResolverContractTests(unittest.TestCase):
         ):
             rc = resolver.main()
 
-        self.assertEqual(rc, 1)
+        self.assertEqual(rc, resolver.EXIT_TRANSIENT)
         self.assertEqual(calls, 4)
         self.assertEqual(stdout.getvalue(), "")
         self.assertIn("no complete usable stale cache", stderr.getvalue())
-        self.assertIn("[op_sdk_resolve] FATAL: authentication/resolution failed:", stderr.getvalue())
+        self.assertIn("classification=transient-exhausted exit=75", stderr.getvalue())
         self.assertNotIn("resolved 0/1", stderr.getvalue())
 
     def test_mixed_auth_and_timeout_markers_fail_immediately(self):
@@ -140,6 +140,80 @@ class ResolverContractTests(unittest.TestCase):
         self.assertFalse(
             resolver._is_transient_error(RuntimeError("forbidden auth token timeout 503"))
         )
+
+    def test_cli_auth_failure_is_permanent_auth_exit_without_retry(self):
+        calls = 0
+
+        async def invalid_token(_refs):
+            nonlocal calls
+            calls += 1
+            raise RuntimeError("403 Forbidden: invalid token")
+
+        env_file = Path(self.temp_dir.name) / "secrets.env"
+        env_file.write_text(f"KEY={REF}\n")
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(resolver, "_resolve_by_ref", invalid_token),
+            mock.patch.object(sys, "argv", ["op_sdk_resolve.py", str(env_file)]),
+            redirect_stdout(io.StringIO()),
+            redirect_stderr(stderr),
+        ):
+            rc = resolver.main()
+
+        self.assertEqual(rc, resolver.EXIT_AUTH)
+        self.assertEqual(calls, 1)
+        self.assertIn("classification=permanent-auth exit=77", stderr.getvalue())
+
+    def test_all_5xx_statuses_are_transient_but_auth_wins(self):
+        self.assertTrue(resolver._is_transient_error(RuntimeError("HTTP 500")))
+        self.assertTrue(resolver._is_transient_error(RuntimeError("HTTP 599")))
+        self.assertFalse(
+            resolver._is_transient_error(
+                RuntimeError("HTTP 503 followed by 401 authentication failed")
+            )
+        )
+
+    def test_normalized_invalid_token_forms_are_permanent_before_transient(self):
+        messages = (
+            "invalid_token: upstream returned 503",
+            "token-invalidated after timeout",
+            "service account token is not valid; HTTP 503",
+            '{"error":"invalid_token","status":503}',
+            '{"status":"UNAUTHENTICATED","detail":"timeout"}',
+            "PERMISSION_DENIED from authorization service 503",
+        )
+
+        for message in messages:
+            with self.subTest(message=message):
+                error = RuntimeError(message)
+                self.assertTrue(resolver._is_auth_error(error))
+                self.assertFalse(resolver._is_transient_error(error))
+                self.assertEqual(
+                    resolver._fatal_exit_code(error),
+                    resolver.EXIT_AUTH,
+                )
+
+    def test_normalized_invalid_token_mixed_error_does_not_retry(self):
+        calls = 0
+        sleeps = []
+
+        async def invalid_token():
+            nonlocal calls
+            calls += 1
+            raise RuntimeError('{"error":"invalid_token","status":503}')
+
+        async def fake_sleep(delay):
+            sleeps.append(delay)
+
+        with (
+            mock.patch.object(resolver.asyncio, "sleep", fake_sleep),
+            redirect_stderr(io.StringIO()),
+            self.assertRaisesRegex(RuntimeError, "invalid_token"),
+        ):
+            asyncio.run(resolver._with_retry(invalid_token))
+
+        self.assertEqual(calls, 1)
+        self.assertEqual(sleeps, [])
 
     def test_exhausted_transient_uses_only_complete_usable_stale_batch(self):
         calls = 0

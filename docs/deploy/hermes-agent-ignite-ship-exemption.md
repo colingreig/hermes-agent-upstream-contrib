@@ -66,14 +66,19 @@ What a cut does (see `scripts/MINI-RELEASE.md` for the authoritative detail):
 5. On **any** verification failure: **automatic rollback** to `releases/.previous` and
    non-zero exit.
 
-It never mutates live runtime state (`config.yaml`, `*.db`, `cron/`, `scripts/`,
-`logs/`, `~/.config`, `~/Library/LaunchAgents`) — that invariant is enforced in code.
+It never mutates persistent runtime state (`config.yaml`, `*.db`, `cron/`,
+`logs/`, `~/.config`, `~/Library/LaunchAgents`). The sole operational-file
+exception is source-controlled `clickup_workspace_refresh.py`: the cut stages,
+SHA-256 verifies, atomically installs, and restores it on rollback.
 
 ### Run it (on the mini only)
 
 ```bash
 # Standard cut of prod-live-patches:
 ~/.hermes/runtime-current/scripts/mini-release-cut.sh --ref prod-live-patches
+
+# Polling-safe cut (equal=no-op, strict descendants only):
+~/.hermes/runtime-current/scripts/mini-release-cut.sh --ref prod-live-patches --if-advanced
 
 # Preview every mutating action, change nothing:
 ~/.hermes/runtime-current/scripts/mini-release-cut.sh --ref prod-live-patches --dry-run

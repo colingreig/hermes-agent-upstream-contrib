@@ -408,37 +408,48 @@ elif [ "$CHANGED" -eq 1 ] || [ "$stale" -eq 1 ]; then
   FAIL=1   # unremediated stale/changed code is a real, actionable failure
 fi
 
-# --- 6. GitHub App token minting (replaces static PAT remap) -----------------
-# The static fine-grained PAT (GH_API_KEY_HERMES) has been DECOMMISSIONED.
-# Both launchd services now mint a fresh GitHub App installation token via
-# github_app_token.py on each start. The App credentials live in Doppler:
-#   GH_APP_PRIVATE_KEY, GH_APP_ID, GH_APP_INSTALLATION_ID
-# The plist sh -c wrapper exports GH_TOKEN as the output of the token script.
-# If a Hermes service reinstall regenerates the plists, the App-token call
-# vanishes and gh fails OPEN to the full-access keyring token. Detect loudly.
-# No auto-fix: a regenerated plist changes structure, so re-wrapping must be
-# done by hand. Backups: ~/Library/LaunchAgents/*.bak-pre-ghtoken
-# Design ref: shared brain decisions/2026-06-12 Hermes scoped GitHub PAT;
-#             task 86e1vuzwb (GitHub App credential layer migration).
-hdr "6. GitHub App token minting (github_app_token.py -> GH_TOKEN)"
-for svc in ai.hermes.gateway com.colingreig.hermes-dashboard; do
+# --- 6. Canonical launchd wrappers + GitHub App token environment -------------
+# Plists contain no minting or secret expressions. The governed release
+# reconciler atomically installs source-identical wrappers and points each plist
+# only at its wrapper. Inspect live env by key presence only; never print values.
+hdr "6. Canonical launchd wrappers (source -> installed -> plist -> live env)"
+for spec in \
+  "ai.hermes.gateway:gateway_secrets_wrap.sh" \
+  "com.colingreig.hermes-dashboard:dashboard_secrets_wrap.sh"; do
+  svc="${spec%%:*}"
+  wrapper_name="${spec#*:}"
+  source_wrapper="$REPO/machine-setup/mini-scripts/$wrapper_name"
+  installed_wrapper="$HOME/.hermes/scripts/$wrapper_name"
   plist="$HOME/Library/LaunchAgents/$svc.plist"
-  if [ ! -f "$plist" ]; then red "MISSING plist: $plist"; FAIL=1; continue; fi
-  if grep -Fq 'github_app_token.py' "$plist"; then
-    grn "App-token mint present  $svc.plist"
+  if [ ! -f "$source_wrapper" ] || [ ! -f "$installed_wrapper" ] \
+     || ! cmp -s "$source_wrapper" "$installed_wrapper"; then
+    red "WRAPPER SOURCE/DEPLOYED MISMATCH: $wrapper_name — run governed release reconciliation"
+    FAIL=1
   else
-    red "APP-TOKEN MINT MISSING in $svc.plist — gh will FAIL OPEN to the full-access keyring token!"
-    red "  Fix: re-add  export GH_TOKEN=\"\$(python3 \"\$HOME/.hermes/scripts/github_app_token.py\" 2>/dev/null || echo '')\";  to the service's sh -c wrapper,"
-    red "       then:  launchctl bootout gui/$UID_NUM/$svc ; launchctl bootstrap gui/$UID_NUM $plist"
+    grn "wrapper identity  $wrapper_name"
+  fi
+  if [ ! -f "$plist" ]; then red "MISSING plist: $plist"; FAIL=1; continue; fi
+  if "$REPO/venv/bin/python" - "$plist" "$installed_wrapper" <<'PY'
+import plistlib
+import sys
+from pathlib import Path
+
+payload = plistlib.loads(Path(sys.argv[1]).read_bytes())
+assert payload.get("ProgramArguments") == ["/bin/bash", sys.argv[2]]
+assert payload.get("KeepAlive") == {"SuccessfulExit": False}
+text = Path(sys.argv[1]).read_text(encoding="utf-8")
+assert not any(marker in text for marker in (
+    "github_app_token.py", "GH_TOKEN", "GH_API_KEY_HERMES",
+    "OPENAI_API_KEY", "VALIDATOR_", "op://",
+))
+PY
+  then
+    grn "plist boundary    $svc -> $wrapper_name (park-on-auth contract)"
+  else
+    red "PLIST WRAPPER/RETRY CONTRACT INVALID: $plist — run governed release reconciliation"
     FAIL=1
   fi
-  # Verify GH_API_KEY_HERMES is NOT referenced (decommissioned)
-  if grep -Fq 'GH_API_KEY_HERMES' "$plist"; then
-    red "STALE PAT REF in $svc.plist — GH_API_KEY_HERMES has been decommissioned!"
-    red "  Fix: replace export GH_TOKEN=\"\$GH_API_KEY_HERMES\" with the App-token mint call above."
-    FAIL=1
-  fi
-  # Live-env check: GH_TOKEN actually present in the RUNNING process env?
+  # Redacted live-env check: only the variable name is matched.
   pid=$(launchctl list 2>/dev/null | awk -v s="$svc" '$3==s{print $1}')
   if [ -z "$pid" ] || [ "$pid" = "-" ]; then ylw "$svc not running — live-env check skipped"; continue; fi
   if ps eww -p "$pid" 2>/dev/null | tr ' ' '\n' | grep -q '^GH_TOKEN='; then
@@ -450,8 +461,8 @@ done
 
 # --- 6a. GitHub App credentials present in 1Password -------------------------
 # The App token script reads GH_APP_PRIVATE_KEY, GH_APP_ID, GH_APP_INSTALLATION_ID
-# from the environment (1Password injects them at gateway boot via op-secrets.env;
-# Doppler decommissioned 2026-07-03). Verify they're set.
+# from the environment resolved from the reference-only launchd-secrets.op-env;
+# Doppler was decommissioned 2026-07-03. Verify the backing fields exist.
 hdr "6a. GitHub App credentials in 1Password (GH_APP_*)"
 _op_read() {
   local val
@@ -463,7 +474,7 @@ APP_KEY=$(_op_read GH_APP_PRIVATE_KEY)
 APP_ID=$(_op_read GH_APP_ID)
 APP_INST=$(_op_read GH_APP_INSTALLATION_ID)
 if [ -n "$APP_KEY" ] && [ -n "$APP_ID" ] && [ -n "$APP_INST" ]; then
-  grn "1Password GH_APP_* secrets present (id=$APP_ID, inst=$APP_INST)"
+  grn "1Password GH_APP_* secrets present (values redacted)"
 else
   red "MISSING 1Password GH_APP_* secrets — App token minting will fail!"
   red "  Set: GH_APP_PRIVATE_KEY (PEM), GH_APP_ID, GH_APP_INSTALLATION_ID in op://Dev Toolbox/dev"
@@ -488,7 +499,7 @@ fi
 hdr "6b. ignite-marketplace sync cron (launchd plist loaded)"
 MKT_PLIST="$HOME/Library/LaunchAgents/com.colingreig.ignite-marketplace-sync.plist"
 MKT_WRAPPER="$HOME/.hermes/scripts/ignite-marketplace-sync.sh"
-MKT_REPO="$HOME/Projects/ignite-marketplace"
+MKT_REPO="/Users/colingreig/dev/ignite-marketplace"
 if [ ! -f "$MKT_PLIST" ]; then
   red "MISSING plist: $MKT_PLIST"; FAIL=1
 else
@@ -503,88 +514,61 @@ fi
 [ -x "$MKT_WRAPPER" ] || { red "wrapper not executable: $MKT_WRAPPER"; FAIL=1; }
 [ -d "$MKT_REPO" ]   || { red "repo missing: $MKT_REPO — re-clone from colingreig/ignite-marketplace"; FAIL=1; }
 
-# --- 6c. Validator chain (openai-codex primary) + executor --------------------
+# --- 6c. Gateway-only OpenAI/validator environment + executor ----------------
 # 2026-06-22: executor + validator migrated to OpenAI gpt-5-mini.
 # 2026-06-25: validator chain updated to openai-codex:gpt-5.4 as primary tier
 #   (flat-fee OAuth, silent-hang-safe). Full chain:
 #     openai-codex:gpt-5.4  (ChatGPT OAuth, auto-refresh, ~/.hermes/auth.json)
-#     openai-api:gpt-5.5    (api key path, 1.05M ctx)
 #     minimax:MiniMax-M3    (unlimited fallback)
 #     gemini:gemini-3.5-flash (last-resort)
-# The wiring lives in TWO update-fragile places:
-#   (a) gateway plist — the OpenAI key remap (mirrors GH_TOKEN §6) plus the
-#       three VALIDATOR_*_CHAIN env literals. A plist regen drops the remap
-#       (openai-api gets NO key) AND the chains (validator silently falls back).
+# The wiring lives in TWO places:
+#   (a) the source-controlled gateway_launch_inner.sh, installed byte-identically
+#       by the governed reconciler. The plist deliberately contains none of it.
 #   (b) cron/jobs.json — the clickup-executor job's model/provider.
-# This is a PLIST + JSON patch, NOT a git patch — `git apply` can't restore it.
-# Detect LOUDLY, no auto-fix (a regenerated plist changes structure; re-wrapping
-# by hand is safer than a blind PlistBuddy poke at secret/model routing).
-# Backups: ~/Library/LaunchAgents/ai.hermes.gateway.plist.bak-*
+# Detect LOUDLY; the release reconciler is the only writer.
 # DURABILITY NOTE (2026-06-25): openai-codex uses OAuth (auth.json), NOT Doppler;
 #   the chain can be set in Doppler claude-code/dev to survive plist regeneration.
 # Design refs: brain operations/2026-06-22 "Hermes executor + validator migrated
 #   to OpenAI gpt-5-mini"; brain 2026-06-25 openai-codex validator chain.
 hdr "6c. Validator chain (openai-codex primary) + OPENAI_API_KEY remap + executor"
-GW_PLIST="$HOME/Library/LaunchAgents/ai.hermes.gateway.plist"
 EXPECT_CHAIN="openai-codex:gpt-5.4,minimax:MiniMax-M3,gemini:gemini-3.5-flash"
-if [ ! -f "$GW_PLIST" ]; then
-  red "MISSING plist: $GW_PLIST"; FAIL=1
+GW_INNER_SOURCE="$REPO/machine-setup/mini-scripts/gateway_launch_inner.sh"
+GW_INNER_INSTALLED="$HOME/.hermes/scripts/gateway_launch_inner.sh"
+if [ ! -f "$GW_INNER_SOURCE" ] || [ ! -f "$GW_INNER_INSTALLED" ] \
+   || ! cmp -s "$GW_INNER_SOURCE" "$GW_INNER_INSTALLED"; then
+  red "gateway inner source/deployed mismatch — run governed release reconciliation"
+  FAIL=1
 else
-  # (a1) OpenAI key remap in the sh -c wrapper
-  if grep -Fq 'export OPENAI_API_KEY="$OPENAI_API_KEY_HERMES"' "$GW_PLIST"; then
-    grn "OpenAI remap present  ai.hermes.gateway.plist"
+  if grep -Fq 'export OPENAI_API_KEY="$OPENAI_API_KEY_HERMES"' "$GW_INNER_INSTALLED"; then
+    grn "OpenAI remap present  gateway_launch_inner.sh"
   else
-    red "OPENAI_API_KEY remap MISSING in ai.hermes.gateway.plist — openai-api provider gets NO key!"
-    red "  Fix: re-add  export OPENAI_API_KEY=\"\$OPENAI_API_KEY_HERMES\";  to the sh -c wrapper,"
-    red "       then:  launchctl bootout gui/$UID_NUM/ai.hermes.gateway ; launchctl bootstrap gui/$UID_NUM $GW_PLIST"
+    red "OPENAI_API_KEY remap MISSING in canonical gateway inner wrapper"
     FAIL=1
   fi
-  # (a2) the three VALIDATOR_*_CHAIN env literals (2026-06-25: openai-codex:gpt-5.4 primary).
-  # The canonical chain lives in EXPECT_CHAIN above and is AUTO-RESTORED under --apply:
-  # PlistBuddy writes the stable EnvironmentVariables dict (structure-independent of any
-  # ProgramArguments revert). A plist-env edit needs bootout+bootstrap (NOT kickstart)
-  # to load, so 6c does its own reload under --restart. Backup: ai.hermes.gateway.plist.bak-6c-*
-  PB=/usr/libexec/PlistBuddy
-  chain_fixed=0; backed_up=0
   for tier in LOW MEDIUM HIGH; do
-    cur=$("$PB" -c "Print :EnvironmentVariables:VALIDATOR_${tier}_CHAIN" "$GW_PLIST" 2>/dev/null)
-    if [ "$cur" = "$EXPECT_CHAIN" ]; then
+    if grep -Fq "export VALIDATOR_${tier}_CHAIN=\"\$VALIDATOR_CHAIN\"" "$GW_INNER_INSTALLED" \
+       && grep -Fq "VALIDATOR_CHAIN=\"$EXPECT_CHAIN\"" "$GW_INNER_INSTALLED"; then
       grn "VALIDATOR_${tier}_CHAIN ok    ($EXPECT_CHAIN)"
-    elif [ "$APPLY" -eq 1 ]; then
-      if [ "$backed_up" -eq 0 ]; then
-        cp "$GW_PLIST" "$GW_PLIST.bak-6c-$(date +%Y%m%d-%H%M%S)" && backed_up=1 && ylw "backed up gateway plist before chain restore"
-      fi
-      if "$PB" -c "Set :EnvironmentVariables:VALIDATOR_${tier}_CHAIN $EXPECT_CHAIN" "$GW_PLIST" 2>/dev/null \
-         || "$PB" -c "Add :EnvironmentVariables:VALIDATOR_${tier}_CHAIN string $EXPECT_CHAIN" "$GW_PLIST" 2>/dev/null; then
-        grn "VALIDATOR_${tier}_CHAIN -> restored ($EXPECT_CHAIN)"; chain_fixed=1; CHANGED=1
-      else
-        red "VALIDATOR_${tier}_CHAIN restore FAILED via PlistBuddy — set it by hand"; FAIL=1
-      fi
     else
-      red "VALIDATOR_${tier}_CHAIN MISSING/WRONG in plist (got '${cur:-<none>}') — validator not on openai-codex:gpt-5.4!"
-      red "  Fix: re-run with --apply --restart (auto-restores), or set by hand + bootout/bootstrap"
+      red "VALIDATOR_${tier}_CHAIN MISSING/WRONG in canonical gateway inner wrapper"
       FAIL=1
     fi
   done
-  # A plist EnvironmentVariables change only loads via bootout+bootstrap (the
-  # epilogue's kickstart -k reuses the in-memory job spec). Do that reload here.
-  if [ "$chain_fixed" -eq 1 ] && [ "$RESTART" -eq 1 ]; then
-    if launchctl bootout "gui/$UID_NUM/ai.hermes.gateway" 2>/dev/null; launchctl bootstrap "gui/$UID_NUM" "$GW_PLIST" 2>/dev/null; then
-      grn "reloaded gateway (bootout+bootstrap) to load restored chains"
-    else
-      red "gateway bootout+bootstrap FAILED after chain restore — reload by hand: launchctl bootstrap gui/$UID_NUM $GW_PLIST"; FAIL=1
-    fi
-  elif [ "$chain_fixed" -eq 1 ]; then
-    ylw "chains restored on disk but NOT loaded — re-run with --restart (bootout+bootstrap), kickstart won't suffice"
-  fi
-  # live-env check: chains actually present (with the right value) in the RUNNING gateway
+  # Redacted live-env checks: compare exact key/value for the non-secret chain,
+  # and key presence only for OPENAI_API_KEY.
   gwpid=$(launchctl list 2>/dev/null | awk '$3=="ai.hermes.gateway"{print $1}')
   if [ -z "$gwpid" ] || [ "$gwpid" = "-" ]; then
     ylw "ai.hermes.gateway not running — live-env check skipped"
-  elif ps eww -p "$gwpid" 2>/dev/null | tr ' ' '\n' | grep -Fxq "VALIDATOR_HIGH_CHAIN=$EXPECT_CHAIN"; then
-    grn "VALIDATOR chains live  ai.hermes.gateway (pid $gwpid, value matches)"
   else
-    red "VALIDATOR_*_CHAIN missing/stale in live env of ai.hermes.gateway (pid $gwpid) — reload: --apply --restart"; FAIL=1
+    if ps eww -p "$gwpid" 2>/dev/null | tr ' ' '\n' | grep -q '^OPENAI_API_KEY=' \
+       && ps eww -p "$gwpid" 2>/dev/null | tr ' ' '\n' | grep -Fxq "VALIDATOR_LOW_CHAIN=$EXPECT_CHAIN" \
+       && ps eww -p "$gwpid" 2>/dev/null | tr ' ' '\n' | grep -Fxq "VALIDATOR_MEDIUM_CHAIN=$EXPECT_CHAIN" \
+       && ps eww -p "$gwpid" 2>/dev/null | tr ' ' '\n' | grep -Fxq "VALIDATOR_HIGH_CHAIN=$EXPECT_CHAIN"; then
+      grn "gateway OpenAI key + validator chains live (redacted key check)"
+    else
+      red "gateway OpenAI key or validator chains missing/stale — governed reconcile + bootout/bootstrap required"
+      FAIL=1
+    fi
   fi
 fi
 # (b) executor job model/provider in jobs.json
@@ -634,101 +618,92 @@ else
 fi
 
 
-# --- 6d. Skills pull freshness check ----------------------------------------
-# Each monitored source gets its own freshness budget. Do NOT let one busy
-# source or one shared audit file mask a stale sibling.
-#
-# NOTE: This is a passive CHECK, not an auto-pull. The actual pulls are handled by:
-#   - com.colingreig.ignite-skills-pull (launchd) for ignite-skills-live (3-hourly)
-#   - com.colingreig.pull_anthropic_skills (launchd) for anthropic-agent-skills (daily)
+# --- 6d. Skills pull launchd + UTC evidence freshness ------------------------
+# The governed reconciler owns both jobs and their machine-readable success
+# evidence. A log line alone is not proof because append-only logs can survive a
+# broken or replaced job.
+for spec in \
+  "com.colingreig.ignite-skills-pull|ignite-skills-pull.sh" \
+  "com.colingreig.pull_anthropic_skills|pull_anthropic_agent_skills.sh"; do
+  label=${spec%%|*}
+  wrapper=${spec#*|}
+  plist="$HOME/Library/LaunchAgents/$label.plist"
+  if [ ! -f "$plist" ]; then
+    red "MISSING governed skill-pull plist: $plist"; FAIL=1
+  elif ! launchctl print "gui/$UID_NUM/$label" >/dev/null 2>&1; then
+    red "launchd NOT loaded: $label"; FAIL=1
+  else
+    grn "launchd loaded  $label"
+  fi
+  [ -x "$HOME/.hermes/scripts/$wrapper" ] \
+    || { red "wrapper not executable: $HOME/.hermes/scripts/$wrapper"; FAIL=1; }
+done
+if launchctl print "gui/$UID_NUM/com.ignite.skills-sync" >/dev/null 2>&1 \
+   || [ -e "$HOME/Library/LaunchAgents/com.ignite.skills-sync.plist" ]; then
+  red "stale com.ignite.skills-sync wiring is still loaded or installed"; FAIL=1
+else
+  grn "stale com.ignite.skills-sync wiring retired"
+fi
+
 FRESHNESS_STATUS_AND_REPORT=$(python3 - <<'PY'
 from __future__ import annotations
 
-import re
 from datetime import datetime, timezone
+import json
 from pathlib import Path
-
-LOCAL_TZ = datetime.now().astimezone().tzinfo or timezone.utc
 
 sources = [
     {
         "label": "ignite-skills-live",
-        "log_path": Path.home() / ".hermes/logs/ignite-skills-pull.log",
+        "evidence": Path.home() / ".hermes/state/skill-pulls/ignite-skills-live-success.json",
+        "root": "/Users/colingreig/dev/ignite-skills-live",
         "cadence_hours": 3,
-        "markers": (" OK:",),
     },
     {
         "label": "anthropic-agent-skills",
-        "log_path": Path.home() / ".hermes/logs/anthropic-skills-pull.log",
+        "evidence": Path.home() / ".hermes/state/skill-pulls/anthropic-agent-skills-success.json",
+        "root": "/Users/colingreig/.claude/plugins/marketplaces/anthropic-agent-skills",
         "cadence_hours": 24,
-        "markers": ("pull OK",),
     },
 ]
 
-iso_ts = re.compile(r"(?P<ts>\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)")
-local_ts = re.compile(r"(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) [A-Z]{3}\b")
-
-
-def parse_timestamp(line: str) -> datetime | None:
-    match = local_ts.search(line)
-    if match:
-        try:
-            parsed = datetime.strptime(match.group("ts"), "%Y-%m-%d %H:%M:%S")
-        except ValueError:
-            return None
-        return parsed.replace(tzinfo=LOCAL_TZ).astimezone(timezone.utc)
-
-    match = iso_ts.search(line)
-    if match:
-        raw = match.group("ts").replace("Z", "+00:00")
-        try:
-            parsed = datetime.fromisoformat(raw)
-        except ValueError:
-            return None
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
-        return parsed.astimezone(timezone.utc)
-
-    return None
-
-
-stale_lines = []
-missing_lines = []
+problems = []
 now = datetime.now(timezone.utc)
 for source in sources:
-    log_path = source["log_path"]
-    cadence_hours = source["cadence_hours"]
-    markers = source["markers"]
-    last_success = None
-
-    if not log_path.is_file():
-        missing_lines.append(f"{source['label']}: missing log {log_path}")
+    evidence = source["evidence"]
+    if not evidence.is_file() or evidence.is_symlink():
+        problems.append(f"{source['label']}: missing or symlinked evidence {evidence}")
         continue
-
-    with log_path.open(encoding="utf-8", errors="replace") as handle:
-        for raw in handle:
-            if not any(marker in raw for marker in markers):
-                continue
-            ts = parse_timestamp(raw)
-            if ts is None:
-                continue
-            if last_success is None or ts > last_success:
-                last_success = ts
-
-    threshold_hours = cadence_hours * 3
-    if last_success is None:
-        missing_lines.append(f"{source['label']}: no parseable success lines in {log_path}")
+    try:
+        payload = json.loads(evidence.read_text(encoding="utf-8"))
+        if payload.get("schema_version") != 1:
+            raise ValueError("wrong schema")
+        if payload.get("source") != source["label"] or payload.get("root") != source["root"]:
+            raise ValueError("source/root identity mismatch")
+        commit = payload.get("commit")
+        if (
+            not isinstance(commit, str)
+            or len(commit) < 40
+            or any(char not in "0123456789abcdef" for char in commit.lower())
+        ):
+            raise ValueError("missing full commit")
+        raw = payload["completed_at"]
+        if not raw.endswith("Z"):
+            raise ValueError("timestamp is not explicit UTC")
+        last_success = datetime.fromisoformat(raw[:-1] + "+00:00")
+    except Exception as exc:
+        problems.append(f"{source['label']}: invalid evidence {evidence}: {exc}")
         continue
-
+    threshold_hours = source["cadence_hours"] * 3
     hours_since = (now - last_success).total_seconds() / 3600.0
-    if hours_since >= threshold_hours:
-        stale_lines.append(
-            f"{source['label']}: last success {hours_since:.1f} hours ago in {log_path} (threshold: {threshold_hours}h)"
+    if hours_since < 0 or hours_since >= threshold_hours:
+        problems.append(
+            f"{source['label']}: evidence age {hours_since:.1f}h outside 0..{threshold_hours}h"
         )
 
-if stale_lines or missing_lines:
+if problems:
     print("STALE")
-    for line in missing_lines + stale_lines:
+    for line in problems:
         print(line)
 else:
     print("OK")
@@ -737,7 +712,7 @@ PY
   FRESHNESS_STATUS=${FRESHNESS_STATUS_AND_REPORT%%$'\n'*}
   FRESHNESS_REPORT=${FRESHNESS_STATUS_AND_REPORT#*$'\n'}
   if [ "$FRESHNESS_STATUS" = "OK" ]; then
-    grn "Skills pull freshness check passed for all monitored sources"
+    grn "Skills pull UTC evidence is fresh for all monitored sources"
   else
     red "Skills pull freshness check failed"
     if [ -n "$FRESHNESS_REPORT" ]; then
@@ -750,6 +725,48 @@ EOF
     fi
     FAIL=1
   fi
+
+# A fresh pull is not enough if long-lived gateway/dashboard processes still
+# serve an old catalog. Each process acknowledges the governed generation after
+# clearing only future-session/catalog caches; existing AIAgent prompts remain
+# byte-stable.
+CATALOG_GENERATION="$HOME/.hermes/state/skill-pulls/catalog-generation.json"
+for svc in ai.hermes.gateway com.colingreig.hermes-dashboard; do
+  pid=$(launchctl list 2>/dev/null | awk -v s="$svc" '$3==s{print $1}')
+  if [ -z "$pid" ] || [ "$pid" = "-" ]; then
+    red "$svc not running — cannot prove live catalog generation"; FAIL=1
+    continue
+  fi
+  CATALOG_ACK="$HOME/.hermes/state/skill-pulls/catalog-observed/$pid.json"
+  if python3 - "$CATALOG_GENERATION" "$CATALOG_ACK" "$pid" <<'PY' 2>/dev/null
+from datetime import datetime
+import json, sys
+from pathlib import Path
+
+generation_path, ack_path, expected_pid = Path(sys.argv[1]), Path(sys.argv[2]), int(sys.argv[3])
+if any(path.is_symlink() or not path.is_file() for path in (generation_path, ack_path)):
+    raise SystemExit(1)
+generation = json.loads(generation_path.read_text(encoding="utf-8"))
+ack = json.loads(ack_path.read_text(encoding="utf-8"))
+if (
+    generation.get("schema_version") != 1
+    or generation.get("state", "stable") != "stable"
+    or ack.get("schema_version") != 1
+    or ack.get("pid") != expected_pid
+    or ack.get("generation") != generation.get("generation")
+):
+    raise SystemExit(1)
+published = datetime.fromisoformat(generation["published_at"].replace("Z", "+00:00"))
+observed = datetime.fromisoformat(ack["observed_at"].replace("Z", "+00:00"))
+raise SystemExit(0 if observed >= published else 1)
+PY
+  then
+    grn "live catalog generation observed  $svc (pid $pid)"
+  else
+    red "$svc has not observed the current external-skill generation: $CATALOG_ACK"
+    FAIL=1
+  fi
+done
 
 # --- 7. Skills bridge: external_dirs wired to the claude-skills library --------
 # Hermes' own skill set (~/.hermes/skills) does NOT include the document skills
@@ -775,20 +792,19 @@ EOF
 hdr "7. Skills bridge (skills.external_dirs)"
 CONFIG_YAML="$HOME/.hermes/config.yaml"
 SNAPSHOT_JSON="$HOME/.hermes/.skills_prompt_snapshot.json"
-# Floor: known-good external dirs as of 2026-07-04. Shrinking below this floor is
-# always a regression signal even if some other dir was added to compensate.
+# Exact canonical set. Unknown additions are rejected too: scope filtering is
+# keyed by absolute path, so an ungoverned root can bypass the role contract.
 EXPECTED_DIRS=(
   "/Users/colingreig/dev/ignite-skills-live/skills"
-  "/Users/colingreig/dev/ignite-skills-live/ignite-code/skills"
   "/Users/colingreig/dev/ignite-skills-live/ignite-content/skills"
   "/Users/colingreig/.claude/plugins/marketplaces/anthropic-agent-skills/skills"
   "/Users/colingreig/brain/packs/social-hub"
   "/Users/colingreig/brain/packs/local-seo-brain"
   "/Users/colingreig/brain/packs/marketing-brain"
   "/Users/colingreig/brain/packs/website-brain"
-  "/Users/colingreig/.claude/plugins/marketplaces/ignite-marketplace/plugins/claude-ads"
-  "/Users/colingreig/.claude/plugins/marketplaces/ignite-marketplace/plugins/claude-seo"
-  "/Users/colingreig/.claude/plugins/marketplaces/ignite-marketplace/plugins/claude-blog"
+  "/Users/colingreig/dev/ignite-marketplace/plugins/claude-ads"
+  "/Users/colingreig/dev/ignite-marketplace/plugins/claude-seo"
+  "/Users/colingreig/dev/ignite-marketplace/plugins/claude-blog"
 )
 SKILLS_BRIDGE_ALERT=""
 if [ ! -f "$CONFIG_YAML" ]; then
@@ -817,6 +833,16 @@ PY
         red "  -> but the directory does NOT exist on disk: $d"
         FAIL=1
         SKILLS_BRIDGE_ALERT="${SKILLS_BRIDGE_ALERT}- configured but missing on disk: $d\n"
+      elif ! "$REPO/venv/bin/python" - "$d" <<'PY' 2>/dev/null
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+sys.exit(0 if path.resolve(strict=True) == path else 1)
+PY
+      then
+        red "  -> configured root escapes its exact trusted path: $d"
+        FAIL=1
+        SKILLS_BRIDGE_ALERT="${SKILLS_BRIDGE_ALERT}- external root escapes trusted path: $d\n"
       fi
     else
       red "external_dirs MISSING  $d — Hermes can't see the document/ignite skills"
@@ -827,6 +853,24 @@ PY
     fi
   done
 
+  if ! "$REPO/venv/bin/python" - "$CONFIG_YAML" "${EXPECTED_DIRS[@]}" <<'PY' 2>/dev/null
+import json, sys, yaml
+cfg = yaml.safe_load(open(sys.argv[1])) or {}
+raw = (cfg.get("skills") or {}).get("external_dirs") or []
+if isinstance(raw, str):
+    try:
+        raw = json.loads(raw)
+    except Exception:
+        raw = [raw]
+expected = sys.argv[2:]
+sys.exit(0 if raw == expected and len(raw) == len(set(raw)) else 1)
+PY
+  then
+    red "external_dirs is not the exact ordered canonical set (unknown, duplicate, or reordered root)"
+    FAIL=1
+    SKILLS_BRIDGE_ALERT="${SKILLS_BRIDGE_ALERT}- external_dirs differs from exact canonical set\n"
+  fi
+
   # 7b. Live skill index sentinel (NEW, 86e25qd33 item 3): config listing the right
   # dirs is necessary but not sufficient — assert the actual rendered skill index
   # (what prompt_builder.build_skills_system_prompt() serves into prompts, LIVE —
@@ -834,11 +878,16 @@ PY
   # written to the snapshot JSON, so the snapshot file alone can't verify this)
   # still contains representative skills from each external category and hasn't
   # silently shrunk below a sane floor.
-  SNAP_RESULT=$("$REPO/venv/bin/python" - "$SNAPSHOT_JSON" "$REPO" <<'PY' 2>&1
+  SNAP_RESULT=$("$REPO/venv/bin/python" - "$SNAPSHOT_JSON" "$REPO" "$CONFIG_YAML" <<'PY' 2>&1
 import sys, re
 sys.path.insert(0, sys.argv[2])
-SENTINELS = ["blog-write", "docx", "seo-audit", "ignite-blog"]
-FLOOR = 150
+import yaml
+SENTINEL = "blog-write"
+cfg = yaml.safe_load(open(sys.argv[3])) or {}
+FLOOR = (cfg.get("skills") or {}).get("index_floor")
+if not isinstance(FLOOR, int) or FLOOR < 1:
+    print(f"UNREADABLE invalid skills.index_floor: {FLOOR!r}")
+    sys.exit(2)
 try:
     from agent import prompt_builder as pb
     txt = pb.build_skills_system_prompt(available_tools=None, available_toolsets=None)
@@ -846,7 +895,7 @@ except Exception as e:
     print(f"UNREADABLE {e!r}")
     sys.exit(2)
 names = set(re.findall(r'(?m)^\s{4}-\s+([a-z0-9][a-z0-9:_-]+)', txt))
-missing = [s for s in SENTINELS if s.lower() not in txt.lower()]
+missing = [] if SENTINEL in names else [SENTINEL]
 print(f"COUNT {len(names)}")
 print(f"MISSING {','.join(missing)}")
 sys.exit(1 if (missing or len(names) < FLOOR) else 0)
@@ -860,16 +909,60 @@ PY
     FAIL=1
     SKILLS_BRIDGE_ALERT="${SKILLS_BRIDGE_ALERT}- skills snapshot unreadable: $SNAPSHOT_JSON\n"
   elif [ "$snap_rc" -eq 0 ]; then
-    grn "live skill index   $snap_count skill(s) live, all sentinels present (floor 150)"
+    configured_floor=$("$REPO/venv/bin/python" - "$CONFIG_YAML" <<'PY'
+import sys,yaml
+print((yaml.safe_load(open(sys.argv[1])) or {}).get("skills",{}).get("index_floor","invalid"))
+PY
+)
+    grn "live skill index   $snap_count skill(s) live, blog-write present (configured floor $configured_floor)"
   else
-    red "live skill index   REGRESSED — $snap_count skill(s) live (floor 150), missing sentinel(s): ${snap_missing:-none}"
+    red "live skill index   REGRESSED — $snap_count skill(s) live, configured floor/sentinel failed: ${snap_missing:-none}"
     red "  This is the exact failure mode that let 217->29 go unnoticed for days."
     FAIL=1
     SKILLS_BRIDGE_ALERT="${SKILLS_BRIDGE_ALERT}- live skill index regressed: ${snap_count:-0} skills live (floor 150), missing sentinel(s): ${snap_missing:-none}\n"
   fi
 fi
 
-# 7c. Alert loudly on any skills-bridge failure above (item 4, 86e25qd33) — a
+# 7c. The reconciler receipt is the source/deployed manifest authority.
+SKILLS_RECEIPT="$HOME/.hermes/releases/marketplace-skills/last-receipt.json"
+if "$REPO/venv/bin/python" - "$SKILLS_RECEIPT" <<'PY' 2>/dev/null
+import hashlib, json, sys
+from pathlib import Path
+
+receipt = Path(sys.argv[1])
+if not receipt.is_file() or receipt.is_symlink():
+    raise SystemExit(1)
+payload = json.loads(receipt.read_text(encoding="utf-8"))
+files = payload.get("files")
+if payload.get("schema_version") != 1 or not isinstance(files, list) or not files:
+    raise SystemExit(1)
+for item in files:
+    target = Path(item["target"])
+    if not target.is_file() or target.is_symlink():
+        raise SystemExit(1)
+    deployed = hashlib.sha256(target.read_bytes()).hexdigest()
+    if deployed != item.get("deployed_sha256"):
+        raise SystemExit(1)
+    source = item.get("source")
+    if source == "generated-config":
+        source_hash = deployed
+    else:
+        source_path = Path(source)
+        if not source_path.is_file() or source_path.is_symlink():
+            raise SystemExit(1)
+        source_hash = hashlib.sha256(source_path.read_bytes()).hexdigest()
+    if source_hash != item.get("source_sha256"):
+        raise SystemExit(1)
+PY
+then
+  grn "skill deployment manifest source/deployed hashes verified"
+else
+  red "skill deployment manifest missing or source/deployed hash mismatch: $SKILLS_RECEIPT"
+  FAIL=1
+  SKILLS_BRIDGE_ALERT="${SKILLS_BRIDGE_ALERT}- source/deployed skill manifest mismatch\n"
+fi
+
+# 7d. Alert loudly on any skills-bridge failure above (item 4, 86e25qd33) — a
 # non-zero script exit alone is easy to miss; babysit-hermes reads this script's
 # output but a ClickUp comment guarantees the failure surfaces even between
 # babysit-hermes passes. Same task-comment convention as the ignite-marketplace
@@ -1852,10 +1945,14 @@ fi
 # untrusted — a noisy false positive on every skill load that trains
 # log-readers to ignore real security warnings.
 #
-# The trusted local root must come from the runtime profile-aware
-# active_skills_dir, not module-level SKILLS_DIR (which can be stale in a
-# long-lived process after the active profile changes). Resolve both the root
-# and candidate before strict relative_to() containment.
+# CURRENT STATE: the runtime resolves the active profile's root through
+# _skills_dir(), then builds `_trusted_dirs = [active_skills_dir.resolve()]`
+# and checks `skill_md.resolve().relative_to(_td)`. The verifier must assert
+# that profile-aware shape, not the stale module-level SKILLS_DIR expression:
+# long-lived runtimes can import before the active profile selects HERMES_HOME.
+# Resolve both the active root and candidate before strict relative_to()
+# containment. This section is a regression tripwire against an unresolved or
+# import-time-stale comparison.
 #
 # NOTE: 'sentry-monitor' and 'grill-me' still legitimately warn in
 # agent.log/gateway.error.log — their SKILL.md files are THEMSELVES symlinks
@@ -1866,23 +1963,25 @@ fi
 # only the top-level-symlink-hop false positive is in scope.
 hdr "32. Skills-symlink trust check (resolve-before-compare, tools/skills_tool.py)"
 SKT="$REPO/tools/skills_tool.py"
-if grep -Fq '_trusted_dirs = [active_skills_dir.resolve()]' "$SKT" 2>/dev/null && grep -Fq 'skill_md.resolve().relative_to(_td)' "$SKT" 2>/dev/null; then
-  grn "structural profile-aware resolved root and strict resolved-path containment present"
+if grep -Fq '_trusted_dirs = [active_skills_dir.resolve()]' "$SKT" 2>/dev/null \
+   && grep -Fq 'skill_md.resolve().relative_to(_td)' "$SKT" 2>/dev/null; then
+  grn "structural active-profile resolve() present on both sides of the trust-prefix comparison"
 else
-  red "STRUCTURAL REGRESSION — trust check no longer uses active_skills_dir.resolve() with resolved-path containment"
-  red "  Fix: in skill_view()'s trust check ($SKT), seed trusted dirs with active_skills_dir.resolve() and compare skill_md.resolve() via relative_to(_td)"
+  red "STRUCTURAL REGRESSION — active-profile trust-prefix comparison no longer resolves symlinks on both sides"
+  red "  Fix: in skill_view()'s trust check ($SKT), seed _trusted_dirs from active_skills_dir.resolve() and compare skill_md.resolve().relative_to(_td)"
   FAIL=1
 fi
 # Behavioral: replicate the trust check against every real skill dir under the
-# (possibly symlinked) active profile skills directory and confirm skills that live under the
+# runtime-selected (possibly symlinked) active skills dir and confirm skills that live under the
 # resolved trusted target are NOT flagged outside-trusted purely because of
 # the top-level symlink hop. A skill whose SKILL.md is itself individually
 # symlinked elsewhere (sentry-monitor, grill-me) is excluded from the
 # false-positive count — that's a different, legitimate warning.
-SK_RESULT=$("$REPO/venv/bin/python" - "$HOME/.hermes/skills" <<'PY' 2>/dev/null
+SK_RESULT=$(cd "$REPO" && "$REPO/venv/bin/python" - <<'PY' 2>/dev/null
 import sys
 import tempfile
 from pathlib import Path
+from tools.skills_tool import _skills_dir
 
 
 def is_within_resolved_root(candidate, root):
@@ -1920,32 +2019,43 @@ with tempfile.TemporaryDirectory() as tmp:
         print("FIXTURE_UNRESOLVED_PREFIX FAIL")
     print(f"FIXTURE_ESCAPED_ROOT {'PASS' if not is_within_resolved_root(escaped_link, active_skills_dir) else 'FAIL'}")
 
-skills_dir = Path(sys.argv[1])
-if not skills_dir.exists():
+active_skills_dir = _skills_dir()
+if not active_skills_dir.exists():
     print("SKIP")
     sys.exit(0)
-trusted = skills_dir.resolve()
+_trusted_dirs = [active_skills_dir.resolve()]
 false_positives = []
+outside_trust = []
 checked = 0
-for d in sorted(p for p in skills_dir.iterdir() if p.is_dir()):
-    smd = d / "SKILL.md"
-    if not smd.exists():
+for d in sorted(p for p in active_skills_dir.iterdir() if p.is_dir()):
+    skill_md = d / "SKILL.md"
+    if not skill_md.exists():
         continue
     checked += 1
-    try:
-        smd.resolve().relative_to(trusted)
-    except ValueError:
+    is_trusted = False
+    for _td in _trusted_dirs:
         try:
-            d.resolve().relative_to(trusted)
-            is_dir_trusted = True
+            skill_md.resolve().relative_to(_td)
+            is_trusted = True
+            break
         except ValueError:
-            is_dir_trusted = False
-        if is_dir_trusted and not smd.is_symlink():
-            false_positives.append(str(smd))
+            continue
+    if is_trusted:
+        continue
+    try:
+        d.resolve().relative_to(_trusted_dirs[0])
+        is_dir_trusted = True
+    except ValueError:
+        is_dir_trusted = False
+    if is_dir_trusted and not skill_md.is_symlink():
+        false_positives.append(str(skill_md))
+    else:
+        outside_trust.append(str(skill_md))
 print(f"CHECKED {checked}")
 print(f"FALSE_POSITIVES {len(false_positives)}")
+print(f"OUTSIDE_TRUST {len(outside_trust)}")
 for f in false_positives:
-    print(f"  {f}")
+    print(f"FALSE_POSITIVE {f}")
 PY
 )
 sk_fixture=$(printf '%s\n' "$SK_RESULT" | awk '/^FIXTURE_/{print $2}' | tr '\n' ' ')
@@ -1956,17 +2066,17 @@ else
   grn "behavior   resolved-root positive passes; unresolved-prefix and escaped-root negatives fail"
 fi
 if printf '%s\n' "$SK_RESULT" | grep -Fxq "SKIP"; then
-  ylw "behavior   $HOME/.hermes/skills does not exist — real-skill scan skipped"
+  ylw "behavior   runtime _skills_dir() does not exist — skipped"
 elif [ -z "$SK_RESULT" ]; then
   red "behavior   sentinel script produced no output — venv python or skills_tool import may be broken"; FAIL=1
 else
   sk_checked=$(printf '%s\n' "$SK_RESULT" | awk '/^CHECKED /{print $2}')
   sk_fp=$(printf '%s\n' "$SK_RESULT" | awk '/^FALSE_POSITIVES /{print $2}')
   if [ "${sk_fp:-1}" = "0" ]; then
-  grn "behavior   $sk_checked skill(s) under the (symlinked) active profile skills dir all resolve inside the trusted tree (no top-level-hop false positives)"
+    grn "behavior   $sk_checked skill(s) under runtime _skills_dir() have no resolved-root false positives"
   else
     red "behavior   $sk_fp of ${sk_checked:-?} skill(s) false-flag outside-trusted purely from the top-level symlink hop:"
-    printf '%s\n' "$SK_RESULT" | sed -n '3,$p' | while IFS= read -r fpline; do red "             $fpline"; done
+    printf '%s\n' "$SK_RESULT" | sed -n 's/^FALSE_POSITIVE /  /p' | while IFS= read -r fpline; do red "             $fpline"; done
     FAIL=1
   fi
 fi
