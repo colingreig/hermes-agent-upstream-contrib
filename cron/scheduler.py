@@ -322,7 +322,12 @@ from cron.jobs import (
     mark_job_run,
     save_job_output,
 )
-from cron.executions import create_execution, finish_execution, mark_execution_running
+from cron.executions import (
+    create_execution,
+    finish_execution,
+    heartbeat_execution,
+    mark_execution_running,
+)
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -337,6 +342,40 @@ SILENT_MARKER = "[SILENT]"
 # NOT when a token merely appears mid-sentence in a genuine report (e.g.
 # "I considered staying [SILENT] but here is the summary…" must deliver).
 _CRON_SILENCE_TOKENS = frozenset({"[SILENT]", "SILENT", "NO_REPLY", "NO REPLY"})
+_EXECUTION_HEARTBEAT_SECONDS = 30.0
+
+
+class _ExecutionLeaseHeartbeat:
+    """Keep a durable execution lease alive while a worker is active."""
+
+    def __init__(self, execution_id: str, owner_token: str):
+        self._execution_id = execution_id
+        self._owner_token = owner_token
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="cron-execution-lease-heartbeat",
+            daemon=True,
+        )
+
+    def start(self) -> None:
+        # Refresh immediately so a queued worker gets a fresh full lease when
+        # it starts doing real work, then refresh independently of agent I/O.
+        heartbeat_execution(self._execution_id, owner_token=self._owner_token)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=1.0)
+
+    def _run(self) -> None:
+        while not self._stop.wait(_EXECUTION_HEARTBEAT_SECONDS):
+            try:
+                if not heartbeat_execution(self._execution_id, owner_token=self._owner_token):
+                    logger.warning("Execution %s lost its lease ownership", self._execution_id)
+                    return
+            except Exception:
+                logger.warning("Execution %s heartbeat failed", self._execution_id, exc_info=True)
 
 
 def _is_cron_silence_response(text: str) -> bool:
@@ -4294,8 +4333,15 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
     failure is recorded via ``mark_job_run``), False only if processing raised.
     """
     execution_id = job.get("execution_id")
+    owner_token = job.get("execution_owner_token")
     if not execution_id:
-        execution_id = create_execution(job["id"], source="direct")["id"]
+        execution = create_execution(job["id"], source="direct")
+        execution_id = execution["id"]
+        owner_token = execution["owner_token"]
+    if not owner_token:
+        raise ValueError("execution owner token is required for cron finalization")
+    lease_heartbeat = None
+    interrupted_by_gateway = False
     try:
         # Pre-run dispatch claim (issue #38758): atomically commit a finite
         # one-shot's dispatch BEFORE its side effect runs, so a tick that dies
@@ -4311,14 +4357,19 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             )
             finish_execution(
                 execution_id,
+                owner_token=owner_token,
                 success=False,
                 error="Dispatch claim rejected; execution was not started.",
+                reason="dispatch_rejected",
             )
             return True  # not an error — already handled/removed
 
         # The attempt is claimed durably before executor/provider dispatch and
         # becomes running only immediately before the actual run.
-        mark_execution_running(execution_id)
+        if mark_execution_running(execution_id, owner_token=owner_token) is None:
+            raise RuntimeError("execution ownership was lost before the job started")
+        lease_heartbeat = _ExecutionLeaseHeartbeat(execution_id, owner_token)
+        lease_heartbeat.start()
 
         # Run the job under the profile's secret scope. get_secret() fails
         # closed outside a scope once profile isolation is in play (multiple
@@ -4414,6 +4465,7 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             # Peek-only: the flag stays set for the authoritative check
             # right before mark_job_run below.
             if success and _is_interrupted(job["id"]):
+                interrupted_by_gateway = True
                 success = False
                 error = (
                     "Interrupted by gateway shutdown before the run finished "
@@ -4482,17 +4534,49 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
                 else "route chain exhausted — no usable provider credential available"
             )
 
-        if not _consume_interrupted_flag(job["id"]):
+        consumed_interrupt = _consume_interrupted_flag(job["id"])
+        if not consumed_interrupt:
             mark_job_run(job["id"], success, error, delivery_error=delivery_error)
-        finish_execution(execution_id, success=success, error=error)
+        terminal_reason = "completed" if success else "run_failed"
+        if not success and (interrupted_by_gateway or consumed_interrupt):
+            terminal_reason = "gateway_child_died"
+        elif not success and error and "timeout" in error.lower():
+            terminal_reason = "timeout"
+        finish_execution(
+            execution_id,
+            owner_token=owner_token,
+            success=success,
+            error=error,
+            reason=terminal_reason,
+        )
         return True
 
     except Exception as e:
         logger.error("Error processing job %s: %s", job['id'], e)
         if not _consume_interrupted_flag(job["id"]):
             mark_job_run(job["id"], False, str(e))
-        finish_execution(execution_id, success=False, error=str(e))
+        finish_execution(
+            execution_id,
+            owner_token=owner_token,
+            success=False,
+            error=str(e),
+            reason="runner_exception",
+        )
         return False
+    except BaseException as e:
+        # Signals and interpreter-level exits are not normal job failures, but
+        # they must still leave an auditable terminal fact before propagating.
+        finish_execution(
+            execution_id,
+            owner_token=owner_token,
+            success=False,
+            error=f"{type(e).__name__}: {e}",
+            reason="signal",
+        )
+        raise
+    finally:
+        if lease_heartbeat is not None:
+            lease_heartbeat.stop()
 
 
 def _notify_provider_jobs_changed() -> None:
@@ -4659,10 +4743,15 @@ def tick(
                     logger.info("Job '%s' already running — skipping", job.get("name", job_id))
                     return None
                 _running_job_ids.add(job_id)
-            # Record the attempt before executor dispatch. Recovery classifies
-            # abandoned records as unknown; it never automatically retries them.
+            # Record the owned, leased attempt before executor dispatch. A
+            # restart can only terminalize a modern row after its lease expiry
+            # and exact owner death prove the worker cannot still report.
             execution = create_execution(job_id, source="builtin")
-            dispatched_job = dict(job, execution_id=execution["id"])
+            dispatched_job = dict(
+                job,
+                execution_id=execution["id"],
+                execution_owner_token=execution["owner_token"],
+            )
             _ctx = contextvars.copy_context()
 
             def _run_and_release(j=dispatched_job, ctx=_ctx):
@@ -4679,8 +4768,10 @@ def tick(
                     _running_job_ids.discard(job_id)
                 finish_execution(
                     execution["id"],
+                    owner_token=execution["owner_token"],
                     success=False,
                     error=f"Executor dispatch failed: {submit_err}",
+                    reason="dispatch_failed",
                 )
                 # Interpreter began finalizing between the guard above and the
                 # submit — release the in-flight claim we just took and skip.
