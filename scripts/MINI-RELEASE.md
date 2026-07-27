@@ -106,9 +106,10 @@ diverged, so bootstrap is intentionally blocked until the branch is reconciled.
    build the web dist (`npm install && npm run build --workspace web` →
    `hermes_cli/web_dist/`). `--offline` is the explicit, best-effort local
    clone fallback; its integrity check must pass before it can be activated.
-5. **Verify the build before any switch**: `venv/bin/python -c "import
-   hermes_cli.main"`, `hermes_cli/web_dist/index.html` present, and the governed
-   refresh and launchd Python/shell sources compile.
+5. **Verify the build before any switch**: release venv imports
+   (`hermes_cli.main`, `google.genai`, `psycopg2`),
+   `hermes_cli/web_dist/index.html` present, and the governed refresh and
+   launchd Python/shell sources compile.
 6. Back up the exact currently deployed refresh bytes under `releases/`, then
    record the current symlink target to `releases/.previous`.
 7. **Atomic switch**: `ln -sfn` a temp symlink + `mv -fh` over
