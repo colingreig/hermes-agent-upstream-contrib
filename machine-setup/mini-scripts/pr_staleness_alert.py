@@ -47,10 +47,13 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-import autonomous_merge
-import pr_pipeline_improvements as ppi
+if __package__:
+    from . import autonomous_merge
+    from . import pr_pipeline_improvements as ppi
+else:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import autonomous_merge
+    import pr_pipeline_improvements as ppi
 
 DEFAULT_STATE_PATH = Path.home() / ".hermes/state/pr_staleness_last.json"
 DEFAULT_DIGEST_HOURS = 24.0
@@ -162,7 +165,10 @@ def decide(
 
 
 def _build_message(stale_prs: list[dict[str, Any]], reason: str):
-    import slack_msg_builder as smb
+    if __package__:
+        from . import slack_msg_builder as smb
+    else:
+        import slack_msg_builder as smb
 
     if not stale_prs:
         return smb.build_status_message(
@@ -192,7 +198,6 @@ def run(allowlist: list[str]) -> int:
     states, _ = ppi.scan_repos(allowlist, now, gh, errors)
     for error in errors:
         print(f"[pr-staleness-alert] {error}", file=sys.stderr)
-
     stale_prs = [
         {
             "repo": pr_state.repo,
@@ -209,7 +214,6 @@ def run(allowlist: list[str]) -> int:
     digest_hours = _digest_hours()
     state_path = _state_path()
     curr_fingerprint = build_fingerprint(stale_prs, thresholds)
-
     try:
         state = _load_state(state_path)
         prev_fingerprint = state.get("fingerprint") or {}
@@ -220,10 +224,8 @@ def run(allowlist: list[str]) -> int:
         # suppress a real alert. If there is currently a stale PR, post it.
         print(f"[pr-staleness-alert] dedupe decision failed, failing open: {exc}", file=sys.stderr)
         should_post, reason = bool(stale_prs), "dedupe error (fail-open)"
-
     if not should_post:
         return 0
-
     message = _build_message(stale_prs, reason)
     ppi.notify(message, alert_log_path=ppi.ALERT_LOG_PATH)
     _save_state(state_path, curr_fingerprint, now)
