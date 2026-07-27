@@ -116,6 +116,14 @@ class Reconciler:
             self.scripts_dir / name: (self.source_path(name), 0o755)
             for name in SCRIPT_ASSETS
         }
+        # Keep the canonical template alongside the rendered launchd reference
+        # file so an installed scripts directory is itself a valid source root
+        # for verification and recovery.  It is deliberately data, not an
+        # executable asset.
+        result[self.scripts_dir / REFERENCE_SOURCE] = (
+            self.source_path(REFERENCE_SOURCE),
+            0o600,
+        )
         result[self.reference_target] = (
             self.source_path(REFERENCE_SOURCE),
             0o600,

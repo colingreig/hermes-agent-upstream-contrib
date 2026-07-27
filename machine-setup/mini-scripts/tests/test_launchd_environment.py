@@ -118,6 +118,18 @@ class LaunchdEnvironmentTests(unittest.TestCase):
                 self.hermes / "scripts" / "reconcile_launchd_environment.py"
             ).read_bytes(),
         )
+        template_source = SOURCE_ROOT / module.REFERENCE_SOURCE
+        deployed_template = self.hermes / "scripts" / module.REFERENCE_SOURCE
+        self.assertEqual(template_source.read_bytes(), deployed_template.read_bytes())
+        self.assertEqual(deployed_template.stat().st_mode & 0o777, 0o600)
+
+        installed_source_reconciler = module.Reconciler(
+            source_root=self.hermes / "scripts",
+            home=self.home,
+            launch_agents_dir=self.launch_agents,
+            state_dir=self.state,
+        )
+        installed_source_reconciler.verify()
 
         for label, wrapper_name in (
             (module.GATEWAY_LABEL, "gateway_secrets_wrap.sh"),
