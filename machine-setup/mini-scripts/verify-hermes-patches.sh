@@ -926,41 +926,17 @@ PY
   fi
 fi
 
-# 7c. The reconciler receipt is the source/deployed manifest authority.
-SKILLS_RECEIPT="$HOME/.hermes/releases/marketplace-skills/last-receipt.json"
-if "$REPO/venv/bin/python" - "$SKILLS_RECEIPT" <<'PY' 2>/dev/null
-import hashlib, json, sys
-from pathlib import Path
-
-receipt = Path(sys.argv[1])
-if not receipt.is_file() or receipt.is_symlink():
-    raise SystemExit(1)
-payload = json.loads(receipt.read_text(encoding="utf-8"))
-files = payload.get("files")
-if payload.get("schema_version") != 1 or not isinstance(files, list) or not files:
-    raise SystemExit(1)
-for item in files:
-    target = Path(item["target"])
-    if not target.is_file() or target.is_symlink():
-        raise SystemExit(1)
-    deployed = hashlib.sha256(target.read_bytes()).hexdigest()
-    if deployed != item.get("deployed_sha256"):
-        raise SystemExit(1)
-    source = item.get("source")
-    if source == "generated-config":
-        source_hash = deployed
-    else:
-        source_path = Path(source)
-        if not source_path.is_file() or source_path.is_symlink():
-            raise SystemExit(1)
-        source_hash = hashlib.sha256(source_path.read_bytes()).hexdigest()
-    if source_hash != item.get("source_sha256"):
-        raise SystemExit(1)
-PY
+# 7c. The reconciler receipt is the source/deployed manifest authority.  Execute
+# only the regular, non-symlinked reconciler in the immutable release source;
+# the mutable deployed copy is one of the targets that trusted code verifies.
+SKILLS_RECONCILER="$REPO/machine-setup/mini-scripts/reconcile_marketplace_skills.py"
+if [ -f "$SKILLS_RECONCILER" ] && [ ! -L "$SKILLS_RECONCILER" ] \
+    && "$REPO/venv/bin/python" "$SKILLS_RECONCILER" verify \
+    --source-root "$REPO/machine-setup/mini-scripts"
 then
   grn "skill deployment manifest source/deployed hashes verified"
 else
-  red "skill deployment manifest missing or source/deployed hash mismatch: $SKILLS_RECEIPT"
+  red "skill deployment manifest or owned generated config verification failed"
   FAIL=1
   SKILLS_BRIDGE_ALERT="${SKILLS_BRIDGE_ALERT}- source/deployed skill manifest mismatch\n"
 fi

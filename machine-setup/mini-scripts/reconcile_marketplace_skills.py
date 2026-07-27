@@ -73,6 +73,29 @@ def _atomic_write(path: Path, data: bytes, mode: int) -> None:
             temporary.unlink()
 
 
+def default_source_root(*, script_path: Path, hermes_home: Path) -> Path:
+    """Select the canonical source tree without trusting deployed script copies.
+
+    A reconciler invoked from its deployed location must use the immutable
+    runtime source rather than treating ``~/.hermes/scripts`` as canonical.
+    Development and explicitly copied fixtures continue to use their own
+    directory.  The intentional ``runtime-current`` ancestor symlink is
+    allowed, but the terminal ``mini-scripts`` directory must exist and must
+    not itself be a symlink.
+    """
+    script_path = script_path.absolute()
+    hermes_home = hermes_home.absolute()
+    if script_path.parent != hermes_home / "scripts":
+        return script_path.parent
+
+    candidate = hermes_home / "runtime-current" / "machine-setup" / "mini-scripts"
+    if candidate.is_symlink() or not candidate.is_dir():
+        raise RuntimeError(
+            f"canonical terminal mini-scripts directory missing or symlinked: {candidate}"
+        )
+    return candidate
+
+
 class Reconciler:
     def __init__(
         self,
@@ -84,7 +107,11 @@ class Reconciler:
         state_dir: Path | None = None,
         external_dirs: tuple[str, ...] = CANONICAL_EXTERNAL_DIRS,
     ) -> None:
-        self.source_root = source_root.resolve()
+        if source_root.is_symlink() or not source_root.is_dir():
+            raise RuntimeError(
+                f"canonical terminal source directory missing or symlinked: {source_root}"
+            )
+        self.source_root = source_root.resolve(strict=True)
         self.home = home.resolve()
         self.hermes_home = (
             hermes_home.resolve() if hermes_home else self.home / ".hermes"
@@ -126,7 +153,14 @@ class Reconciler:
         for target, (source, _) in self.target_map().items():
             if source is None:
                 continue
-            if not source.is_file() or source.is_symlink():
+            try:
+                resolved_source = source.resolve(strict=True)
+                resolved_source.relative_to(self.source_root)
+            except (FileNotFoundError, RuntimeError, ValueError):
+                raise RuntimeError(
+                    f"canonical source missing, invalid, or outside source root: {source}"
+                ) from None
+            if source.is_symlink() or not resolved_source.is_file():
                 raise RuntimeError(f"canonical source missing or symlinked: {source}")
             if target.suffix == ".plist":
                 payload = plistlib.loads(source.read_bytes())
@@ -170,6 +204,29 @@ class Reconciler:
         skills["external_dirs"] = list(self.external_dirs)
         skills["index_floor"] = INDEX_FLOOR
         return yaml.safe_dump(config, sort_keys=False, allow_unicode=True).encode()
+
+    def _verify_generated_config(self) -> None:
+        """Verify only the config fields this reconciler owns.
+
+        ``config.yaml`` is shared user configuration.  Its unrelated keys and
+        skills settings must survive a reconciliation and must not make a
+        later verification fail merely because YAML formatting changed.
+        """
+        try:
+            import yaml
+
+            config = yaml.safe_load(self.config_path.read_text(encoding="utf-8")) or {}
+        except Exception as exc:
+            raise RuntimeError(f"could not parse config: {exc}") from exc
+        if not isinstance(config, dict):
+            raise RuntimeError("config root must be a mapping")
+        skills = config.get("skills")
+        if not isinstance(skills, dict):
+            raise RuntimeError("skills config must be a mapping")
+        if skills.get("external_dirs") != list(self.external_dirs):
+            raise RuntimeError("generated config external_dirs mismatch")
+        if skills.get("index_floor") != INDEX_FLOOR:
+            raise RuntimeError("generated config index_floor mismatch")
 
     def desired(self) -> dict[Path, tuple[bytes, int]]:
         desired = {
@@ -272,24 +329,55 @@ class Reconciler:
         for target, (expected, mode) in desired.items():
             if not target.is_file() or target.is_symlink():
                 raise RuntimeError(f"deployed target missing or symlinked: {target}")
-            if target.read_bytes() != expected:
+            if target != self.config_path and target.read_bytes() != expected:
                 raise RuntimeError(f"source/deployed identity mismatch: {target}")
             if stat.S_IMODE(target.stat().st_mode) != mode:
                 raise RuntimeError(f"deployed mode mismatch: {target}")
+        self._verify_generated_config()
         if self.stale_plist.exists():
             raise RuntimeError(f"stale launchd wiring remains: {self.stale_plist}")
         if check_receipt:
             receipt = self.state_dir / "last-receipt.json"
             if not receipt.is_file() or receipt.is_symlink():
                 raise RuntimeError("marketplace skill receipt missing or symlinked")
-            records = {item["target"]: item for item in json.loads(receipt.read_bytes())["files"]}
-            for target, (data, _) in desired.items():
-                record = records.get(str(target))
-                if not record:
-                    raise RuntimeError(f"receipt entry missing: {target}")
-                if record["source_sha256"] != _sha256(data):
+            if stat.S_IMODE(receipt.stat().st_mode) != 0o644:
+                raise RuntimeError("marketplace skill receipt mode mismatch")
+            try:
+                payload = json.loads(receipt.read_bytes())
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise RuntimeError(f"marketplace skill receipt malformed: {exc}") from exc
+            files = payload.get("files") if isinstance(payload, dict) else None
+            if (
+                not isinstance(payload, dict)
+                or payload.get("schema_version") != 1
+                or not isinstance(files, list)
+            ):
+                raise RuntimeError("marketplace skill receipt malformed")
+            records: dict[str, dict[str, Any]] = {}
+            for item in files:
+                if not isinstance(item, dict) or not isinstance(item.get("target"), str):
+                    raise RuntimeError("marketplace skill receipt malformed")
+                target_name = item["target"]
+                if target_name in records:
+                    raise RuntimeError(f"duplicate receipt entry: {target_name}")
+                records[target_name] = item
+            expected_targets = {str(target) for target in desired}
+            if set(records) != expected_targets:
+                raise RuntimeError("marketplace skill receipt target set mismatch")
+            for target, (data, mode) in desired.items():
+                record = records[str(target)]
+                if record.get("mode") != f"{mode:04o}":
+                    raise RuntimeError(f"receipt mode mismatch: {target}")
+                if target == self.config_path:
+                    if record.get("source") != "generated-config":
+                        raise RuntimeError(f"receipt source mismatch: {target}")
+                    continue
+                source = self.target_map()[target][0]
+                if source is None or record.get("source") != str(source):
+                    raise RuntimeError(f"receipt source mismatch: {target}")
+                if record.get("source_sha256") != _sha256(data):
                     raise RuntimeError(f"receipt source hash mismatch: {target}")
-                if record["deployed_sha256"] != _sha256(target.read_bytes()):
+                if record.get("deployed_sha256") != _sha256(target.read_bytes()):
                     raise RuntimeError(f"receipt deployed hash mismatch: {target}")
 
     def rollback(self) -> None:
@@ -378,17 +466,23 @@ class Reconciler:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("action", choices=("install", "verify", "rollback"))
-    parser.add_argument("--source-root", type=Path, default=Path(__file__).resolve().parent)
+    parser.add_argument("--source-root", type=Path)
     parser.add_argument("--home", type=Path, default=Path.home())
     parser.add_argument("--hermes-home", type=Path)
     parser.add_argument("--launch-agents-dir", type=Path)
     parser.add_argument("--state-dir", type=Path)
     parser.add_argument("--reload", action="store_true")
     args = parser.parse_args()
+    hermes_home = args.hermes_home or Path(
+        os.environ.get("HERMES_HOME", args.home / ".hermes")
+    )
+    source_root = args.source_root or default_source_root(
+        script_path=Path(__file__), hermes_home=hermes_home
+    )
     reconciler = Reconciler(
-        source_root=args.source_root,
+        source_root=source_root,
         home=args.home,
-        hermes_home=args.hermes_home,
+        hermes_home=hermes_home,
         launch_agents_dir=args.launch_agents_dir,
         state_dir=args.state_dir,
     )
