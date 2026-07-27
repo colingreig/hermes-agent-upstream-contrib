@@ -408,37 +408,48 @@ elif [ "$CHANGED" -eq 1 ] || [ "$stale" -eq 1 ]; then
   FAIL=1   # unremediated stale/changed code is a real, actionable failure
 fi
 
-# --- 6. GitHub App token minting (replaces static PAT remap) -----------------
-# The static fine-grained PAT (GH_API_KEY_HERMES) has been DECOMMISSIONED.
-# Both launchd services now mint a fresh GitHub App installation token via
-# github_app_token.py on each start. The App credentials live in Doppler:
-#   GH_APP_PRIVATE_KEY, GH_APP_ID, GH_APP_INSTALLATION_ID
-# The plist sh -c wrapper exports GH_TOKEN as the output of the token script.
-# If a Hermes service reinstall regenerates the plists, the App-token call
-# vanishes and gh fails OPEN to the full-access keyring token. Detect loudly.
-# No auto-fix: a regenerated plist changes structure, so re-wrapping must be
-# done by hand. Backups: ~/Library/LaunchAgents/*.bak-pre-ghtoken
-# Design ref: shared brain decisions/2026-06-12 Hermes scoped GitHub PAT;
-#             task 86e1vuzwb (GitHub App credential layer migration).
-hdr "6. GitHub App token minting (github_app_token.py -> GH_TOKEN)"
-for svc in ai.hermes.gateway com.colingreig.hermes-dashboard; do
+# --- 6. Canonical launchd wrappers + GitHub App token environment -------------
+# Plists contain no minting or secret expressions. The governed release
+# reconciler atomically installs source-identical wrappers and points each plist
+# only at its wrapper. Inspect live env by key presence only; never print values.
+hdr "6. Canonical launchd wrappers (source -> installed -> plist -> live env)"
+for spec in \
+  "ai.hermes.gateway:gateway_secrets_wrap.sh" \
+  "com.colingreig.hermes-dashboard:dashboard_secrets_wrap.sh"; do
+  svc="${spec%%:*}"
+  wrapper_name="${spec#*:}"
+  source_wrapper="$REPO/machine-setup/mini-scripts/$wrapper_name"
+  installed_wrapper="$HOME/.hermes/scripts/$wrapper_name"
   plist="$HOME/Library/LaunchAgents/$svc.plist"
-  if [ ! -f "$plist" ]; then red "MISSING plist: $plist"; FAIL=1; continue; fi
-  if grep -Fq 'github_app_token.py' "$plist"; then
-    grn "App-token mint present  $svc.plist"
+  if [ ! -f "$source_wrapper" ] || [ ! -f "$installed_wrapper" ] \
+     || ! cmp -s "$source_wrapper" "$installed_wrapper"; then
+    red "WRAPPER SOURCE/DEPLOYED MISMATCH: $wrapper_name — run governed release reconciliation"
+    FAIL=1
   else
-    red "APP-TOKEN MINT MISSING in $svc.plist — gh will FAIL OPEN to the full-access keyring token!"
-    red "  Fix: re-add  export GH_TOKEN=\"\$(python3 \"\$HOME/.hermes/scripts/github_app_token.py\" 2>/dev/null || echo '')\";  to the service's sh -c wrapper,"
-    red "       then:  launchctl bootout gui/$UID_NUM/$svc ; launchctl bootstrap gui/$UID_NUM $plist"
+    grn "wrapper identity  $wrapper_name"
+  fi
+  if [ ! -f "$plist" ]; then red "MISSING plist: $plist"; FAIL=1; continue; fi
+  if "$REPO/venv/bin/python" - "$plist" "$installed_wrapper" <<'PY'
+import plistlib
+import sys
+from pathlib import Path
+
+payload = plistlib.loads(Path(sys.argv[1]).read_bytes())
+assert payload.get("ProgramArguments") == ["/bin/bash", sys.argv[2]]
+assert payload.get("KeepAlive") == {"SuccessfulExit": False}
+text = Path(sys.argv[1]).read_text(encoding="utf-8")
+assert not any(marker in text for marker in (
+    "github_app_token.py", "GH_TOKEN", "GH_API_KEY_HERMES",
+    "OPENAI_API_KEY", "VALIDATOR_", "op://",
+))
+PY
+  then
+    grn "plist boundary    $svc -> $wrapper_name (park-on-auth contract)"
+  else
+    red "PLIST WRAPPER/RETRY CONTRACT INVALID: $plist — run governed release reconciliation"
     FAIL=1
   fi
-  # Verify GH_API_KEY_HERMES is NOT referenced (decommissioned)
-  if grep -Fq 'GH_API_KEY_HERMES' "$plist"; then
-    red "STALE PAT REF in $svc.plist — GH_API_KEY_HERMES has been decommissioned!"
-    red "  Fix: replace export GH_TOKEN=\"\$GH_API_KEY_HERMES\" with the App-token mint call above."
-    FAIL=1
-  fi
-  # Live-env check: GH_TOKEN actually present in the RUNNING process env?
+  # Redacted live-env check: only the variable name is matched.
   pid=$(launchctl list 2>/dev/null | awk -v s="$svc" '$3==s{print $1}')
   if [ -z "$pid" ] || [ "$pid" = "-" ]; then ylw "$svc not running — live-env check skipped"; continue; fi
   if ps eww -p "$pid" 2>/dev/null | tr ' ' '\n' | grep -q '^GH_TOKEN='; then
@@ -450,8 +461,8 @@ done
 
 # --- 6a. GitHub App credentials present in 1Password -------------------------
 # The App token script reads GH_APP_PRIVATE_KEY, GH_APP_ID, GH_APP_INSTALLATION_ID
-# from the environment (1Password injects them at gateway boot via op-secrets.env;
-# Doppler decommissioned 2026-07-03). Verify they're set.
+# from the environment resolved from the reference-only launchd-secrets.op-env;
+# Doppler was decommissioned 2026-07-03. Verify the backing fields exist.
 hdr "6a. GitHub App credentials in 1Password (GH_APP_*)"
 _op_read() {
   local val
@@ -463,7 +474,7 @@ APP_KEY=$(_op_read GH_APP_PRIVATE_KEY)
 APP_ID=$(_op_read GH_APP_ID)
 APP_INST=$(_op_read GH_APP_INSTALLATION_ID)
 if [ -n "$APP_KEY" ] && [ -n "$APP_ID" ] && [ -n "$APP_INST" ]; then
-  grn "1Password GH_APP_* secrets present (id=$APP_ID, inst=$APP_INST)"
+  grn "1Password GH_APP_* secrets present (values redacted)"
 else
   red "MISSING 1Password GH_APP_* secrets — App token minting will fail!"
   red "  Set: GH_APP_PRIVATE_KEY (PEM), GH_APP_ID, GH_APP_INSTALLATION_ID in op://Dev Toolbox/dev"
@@ -503,88 +514,61 @@ fi
 [ -x "$MKT_WRAPPER" ] || { red "wrapper not executable: $MKT_WRAPPER"; FAIL=1; }
 [ -d "$MKT_REPO" ]   || { red "repo missing: $MKT_REPO — re-clone from colingreig/ignite-marketplace"; FAIL=1; }
 
-# --- 6c. Validator chain (openai-codex primary) + executor --------------------
+# --- 6c. Gateway-only OpenAI/validator environment + executor ----------------
 # 2026-06-22: executor + validator migrated to OpenAI gpt-5-mini.
 # 2026-06-25: validator chain updated to openai-codex:gpt-5.4 as primary tier
 #   (flat-fee OAuth, silent-hang-safe). Full chain:
 #     openai-codex:gpt-5.4  (ChatGPT OAuth, auto-refresh, ~/.hermes/auth.json)
-#     openai-api:gpt-5.5    (api key path, 1.05M ctx)
 #     minimax:MiniMax-M3    (unlimited fallback)
 #     gemini:gemini-3.5-flash (last-resort)
-# The wiring lives in TWO update-fragile places:
-#   (a) gateway plist — the OpenAI key remap (mirrors GH_TOKEN §6) plus the
-#       three VALIDATOR_*_CHAIN env literals. A plist regen drops the remap
-#       (openai-api gets NO key) AND the chains (validator silently falls back).
+# The wiring lives in TWO places:
+#   (a) the source-controlled gateway_launch_inner.sh, installed byte-identically
+#       by the governed reconciler. The plist deliberately contains none of it.
 #   (b) cron/jobs.json — the clickup-executor job's model/provider.
-# This is a PLIST + JSON patch, NOT a git patch — `git apply` can't restore it.
-# Detect LOUDLY, no auto-fix (a regenerated plist changes structure; re-wrapping
-# by hand is safer than a blind PlistBuddy poke at secret/model routing).
-# Backups: ~/Library/LaunchAgents/ai.hermes.gateway.plist.bak-*
+# Detect LOUDLY; the release reconciler is the only writer.
 # DURABILITY NOTE (2026-06-25): openai-codex uses OAuth (auth.json), NOT Doppler;
 #   the chain can be set in Doppler claude-code/dev to survive plist regeneration.
 # Design refs: brain operations/2026-06-22 "Hermes executor + validator migrated
 #   to OpenAI gpt-5-mini"; brain 2026-06-25 openai-codex validator chain.
 hdr "6c. Validator chain (openai-codex primary) + OPENAI_API_KEY remap + executor"
-GW_PLIST="$HOME/Library/LaunchAgents/ai.hermes.gateway.plist"
 EXPECT_CHAIN="openai-codex:gpt-5.4,minimax:MiniMax-M3,gemini:gemini-3.5-flash"
-if [ ! -f "$GW_PLIST" ]; then
-  red "MISSING plist: $GW_PLIST"; FAIL=1
+GW_INNER_SOURCE="$REPO/machine-setup/mini-scripts/gateway_launch_inner.sh"
+GW_INNER_INSTALLED="$HOME/.hermes/scripts/gateway_launch_inner.sh"
+if [ ! -f "$GW_INNER_SOURCE" ] || [ ! -f "$GW_INNER_INSTALLED" ] \
+   || ! cmp -s "$GW_INNER_SOURCE" "$GW_INNER_INSTALLED"; then
+  red "gateway inner source/deployed mismatch — run governed release reconciliation"
+  FAIL=1
 else
-  # (a1) OpenAI key remap in the sh -c wrapper
-  if grep -Fq 'export OPENAI_API_KEY="$OPENAI_API_KEY_HERMES"' "$GW_PLIST"; then
-    grn "OpenAI remap present  ai.hermes.gateway.plist"
+  if grep -Fq 'export OPENAI_API_KEY="$OPENAI_API_KEY_HERMES"' "$GW_INNER_INSTALLED"; then
+    grn "OpenAI remap present  gateway_launch_inner.sh"
   else
-    red "OPENAI_API_KEY remap MISSING in ai.hermes.gateway.plist — openai-api provider gets NO key!"
-    red "  Fix: re-add  export OPENAI_API_KEY=\"\$OPENAI_API_KEY_HERMES\";  to the sh -c wrapper,"
-    red "       then:  launchctl bootout gui/$UID_NUM/ai.hermes.gateway ; launchctl bootstrap gui/$UID_NUM $GW_PLIST"
+    red "OPENAI_API_KEY remap MISSING in canonical gateway inner wrapper"
     FAIL=1
   fi
-  # (a2) the three VALIDATOR_*_CHAIN env literals (2026-06-25: openai-codex:gpt-5.4 primary).
-  # The canonical chain lives in EXPECT_CHAIN above and is AUTO-RESTORED under --apply:
-  # PlistBuddy writes the stable EnvironmentVariables dict (structure-independent of any
-  # ProgramArguments revert). A plist-env edit needs bootout+bootstrap (NOT kickstart)
-  # to load, so 6c does its own reload under --restart. Backup: ai.hermes.gateway.plist.bak-6c-*
-  PB=/usr/libexec/PlistBuddy
-  chain_fixed=0; backed_up=0
   for tier in LOW MEDIUM HIGH; do
-    cur=$("$PB" -c "Print :EnvironmentVariables:VALIDATOR_${tier}_CHAIN" "$GW_PLIST" 2>/dev/null)
-    if [ "$cur" = "$EXPECT_CHAIN" ]; then
+    if grep -Fq "export VALIDATOR_${tier}_CHAIN=\"\$VALIDATOR_CHAIN\"" "$GW_INNER_INSTALLED" \
+       && grep -Fq "VALIDATOR_CHAIN=\"$EXPECT_CHAIN\"" "$GW_INNER_INSTALLED"; then
       grn "VALIDATOR_${tier}_CHAIN ok    ($EXPECT_CHAIN)"
-    elif [ "$APPLY" -eq 1 ]; then
-      if [ "$backed_up" -eq 0 ]; then
-        cp "$GW_PLIST" "$GW_PLIST.bak-6c-$(date +%Y%m%d-%H%M%S)" && backed_up=1 && ylw "backed up gateway plist before chain restore"
-      fi
-      if "$PB" -c "Set :EnvironmentVariables:VALIDATOR_${tier}_CHAIN $EXPECT_CHAIN" "$GW_PLIST" 2>/dev/null \
-         || "$PB" -c "Add :EnvironmentVariables:VALIDATOR_${tier}_CHAIN string $EXPECT_CHAIN" "$GW_PLIST" 2>/dev/null; then
-        grn "VALIDATOR_${tier}_CHAIN -> restored ($EXPECT_CHAIN)"; chain_fixed=1; CHANGED=1
-      else
-        red "VALIDATOR_${tier}_CHAIN restore FAILED via PlistBuddy — set it by hand"; FAIL=1
-      fi
     else
-      red "VALIDATOR_${tier}_CHAIN MISSING/WRONG in plist (got '${cur:-<none>}') — validator not on openai-codex:gpt-5.4!"
-      red "  Fix: re-run with --apply --restart (auto-restores), or set by hand + bootout/bootstrap"
+      red "VALIDATOR_${tier}_CHAIN MISSING/WRONG in canonical gateway inner wrapper"
       FAIL=1
     fi
   done
-  # A plist EnvironmentVariables change only loads via bootout+bootstrap (the
-  # epilogue's kickstart -k reuses the in-memory job spec). Do that reload here.
-  if [ "$chain_fixed" -eq 1 ] && [ "$RESTART" -eq 1 ]; then
-    if launchctl bootout "gui/$UID_NUM/ai.hermes.gateway" 2>/dev/null; launchctl bootstrap "gui/$UID_NUM" "$GW_PLIST" 2>/dev/null; then
-      grn "reloaded gateway (bootout+bootstrap) to load restored chains"
-    else
-      red "gateway bootout+bootstrap FAILED after chain restore — reload by hand: launchctl bootstrap gui/$UID_NUM $GW_PLIST"; FAIL=1
-    fi
-  elif [ "$chain_fixed" -eq 1 ]; then
-    ylw "chains restored on disk but NOT loaded — re-run with --restart (bootout+bootstrap), kickstart won't suffice"
-  fi
-  # live-env check: chains actually present (with the right value) in the RUNNING gateway
+  # Redacted live-env checks: compare exact key/value for the non-secret chain,
+  # and key presence only for OPENAI_API_KEY.
   gwpid=$(launchctl list 2>/dev/null | awk '$3=="ai.hermes.gateway"{print $1}')
   if [ -z "$gwpid" ] || [ "$gwpid" = "-" ]; then
     ylw "ai.hermes.gateway not running — live-env check skipped"
-  elif ps eww -p "$gwpid" 2>/dev/null | tr ' ' '\n' | grep -Fxq "VALIDATOR_HIGH_CHAIN=$EXPECT_CHAIN"; then
-    grn "VALIDATOR chains live  ai.hermes.gateway (pid $gwpid, value matches)"
   else
-    red "VALIDATOR_*_CHAIN missing/stale in live env of ai.hermes.gateway (pid $gwpid) — reload: --apply --restart"; FAIL=1
+    if ps eww -p "$gwpid" 2>/dev/null | tr ' ' '\n' | grep -q '^OPENAI_API_KEY=' \
+       && ps eww -p "$gwpid" 2>/dev/null | tr ' ' '\n' | grep -Fxq "VALIDATOR_LOW_CHAIN=$EXPECT_CHAIN" \
+       && ps eww -p "$gwpid" 2>/dev/null | tr ' ' '\n' | grep -Fxq "VALIDATOR_MEDIUM_CHAIN=$EXPECT_CHAIN" \
+       && ps eww -p "$gwpid" 2>/dev/null | tr ' ' '\n' | grep -Fxq "VALIDATOR_HIGH_CHAIN=$EXPECT_CHAIN"; then
+      grn "gateway OpenAI key + validator chains live (redacted key check)"
+    else
+      red "gateway OpenAI key or validator chains missing/stale — governed reconcile + bootout/bootstrap required"
+      FAIL=1
+    fi
   fi
 fi
 # (b) executor job model/provider in jobs.json

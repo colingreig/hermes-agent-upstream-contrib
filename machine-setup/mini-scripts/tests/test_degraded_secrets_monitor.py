@@ -32,11 +32,8 @@ class DegradedSecretsMonitorClassifierTests(unittest.TestCase):
         self.assertTrue(result["triggered"])
         self.assertEqual(result["count"], 3)
 
-    def test_classified_auth_and_transient_formats_escalate(self):
+    def test_classified_transient_formats_escalate(self):
         formats = (
-            "classification=auth",
-            "classification=permanent-auth",
-            "classification=permanent_auth",
             "classification=transient-exhausted",
             "classification=transient_exhausted",
         )
@@ -49,6 +46,21 @@ class DegradedSecretsMonitorClassifierTests(unittest.TestCase):
                 result = self._check([line] * 3)
                 self.assertTrue(result["triggered"])
                 self.assertEqual(result["count"], 3)
+
+    def test_permanent_auth_parks_and_escalates_on_first_record(self):
+        for classification in (
+            "classification=auth",
+            "classification=permanent-auth",
+            "classification=permanent_auth",
+        ):
+            with self.subTest(classification=classification):
+                line = (
+                    "2026-07-27T03:59:00Z gateway_secrets_wrap: FATAL "
+                    f"{classification} exit=77: credential repair required\n"
+                )
+                result = monitor.check_parked_auth([line], now=self.NOW)
+                self.assertTrue(result["triggered"])
+                self.assertEqual(result["count"], 1)
 
     def test_detection_result_never_retains_secret_bearing_log_payload(self):
         secret = "opaque-secret-that-must-not-be-retained"

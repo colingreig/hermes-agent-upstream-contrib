@@ -62,7 +62,11 @@ SLACK_MENTION = "<@UN4CQ1EGG>"
 FATAL_RE = re.compile(
     r"^(?P<ts>\S+) gateway_secrets_wrap: "
     r"(?:>>> FATAL: 1Password unreachable"
-    r"|FATAL classification=(?:auth|permanent[-_]auth|transient[-_]exhausted))\b"
+    r"|FATAL classification=(?:transient[-_]exhausted|resolver|token-mint))\b"
+)
+PARKED_AUTH_RE = re.compile(
+    r"^(?P<ts>\S+) gateway_secrets_wrap: FATAL "
+    r"classification=(?:auth|permanent[-_]auth)\b"
 )
 PLACEHOLDER_RE = re.compile(
     r"MCP server '(?P<server>[^']+)': header '(?P<header>[^']+)' still contains "
@@ -111,6 +115,21 @@ def check_fatal_loop(lines, now=None, threshold=FATAL_THRESHOLD, window_min=FATA
             "threshold": threshold, "window_min": window_min, "timestamps": hits}
 
 
+def check_parked_auth(lines, now=None, window_min=FATAL_WINDOW_MIN):
+    """A single recent permanent-auth record is degraded: launchd is parked."""
+    now = now or _now()
+    hits = []
+    for line in lines:
+        match = PARKED_AUTH_RE.search(line)
+        if not match:
+            continue
+        timestamp = _parse_ts(match.group("ts"))
+        if timestamp and timedelta(0) <= (now - timestamp) <= timedelta(minutes=window_min):
+            hits.append(timestamp.isoformat())
+    return {"triggered": bool(hits), "count": len(hits),
+            "window_min": window_min, "timestamps": hits}
+
+
 def check_unresolved_placeholder(lines, whitelist=None):
     whitelist = WHITELIST if whitelist is None else whitelist
     seen, hits = set(), []
@@ -145,11 +164,12 @@ def _save_state(obj):
     os.replace(tmp, STATE_PATH)
 
 
-def _signature(fatal, placeholder):
+def _signature(fatal, parked_auth, placeholder):
     # Lists, not tuples: a tuple survives in-process but round-trips through JSON
     # state as a list, so comparing a freshly-built tuple against a reloaded list
     # would always be unequal (tuple != list in Python) and dedup would never hold.
     return {"fatal": fatal["triggered"],
+            "parked_auth": parked_auth["triggered"],
             "placeholder_keys": sorted([[h["server"], h["var"]] for h in placeholder["hits"]])}
 
 
@@ -234,11 +254,13 @@ def main():
     now = _parse_ts(args.now) if args.now else _now()
     lines = read_tail(args.log_file)
     fatal = check_fatal_loop(lines, now=now)
+    parked_auth = check_parked_auth(lines, now=now)
     placeholder = check_unresolved_placeholder(lines)
-    sig = _signature(fatal, placeholder)
-    degraded = fatal["triggered"] or placeholder["triggered"]
+    sig = _signature(fatal, parked_auth, placeholder)
+    degraded = fatal["triggered"] or parked_auth["triggered"] or placeholder["triggered"]
 
-    result = {"degraded": degraded, "fatal_loop": fatal, "placeholder": placeholder,
+    result = {"degraded": degraded, "fatal_loop": fatal, "parked_auth": parked_auth,
+              "placeholder": placeholder,
               "checked_at": now.isoformat()}
 
     if args.json:
@@ -248,6 +270,8 @@ def main():
     else:
         if fatal["triggered"]:
             print(f"[degraded-secrets-monitor] FATAL-loop: {fatal['count']} hits in last {fatal['window_min']}min")
+        if parked_auth["triggered"]:
+            print("[degraded-secrets-monitor] gateway parked after permanent authentication failure")
         for h in placeholder["hits"]:
             print(f"[degraded-secrets-monitor] unresolved placeholder: server={h['server']} var={h['var']}")
 
@@ -260,6 +284,10 @@ def main():
                 msg_lines.append(
                     f"- 1Password unreachable: {fatal['count']} FATAL relaunches in the last "
                     f"{fatal['window_min']} min (gateway can't recover on its own).")
+            if parked_auth["triggered"]:
+                msg_lines.append(
+                    "- Gateway launch is parked after a permanent authentication failure; "
+                    "repair credentials, then bootstrap the LaunchAgent.")
             for h in placeholder["hits"]:
                 msg_lines.append(
                     f"- Unresolved secret placeholder: MCP server '{h['server']}' header "

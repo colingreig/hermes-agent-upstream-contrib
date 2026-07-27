@@ -13,8 +13,9 @@
 # release directory in full, verifies it, and only then atomically repoints
 # the `runtime-current` symlink and restarts the services. It NEVER mutates
 # persistent runtime state (DBs, config, cron, logs, LaunchAgents). The sole
-# operational-file exception is an exact-path, hash-verified, rollback-safe
-# deployment of clickup_workspace_refresh.py.
+# operational-file exceptions are exact-path, hash-verified, rollback-safe
+# deployments of clickup_workspace_refresh.py and the canonical launchd
+# wrappers/plists through reconcile_launchd_environment.py.
 #
 # Tracked in ClickUp 86e2ddah5; conditional polling/governed script deployment
 # added under 86e2gdfwc.
@@ -40,6 +41,7 @@ CLICKUP_CLI_PATH_DIR="/opt/homebrew/bin"
 CLICKUP_CLI_NAME="cu-clickup"
 VENDORED_REFRESH_REL="machine-setup/mini-scripts/clickup_workspace_refresh.py"
 DEPLOYED_REFRESH="$HERMES_HOME/scripts/clickup_workspace_refresh.py"
+VENDORED_LAUNCHD_RECONCILER_REL="machine-setup/mini-scripts/reconcile_launchd_environment.py"
 
 UID_NUM="$(id -u)"
 GUI_DOMAIN="gui/${UID_NUM}"
@@ -69,6 +71,7 @@ DRY_RUN=0
 DO_PRUNE=0
 OFFLINE=0
 IF_ADVANCED=0
+LAUNCHD_ENV_CHANGED=0
 PREFLIGHT=0
 
 usage() {
@@ -407,6 +410,49 @@ restore_governed_refresh_for_release() {
   install_governed_refresh_from_source "$source"
 }
 
+# Deploy the release-owned launchd wrappers, token minter, resolver, reference
+# template, and generated plists through their transactional reconciler. The
+# reconciler owns exact pre-install snapshots and source/deployed hash receipts.
+install_governed_launchd_environment() {
+  local release_dir="${1:-}"
+  local reconciler="$release_dir/$VENDORED_LAUNCHD_RECONCILER_REL"
+  local source_root
+  source_root="$(dirname "$reconciler")"
+  [ -f "$reconciler" ] && [ ! -L "$reconciler" ] \
+    || { warn "launchd environment reconciler missing or symlinked: $reconciler"; return 1; }
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '\033[35m[DRY-RUN]\033[0m %s %s install --source-root %s --home %s --hermes-home %s --reload\n' \
+      "$release_dir/venv/bin/python" "$reconciler" "$source_root" "$HOME" "$HERMES_HOME"
+    return 0
+  fi
+  if ! "$release_dir/venv/bin/python" "$reconciler" install \
+    --source-root "$source_root" --home "$HOME" --hermes-home "$HERMES_HOME" --reload; then
+    return 1
+  fi
+  LAUNCHD_ENV_CHANGED=1
+}
+
+rollback_governed_launchd_environment() {
+  local reason="${1:-automatic}"
+  local reconciler="$HERMES_HOME/scripts/reconcile_launchd_environment.py"
+  if [ "$LAUNCHD_ENV_CHANGED" -ne 1 ] && [ "$reason" != "explicit --rollback" ]; then
+    return 0
+  fi
+  if [ ! -f "$reconciler" ] || [ -L "$reconciler" ]; then
+    [ "$LAUNCHD_ENV_CHANGED" -eq 1 ] && return 1
+    warn "no governed launchd snapshot available; leaving pre-contract launchd files unchanged"
+    return 0
+  fi
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '\033[35m[DRY-RUN]\033[0m %s %s rollback --home %s --hermes-home %s --reload\n' \
+      "$CURRENT_LINK/venv/bin/python" "$reconciler" "$HOME" "$HERMES_HOME"
+    return 0
+  fi
+  "$CURRENT_LINK/venv/bin/python" "$reconciler" rollback \
+    --home "$HOME" --hermes-home "$HERMES_HOME" --reload
+  LAUNCHD_ENV_CHANGED=0
+}
+
 # Install the release-owned ClickUp wrapper as a stable user command.  The
 # wrapper itself calls the protected live refresh script, so it remains valid
 # across runtime-current switches and rollbacks.  Reinstalling it after every
@@ -654,6 +700,8 @@ rollback_to_previous() {
     || die "rollback could not restore governed ClickUp refresh — MANUAL INTERVENTION REQUIRED"
   install_clickup_cli "$prev" \
     || die "rollback could not restore managed ClickUp CLI — MANUAL INTERVENTION REQUIRED"
+  rollback_governed_launchd_environment "$reason" \
+    || die "rollback could not restore governed launchd environment — MANUAL INTERVENTION REQUIRED"
   kickstart "$GATEWAY_TARGET"
   if verify_gateway "$prev" "$offset"; then
     kickstart "$DASHBOARD_TARGET"
@@ -1027,7 +1075,7 @@ fi
 
 # --- Verify the build BEFORE any switch ------------------------------------
 if [ "$DRY_RUN" -eq 1 ]; then
-  printf '\033[35m[DRY-RUN]\033[0m verify: venv python imports hermes_cli.main + web_dist/index.html + governed refresh source compile\n'
+  printf '\033[35m[DRY-RUN]\033[0m verify: venv import + web_dist + governed refresh/launchd sources compile\n'
 else
   log "verifying build artifacts"
   ( cd "$NEW_DIR" && "$NEW_DIR/venv/bin/python" -c "import hermes_cli.main" ) \
@@ -1046,7 +1094,16 @@ PY
   then
     die "build verify failed: governed refresh source does not compile"
   fi
-  ok "build verified (import OK, web dist present, governed refresh compiles)"
+  LAUNCHD_SOURCE_ROOT="$NEW_DIR/$(dirname "$VENDORED_LAUNCHD_RECONCILER_REL")"
+  for wrapper in gateway_secrets_wrap.sh dashboard_secrets_wrap.sh gateway_launch_inner.sh; do
+    bash -n "$LAUNCHD_SOURCE_ROOT/$wrapper" \
+      || die "build verify failed: launchd wrapper syntax invalid: $wrapper"
+  done
+  "$NEW_DIR/venv/bin/python" -m py_compile \
+    "$LAUNCHD_SOURCE_ROOT/reconcile_launchd_environment.py" \
+    "$LAUNCHD_SOURCE_ROOT/github_app_token.py" \
+    || die "build verify failed: governed launchd Python source does not compile"
+  ok "build verified (import, web dist, governed refresh, launchd sources)"
 fi
 
 # Preserve the exact pre-cut deployed script for bootstrap rollback before
@@ -1066,20 +1123,16 @@ else
 fi
 
 # --- Switch: atomic symlink swap + restart + verify ------------------------
-GW_OFFSET="$(log_offset)"
+LAUNCHD_GW_OFFSET="$(log_offset)"
 repoint_symlink "$NEW_DIR"
-kickstart_after_switch "$GATEWAY_TARGET" "gateway"
-
-if ! verify_gateway "$NEW_DIR" "$GW_OFFSET"; then
-  warn "gateway did not verify healthy on new release — rolling back"
-  rollback_to_previous "gateway verify failed"
+if ! install_governed_launchd_environment "$NEW_DIR"; then
+  warn "governed launchd environment install/reload failed — rolling back"
+  rollback_to_previous "governed launchd environment install failed"
   die "cut aborted and rolled back to previous release"
 fi
-
-kickstart_after_switch "$DASHBOARD_TARGET" "dashboard"
-if ! verify_dashboard; then
-  warn "dashboard did not verify healthy on new release — rolling back"
-  rollback_to_previous "dashboard verify failed"
+if ! verify_gateway "$NEW_DIR" "$LAUNCHD_GW_OFFSET" || ! verify_dashboard; then
+  warn "services did not verify through governed launchd environment — rolling back"
+  rollback_to_previous "governed launchd environment verify failed"
   die "cut aborted and rolled back to previous release"
 fi
 

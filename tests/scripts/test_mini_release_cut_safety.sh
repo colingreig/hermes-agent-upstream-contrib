@@ -24,6 +24,7 @@ expect_failure() {
 
 mkdir -p "$TEST_ROOT/home/.hermes/releases"
 HERMES_HOME="$(cd -P "$TEST_ROOT/home/.hermes" && pwd -P)"
+export HERMES_HOME
 # shellcheck disable=SC1090 # SCRIPT is calculated from this test's location.
 MINI_RELEASE_CUT_TEST_LIB=1 source "$SCRIPT"
 
@@ -150,6 +151,57 @@ mkdir "$EMPTY_OLD_RELEASE"
 restore_governed_refresh_for_release "$EMPTY_OLD_RELEASE" >/dev/null
 [ "$(sha256_file "$DEPLOYED_REFRESH")" = "$old_refresh_hash" ] \
   || fail "governed refresh rollback did not restore staged pre-vendor bytes"
+
+# The release path invokes the release-owned launchd reconciler with the exact
+# source root and records that rollback is now required. Rollback uses the
+# deployed reconciler through runtime-current and asks it to reload both jobs.
+LAUNCHD_RELEASE="$RELEASES_DIR/v1.1.0-launchd"
+LAUNCHD_RECONCILER="$LAUNCHD_RELEASE/$VENDORED_LAUNCHD_RECONCILER_REL"
+mkdir -p "$(dirname "$LAUNCHD_RECONCILER")" "$LAUNCHD_RELEASE/venv/bin"
+printf '# placeholder reconciler\n' > "$LAUNCHD_RECONCILER"
+cat > "$LAUNCHD_RELEASE/venv/bin/python" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$HERMES_HOME/launchd-reconciler-calls"
+case " $* " in
+  *" install "*) [ "${FAKE_RECONCILER_FAIL_INSTALL:-0}" -eq 0 ] || exit 42 ;;
+esac
+SH
+chmod 0755 "$LAUNCHD_RELEASE/venv/bin/python"
+install_governed_launchd_environment "$LAUNCHD_RELEASE"
+[ "$LAUNCHD_ENV_CHANGED" -eq 1 ] \
+  || fail "launchd install did not arm release rollback"
+grep -Fq "install --source-root $(dirname "$LAUNCHD_RECONCILER")" \
+  "$HERMES_HOME/launchd-reconciler-calls" \
+  || fail "release did not invoke launchd install from its canonical source root"
+
+# A later cut starts with an unarmed in-process marker. If reconciliation fails
+# during validation/before snapshot creation, it must not consume the previous
+# successful generation's rollback pointer.
+LAUNCHD_ENV_CHANGED=0
+calls_before_failed_install="$(wc -l < "$HERMES_HOME/launchd-reconciler-calls" | tr -d ' ')"
+export FAKE_RECONCILER_FAIL_INSTALL=1
+if install_governed_launchd_environment "$LAUNCHD_RELEASE"; then
+  fail "failed launchd validation/install was reported as successful"
+fi
+unset FAKE_RECONCILER_FAIL_INSTALL
+[ "$LAUNCHD_ENV_CHANGED" -eq 0 ] \
+  || fail "failed pre-snapshot launchd install incorrectly armed rollback"
+rollback_governed_launchd_environment "failed pre-snapshot validation"
+calls_after_failed_rollback="$(wc -l < "$HERMES_HOME/launchd-reconciler-calls" | tr -d ' ')"
+[ "$calls_after_failed_rollback" -eq $((calls_before_failed_install + 1)) ] \
+  || fail "failed pre-snapshot install rolled back a prior successful generation"
+
+# The first successful generation remains independently rollback-capable.
+LAUNCHD_ENV_CHANGED=1
+cp "$LAUNCHD_RECONCILER" "$HERMES_HOME/scripts/reconcile_launchd_environment.py"
+ln -s "$LAUNCHD_RELEASE" "$CURRENT_LINK"
+rollback_governed_launchd_environment "test rollback"
+[ "$LAUNCHD_ENV_CHANGED" -eq 0 ] \
+  || fail "launchd rollback did not clear the changed marker"
+grep -Fq "reconcile_launchd_environment.py rollback" \
+  "$HERMES_HOME/launchd-reconciler-calls" \
+  || fail "release rollback did not invoke the deployed launchd snapshot restore"
+rm "$CURRENT_LINK"
 
 # A rollback whose gateway is healthy but dashboard remains unhealthy must
 # terminate nonzero; a warning-only rollback would make this subshell succeed.

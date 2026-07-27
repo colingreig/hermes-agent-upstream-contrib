@@ -12,9 +12,9 @@ automation produced that layout, so it could not be reviewed or reproduced.
 
 This script **is** that automation. It builds a brand-new release directory in
 full, verifies it, and only then atomically repoints the `runtime-current`
-symlink and restarts the services. Persistent runtime state remains untouched;
-the one explicit operational-file exception is the governed, rollback-safe
-`clickup_workspace_refresh.py` deployment described below.
+symlink and restarts the services. Persistent runtime state remains untouched
+except for the two explicit, rollback-safe governed deployments described
+below: `clickup_workspace_refresh.py` and the canonical launchd environment.
 
 Tracked in ClickUp `86e2ddah5`.
 
@@ -34,6 +34,11 @@ Tracked in ClickUp `86e2ddah5`.
   `machine-setup/mini-scripts/clickup_workspace_refresh.py`. A successful cut
   atomically installs those exact bytes at the protected live path and records
   both SHA-256 values in a content-addressed receipt.
+- The canonical launchd environment lives in
+  `machine-setup/mini-scripts/` and is installed by
+  `reconcile_launchd_environment.py`: source-identical wrappers/minter/resolver,
+  a reference-only secret file, and generated gateway/dashboard plists. Its
+  content-addressed snapshot restores exact prior bytes on rollback.
 - `.mini-release-last-receipt.json` is the stable latest receipt; immutable
   `.mini-release-receipt-<sha256>.json` siblings are addressed by their exact
   payload bytes.
@@ -101,22 +106,25 @@ diverged, so bootstrap is intentionally blocked until the branch is reconciled.
    clone fallback; its integrity check must pass before it can be activated.
 5. **Verify the build before any switch**: `venv/bin/python -c "import
    hermes_cli.main"`, `hermes_cli/web_dist/index.html` present, and the governed
-   refresh source exists as a regular file and compiles.
+   refresh and launchd Python/shell sources compile.
 6. Back up the exact currently deployed refresh bytes under `releases/`, then
    record the current symlink target to `releases/.previous`.
 7. **Atomic switch**: `ln -sfn` a temp symlink + `mv -fh` over
-   `runtime-current`, then `launchctl kickstart -k` the gateway.
-8. **Verify (up to 60s)**: gateway process running from the new release path,
+   `runtime-current`.
+8. Transactionally reconcile both LaunchAgents and their canonical wrappers,
+   then reload with `bootout` + `bootstrap`. Plists point only to wrappers;
+   permanent auth parks cleanly while transient exhaustion remains retryable.
+9. **Verify (up to 60s)**: gateway process running through the new release,
    `Gateway running with N platform(s)` with N ≥ 2 in `gateway.log`, and
-   `:8642` listening. Then restart + verify the dashboard (`:9119` → HTTP 200).
-9. Atomically install and hash-verify the governed refresh source at
+   `:8642` listening; then verify the dashboard (`:9119` → HTTP 200).
+10. Atomically install and hash-verify the governed refresh source at
    `~/.hermes/scripts/clickup_workspace_refresh.py`, then install (or repair)
    the executable `~/.local/bin/cu-clickup` wrapper and PATH link.
-10. Record a deterministic receipt with old/new commits, runtime target, source
+11. Record a deterministic receipt with old/new commits, runtime target, source
     hash, deployed hash, ref, event, and result detail.
-11. On **any** verification, governed install, CLI install, hash, or receipt
-    failure: **automatic rollback** of both runtime target and governed refresh
-    bytes, restart, re-verify, and exit non-zero.
+12. On **any** verification, governed install, CLI install, hash, or receipt
+    failure: **automatic rollback** of the runtime target, launchd snapshot, and
+    governed refresh bytes, restart, re-verify, and exit non-zero.
 
 ## Hard safety invariants (enforced in code, not comments)
 
@@ -135,15 +143,15 @@ diverged, so bootstrap is intentionally blocked until the branch is reconciled.
    repoint, (b) the `launchctl` restart, and (c) the atomic replacement of the
    managed command `~/.local/bin/cu-clickup` plus its
    `/opt/homebrew/bin/cu-clickup` discovery link, each funnelled through
-   dedicated functions. The one governed operational script replacement is
-   exact-path-only, refuses symlink source/destination paths, stages and hashes
-   in `~/.hermes/scripts`, and atomically renames over only
-   `clickup_workspace_refresh.py`. The wrapper contains no token and reads
+   dedicated functions. The governed operational replacements are
+   exact-path-only, refuse symlink source/destination paths, stage and hash
+   in the destination directory, and atomically rename over only the declared
+   refresh/launchd assets. The ClickUp wrapper contains no token and reads
    credentials from the environment only when it invokes that script.
-3. It **never** touches `~/.hermes/{config.yaml,*.db,cron/,logs/,recovery/}`,
-   `~/.config`, or `~/Library/LaunchAgents`. `~/.hermes/scripts/` remains
-   forbidden to every generic write; the exact governed refresh replacement
-   described above is the sole exception. Logs remain read-only.
+3. It **never** touches `~/.hermes/{config.yaml,*.db,cron/,logs/,recovery/}` or
+   `~/.config`. `~/.hermes/scripts/` and `~/Library/LaunchAgents` remain
+   forbidden to generic writes; only the exact governed refresh and launchd
+   reconciler target sets are exceptions. Logs remain read-only.
 4. It **refuses to run** if the target release dir already exists — never
    mutates a release in place.
 5. It **refuses to bootstrap** a missing `runtime-current` symlink or
@@ -173,7 +181,7 @@ diverged, so bootstrap is intentionally blocked until the branch is reconciled.
 
 Repoints `runtime-current` to the release recorded in `releases/.previous`,
 atomically restores that release's governed refresh source (or the staged
-pre-vendor bytes for the bootstrap cut), restores the managed CLI, restarts both
-services, and re-verifies. No build. If restoration or either service does not
-verify healthy it exits non-zero and asks for manual intervention rather than
-looping.
+pre-vendor bytes for the bootstrap cut), restores the exact prior launchd
+snapshot and managed CLI, restarts both services, and re-verifies. No build. If
+restoration or either service does not verify healthy it exits non-zero and
+asks for manual intervention rather than looping.
