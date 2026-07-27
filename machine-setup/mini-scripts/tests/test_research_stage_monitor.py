@@ -409,7 +409,10 @@ def test_exit_codes_map_to_each_documented_status(tmp_path, capsys):
         ]
     )
     result_insufficient = capsys.readouterr().out
-    assert rc_insufficient == 4
+    # A fresh insufficient-data window is an observable advisory, not a
+    # failed cron run. apply_inconclusive_escalation upgrades it to exit 6
+    # only after strictly more than the configured continuous window.
+    assert rc_insufficient == 0
     assert '"status": "insufficient-data"' in result_insufficient
 
     degraded_ledger = tmp_path / "degraded.jsonl"

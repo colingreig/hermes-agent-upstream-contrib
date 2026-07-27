@@ -37,8 +37,9 @@ that only checks process exit status can still tell the conditions apart:
                                   threshold)
     fetch-degraded             5 fetch_success_rate (grounded_pages /
                                   attempted_fetches) fell below 0.50
-    insufficient-data          4 fewer than --min-attempts real
-                                  (non-smoke) attempts to judge
+    insufficient-data          0 fewer than --min-attempts real
+                                  (non-smoke) attempts to judge; advisory
+                                  until the persistent-inconclusive threshold
     healthy                    0 everything above is within bounds
 
 ``--quiet-when-healthy``: mini ``no_agent`` cron jobs deliver a message on
@@ -492,9 +493,11 @@ def evaluate(
 # Exit code per JSON `status` value. The JSON `status` field stays
 # authoritative; this exists only so a cron/watchdog that can't parse JSON
 # (checks exit status alone) can still distinguish "provider is genuinely
-# failing" (2) from "stage never ran / ledger stale" (3) from "not enough
-# real traffic to judge yet" (4) from "fetch coverage silently drifting"
-# (5), instead of collapsing them into one opaque non-zero code.
+# failing" (2) from "stage never ran / ledger stale" (3) and "fetch coverage
+# silently drifting" (5), instead of collapsing them into one opaque non-zero
+# code. Insufficient traffic is intentionally advisory (0) until the durable
+# inconclusive-window escalation changes its status to persistently-inconclusive
+# (6).
 _EXIT_CODES = {
     "healthy": 0,
     "disabled-or-smoke-only": 0,
@@ -502,7 +505,7 @@ _EXIT_CODES = {
     "search-outage": 2,
     "ungrounded": 2,
     "not-observed": 3,
-    "insufficient-data": 4,
+    "insufficient-data": 0,
     "fetch-degraded": 5,
     "persistently-inconclusive": 6,
 }
@@ -535,8 +538,8 @@ def main(argv: list[str] | None = None) -> int:
             "(grounded_pages / attempted_fetches) < "
             f"{FETCH_SUCCESS_ALARM} (warn below {FETCH_SUCCESS_WARN}; warning JSON "
             "remains visible with --quiet-when-healthy, but status/exit stay healthy/0)\n"
-            "  insufficient-data (4)     -- fewer than --min-attempts real, non-smoke "
-            "attempts in the lookback window\n"
+            "  insufficient-data (0)     -- fewer than --min-attempts real, non-smoke "
+            "attempts in the lookback window; advisory until persistent\n"
             "  healthy (0)               -- everything above is within bounds\n"
             "The JSON `status` field printed to stdout is authoritative; these exit "
             "codes exist for consumers that only check process exit status."
@@ -589,7 +592,7 @@ def main(argv: list[str] | None = None) -> int:
             "the lookback window before served/degraded/coverage rates "
             "are trusted enough to report 'healthy' or 'degraded'/"
             "'ungrounded'/'fetch-degraded'. Below this, status is "
-            "'insufficient-data' (exit 4) UNLESS a search-outage condition "
+            "'insufficient-data' (advisory exit 0) UNLESS a search-outage condition "
             "is independently detected, which always takes precedence. "
             "Default: %(default)s."
         ),
