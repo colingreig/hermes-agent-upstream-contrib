@@ -12,7 +12,9 @@ automation produced that layout, so it could not be reviewed or reproduced.
 
 This script **is** that automation. It builds a brand-new release directory in
 full, verifies it, and only then atomically repoints the `runtime-current`
-symlink and restarts the services. It never mutates live runtime state.
+symlink and restarts the services. Persistent runtime state remains untouched;
+the one explicit operational-file exception is the governed, rollback-safe
+`clickup_workspace_refresh.py` deployment described below.
 
 Tracked in ClickUp `86e2ddah5`.
 
@@ -28,6 +30,13 @@ Tracked in ClickUp `86e2ddah5`.
   protected live `~/.hermes/scripts/clickup_workspace_refresh.py`;
   `/opt/homebrew/bin/cu-clickup` links to it so clean non-interactive shells
   can discover the command without depending on dotfile PATH setup.
+- The canonical refresh source is
+  `machine-setup/mini-scripts/clickup_workspace_refresh.py`. A successful cut
+  atomically installs those exact bytes at the protected live path and records
+  both SHA-256 values in a content-addressed receipt.
+- `.mini-release-last-receipt.json` is the stable latest receipt; immutable
+  `.mini-release-receipt-<sha256>.json` siblings are addressed by their exact
+  payload bytes.
 
 ## Usage
 
@@ -41,6 +50,9 @@ which is not on a non-interactive ssh PATH — the script extends PATH itself.
 # Preview every mutating action, change nothing:
 ~/.hermes/runtime-current/scripts/mini-release-cut.sh --ref prod-live-patches --dry-run
 
+# Polling-safe mode: equal is a successful no-op; only a strict descendant cuts:
+~/.hermes/runtime-current/scripts/mini-release-cut.sh --ref prod-live-patches --if-advanced
+
 # Cut a specific sha or branch:
 ~/.hermes/runtime-current/scripts/mini-release-cut.sh --ref <sha-or-branch>
 
@@ -52,6 +64,25 @@ which is not on a non-interactive ssh PATH — the script extends PATH itself.
 ```
 
 `--ref` defaults to `prod-live-patches`.
+
+## Optional local polling job
+
+The poller is local-only and does not expose a webhook. Its wrapper delegates
+all decisions to the locked cutter:
+
+```bash
+~/.hermes/runtime-current/scripts/install-mini-release-poller.sh --install
+# Review the installed plist, then explicitly load it:
+~/.hermes/runtime-current/scripts/install-mini-release-poller.sh --install-and-enable
+```
+
+The installer first runs the cutter's dedicated `--preflight` mode. Preflight
+acquires the real release lock, fetches current origin metadata, and refuses a
+behind or diverged branch without building, switching, restarting services, or
+writing a receipt. The LaunchAgent runs every 15 minutes and is not `RunAtLoad`.
+Do not enable it until `prod-live-patches` contains the active runtime commit:
+on 2026-07-26 the Mini's active `231607384a1d` and branch `9a48716a786d` were
+diverged, so bootstrap is intentionally blocked until the branch is reconciled.
 
 ## What a cut does (order matters)
 
@@ -69,18 +100,23 @@ which is not on a non-interactive ssh PATH — the script extends PATH itself.
    `hermes_cli/web_dist/`). `--offline` is the explicit, best-effort local
    clone fallback; its integrity check must pass before it can be activated.
 5. **Verify the build before any switch**: `venv/bin/python -c "import
-   hermes_cli.main"` and `hermes_cli/web_dist/index.html` present.
-6. Record the current symlink target to `releases/.previous`.
+   hermes_cli.main"`, `hermes_cli/web_dist/index.html` present, and the governed
+   refresh source exists as a regular file and compiles.
+6. Back up the exact currently deployed refresh bytes under `releases/`, then
+   record the current symlink target to `releases/.previous`.
 7. **Atomic switch**: `ln -sfn` a temp symlink + `mv -fh` over
    `runtime-current`, then `launchctl kickstart -k` the gateway.
 8. **Verify (up to 60s)**: gateway process running from the new release path,
    `Gateway running with N platform(s)` with N ≥ 2 in `gateway.log`, and
    `:8642` listening. Then restart + verify the dashboard (`:9119` → HTTP 200).
-9. Atomically install (or repair) the executable `~/.local/bin/cu-clickup`
-   wrapper from the verified release and its `/opt/homebrew/bin/cu-clickup`
-   PATH link.
-10. On **any** verification failure: **automatic rollback** (repoint to
-   `.previous`, restart, re-verify) and exit non-zero.
+9. Atomically install and hash-verify the governed refresh source at
+   `~/.hermes/scripts/clickup_workspace_refresh.py`, then install (or repair)
+   the executable `~/.local/bin/cu-clickup` wrapper and PATH link.
+10. Record a deterministic receipt with old/new commits, runtime target, source
+    hash, deployed hash, ref, event, and result detail.
+11. On **any** verification, governed install, CLI install, hash, or receipt
+    failure: **automatic rollback** of both runtime target and governed refresh
+    bytes, restart, re-verify, and exit non-zero.
 
 ## Hard safety invariants (enforced in code, not comments)
 
@@ -99,11 +135,15 @@ which is not on a non-interactive ssh PATH — the script extends PATH itself.
    repoint, (b) the `launchctl` restart, and (c) the atomic replacement of the
    managed command `~/.local/bin/cu-clickup` plus its
    `/opt/homebrew/bin/cu-clickup` discovery link, each funnelled through
-   dedicated functions. The wrapper contains no token and reads credentials
-   from the environment only when it invokes the existing refresh script.
-3. It **never** touches `~/.hermes/{config.yaml,*.db,cron/,scripts/,logs/,
-   recovery/}`, `~/.config`, or `~/Library/LaunchAgents` (guarded by
-   `assert_not_forbidden`; `logs/` is read-only for verification only).
+   dedicated functions. The one governed operational script replacement is
+   exact-path-only, refuses symlink source/destination paths, stages and hashes
+   in `~/.hermes/scripts`, and atomically renames over only
+   `clickup_workspace_refresh.py`. The wrapper contains no token and reads
+   credentials from the environment only when it invokes that script.
+3. It **never** touches `~/.hermes/{config.yaml,*.db,cron/,logs/,recovery/}`,
+   `~/.config`, or `~/Library/LaunchAgents`. `~/.hermes/scripts/` remains
+   forbidden to every generic write; the exact governed refresh replacement
+   described above is the sole exception. Logs remain read-only.
 4. It **refuses to run** if the target release dir already exists — never
    mutates a release in place.
 5. It **refuses to bootstrap** a missing `runtime-current` symlink or
@@ -119,6 +159,11 @@ which is not on a non-interactive ssh PATH — the script extends PATH itself.
 10. A `releases/.mini-release-cut.lock` directory is acquired atomically for
     the full cut, rollback, or prune operation, so concurrent operators cannot
     race a switch or cleanup.
+11. `--if-advanced` resolves and classifies the ref while holding that same
+    lock. Equal commits emit a content-addressed no-op receipt. Only a strict
+    descendant can cut; behind, diverged, or unresolvable ancestry fails closed.
+12. Receipt filenames are the SHA-256 of their canonical JSON payload. Repeated
+    polls in identical state reuse the same immutable receipt.
 
 ## Rollback
 
@@ -127,6 +172,8 @@ which is not on a non-interactive ssh PATH — the script extends PATH itself.
 ```
 
 Repoints `runtime-current` to the release recorded in `releases/.previous`,
-restarts both services, and re-verifies. No build. If the rollback restart does
-not verify **both** gateway and dashboard health it exits non-zero and asks for
-manual intervention rather than looping.
+atomically restores that release's governed refresh source (or the staged
+pre-vendor bytes for the bootstrap cut), restores the managed CLI, restarts both
+services, and re-verifies. No build. If restoration or either service does not
+verify healthy it exits non-zero and asks for manual intervention rather than
+looping.

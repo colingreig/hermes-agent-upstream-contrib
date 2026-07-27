@@ -113,6 +113,12 @@ under `pr_pipeline/`. Do not compare or copy those files one at a time.
 
 ## Files
 
+- `clickup_workspace_refresh.py` — canonical source for the Mini's protected
+  `~/.hermes/scripts/clickup_workspace_refresh.py`. Unlike legacy manual-copy
+  entries, this file is installed by `scripts/mini-release-cut.sh`: source and
+  deployed SHA-256 values are recorded in a content-addressed release receipt,
+  and rollback atomically restores the prior release's source or the staged
+  pre-vendor bytes.
 - `op_sdk_resolve.py` — resolves `op://` secret references for
   `gateway_secrets_wrap.sh` and cron/sentinel scripts. **Connect-first since
   2026-07-24**: prefers a locally-run 1Password Connect server (see

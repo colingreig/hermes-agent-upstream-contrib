@@ -23,16 +23,22 @@ expect_failure() {
 }
 
 mkdir -p "$TEST_ROOT/home/.hermes/releases"
+HERMES_HOME="$(cd -P "$TEST_ROOT/home/.hermes" && pwd -P)"
 # shellcheck disable=SC1090 # SCRIPT is calculated from this test's location.
-HERMES_HOME="$TEST_ROOT/home/.hermes" MINI_RELEASE_CUT_TEST_LIB=1 source "$SCRIPT"
+MINI_RELEASE_CUT_TEST_LIB=1 source "$SCRIPT"
 
 RELEASES_DIR="$(canonical_existing_dir "$TEST_ROOT/home/.hermes/releases")"
 PREV_FILE="$RELEASES_DIR/.previous"
 CUT_LOCK_DIR="$RELEASES_DIR/.mini-release-cut.lock"
+LAST_RECEIPT_FILE="$RELEASES_DIR/.mini-release-last-receipt.json"
+REFRESH_BACKUP_FILE="$RELEASES_DIR/.clickup_workspace_refresh.previous"
 LOCAL_BIN_DIR="$TEST_ROOT/home/.local/bin"
 CLICKUP_CLI_PATH_DIR="$TEST_ROOT/home/homebrew-bin"
 # shellcheck disable=SC2034 # referenced by helpers sourced from SCRIPT.
 DRY_RUN=0
+mkdir -p "$HERMES_HOME/scripts"
+printf '#!/usr/bin/env python3\nprint("old")\n' > "$DEPLOYED_REFRESH"
+chmod 0755 "$DEPLOYED_REFRESH"
 
 # The managed ClickUp wrapper is installed atomically, is executable, and a
 # later cut repairs a stale or missing command with the release-owned source.
@@ -83,10 +89,75 @@ expect_failure acquire_cut_lock
 release_cut_lock
 [ ! -e "$CUT_LOCK_DIR" ] || fail "release-cut lock was not removed"
 
+# Conditional polling accepts equality as a no-op, accepts only a strict
+# descendant as an advance, and distinguishes behind/diverged rejection.
+classify_fixture() {
+  local active="$1" target="$2" mode="$3"
+  (
+    # shellcheck disable=SC2329 # invoked indirectly by classify_ref_advancement.
+    git_current() {
+      [ "${1:-}" = merge-base ] || return 2
+      [ "${2:-}" = --is-ancestor ] || return 2
+      case "$mode:${3:-}:${4:-}" in
+        advance:active:target|behind:target:active) return 0 ;;
+        *) return 1 ;;
+      esac
+    }
+    classify_ref_advancement "$active" "$target"
+  )
+}
+[ "$(classify_fixture same same equal)" = equal ] || fail "equal commits were not a no-op"
+[ "$(classify_fixture active target advance)" = advance ] || fail "strict descendant was not accepted"
+[ "$(classify_fixture active target behind)" = behind ] || fail "behind ref was not rejected distinctly"
+[ "$(classify_fixture active target diverged)" = diverged ] || fail "diverged ref was not rejected distinctly"
+
+# Receipts are deterministic and content-addressed: repeating the same no-op
+# state reuses one immutable payload and updates the stable last pointer.
+# shellcheck disable=SC2034 # consumed by write_release_receipt from sourced script.
+REF="prod-live-patches"
+SOURCE_HASH="1111111111111111111111111111111111111111111111111111111111111111"
+DEPLOYED_HASH="2222222222222222222222222222222222222222222222222222222222222222"
+write_release_receipt noop aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa "$RELEASES_DIR/v1" "$SOURCE_HASH" "$DEPLOYED_HASH" \
+  "resolved ref already active" >/dev/null
+first_receipt="$(find "$RELEASES_DIR" -maxdepth 1 -type f -name '.mini-release-receipt-*.json' -print)"
+[ -n "$first_receipt" ] || fail "content-addressed receipt was not created"
+receipt_count_before="$(find "$RELEASES_DIR" -maxdepth 1 -type f -name '.mini-release-receipt-*.json' | wc -l | tr -d ' ')"
+write_release_receipt noop aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa "$RELEASES_DIR/v1" "$SOURCE_HASH" "$DEPLOYED_HASH" \
+  "resolved ref already active" >/dev/null
+receipt_count_after="$(find "$RELEASES_DIR" -maxdepth 1 -type f -name '.mini-release-receipt-*.json' | wc -l | tr -d ' ')"
+[ "$receipt_count_before" = "$receipt_count_after" ] || fail "idempotent no-op created duplicate receipts"
+receipt_name_hash="${first_receipt##*.mini-release-receipt-}"
+receipt_name_hash="${receipt_name_hash%.json}"
+[ "$(sha256_file "$first_receipt")" = "$receipt_name_hash" ] \
+  || fail "receipt filename is not its content SHA-256"
+cmp -s "$first_receipt" "$LAST_RECEIPT_FILE" || fail "stable receipt pointer differs from addressed receipt"
+
+# Governed refresh deployment stages the old exact bytes, atomically installs
+# the release source, and can restore bootstrap-era bytes when the old release
+# predates vendoring.
+GOVERNED_RELEASE="$RELEASES_DIR/v1.0.0-governed"
+mkdir -p "$GOVERNED_RELEASE/$(dirname "$VENDORED_REFRESH_REL")"
+printf '#!/usr/bin/env python3\nprint("new")\n' > "$GOVERNED_RELEASE/$VENDORED_REFRESH_REL"
+stage_refresh_backup
+old_refresh_hash="$(sha256_file "$REFRESH_BACKUP_FILE")"
+install_governed_refresh "$GOVERNED_RELEASE" >/dev/null
+[ "$(sha256_file "$DEPLOYED_REFRESH")" = "$(sha256_file "$GOVERNED_RELEASE/$VENDORED_REFRESH_REL")" ] \
+  || fail "governed refresh install did not match release source"
+EMPTY_OLD_RELEASE="$RELEASES_DIR/v0.9.0-pre-vendor"
+mkdir "$EMPTY_OLD_RELEASE"
+restore_governed_refresh_for_release "$EMPTY_OLD_RELEASE" >/dev/null
+[ "$(sha256_file "$DEPLOYED_REFRESH")" = "$old_refresh_hash" ] \
+  || fail "governed refresh rollback did not restore staged pre-vendor bytes"
+
 # A rollback whose gateway is healthy but dashboard remains unhealthy must
 # terminate nonzero; a warning-only rollback would make this subshell succeed.
 PREVIOUS_RELEASE="$RELEASES_DIR/v1.2.3-123456789abc"
-mkdir "$PREVIOUS_RELEASE"
+mkdir -p "$PREVIOUS_RELEASE/scripts" "$PREVIOUS_RELEASE/$(dirname "$VENDORED_REFRESH_REL")"
+printf '#!/usr/bin/env bash\nprintf previous\n' > "$PREVIOUS_RELEASE/scripts/cu-clickup"
+chmod 0755 "$PREVIOUS_RELEASE/scripts/cu-clickup"
+printf '#!/usr/bin/env python3\nprint("previous")\n' > "$PREVIOUS_RELEASE/$VENDORED_REFRESH_REL"
 printf '%s\n' "$PREVIOUS_RELEASE" > "$PREV_FILE"
 if (
   # shellcheck disable=SC2329 # invoked indirectly by rollback_to_previous.
@@ -130,5 +201,139 @@ for failed_service in gateway dashboard; do
   [ "$(readlink "$CURRENT_LINK")" = "$PREVIOUS_RELEASE" ] \
     || fail "$failed_service kickstart failure left runtime-current on the new release"
 done
+
+# Receipt path validation failures occur after the runtime and governed script
+# have switched. They must return through the caller's rollback branch rather
+# than exiting from a nested path assertion and leaving the new release live.
+repoint_symlink "$NEW_RELEASE" >/dev/null
+printf '#!/usr/bin/env python3\nprint("new live")\n' > "$DEPLOYED_REFRESH"
+RECEIPT_OUTSIDE="$TEST_ROOT/receipt-outside"
+printf 'must remain untouched\n' > "$RECEIPT_OUTSIDE"
+rm -f "$LAST_RECEIPT_FILE"
+ln -s "$RECEIPT_OUTSIDE" "$LAST_RECEIPT_FILE"
+if (
+  # shellcheck disable=SC2329 # invoked indirectly by rollback_to_previous.
+  kickstart() { :; }
+  # shellcheck disable=SC2329 # invoked indirectly by rollback_to_previous.
+  verify_gateway() { return 0; }
+  # shellcheck disable=SC2329 # invoked indirectly by rollback_to_previous.
+  verify_dashboard() { return 0; }
+  # Keep this regression focused on runtime/refresh restoration.
+  # shellcheck disable=SC2329 # invoked indirectly by rollback_to_previous.
+  install_clickup_cli() { :; }
+  record_cut_receipt_or_rollback advanced \
+    aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+    bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+    "$NEW_RELEASE" "$SOURCE_HASH" "$DEPLOYED_HASH" \
+    "post-switch receipt validation regression"
+) >/dev/null 2>&1; then
+  fail "receipt symlink failure returned success after rollback"
+fi
+[ "$(readlink "$CURRENT_LINK")" = "$PREVIOUS_RELEASE" ] \
+  || fail "receipt symlink failure left runtime-current on the new release"
+[ "$(sha256_file "$DEPLOYED_REFRESH")" = "$(sha256_file "$PREVIOUS_RELEASE/$VENDORED_REFRESH_REL")" ] \
+  || fail "receipt symlink failure did not restore previous governed refresh bytes"
+[ "$(cat "$RECEIPT_OUTSIDE")" = "must remain untouched" ] \
+  || fail "receipt symlink failure modified the symlink target"
+rm "$LAST_RECEIPT_FILE"
+
+# Polling artifacts are source-controlled, point only at the conditional
+# release mode, and the plist is parseable without requiring launchd.
+POLL_WRAPPER="$SCRIPT_DIR/../../scripts/mini-release-poll.sh"
+POLL_INSTALLER="$SCRIPT_DIR/../../scripts/install-mini-release-poller.sh"
+POLL_PLIST="$SCRIPT_DIR/../../scripts/launchd/com.colingreig.hermes.release-poll.plist"
+grep -Fq -- '--if-advanced' "$POLL_WRAPPER" || fail "poll wrapper does not require conditional mode"
+grep -Fq -- '--preflight' "$POLL_INSTALLER" || fail "poll installer has no fail-closed preflight"
+python3 - "$POLL_PLIST" <<'PY' || fail "release poll plist is not parseable"
+import plistlib
+import sys
+from pathlib import Path
+
+payload = plistlib.loads(Path(sys.argv[1]).read_bytes())
+assert payload["Label"] == "com.colingreig.hermes.release-poll"
+assert payload["StartInterval"] == 900
+assert payload["ProgramArguments"][-1].endswith("/runtime-current/scripts/mini-release-poll.sh")
+assert not payload.get("RunAtLoad", False)
+PY
+
+# Installer preflight must fetch while holding the real release lock. Begin
+# with a stale origin ref equal to HEAD; the fake fetch advances it to a
+# divergent commit. A dry-run-style preflight would incorrectly install,
+# while the real preflight must reject and leave LaunchAgents untouched.
+PREFLIGHT_ROOT="$TEST_ROOT/preflight"
+PREFLIGHT_HOME="$PREFLIGHT_ROOT/home"
+PREFLIGHT_HERMES="$PREFLIGHT_HOME/.hermes"
+PREFLIGHT_RELEASE="$PREFLIGHT_HERMES/releases/v1.0.0-active"
+PREFLIGHT_BIN="$PREFLIGHT_ROOT/bin"
+PREFLIGHT_STATE="$PREFLIGHT_ROOT/origin-state"
+PREFLIGHT_MARKER="$PREFLIGHT_ROOT/fetch-held-lock"
+PREFLIGHT_LOG="$PREFLIGHT_ROOT/git.log"
+mkdir -p "$PREFLIGHT_RELEASE/scripts/launchd" "$PREFLIGHT_BIN"
+cp "$SCRIPT" "$PREFLIGHT_RELEASE/scripts/mini-release-cut.sh"
+cp "$POLL_PLIST" \
+  "$PREFLIGHT_RELEASE/scripts/launchd/com.colingreig.hermes.release-poll.plist"
+chmod 0755 "$PREFLIGHT_RELEASE/scripts/mini-release-cut.sh"
+ln -s "$PREFLIGHT_RELEASE" "$PREFLIGHT_HERMES/runtime-current"
+printf '%s\n' aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa > "$PREFLIGHT_STATE"
+cat > "$PREFLIGHT_BIN/git" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "$FAKE_GIT_LOG"
+case " $* " in
+  *" fetch --prune origin "*)
+    [ -d "$FAKE_RELEASES_DIR/.mini-release-cut.lock" ] || exit 90
+    printf 'locked\n' > "$FAKE_FETCH_MARKER"
+    printf '%s\n' "$FAKE_REMOTE_SHA" > "$FAKE_GIT_STATE"
+    exit 0
+    ;;
+esac
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -C|-c) shift 2 ;;
+    *) break ;;
+  esac
+done
+case "${1:-}" in
+  remote)
+    printf 'ssh://example.invalid/hermes-agent.git\n'
+    ;;
+  rev-parse)
+    target="${*: -1}"
+    case "$target" in
+      origin/*) cat "$FAKE_GIT_STATE" ;;
+      HEAD*) printf '%s\n' "$FAKE_ACTIVE_SHA" ;;
+      *) exit 1 ;;
+    esac
+    ;;
+  merge-base)
+    # The fetched remote is divergent from the active commit in both
+    # ancestor directions.
+    exit 1
+    ;;
+  *)
+    exit 2
+    ;;
+esac
+SH
+chmod 0755 "$PREFLIGHT_BIN/git"
+if HOME="$PREFLIGHT_HOME" HERMES_HOME="$PREFLIGHT_HERMES" \
+  PATH="$PREFLIGHT_BIN:$PATH" \
+  FAKE_GIT_LOG="$PREFLIGHT_LOG" \
+  FAKE_GIT_STATE="$PREFLIGHT_STATE" \
+  FAKE_RELEASES_DIR="$PREFLIGHT_HERMES/releases" \
+  FAKE_FETCH_MARKER="$PREFLIGHT_MARKER" \
+  FAKE_ACTIVE_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  FAKE_REMOTE_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+  "$POLL_INSTALLER" --install >/dev/null 2>&1; then
+  fail "installer accepted stale local equality after current remote diverged"
+fi
+[ -f "$PREFLIGHT_MARKER" ] \
+  || fail "installer preflight did not fetch while holding the release lock"
+[ ! -e "$PREFLIGHT_HERMES/releases/.mini-release-cut.lock" ] \
+  || fail "installer preflight left the release lock behind"
+[ ! -e "$PREFLIGHT_HOME/Library/LaunchAgents/com.colingreig.hermes.release-poll.plist" ] \
+  || fail "installer wrote the LaunchAgent after divergent preflight"
+[ ! -e "$PREFLIGHT_HERMES/releases/.mini-release-last-receipt.json" ] \
+  || fail "installer preflight wrote a release receipt"
 
 printf 'mini-release-cut safety checks passed\n'
