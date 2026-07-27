@@ -67,10 +67,14 @@ SLACK_ESCALATION_CHANNEL = os.environ.get("SLACK_ESCALATION_CHANNEL", "slack:her
 SLACK_MENTION = "<@UN4CQ1EGG>"
 
 DRY_RUN = bool(os.environ.get("DRY_RUN"))
-# Trust-boundary bootstrap: this canonical PR-pipeline snapshot is deployed
-# shadow-only.  Merge execution remains unavailable until a later reviewed
-# activation replaces this hard gate; an inherited environment cannot opt in.
-VALIDATE_SHADOW = True
+# Activation switch (Task: autonomous-merge activation). Default is ACTIVATED
+# (False, not shadow) unless HERMES_MERGE_SHADOW is explicitly truthy — the
+# SAME env-derived helper autonomous_merge._shadow(), merge_guard._shadow(),
+# and the verdict writer's "shadow" stamp all call
+# (validator_verdict.merge_shadow_active()), so none of them can disagree
+# about which mode the pipeline is in. Read once at import time: this module
+# runs as a fresh process per invocation, same as the DRY_RUN pattern above.
+VALIDATE_SHADOW = validator_verdict.merge_shadow_active()
 
 # ---------------------------------------------------------------------------
 # Pure logic — importable, side-effect-free

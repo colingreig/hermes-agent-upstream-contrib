@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import sys
 import tempfile
@@ -167,12 +168,16 @@ class RuntimeWiringTests(unittest.TestCase):
             self.assertTrue(ledger.exists())
             self.assertEqual(retired_json.read_text(), legacy_payload)
 
-            # The production merge sweep is a real MergeActor caller, but its
-            # hard shadow kill switch prevents every privileged dependency and
-            # every live merge while Task 3 has not activated ownership.
-            action, detail = autonomous_merge.evaluate(
-                "acme/widget", 7, stored, {"acme/widget"}
-            )
+            # The production merge sweep is a real MergeActor caller. Force
+            # HERMES_MERGE_SHADOW=1 for this assertion regardless of the
+            # ambient environment (autonomous-merge activation made _shadow()
+            # env-derived and default-activated) so this proof of the fenced
+            # MergeActor plan stays deterministic: the shadow kill switch
+            # prevents every privileged dependency and every live merge.
+            with mock.patch.dict(os.environ, {"HERMES_MERGE_SHADOW": "1"}):
+                action, detail = autonomous_merge.evaluate(
+                    "acme/widget", 7, stored, {"acme/widget"}
+                )
             self.assertEqual(action, "skip")
             self.assertIn("fenced MergeActor plan", detail)
 

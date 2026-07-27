@@ -70,6 +70,30 @@ DEFAULT_MAX_AGE_H = 24
 _LEASE_TTL_S = 15 * 60
 _STATUS_PROVIDER_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:@/-]{0,240}$")
 
+# --- shared merge-shadow activation switch (Task: autonomous-merge activation) -
+#
+# Single source of truth for "is the PR-merge pipeline still in shadow
+# (observe-only) mode, or has it been activated?". Every merge gate
+# (autonomous_merge._shadow(), merge_guard._shadow(),
+# hermes_validate_ops.VALIDATE_SHADOW) AND the verdict writer below
+# (``finalize_shadow_review`` / ``_validate_record``'s ``shadow`` stamp) call
+# this ONE function so they can never disagree about which mode is active.
+#
+# Default is ACTIVATED (returns False, i.e. NOT shadow). Set
+# HERMES_MERGE_SHADOW to a truthy value ({1,true,yes,on}, case-insensitive) to
+# force shadow back on (e.g. an emergency freeze) without touching code.
+_MERGE_SHADOW_ENV = "HERMES_MERGE_SHADOW"
+_MERGE_SHADOW_TRUTHY = {"1", "true", "yes", "on"}
+
+
+def merge_shadow_active(env: Mapping[str, str] | None = None) -> bool:
+    """Return True iff the PR-merge pipeline must stay in shadow (observe-only)
+    mode. Default-activated: False unless HERMES_MERGE_SHADOW is explicitly
+    truthy. Every merge gate and the verdict writer must call this function
+    (not re-implement the env parsing) so they cannot drift apart."""
+    source = env if env is not None else os.environ
+    return (source.get(_MERGE_SHADOW_ENV, "") or "").strip().lower() in _MERGE_SHADOW_TRUTHY
+
 
 class VerdictStoreError(RuntimeError):
     """The authoritative verdict boundary could not safely complete."""
@@ -155,9 +179,14 @@ def _validate_record(identity: TrustedMergeIdentity, record: Mapping[str, Any]) 
     cleaned["pr"] = identity.pr_number
     cleaned["head_sha"] = identity.head_sha
     cleaned["expected_repo"] = identity.canonical_repo
-    # This deployment performs observation only.  A future activation must be a
-    # reviewed change that supplies a non-shadow trusted executor.
-    cleaned["shadow"] = True
+    # "shadow" is stamped exclusively by finalize_shadow_review() at WRITE time
+    # (from merge_shadow_active()), never inferred here or trusted from an
+    # arbitrary caller. This function also reconstructs ALREADY-FINALIZED
+    # records on READ (see _finalization_record) — an immutable terminal
+    # verdict's historical shadow value must not be recomputed against
+    # today's env, only validated as the explicit boolean it was written with.
+    if not isinstance(cleaned.get("shadow"), bool):
+        raise VerdictStoreError("verdict record must carry an explicit boolean 'shadow' flag")
     return cleaned
 
 
@@ -273,7 +302,15 @@ def finalize_shadow_review(session: ShadowReviewSession, record: Mapping[str, An
         return existing, True
     if session.lease is None:
         raise VerdictStoreError("shadow review session has no live fencing lease")
-    cleaned = _validate_record(session.identity, record)
+    # Single source of truth: stamp "shadow" from the SAME env-derived switch
+    # every merge gate reads, discarding whatever the caller supplied. A new
+    # terminal verdict's shadow state must always match the pipeline's CURRENT
+    # activation mode at the moment it is finalized — never a caller's guess,
+    # and never recomputed later (it becomes immutable the instant it is
+    # written; see _validate_record's read-path note above).
+    stamped = dict(record)
+    stamped["shadow"] = merge_shadow_active()
+    cleaned = _validate_record(session.identity, stamped)
     evidence = {
         "record": cleaned,
         "review_runner": {"mode": "shadow", "executed_pr_code": False},
@@ -576,6 +613,9 @@ def cmd_write(args: argparse.Namespace) -> int:
             "expected_repo": args.expected_repo or identity.canonical_repo,
             "model_used": args.model,
             "findings": json.loads(Path(args.findings).read_text(encoding="utf-8")) if args.findings else [],
+            # Overwritten by finalize_shadow_review() from merge_shadow_active();
+            # this placeholder is never trusted, only present so the dict has a
+            # deterministic shape before the writer stamps it.
             "shadow": True,
             "ts": _now_iso(),
         }

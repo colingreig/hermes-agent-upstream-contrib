@@ -104,11 +104,13 @@ def _env_truthy(name):
 
 
 def _shadow():
-    # Trust-boundary bootstrap: this vendored deployment is intentionally
-    # observation-only.  An environment typo or a cron's inherited environment
-    # must never turn a source-reconciliation deploy into a merge actor.
-    # Graduating out of shadow is a separate, explicitly reviewed change.
-    return True
+    # Activation switch (Task: autonomous-merge activation). Default is
+    # ACTIVATED (not shadow) unless HERMES_MERGE_SHADOW is explicitly truthy —
+    # a single env-derived helper shared with merge_guard._shadow(),
+    # hermes_validate_ops.VALIDATE_SHADOW, and the verdict writer's "shadow"
+    # stamp (validator_verdict.merge_shadow_active()) so all four can never
+    # disagree about which mode the pipeline is in.
+    return validator_verdict.merge_shadow_active()
 
 
 def _tier_autonomy_enabled(tier):

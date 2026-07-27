@@ -161,11 +161,15 @@ def _is_merge_command(cmd):
 
 
 def _shadow():
-    # The vendored trust-boundary snapshot is shadow-only.  Preserve this
-    # mechanical block even when a caller injects VALIDATE_SHADOW=false or an
-    # autonomous-merge flag.  Live merge activation is deliberately outside
-    # the reconciler's deployment surface.
-    return True
+    # Activation switch (Task: autonomous-merge activation). Default is
+    # ACTIVATED (not shadow) unless HERMES_MERGE_SHADOW is explicitly truthy —
+    # the SAME env-derived helper autonomous_merge._shadow(),
+    # hermes_validate_ops.VALIDATE_SHADOW, and the verdict writer's "shadow"
+    # stamp all call, so none of them can disagree about which mode the
+    # pipeline is in. When this returns False, control falls through to
+    # _verdict_gate() below, which still refuses the merge unless a fresh
+    # non-shadow PASS verdict exists for the exact PR head.
+    return validator_verdict.merge_shadow_active()
 
 
 def _tier_autonomy_enabled(tier):

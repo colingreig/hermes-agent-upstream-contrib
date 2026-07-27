@@ -191,8 +191,14 @@ def _run_behavioral_proofs(scripts_dir: Path) -> None:
         if shadow_review.status != "shadow":
             raise VerificationError("review runner executes without explicit authorization")
         shadow_merge = MergeActor(object(), lambda *_args: False).merge(candidate, execute=False)
-        if shadow_merge.status != "shadow" or not autonomous_merge._shadow():
+        if shadow_merge.status != "shadow":
             raise VerificationError("a deployed merge surface can escape shadow mode")
+        # autonomous_merge._shadow() is now the env-derived, default-activated
+        # switch (HERMES_MERGE_SHADOW) shared with merge_guard and
+        # hermes_validate_ops — it is no longer a permanent True, so it is not
+        # asserted here. MergeActor.merge(execute=False) above is still the
+        # structural proof that this deployed payload cannot mutate anything
+        # without an explicit, reviewed execute=True caller.
     finally:
         try:
             sys.path.remove(str(scripts_dir))
