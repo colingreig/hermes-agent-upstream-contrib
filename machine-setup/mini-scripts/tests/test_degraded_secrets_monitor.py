@@ -7,6 +7,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import plistlib
 import subprocess
 import sys
 import tempfile
@@ -15,6 +16,11 @@ import unittest
 
 SOURCE = Path(__file__).resolve().parent.parent / "degraded_secrets_monitor.py"
 SCRIPT_DIR = SOURCE.parent
+LAUNCHD_PLIST = (
+    SCRIPT_DIR
+    / "launchd"
+    / "com.colingreig.hermes.degraded-secrets-monitor.plist"
+)
 SPEC = importlib.util.spec_from_file_location(
     "degraded_secrets_monitor_under_test", SOURCE
 )
@@ -333,6 +339,47 @@ class DegradedSecretsMonitorCredentialPoolTests(unittest.TestCase):
         self.assertIn("[degraded-secrets-monitor] healthy", result.stdout)
         self.assertIn("[degraded-secrets-monitor] recovered", result.stdout)
         self.assertIsNone(state["last_alert_signature"])
+
+
+class DegradedSecretsMonitorLaunchdContractTests(unittest.TestCase):
+    def test_launchagent_contract_targets_live_monitor_and_alert_destinations(self):
+        payload = plistlib.loads(LAUNCHD_PLIST.read_bytes())
+
+        self.assertEqual(
+            payload["Label"],
+            "com.colingreig.hermes.degraded-secrets-monitor",
+        )
+        self.assertEqual(
+            payload["ProgramArguments"],
+            [
+                "/usr/bin/python3",
+                "/Users/colingreig/.hermes/scripts/degraded_secrets_monitor.py",
+                "--alert",
+            ],
+        )
+        self.assertEqual(payload["StartInterval"], 300)
+        self.assertTrue(payload["RunAtLoad"])
+
+        env = payload["EnvironmentVariables"]
+        self.assertEqual(env["HOME"], "/Users/colingreig")
+        self.assertEqual(env["HERMES_HOME"], "/Users/colingreig/.hermes")
+        self.assertEqual(env["DEGRADED_SECRETS_ALERT_TASK_ID"], "86e2610g8")
+        self.assertEqual(env["DEGRADED_SECRETS_ALERT_SLACK"], "slack:D0BA2PM9CFM")
+        self.assertIn("/Users/colingreig/.local/bin", env["PATH"].split(":"))
+        self.assertIn("/usr/bin", env["PATH"].split(":"))
+
+        self.assertEqual(
+            payload["StandardOutPath"],
+            "/Users/colingreig/.hermes/logs/degraded-secrets-monitor.launchd.log",
+        )
+        self.assertEqual(
+            payload["StandardErrorPath"],
+            "/Users/colingreig/.hermes/logs/degraded-secrets-monitor.launchd.error.log",
+        )
+        self.assertNotIn("KeepAlive", payload)
+        serialized = LAUNCHD_PLIST.read_text(encoding="utf-8")
+        self.assertNotIn("CLICKUP_API_TOKEN", serialized)
+        self.assertNotIn("op://", serialized)
 
 
 if __name__ == "__main__":
