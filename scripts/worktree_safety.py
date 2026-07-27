@@ -131,15 +131,29 @@ def content_landed(path: Path) -> bool:
     design: any error, ambiguity, or missing default ref returns False (worktree survives).
     A false "not landed" is fine; a false "landed" is forbidden."""
     # Best-effort refresh so a stale local `origin/HEAD`/`origin/main` doesn't cause a false
-    # NOT-landed for something that merged since the last fetch. Never let failure here be
-    # fatal, and never let it flip a result toward "landed" — worst case it's a no-op.
-    _git(["fetch", "origin", "--quiet"], path, timeout=60)
+    # NOT-landed for something that merged since the last fetch. The fetch commands remain
+    # non-throwing via _git(), but a failed refresh means local refs may be stale enough to
+    # create a false "landed" through ancestry or tree equality, so fail closed.
+    origin_fetch = _git(["fetch", "origin", "--quiet"], path, timeout=60)
+    if origin_fetch is None or origin_fetch.returncode != 0:
+        return False
+    remotes_proc = _git(["remote"], path)
+    if (
+        remotes_proc is not None
+        and remotes_proc.returncode == 0
+        and "fork" in remotes_proc.stdout.split()
+    ):
+        fork_fetch = _git(["fetch", "fork", "--quiet"], path, timeout=60)
+        if fork_fetch is None or fork_fetch.returncode != 0:
+            return False
 
     ref = default_ref(path)
     if not ref:
         return False
 
     # (a) Normal (non-squash) merge: HEAD is already an ancestor of the default branch.
+    # Shallow clones may not contain enough ancestry for this check; when git cannot prove
+    # ancestry, conservatively fall through to the existing squash/tree-equality path.
     proc = _git(["merge-base", "--is-ancestor", "HEAD", ref], path)
     if proc is not None and proc.returncode == 0:
         return True
