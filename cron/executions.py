@@ -527,9 +527,10 @@ def apply_historical_execution_reconciliation(
     one immediate transaction and compared byte-for-byte with the manifest
     before any update occurs.
     """
+    canonical_manifest_hash = str(manifest_hash).strip().lower()
     _validate_historical_manifest(
         manifest,
-        manifest_hash=manifest_hash,
+        manifest_hash=canonical_manifest_hash,
         database_snapshot_sha256=database_snapshot_sha256,
         runtime_release=runtime_release,
         runtime_commit=runtime_commit,
@@ -538,7 +539,7 @@ def apply_historical_execution_reconciliation(
     originals = {entry["execution_id"]: entry["original"] for entry in entries}
     error = (
         "Historical legacy-unfenced execution reconciled from reviewed manifest "
-        f"{manifest_hash}; the recorded owner PID was absent at apply time."
+        f"{canonical_manifest_hash}; the recorded owner PID was absent at apply time."
     )
 
     with _lock:
@@ -592,7 +593,7 @@ def apply_historical_execution_reconciliation(
             if already_reconciled:
                 conn.commit()
                 return {
-                    "manifest_hash": manifest_hash,
+                    "manifest_hash": canonical_manifest_hash,
                     "mutated": 0,
                     "already_reconciled": len(already_reconciled),
                     "entries": [
@@ -645,7 +646,7 @@ def apply_historical_execution_reconciliation(
             ).fetchall()
             final_by_id = {row["id"]: row for row in final_rows}
             return {
-                "manifest_hash": manifest_hash,
+                "manifest_hash": canonical_manifest_hash,
                 "mutated": changed,
                 "already_reconciled": 0,
                 "entries": [

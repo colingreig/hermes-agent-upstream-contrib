@@ -462,10 +462,12 @@ def _historical_manifest(executions):
     )
 
 
-def _apply_historical_manifest(executions, manifest):
+def _apply_historical_manifest(executions, manifest, *, manifest_hash=None):
     return executions.apply_historical_execution_reconciliation(
         manifest,
-        manifest_hash=manifest["content_hash"],
+        manifest_hash=(
+            manifest["content_hash"] if manifest_hash is None else manifest_hash
+        ),
         database_snapshot_sha256="a" * 64,
         runtime_release="mini-release-20260727",
         runtime_commit="1" * 40,
@@ -631,7 +633,7 @@ def test_historical_apply_rolls_back_all_rows_on_update_failure(
     assert all(row["terminal_at"] is None for row in approved)
 
 
-def test_historical_apply_is_atomic_idempotent_and_preserves_outside_rows(
+def test_historical_apply_is_atomic_idempotent_across_hash_case_and_preserves_outside_rows(
     monkeypatch, tmp_path,
 ):
     executions = _point_ledger(monkeypatch, tmp_path)
@@ -639,7 +641,11 @@ def test_historical_apply_is_atomic_idempotent_and_preserves_outside_rows(
     monkeypatch.setattr("gateway.status._pid_exists", lambda _pid: False)
     manifest = _historical_manifest(executions)
 
-    first = _apply_historical_manifest(executions, manifest)
+    first = _apply_historical_manifest(
+        executions,
+        manifest,
+        manifest_hash=manifest["content_hash"].upper(),
+    )
     after_first = {
         row["id"]: row for row in executions.list_executions(limit=100)
     }
@@ -650,6 +656,7 @@ def test_historical_apply_is_atomic_idempotent_and_preserves_outside_rows(
 
     assert first["mutated"] == 6
     assert first["already_reconciled"] == 0
+    assert first["manifest_hash"] == manifest["content_hash"]
     assert second["mutated"] == 0
     assert second["already_reconciled"] == 6
     assert second["entries"] == first["entries"]
