@@ -60,7 +60,7 @@ What a cut does (see `scripts/MINI-RELEASE.md` for the authoritative detail):
    `hermes_cli/web_dist/index.html` present.
 3. **Atomic symlink flip** of `runtime-current` (`ln -sfn` temp + `mv -fh`), recording
    the prior target to `releases/.previous`.
-4. **Gateway restart + verify** (up to 60s): process running from the new release
+4. **Gateway restart + verify** (up to 240s): process running from the new release
    path, `Gateway running with N platform(s)` (N ≥ 2), `:8642` listening, then the
    dashboard `:9119` returns HTTP 200.
 5. On **any** verification failure: **automatic rollback** to `releases/.previous` and
