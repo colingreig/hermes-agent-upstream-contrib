@@ -499,7 +499,7 @@ fi
 hdr "6b. ignite-marketplace sync cron (launchd plist loaded)"
 MKT_PLIST="$HOME/Library/LaunchAgents/com.colingreig.ignite-marketplace-sync.plist"
 MKT_WRAPPER="$HOME/.hermes/scripts/ignite-marketplace-sync.sh"
-MKT_REPO="$HOME/Projects/ignite-marketplace"
+MKT_REPO="/Users/colingreig/dev/ignite-marketplace"
 if [ ! -f "$MKT_PLIST" ]; then
   red "MISSING plist: $MKT_PLIST"; FAIL=1
 else
@@ -618,101 +618,92 @@ else
 fi
 
 
-# --- 6d. Skills pull freshness check ----------------------------------------
-# Each monitored source gets its own freshness budget. Do NOT let one busy
-# source or one shared audit file mask a stale sibling.
-#
-# NOTE: This is a passive CHECK, not an auto-pull. The actual pulls are handled by:
-#   - com.colingreig.ignite-skills-pull (launchd) for ignite-skills-live (3-hourly)
-#   - com.colingreig.pull_anthropic_skills (launchd) for anthropic-agent-skills (daily)
+# --- 6d. Skills pull launchd + UTC evidence freshness ------------------------
+# The governed reconciler owns both jobs and their machine-readable success
+# evidence. A log line alone is not proof because append-only logs can survive a
+# broken or replaced job.
+for spec in \
+  "com.colingreig.ignite-skills-pull|ignite-skills-pull.sh" \
+  "com.colingreig.pull_anthropic_skills|pull_anthropic_agent_skills.sh"; do
+  label=${spec%%|*}
+  wrapper=${spec#*|}
+  plist="$HOME/Library/LaunchAgents/$label.plist"
+  if [ ! -f "$plist" ]; then
+    red "MISSING governed skill-pull plist: $plist"; FAIL=1
+  elif ! launchctl print "gui/$UID_NUM/$label" >/dev/null 2>&1; then
+    red "launchd NOT loaded: $label"; FAIL=1
+  else
+    grn "launchd loaded  $label"
+  fi
+  [ -x "$HOME/.hermes/scripts/$wrapper" ] \
+    || { red "wrapper not executable: $HOME/.hermes/scripts/$wrapper"; FAIL=1; }
+done
+if launchctl print "gui/$UID_NUM/com.ignite.skills-sync" >/dev/null 2>&1 \
+   || [ -e "$HOME/Library/LaunchAgents/com.ignite.skills-sync.plist" ]; then
+  red "stale com.ignite.skills-sync wiring is still loaded or installed"; FAIL=1
+else
+  grn "stale com.ignite.skills-sync wiring retired"
+fi
+
 FRESHNESS_STATUS_AND_REPORT=$(python3 - <<'PY'
 from __future__ import annotations
 
-import re
 from datetime import datetime, timezone
+import json
 from pathlib import Path
-
-LOCAL_TZ = datetime.now().astimezone().tzinfo or timezone.utc
 
 sources = [
     {
         "label": "ignite-skills-live",
-        "log_path": Path.home() / ".hermes/logs/ignite-skills-pull.log",
+        "evidence": Path.home() / ".hermes/state/skill-pulls/ignite-skills-live-success.json",
+        "root": "/Users/colingreig/dev/ignite-skills-live",
         "cadence_hours": 3,
-        "markers": (" OK:",),
     },
     {
         "label": "anthropic-agent-skills",
-        "log_path": Path.home() / ".hermes/logs/anthropic-skills-pull.log",
+        "evidence": Path.home() / ".hermes/state/skill-pulls/anthropic-agent-skills-success.json",
+        "root": "/Users/colingreig/.claude/plugins/marketplaces/anthropic-agent-skills",
         "cadence_hours": 24,
-        "markers": ("pull OK",),
     },
 ]
 
-iso_ts = re.compile(r"(?P<ts>\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)")
-local_ts = re.compile(r"(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) [A-Z]{3}\b")
-
-
-def parse_timestamp(line: str) -> datetime | None:
-    match = local_ts.search(line)
-    if match:
-        try:
-            parsed = datetime.strptime(match.group("ts"), "%Y-%m-%d %H:%M:%S")
-        except ValueError:
-            return None
-        return parsed.replace(tzinfo=LOCAL_TZ).astimezone(timezone.utc)
-
-    match = iso_ts.search(line)
-    if match:
-        raw = match.group("ts").replace("Z", "+00:00")
-        try:
-            parsed = datetime.fromisoformat(raw)
-        except ValueError:
-            return None
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
-        return parsed.astimezone(timezone.utc)
-
-    return None
-
-
-stale_lines = []
-missing_lines = []
+problems = []
 now = datetime.now(timezone.utc)
 for source in sources:
-    log_path = source["log_path"]
-    cadence_hours = source["cadence_hours"]
-    markers = source["markers"]
-    last_success = None
-
-    if not log_path.is_file():
-        missing_lines.append(f"{source['label']}: missing log {log_path}")
+    evidence = source["evidence"]
+    if not evidence.is_file() or evidence.is_symlink():
+        problems.append(f"{source['label']}: missing or symlinked evidence {evidence}")
         continue
-
-    with log_path.open(encoding="utf-8", errors="replace") as handle:
-        for raw in handle:
-            if not any(marker in raw for marker in markers):
-                continue
-            ts = parse_timestamp(raw)
-            if ts is None:
-                continue
-            if last_success is None or ts > last_success:
-                last_success = ts
-
-    threshold_hours = cadence_hours * 3
-    if last_success is None:
-        missing_lines.append(f"{source['label']}: no parseable success lines in {log_path}")
+    try:
+        payload = json.loads(evidence.read_text(encoding="utf-8"))
+        if payload.get("schema_version") != 1:
+            raise ValueError("wrong schema")
+        if payload.get("source") != source["label"] or payload.get("root") != source["root"]:
+            raise ValueError("source/root identity mismatch")
+        commit = payload.get("commit")
+        if (
+            not isinstance(commit, str)
+            or len(commit) < 40
+            or any(char not in "0123456789abcdef" for char in commit.lower())
+        ):
+            raise ValueError("missing full commit")
+        raw = payload["completed_at"]
+        if not raw.endswith("Z"):
+            raise ValueError("timestamp is not explicit UTC")
+        last_success = datetime.fromisoformat(raw[:-1] + "+00:00")
+    except Exception as exc:
+        problems.append(f"{source['label']}: invalid evidence {evidence}: {exc}")
         continue
-
+    threshold_hours = source["cadence_hours"] * 3
     hours_since = (now - last_success).total_seconds() / 3600.0
-    if hours_since >= threshold_hours:
-        stale_lines.append(
-            f"{source['label']}: last success {hours_since:.1f} hours ago in {log_path} (threshold: {threshold_hours}h)"
+    if hours_since < 0 or hours_since >= threshold_hours:
+        problems.append(
+            f"{source['label']}: evidence age {hours_since:.1f}h outside 0..{threshold_hours}h"
         )
 
-if stale_lines or missing_lines:
+if problems:
     print("STALE")
-    for line in missing_lines + stale_lines:
+    for line in problems:
         print(line)
 else:
     print("OK")
@@ -721,7 +712,7 @@ PY
   FRESHNESS_STATUS=${FRESHNESS_STATUS_AND_REPORT%%$'\n'*}
   FRESHNESS_REPORT=${FRESHNESS_STATUS_AND_REPORT#*$'\n'}
   if [ "$FRESHNESS_STATUS" = "OK" ]; then
-    grn "Skills pull freshness check passed for all monitored sources"
+    grn "Skills pull UTC evidence is fresh for all monitored sources"
   else
     red "Skills pull freshness check failed"
     if [ -n "$FRESHNESS_REPORT" ]; then
@@ -734,6 +725,48 @@ EOF
     fi
     FAIL=1
   fi
+
+# A fresh pull is not enough if long-lived gateway/dashboard processes still
+# serve an old catalog. Each process acknowledges the governed generation after
+# clearing only future-session/catalog caches; existing AIAgent prompts remain
+# byte-stable.
+CATALOG_GENERATION="$HOME/.hermes/state/skill-pulls/catalog-generation.json"
+for svc in ai.hermes.gateway com.colingreig.hermes-dashboard; do
+  pid=$(launchctl list 2>/dev/null | awk -v s="$svc" '$3==s{print $1}')
+  if [ -z "$pid" ] || [ "$pid" = "-" ]; then
+    red "$svc not running — cannot prove live catalog generation"; FAIL=1
+    continue
+  fi
+  CATALOG_ACK="$HOME/.hermes/state/skill-pulls/catalog-observed/$pid.json"
+  if python3 - "$CATALOG_GENERATION" "$CATALOG_ACK" "$pid" <<'PY' 2>/dev/null
+from datetime import datetime
+import json, sys
+from pathlib import Path
+
+generation_path, ack_path, expected_pid = Path(sys.argv[1]), Path(sys.argv[2]), int(sys.argv[3])
+if any(path.is_symlink() or not path.is_file() for path in (generation_path, ack_path)):
+    raise SystemExit(1)
+generation = json.loads(generation_path.read_text(encoding="utf-8"))
+ack = json.loads(ack_path.read_text(encoding="utf-8"))
+if (
+    generation.get("schema_version") != 1
+    or generation.get("state", "stable") != "stable"
+    or ack.get("schema_version") != 1
+    or ack.get("pid") != expected_pid
+    or ack.get("generation") != generation.get("generation")
+):
+    raise SystemExit(1)
+published = datetime.fromisoformat(generation["published_at"].replace("Z", "+00:00"))
+observed = datetime.fromisoformat(ack["observed_at"].replace("Z", "+00:00"))
+raise SystemExit(0 if observed >= published else 1)
+PY
+  then
+    grn "live catalog generation observed  $svc (pid $pid)"
+  else
+    red "$svc has not observed the current external-skill generation: $CATALOG_ACK"
+    FAIL=1
+  fi
+done
 
 # --- 7. Skills bridge: external_dirs wired to the claude-skills library --------
 # Hermes' own skill set (~/.hermes/skills) does NOT include the document skills
@@ -759,20 +792,19 @@ EOF
 hdr "7. Skills bridge (skills.external_dirs)"
 CONFIG_YAML="$HOME/.hermes/config.yaml"
 SNAPSHOT_JSON="$HOME/.hermes/.skills_prompt_snapshot.json"
-# Floor: known-good external dirs as of 2026-07-04. Shrinking below this floor is
-# always a regression signal even if some other dir was added to compensate.
+# Exact canonical set. Unknown additions are rejected too: scope filtering is
+# keyed by absolute path, so an ungoverned root can bypass the role contract.
 EXPECTED_DIRS=(
   "/Users/colingreig/dev/ignite-skills-live/skills"
-  "/Users/colingreig/dev/ignite-skills-live/ignite-code/skills"
   "/Users/colingreig/dev/ignite-skills-live/ignite-content/skills"
   "/Users/colingreig/.claude/plugins/marketplaces/anthropic-agent-skills/skills"
   "/Users/colingreig/brain/packs/social-hub"
   "/Users/colingreig/brain/packs/local-seo-brain"
   "/Users/colingreig/brain/packs/marketing-brain"
   "/Users/colingreig/brain/packs/website-brain"
-  "/Users/colingreig/.claude/plugins/marketplaces/ignite-marketplace/plugins/claude-ads"
-  "/Users/colingreig/.claude/plugins/marketplaces/ignite-marketplace/plugins/claude-seo"
-  "/Users/colingreig/.claude/plugins/marketplaces/ignite-marketplace/plugins/claude-blog"
+  "/Users/colingreig/dev/ignite-marketplace/plugins/claude-ads"
+  "/Users/colingreig/dev/ignite-marketplace/plugins/claude-seo"
+  "/Users/colingreig/dev/ignite-marketplace/plugins/claude-blog"
 )
 SKILLS_BRIDGE_ALERT=""
 if [ ! -f "$CONFIG_YAML" ]; then
@@ -801,6 +833,16 @@ PY
         red "  -> but the directory does NOT exist on disk: $d"
         FAIL=1
         SKILLS_BRIDGE_ALERT="${SKILLS_BRIDGE_ALERT}- configured but missing on disk: $d\n"
+      elif ! "$REPO/venv/bin/python" - "$d" <<'PY' 2>/dev/null
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+sys.exit(0 if path.resolve(strict=True) == path else 1)
+PY
+      then
+        red "  -> configured root escapes its exact trusted path: $d"
+        FAIL=1
+        SKILLS_BRIDGE_ALERT="${SKILLS_BRIDGE_ALERT}- external root escapes trusted path: $d\n"
       fi
     else
       red "external_dirs MISSING  $d — Hermes can't see the document/ignite skills"
@@ -811,6 +853,24 @@ PY
     fi
   done
 
+  if ! "$REPO/venv/bin/python" - "$CONFIG_YAML" "${EXPECTED_DIRS[@]}" <<'PY' 2>/dev/null
+import json, sys, yaml
+cfg = yaml.safe_load(open(sys.argv[1])) or {}
+raw = (cfg.get("skills") or {}).get("external_dirs") or []
+if isinstance(raw, str):
+    try:
+        raw = json.loads(raw)
+    except Exception:
+        raw = [raw]
+expected = sys.argv[2:]
+sys.exit(0 if raw == expected and len(raw) == len(set(raw)) else 1)
+PY
+  then
+    red "external_dirs is not the exact ordered canonical set (unknown, duplicate, or reordered root)"
+    FAIL=1
+    SKILLS_BRIDGE_ALERT="${SKILLS_BRIDGE_ALERT}- external_dirs differs from exact canonical set\n"
+  fi
+
   # 7b. Live skill index sentinel (NEW, 86e25qd33 item 3): config listing the right
   # dirs is necessary but not sufficient — assert the actual rendered skill index
   # (what prompt_builder.build_skills_system_prompt() serves into prompts, LIVE —
@@ -818,11 +878,16 @@ PY
   # written to the snapshot JSON, so the snapshot file alone can't verify this)
   # still contains representative skills from each external category and hasn't
   # silently shrunk below a sane floor.
-  SNAP_RESULT=$("$REPO/venv/bin/python" - "$SNAPSHOT_JSON" "$REPO" <<'PY' 2>&1
+  SNAP_RESULT=$("$REPO/venv/bin/python" - "$SNAPSHOT_JSON" "$REPO" "$CONFIG_YAML" <<'PY' 2>&1
 import sys, re
 sys.path.insert(0, sys.argv[2])
-SENTINELS = ["blog-write", "docx", "seo-audit", "ignite-blog"]
-FLOOR = 150
+import yaml
+SENTINEL = "blog-write"
+cfg = yaml.safe_load(open(sys.argv[3])) or {}
+FLOOR = (cfg.get("skills") or {}).get("index_floor")
+if not isinstance(FLOOR, int) or FLOOR < 1:
+    print(f"UNREADABLE invalid skills.index_floor: {FLOOR!r}")
+    sys.exit(2)
 try:
     from agent import prompt_builder as pb
     txt = pb.build_skills_system_prompt(available_tools=None, available_toolsets=None)
@@ -830,7 +895,7 @@ except Exception as e:
     print(f"UNREADABLE {e!r}")
     sys.exit(2)
 names = set(re.findall(r'(?m)^\s{4}-\s+([a-z0-9][a-z0-9:_-]+)', txt))
-missing = [s for s in SENTINELS if s.lower() not in txt.lower()]
+missing = [] if SENTINEL in names else [SENTINEL]
 print(f"COUNT {len(names)}")
 print(f"MISSING {','.join(missing)}")
 sys.exit(1 if (missing or len(names) < FLOOR) else 0)
@@ -844,16 +909,60 @@ PY
     FAIL=1
     SKILLS_BRIDGE_ALERT="${SKILLS_BRIDGE_ALERT}- skills snapshot unreadable: $SNAPSHOT_JSON\n"
   elif [ "$snap_rc" -eq 0 ]; then
-    grn "live skill index   $snap_count skill(s) live, all sentinels present (floor 150)"
+    configured_floor=$("$REPO/venv/bin/python" - "$CONFIG_YAML" <<'PY'
+import sys,yaml
+print((yaml.safe_load(open(sys.argv[1])) or {}).get("skills",{}).get("index_floor","invalid"))
+PY
+)
+    grn "live skill index   $snap_count skill(s) live, blog-write present (configured floor $configured_floor)"
   else
-    red "live skill index   REGRESSED — $snap_count skill(s) live (floor 150), missing sentinel(s): ${snap_missing:-none}"
+    red "live skill index   REGRESSED — $snap_count skill(s) live, configured floor/sentinel failed: ${snap_missing:-none}"
     red "  This is the exact failure mode that let 217->29 go unnoticed for days."
     FAIL=1
     SKILLS_BRIDGE_ALERT="${SKILLS_BRIDGE_ALERT}- live skill index regressed: ${snap_count:-0} skills live (floor 150), missing sentinel(s): ${snap_missing:-none}\n"
   fi
 fi
 
-# 7c. Alert loudly on any skills-bridge failure above (item 4, 86e25qd33) — a
+# 7c. The reconciler receipt is the source/deployed manifest authority.
+SKILLS_RECEIPT="$HOME/.hermes/releases/marketplace-skills/last-receipt.json"
+if "$REPO/venv/bin/python" - "$SKILLS_RECEIPT" <<'PY' 2>/dev/null
+import hashlib, json, sys
+from pathlib import Path
+
+receipt = Path(sys.argv[1])
+if not receipt.is_file() or receipt.is_symlink():
+    raise SystemExit(1)
+payload = json.loads(receipt.read_text(encoding="utf-8"))
+files = payload.get("files")
+if payload.get("schema_version") != 1 or not isinstance(files, list) or not files:
+    raise SystemExit(1)
+for item in files:
+    target = Path(item["target"])
+    if not target.is_file() or target.is_symlink():
+        raise SystemExit(1)
+    deployed = hashlib.sha256(target.read_bytes()).hexdigest()
+    if deployed != item.get("deployed_sha256"):
+        raise SystemExit(1)
+    source = item.get("source")
+    if source == "generated-config":
+        source_hash = deployed
+    else:
+        source_path = Path(source)
+        if not source_path.is_file() or source_path.is_symlink():
+            raise SystemExit(1)
+        source_hash = hashlib.sha256(source_path.read_bytes()).hexdigest()
+    if source_hash != item.get("source_sha256"):
+        raise SystemExit(1)
+PY
+then
+  grn "skill deployment manifest source/deployed hashes verified"
+else
+  red "skill deployment manifest missing or source/deployed hash mismatch: $SKILLS_RECEIPT"
+  FAIL=1
+  SKILLS_BRIDGE_ALERT="${SKILLS_BRIDGE_ALERT}- source/deployed skill manifest mismatch\n"
+fi
+
+# 7d. Alert loudly on any skills-bridge failure above (item 4, 86e25qd33) — a
 # non-zero script exit alone is easy to miss; babysit-hermes reads this script's
 # output but a ClickUp comment guarantees the failure surfaces even between
 # babysit-hermes passes. Same task-comment convention as the ignite-marketplace

@@ -9,8 +9,10 @@ import logging
 import os
 import sys
 import threading
+import time
 import contextvars
 from collections import OrderedDict
+from datetime import datetime, timezone
 from pathlib import Path
 
 from hermes_constants import get_hermes_home, get_skills_dir, is_wsl
@@ -1300,6 +1302,12 @@ _SKILLS_PROMPT_CACHE_MAX = 8
 _SKILLS_PROMPT_CACHE: OrderedDict[tuple, str] = OrderedDict()
 _SKILLS_PROMPT_CACHE_LOCK = threading.Lock()
 _SKILLS_SNAPSHOT_VERSION = 1
+_SKILLS_CATALOG_GENERATION_LOCK = threading.Lock()
+_SKILLS_CATALOG_GENERATION: str | None = None
+_SKILLS_CATALOG_OBSERVER_STARTED = False
+_SKILLS_CATALOG_OBSERVER_INTERVAL_SECONDS = 2.0
+_SKILLS_CATALOG_UPDATE_WAIT_SECONDS = 2.0
+_SKILLS_CATALOG_UPDATE_POLL_SECONDS = 0.05
 
 
 def _skills_prompt_snapshot_path() -> Path:
@@ -1315,6 +1323,154 @@ def clear_skills_system_prompt_cache(*, clear_snapshot: bool = False) -> None:
             _skills_prompt_snapshot_path().unlink(missing_ok=True)
         except OSError as e:
             logger.debug("Could not remove skills prompt snapshot: %s", e)
+
+
+def _skills_catalog_generation_path() -> Path:
+    return get_hermes_home() / "state" / "skill-pulls" / "catalog-generation.json"
+
+
+def _read_external_skills_catalog_state() -> tuple[str, str, dict]:
+    """Return ``(state, generation, payload)`` for the governed catalog."""
+    marker = _skills_catalog_generation_path()
+    try:
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        # External skills are optional. A machine without governed pull state
+        # retains the historical unversioned-cache behavior.
+        return "stable", "", {}
+    except Exception:
+        return "invalid", "", {}
+
+    state = payload.get("state", "stable")
+    if state != "stable":
+        if state in {"updating", "failed"}:
+            return state, "", payload
+        return "invalid", "", payload
+    try:
+        generation = payload.get("generation")
+        if (
+            payload.get("schema_version") == 1
+            and isinstance(generation, str)
+            and len(generation) == 64
+            and all(char in "0123456789abcdef" for char in generation)
+        ):
+            return "stable", generation, payload
+    except Exception:
+        pass
+    return "invalid", "", payload
+
+
+def _read_external_skills_generation() -> str | None:
+    """Wait briefly for a stable catalog; return ``None`` when unavailable."""
+    deadline = time.monotonic() + _SKILLS_CATALOG_UPDATE_WAIT_SECONDS
+    while True:
+        state, generation, _payload = _read_external_skills_catalog_state()
+        if state == "stable":
+            return generation
+        if state != "updating" or time.monotonic() >= deadline:
+            return None
+        time.sleep(
+            min(
+                _SKILLS_CATALOG_UPDATE_POLL_SECONDS,
+                max(0.0, deadline - time.monotonic()),
+            )
+        )
+
+
+def _acknowledge_skills_catalog_generation(payload: dict) -> None:
+    generation = payload.get("generation")
+    if not isinstance(generation, str) or len(generation) != 64:
+        return
+    ack = {
+        "schema_version": 1,
+        "pid": os.getpid(),
+        "generation": generation,
+        "source": payload.get("source"),
+        "published_at": payload.get("published_at"),
+        "observed_at": datetime.now(timezone.utc)
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z"),
+    }
+    try:
+        atomic_json_write(
+            get_hermes_home()
+            / "state"
+            / "skill-pulls"
+            / "catalog-observed"
+            / f"{os.getpid()}.json",
+            ack,
+            mode=0o644,
+        )
+    except Exception:
+        logger.debug("Could not acknowledge skills catalog generation", exc_info=True)
+
+
+def observe_external_skills_generation() -> bool:
+    """Invalidate future catalog builds when a governed pull publishes a change.
+
+    Existing ``AIAgent`` instances retain their already-built stable system
+    prompt. Only module caches used by future agent/session and catalog builds
+    are cleared, preserving per-conversation prompt-cache byte stability.
+    """
+    global _SKILLS_CATALOG_GENERATION
+    state, generation, payload = _read_external_skills_catalog_state()
+    if state != "stable" or not generation:
+        with _SKILLS_CATALOG_GENERATION_LOCK:
+            had_stable_generation = _SKILLS_CATALOG_GENERATION is not None
+            _SKILLS_CATALOG_GENERATION = None
+        if had_stable_generation:
+            clear_skills_system_prompt_cache(clear_snapshot=False)
+            try:
+                from tools.skills_tool import clear_skills_discovery_cache
+
+                clear_skills_discovery_cache()
+            except Exception:
+                logger.debug(
+                    "Could not clear skills discovery cache", exc_info=True
+                )
+        return had_stable_generation
+
+    changed = False
+    with _SKILLS_CATALOG_GENERATION_LOCK:
+        previous = _SKILLS_CATALOG_GENERATION
+        if previous != generation:
+            _SKILLS_CATALOG_GENERATION = generation
+            changed = previous is not None
+    if changed:
+        clear_skills_system_prompt_cache(clear_snapshot=False)
+        try:
+            from tools.skills_tool import clear_skills_discovery_cache
+
+            clear_skills_discovery_cache()
+        except Exception:
+            logger.debug("Could not clear skills discovery cache", exc_info=True)
+    _acknowledge_skills_catalog_generation(payload)
+    return changed
+
+
+def start_external_skills_generation_observer() -> None:
+    """Start one daemon observer for governed external-skill generations."""
+    global _SKILLS_CATALOG_OBSERVER_STARTED
+    with _SKILLS_CATALOG_GENERATION_LOCK:
+        if _SKILLS_CATALOG_OBSERVER_STARTED:
+            return
+        _SKILLS_CATALOG_OBSERVER_STARTED = True
+
+    observe_external_skills_generation()
+
+    def _watch() -> None:
+        while True:
+            threading.Event().wait(_SKILLS_CATALOG_OBSERVER_INTERVAL_SECONDS)
+            try:
+                observe_external_skills_generation()
+            except Exception:
+                logger.debug("Skills catalog generation observer failed", exc_info=True)
+
+    threading.Thread(
+        target=_watch,
+        daemon=True,
+        name="skills-catalog-generation-observer",
+    ).start()
 
 
 def _build_skills_manifest(skills_dir: Path) -> dict[str, list[int]]:
@@ -1449,16 +1605,15 @@ def _parse_skill_file(skill_file: Path) -> tuple[bool, dict, str]:
 # same-named dir under a different root can't collide.
 _SKILL_DIR_LABELS: dict[str, str] = {
     "/Users/colingreig/dev/ignite-skills-live/skills": "ops",
-    "/Users/colingreig/dev/ignite-skills-live/ignite-code/skills": "dev",
     "/Users/colingreig/dev/ignite-skills-live/ignite-content/skills": "content",
     "/Users/colingreig/.claude/plugins/marketplaces/anthropic-agent-skills/skills": "general-dev",
     "/Users/colingreig/brain/packs/social-hub": "content",
     "/Users/colingreig/brain/packs/local-seo-brain": "seo",
     "/Users/colingreig/brain/packs/marketing-brain": "seo",
     "/Users/colingreig/brain/packs/website-brain": "seo",
-    "/Users/colingreig/.claude/plugins/marketplaces/ignite-marketplace/plugins/claude-ads": "seo",
-    "/Users/colingreig/.claude/plugins/marketplaces/ignite-marketplace/plugins/claude-seo": "seo",
-    "/Users/colingreig/.claude/plugins/marketplaces/ignite-marketplace/plugins/claude-blog": "content",
+    "/Users/colingreig/dev/ignite-marketplace/plugins/claude-ads": "seo",
+    "/Users/colingreig/dev/ignite-marketplace/plugins/claude-seo": "seo",
+    "/Users/colingreig/dev/ignite-marketplace/plugins/claude-blog": "content",
 }
 
 # Role -> included labels. A role name not present here (including "" / unset)
@@ -1541,6 +1696,8 @@ def build_skills_system_prompt(
     available_tools: "set[str] | None" = None,
     available_toolsets: "set[str] | None" = None,
     compact_categories: "frozenset[str] | None" = None,
+    *,
+    _generation_retry: int = 0,
 ) -> str:
     """Build a compact skill index for the system prompt.
 
@@ -1582,9 +1739,16 @@ def build_skills_system_prompt(
     if _skill_dir_scope is not None:
         external_dirs = [d for d in external_dirs if str(d) in _skill_dir_scope]
     disabled = get_disabled_skill_names(_platform_hint or None)
+    catalog_generation = _read_external_skills_generation()
+    if catalog_generation is None:
+        logger.warning(
+            "External skills catalog is not stable; omitting the skills index"
+        )
+        return ""
     cache_key = (
         str(skills_dir),
         tuple(str(d) for d in external_dirs),
+        catalog_generation,
         tuple(sorted(str(t) for t in (available_tools or set()))),
         tuple(sorted(str(ts) for ts in (available_toolsets or set()))),
         _platform_hint,
@@ -1594,8 +1758,11 @@ def build_skills_system_prompt(
     with _SKILLS_PROMPT_CACHE_LOCK:
         cached = _SKILLS_PROMPT_CACHE.get(cache_key)
         if cached is not None:
-            _SKILLS_PROMPT_CACHE.move_to_end(cache_key)
-            return cached
+            # Do not serve the old generation if a pull published between the
+            # generation read and this cache lookup.
+            if _read_external_skills_generation() == catalog_generation:
+                _SKILLS_PROMPT_CACHE.move_to_end(cache_key)
+                return cached
 
     # ── Layer 2: disk snapshot ────────────────────────────────────────
     snapshot = _load_skills_snapshot(skills_dir)
@@ -1798,6 +1965,24 @@ def build_skills_system_prompt(
             "\n"
             "Only proceed without loading a skill if genuinely none are relevant to the task."
             + hidden_note
+        )
+
+    # A governed pull can replace external skill files while this cold scan is
+    # running. Rebuild against the new generation instead of caching or
+    # returning bytes assembled across that boundary. Existing conversations
+    # are unaffected: they retain the system_prompt persisted with the session.
+    if _read_external_skills_generation() != catalog_generation:
+        if _generation_retry >= 2:
+            logger.warning(
+                "External skills generation changed repeatedly during prompt build; "
+                "omitting the unstable skills index"
+            )
+            return ""
+        return build_skills_system_prompt(
+            available_tools=available_tools,
+            available_toolsets=available_toolsets,
+            compact_categories=compact_categories,
+            _generation_retry=_generation_retry + 1,
         )
 
     # ── Store in LRU cache ────────────────────────────────────────────

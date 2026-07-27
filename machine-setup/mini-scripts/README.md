@@ -120,6 +120,20 @@ under `pr_pipeline/`. Do not compare or copy those files one at a time.
   installed gateway wrapper. Plists point only to wrappers and use
   `KeepAlive.SuccessfulExit=false`: permanent authentication errors exit
   cleanly and park, while transient exhaustion remains nonzero/retryable.
+- `reconcile_marketplace_skills.py` — governed installer for the canonical
+  external-skill roots, `skills.index_floor`, the ignite/Anthropic pull
+  wrappers, and their LaunchAgent plists. It retires only the exact legacy
+  `com.ignite.skills-sync` plist/job, rejects missing or symlink-escaped roots,
+  records source/deployed SHA-256 receipts, and snapshots config plus all owned
+  paths for exact release rollback. Successful pulls write parseable UTC JSON
+  evidence under `~/.hermes/state/skill-pulls/`; the verifier checks both jobs
+  are loaded and each source remains within three scheduled cadences. Pulls
+  fail before fetch/evidence when tracked or untracked prompt-visible content
+  is dirty. Their directory locks carry PID + process-start ownership, reject
+  live contention, and reclaim dead/reboot-stale owners without a permanent
+  mkdir wedge. Changed pulls publish a catalog generation observed by the
+  running gateway/dashboard; those processes clear only future-session and
+  catalog caches, never an existing conversation's byte-stable system prompt.
 - `github_app_token.py` — mints a short-lived GitHub App installation token.
   Both service wrappers invoke it with the absolute runtime Python, require a
   non-empty token, and never log the token or credentials. The gateway inner

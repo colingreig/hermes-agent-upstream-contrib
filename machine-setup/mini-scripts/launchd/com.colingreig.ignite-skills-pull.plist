@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.colingreig.ignite-skills-pull</string>
+  <key>ProgramArguments</key>
+  <array><string>/bin/bash</string><string>/Users/colingreig/.hermes/scripts/ignite-skills-pull.sh</string></array>
+  <key>EnvironmentVariables</key>
+  <dict><key>HERMES_HOME</key><string>/Users/colingreig/.hermes</string><key>PATH</key><string>/Users/colingreig/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string></dict>
+  <key>RunAtLoad</key><true/>
+  <key>StartInterval</key><integer>10800</integer>
+  <key>StandardOutPath</key><string>/Users/colingreig/.hermes/logs/ignite-skills-pull.launchd.log</string>
+  <key>StandardErrorPath</key><string>/Users/colingreig/.hermes/logs/ignite-skills-pull.launchd.error.log</string>
+</dict>
+</plist>

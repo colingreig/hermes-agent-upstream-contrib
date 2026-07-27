@@ -15,7 +15,8 @@
 # persistent runtime state (DBs, config, cron, logs, LaunchAgents). The sole
 # operational-file exceptions are exact-path, hash-verified, rollback-safe
 # deployments of clickup_workspace_refresh.py and the canonical launchd
-# wrappers/plists through reconcile_launchd_environment.py.
+# wrappers/plists through reconcile_launchd_environment.py, plus canonical
+# external-skill config/wrappers/plists through reconcile_marketplace_skills.py.
 #
 # Tracked in ClickUp 86e2ddah5; conditional polling/governed script deployment
 # added under 86e2gdfwc.
@@ -42,6 +43,7 @@ CLICKUP_CLI_NAME="cu-clickup"
 VENDORED_REFRESH_REL="machine-setup/mini-scripts/clickup_workspace_refresh.py"
 DEPLOYED_REFRESH="$HERMES_HOME/scripts/clickup_workspace_refresh.py"
 VENDORED_LAUNCHD_RECONCILER_REL="machine-setup/mini-scripts/reconcile_launchd_environment.py"
+VENDORED_SKILLS_RECONCILER_REL="machine-setup/mini-scripts/reconcile_marketplace_skills.py"
 
 UID_NUM="$(id -u)"
 GUI_DOMAIN="gui/${UID_NUM}"
@@ -72,6 +74,7 @@ DO_PRUNE=0
 OFFLINE=0
 IF_ADVANCED=0
 LAUNCHD_ENV_CHANGED=0
+MARKETPLACE_SKILLS_CHANGED=0
 PREFLIGHT=0
 
 usage() {
@@ -453,6 +456,49 @@ rollback_governed_launchd_environment() {
   LAUNCHD_ENV_CHANGED=0
 }
 
+# Install canonical external-skill roots and pull jobs through an independent
+# transaction. Its snapshot includes config.yaml, the retired legacy plist,
+# deployed assets, and the prior manifest receipt.
+install_governed_marketplace_skills() {
+  local release_dir="${1:-}"
+  local reconciler="$release_dir/$VENDORED_SKILLS_RECONCILER_REL"
+  local source_root
+  source_root="$(dirname "$reconciler")"
+  [ -f "$reconciler" ] && [ ! -L "$reconciler" ] \
+    || { warn "marketplace skills reconciler missing or symlinked: $reconciler"; return 1; }
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '\033[35m[DRY-RUN]\033[0m %s %s install --source-root %s --home %s --hermes-home %s --reload\n' \
+      "$release_dir/venv/bin/python" "$reconciler" "$source_root" "$HOME" "$HERMES_HOME"
+    return 0
+  fi
+  if ! "$release_dir/venv/bin/python" "$reconciler" install \
+    --source-root "$source_root" --home "$HOME" --hermes-home "$HERMES_HOME" --reload; then
+    return 1
+  fi
+  MARKETPLACE_SKILLS_CHANGED=1
+}
+
+rollback_governed_marketplace_skills() {
+  local reason="${1:-automatic}"
+  local reconciler="$HERMES_HOME/scripts/reconcile_marketplace_skills.py"
+  if [ "$MARKETPLACE_SKILLS_CHANGED" -ne 1 ] && [ "$reason" != "explicit --rollback" ]; then
+    return 0
+  fi
+  if [ ! -f "$reconciler" ] || [ -L "$reconciler" ]; then
+    [ "$MARKETPLACE_SKILLS_CHANGED" -eq 1 ] && return 1
+    warn "no governed marketplace-skills snapshot available; leaving pre-contract files unchanged"
+    return 0
+  fi
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '\033[35m[DRY-RUN]\033[0m %s %s rollback --home %s --hermes-home %s --reload\n' \
+      "$CURRENT_LINK/venv/bin/python" "$reconciler" "$HOME" "$HERMES_HOME"
+    return 0
+  fi
+  "$CURRENT_LINK/venv/bin/python" "$reconciler" rollback \
+    --home "$HOME" --hermes-home "$HERMES_HOME" --reload
+  MARKETPLACE_SKILLS_CHANGED=0
+}
+
 # Install the release-owned ClickUp wrapper as a stable user command.  The
 # wrapper itself calls the protected live refresh script, so it remains valid
 # across runtime-current switches and rollbacks.  Reinstalling it after every
@@ -700,6 +746,8 @@ rollback_to_previous() {
     || die "rollback could not restore governed ClickUp refresh — MANUAL INTERVENTION REQUIRED"
   install_clickup_cli "$prev" \
     || die "rollback could not restore managed ClickUp CLI — MANUAL INTERVENTION REQUIRED"
+  rollback_governed_marketplace_skills "$reason" \
+    || die "rollback could not restore governed marketplace skills — MANUAL INTERVENTION REQUIRED"
   rollback_governed_launchd_environment "$reason" \
     || die "rollback could not restore governed launchd environment — MANUAL INTERVENTION REQUIRED"
   kickstart "$GATEWAY_TARGET"
@@ -1101,8 +1149,31 @@ PY
   done
   "$NEW_DIR/venv/bin/python" -m py_compile \
     "$LAUNCHD_SOURCE_ROOT/reconcile_launchd_environment.py" \
+    "$LAUNCHD_SOURCE_ROOT/reconcile_marketplace_skills.py" \
+    "$LAUNCHD_SOURCE_ROOT/record_skill_pull_success.py" \
+    "$LAUNCHD_SOURCE_ROOT/skill_pull_guard.py" \
     "$LAUNCHD_SOURCE_ROOT/github_app_token.py" \
     || die "build verify failed: governed launchd Python source does not compile"
+  for wrapper in ignite-skills-pull.sh pull_anthropic_agent_skills.sh; do
+    bash -n "$LAUNCHD_SOURCE_ROOT/$wrapper" \
+      || die "build verify failed: skill pull wrapper syntax invalid: $wrapper"
+  done
+  "$NEW_DIR/venv/bin/python" - "$LAUNCHD_SOURCE_ROOT/launchd" <<'PY' \
+    || die "build verify failed: skill pull plist contract invalid"
+import plistlib
+import sys
+from pathlib import Path
+root = Path(sys.argv[1])
+expected = {
+    "com.colingreig.ignite-skills-pull": 10800,
+    "com.colingreig.pull_anthropic_skills": 86400,
+}
+for label, cadence in expected.items():
+    payload = plistlib.loads((root / f"{label}.plist").read_bytes())
+    assert payload["Label"] == label
+    assert payload["StartInterval"] == cadence
+    assert payload["RunAtLoad"] is True
+PY
   ok "build verified (import, web dist, governed refresh, launchd sources)"
 fi
 
@@ -1128,6 +1199,11 @@ repoint_symlink "$NEW_DIR"
 if ! install_governed_launchd_environment "$NEW_DIR"; then
   warn "governed launchd environment install/reload failed — rolling back"
   rollback_to_previous "governed launchd environment install failed"
+  die "cut aborted and rolled back to previous release"
+fi
+if ! install_governed_marketplace_skills "$NEW_DIR"; then
+  warn "governed marketplace skills install/reload failed — rolling back"
+  rollback_to_previous "governed marketplace skills install failed"
   die "cut aborted and rolled back to previous release"
 fi
 if ! verify_gateway "$NEW_DIR" "$LAUNCHD_GW_OFFSET" || ! verify_dashboard; then

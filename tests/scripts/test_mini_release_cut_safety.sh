@@ -203,6 +203,38 @@ grep -Fq "reconcile_launchd_environment.py rollback" \
   || fail "release rollback did not invoke the deployed launchd snapshot restore"
 rm "$CURRENT_LINK"
 
+# Marketplace-skill reconciliation is a separately armed release transaction:
+# failed validation cannot consume an older snapshot, while a successful
+# install is restored through the deployed reconciler during rollback.
+SKILLS_RECONCILER="$LAUNCHD_RELEASE/$VENDORED_SKILLS_RECONCILER_REL"
+printf '# placeholder skills reconciler\n' > "$SKILLS_RECONCILER"
+install_governed_marketplace_skills "$LAUNCHD_RELEASE"
+[ "$MARKETPLACE_SKILLS_CHANGED" -eq 1 ] \
+  || fail "marketplace skills install did not arm release rollback"
+grep -Fq "reconcile_marketplace_skills.py install --source-root $(dirname "$SKILLS_RECONCILER")" \
+  "$HERMES_HOME/launchd-reconciler-calls" \
+  || fail "release did not invoke marketplace skills install from canonical source root"
+
+MARKETPLACE_SKILLS_CHANGED=0
+export FAKE_RECONCILER_FAIL_INSTALL=1
+if install_governed_marketplace_skills "$LAUNCHD_RELEASE"; then
+  fail "failed marketplace skills validation/install was reported as successful"
+fi
+unset FAKE_RECONCILER_FAIL_INSTALL
+[ "$MARKETPLACE_SKILLS_CHANGED" -eq 0 ] \
+  || fail "failed marketplace skills install incorrectly armed rollback"
+
+MARKETPLACE_SKILLS_CHANGED=1
+cp "$SKILLS_RECONCILER" "$HERMES_HOME/scripts/reconcile_marketplace_skills.py"
+ln -s "$LAUNCHD_RELEASE" "$CURRENT_LINK"
+rollback_governed_marketplace_skills "test rollback"
+[ "$MARKETPLACE_SKILLS_CHANGED" -eq 0 ] \
+  || fail "marketplace skills rollback did not clear the changed marker"
+grep -Fq "reconcile_marketplace_skills.py rollback" \
+  "$HERMES_HOME/launchd-reconciler-calls" \
+  || fail "release rollback did not invoke marketplace skills snapshot restore"
+rm "$CURRENT_LINK"
+
 # A rollback whose gateway is healthy but dashboard remains unhealthy must
 # terminate nonzero; a warning-only rollback would make this subshell succeed.
 PREVIOUS_RELEASE="$RELEASES_DIR/v1.2.3-123456789abc"
