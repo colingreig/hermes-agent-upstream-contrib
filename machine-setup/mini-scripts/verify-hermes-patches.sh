@@ -894,7 +894,10 @@ try:
 except Exception as e:
     print(f"UNREADABLE {e!r}")
     sys.exit(2)
-names = set(re.findall(r'(?m)^\s{4}-\s+([a-z0-9][a-z0-9:_-]+)', txt))
+names = {
+    name.removesuffix(":")
+    for name in re.findall(r'(?m)^\s{4}-\s+([a-z0-9][a-z0-9:_-]+)', txt)
+}
 missing = [] if SENTINEL in names else [SENTINEL]
 print(f"COUNT {len(names)}")
 print(f"MISSING {','.join(missing)}")
