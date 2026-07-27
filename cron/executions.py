@@ -179,13 +179,24 @@ def _owner_liveness(pid: int, started_at: Optional[int]) -> str:
 
 def _prune_unlocked(conn: sqlite3.Connection) -> None:
     limit = max(0, int(MAX_TERMINAL_EXECUTIONS))
+    placeholders = ",".join(
+        "?" for _ in HISTORICAL_RECONCILIATION_EXECUTION_IDS
+    )
     conn.execute(
-        """DELETE FROM executions WHERE id IN (
+        f"""DELETE FROM executions WHERE id IN (
              SELECT id FROM executions
              WHERE status IN ('completed','failed','interrupted','unknown')
+               AND NOT (
+                 terminal_reason IS ?
+                 AND id IN ({placeholders})
+               )
              ORDER BY claimed_at DESC, id DESC LIMIT -1 OFFSET ?
            )""",
-        (limit,),
+        (
+            HISTORICAL_RECONCILIATION_REASON,
+            *HISTORICAL_RECONCILIATION_EXECUTION_IDS,
+            limit,
+        ),
     )
 
 
@@ -659,6 +670,178 @@ def apply_historical_execution_reconciliation(
                     }
                     for execution_id in HISTORICAL_RECONCILIATION_EXECUTION_IDS
                 ],
+            }
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+
+def restore_historical_reconciliation_rows_from_snapshot(
+    snapshot_path: str | Path,
+    manifest: Dict[str, Any],
+    *,
+    manifest_hash: str,
+    database_snapshot_sha256: str,
+    runtime_release: str,
+    runtime_commit: str,
+) -> Dict[str, Any]:
+    """Atomically restore the six approved originals from their reviewed backup.
+
+    This is a bounded recovery path for an operational interruption between
+    historical reconciliation and durable retention.  It accepts neither a
+    caller-provided allow-list nor arbitrary row contents: the backup digest,
+    reviewed manifest, fixed IDs, schema, and every original value must agree.
+    Existing partial or drifted rows fail closed.  An exact all-six retry is a
+    zero-mutation success so a crash after commit can be resumed safely.
+    """
+    canonical_manifest_hash = str(manifest_hash).strip().lower()
+    snapshot_hash = str(database_snapshot_sha256).strip().lower()
+    _validate_historical_manifest(
+        manifest,
+        manifest_hash=canonical_manifest_hash,
+        database_snapshot_sha256=snapshot_hash,
+        runtime_release=runtime_release,
+        runtime_commit=runtime_commit,
+    )
+
+    snapshot = Path(snapshot_path).expanduser().resolve()
+    if not snapshot.is_file():
+        raise HistoricalReconciliationError("historical database snapshot is missing")
+    digest = hashlib.sha256()
+    try:
+        with snapshot.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError as exc:
+        raise HistoricalReconciliationError(
+            "historical database snapshot could not be read"
+        ) from exc
+    if digest.hexdigest() != snapshot_hash:
+        raise HistoricalReconciliationError(
+            "historical database snapshot hash verification failed"
+        )
+
+    expected_ids = list(HISTORICAL_RECONCILIATION_EXECUTION_IDS)
+    originals = {
+        entry["execution_id"]: entry["original"] for entry in manifest["entries"]
+    }
+    placeholders = ",".join("?" for _ in expected_ids)
+
+    def schema_identity(conn: sqlite3.Connection) -> Dict[str, Any]:
+        table_row = conn.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type='table' AND name='executions'"
+        ).fetchone()
+        table_sql = table_row["sql"] if table_row is not None else None
+        return {
+            "table_info": [
+                tuple(row) for row in conn.execute("PRAGMA table_info(executions)")
+            ],
+            "table_sql": (
+                " ".join(str(table_sql).split()) if table_sql is not None else None
+            ),
+            "user_version": int(conn.execute("PRAGMA user_version").fetchone()[0]),
+        }
+
+    try:
+        snapshot_conn = sqlite3.connect(
+            f"file:{snapshot.as_posix()}?mode=ro", uri=True, timeout=5,
+        )
+        snapshot_conn.row_factory = sqlite3.Row
+        snapshot_schema = schema_identity(snapshot_conn)
+        snapshot_columns = [
+            row[1] for row in snapshot_schema["table_info"]
+        ]
+        snapshot_rows = snapshot_conn.execute(
+            f"SELECT * FROM executions WHERE id IN ({placeholders})",
+            expected_ids,
+        ).fetchall()
+    except sqlite3.Error as exc:
+        raise HistoricalReconciliationError(
+            "historical database snapshot is not a readable execution ledger"
+        ) from exc
+    finally:
+        if "snapshot_conn" in locals():
+            snapshot_conn.close()
+
+    snapshot_by_id = {row["id"]: dict(row) for row in snapshot_rows}
+    if (
+        len(snapshot_by_id) != len(expected_ids)
+        or set(snapshot_by_id) != set(expected_ids)
+    ):
+        raise HistoricalReconciliationError(
+            "historical database snapshot does not contain the fixed approved set"
+        )
+
+    with _lock:
+        conn = _connect()
+        try:
+            conn.commit()
+            conn.execute("BEGIN IMMEDIATE")
+            live_schema = schema_identity(conn)
+            if live_schema != snapshot_schema:
+                raise HistoricalReconciliationError(
+                    "historical snapshot/live execution schemas differ"
+                )
+            for execution_id in expected_ids:
+                if snapshot_by_id[execution_id] != originals[execution_id]:
+                    raise HistoricalReconciliationError(
+                        f"historical database snapshot content changed: {execution_id}"
+                    )
+            live_columns = [
+                row[1] for row in live_schema["table_info"]
+            ]
+            live_rows = conn.execute(
+                f"SELECT * FROM executions WHERE id IN ({placeholders})",
+                expected_ids,
+            ).fetchall()
+            live_by_id = {row["id"]: dict(row) for row in live_rows}
+            if live_by_id:
+                if (
+                    len(live_by_id) == len(expected_ids)
+                    and all(
+                        live_by_id[execution_id] == originals[execution_id]
+                        for execution_id in expected_ids
+                    )
+                ):
+                    conn.commit()
+                    return {
+                        "manifest_hash": canonical_manifest_hash,
+                        "mutated": 0,
+                        "already_restored": len(expected_ids),
+                        "execution_ids": expected_ids,
+                    }
+                raise HistoricalReconciliationError(
+                    "historical restore requires all six approved rows to be absent "
+                    "or already restored exactly"
+                )
+
+            columns_sql = ", ".join(snapshot_columns)
+            values_sql = ", ".join("?" for _ in snapshot_columns)
+            changed = 0
+            for execution_id in expected_ids:
+                row = originals[execution_id]
+                cur = conn.execute(
+                    f"INSERT INTO executions ({columns_sql}) VALUES ({values_sql})",
+                    tuple(row[column] for column in snapshot_columns),
+                )
+                if cur.rowcount != 1:
+                    raise HistoricalReconciliationError(
+                        f"historical restore rejected execution: {execution_id}"
+                    )
+                changed += 1
+            if changed != len(expected_ids):
+                raise HistoricalReconciliationError(
+                    "historical restore did not insert the complete approved set"
+                )
+            conn.commit()
+            return {
+                "manifest_hash": canonical_manifest_hash,
+                "mutated": changed,
+                "already_restored": 0,
+                "execution_ids": expected_ids,
             }
         except Exception:
             conn.rollback()
