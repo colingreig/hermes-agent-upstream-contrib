@@ -109,7 +109,9 @@ class CronScheduler(ABC):
         job = get_job(job_id)
         if job is None:
             return False  # job removed (e.g. repeat-N exhausted) between arm and fire
-        job["execution_id"] = create_execution(job_id, source=self.name)["id"]
+        execution = create_execution(job_id, source=self.name)
+        job["execution_id"] = execution["id"]
+        job["execution_owner_token"] = execution["owner_token"]
         return run_one_job(job, adapters=adapters, loop=loop)
 
     def reconcile(self) -> None:
@@ -183,7 +185,7 @@ class InProcessCronScheduler(CronScheduler):
         recovered = self.recover_interrupted()
         if recovered:
             logger.warning(
-                "Marked %d interrupted cron execution(s) unknown after restart",
+                "Marked %d cron execution(s) interrupted after restart",
                 recovered,
             )
         # Heartbeat once before the first sleep so `hermes cron status` sees a

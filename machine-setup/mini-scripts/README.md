@@ -35,8 +35,81 @@ directory tree, the skill's own scripts dir — the filename here is prefixed
 directory; drop the prefix when copying to the mini). See "Claim retry cap"
 below for the exact copy commands.
 
-Diff against the live file periodically (`ssh mini cat ~/.hermes/scripts/<file>`
-vs this copy) to catch drift — nothing currently automates that check.
+A second exception: `repo-aliases.json` deploys to
+`~/.hermes/config/repo-aliases.json` (not the scripts dir). See "Validator
+repository identity" below.
+
+## Validator repository identity (`pr_pipeline/validator_repo_guard.py`, `repo-aliases.json`)
+
+Guards the `hermes-pr-validate` cron (id `5a76e290811d`) against spurious
+`class=wrong-repo` FAIL verdicts. Two root causes, both fixed 2026-07-26:
+
+- **RC1 — wrong workdir.** The job's `workdir` was hardcoded to
+  `/Users/colingreig/dev/thermal` while the job is chartered for the
+  hermes-agent board, so ignite-validate resolved the wrong board/repo.
+  Repointed in `jobs.json`; `--expect-repo` mode is the standing tripwire.
+- **RC2 — repo identity compared as a NAME STRING.** On 2026-07-23
+  `colingreig/hermes-agent` was renamed to
+  `colingreig/hermes-agent-upstream-contrib`. GitHub redirects the old name, so
+  both spellings address ONE repo — but the mini holds both simultaneously
+  (`~/dev/hermes-agent` origin uses the OLD name; the bare mirror and every
+  `wt-new` worktree use the NEW one; Execution Briefs say `Target repo:
+  hermes-agent`; handoff PR/CI URLs say `...-upstream-contrib`). Every literal
+  comparison of those two spellings produced a false `wrong-repo` FAIL against
+  correct, merged work (86e2gh04e, 86e2gdmfk, 86e25xww8, 86e2f7ukm — all
+  manually voided).
+
+The fix resolves every repo reference to its **canonical GitHub identity**
+(`gh api repos/<owner>/<name> --jq .node_id`, which follows renames) and
+compares identities, never names. That is deliberately generic: the *next*
+rename needs no code change and no alias entry.
+
+```bash
+# Mode A — is this checkout the repo this cron is chartered for?
+python3 ~/.hermes/scripts/validator_repo_guard.py --expect-repo hermes-agent --workdir "$(pwd)"
+# Mode B — is the evidence PR/CI URL the SAME repo as the task's target?
+python3 ~/.hermes/scripts/validator_repo_guard.py --compare hermes-agent <pr-or-ci-url>
+# Mode C — debug one reference
+python3 ~/.hermes/scripts/validator_repo_guard.py --identity hermes-agent
+```
+
+Exit codes — **0** same/OK, **3** ABORT (skip the task, write NO verdict and
+change NO status), **4** confirmed different repositories (a `wrong-repo` FAIL
+is authorized). Exit 3 is the fail-closed default whenever identity cannot be
+established: a spurious FAIL kicks real reviewed work back to `to do` and burns
+multi-day rework loops, while a skip costs one hourly cycle.
+
+Two supporting notes:
+
+- **Definite-404 inference.** The mini's App token (`hermes-dev-assistant[bot]`)
+  is installed per repository, so some real repos 404 for it (e.g.
+  `colingreig/hermes-ops-scripts`, the genuine wrong-repo in 86e2eu4fp). Since
+  both the rename redirect and installation access key on the repository *id*,
+  a definite HTTP 404 against a credential that just resolved the target LIVE
+  proves the evidence repo is not a rename alias of the target → `DIFFERENT`.
+  A non-404 `gh` failure proves nothing → `UNRESOLVED`/skip.
+- **`repo-aliases.json`** (`~/.hermes/config/repo-aliases.json`, override
+  `$HERMES_REPO_ALIASES`) is an offline **last resort only** — it short-circuits
+  the network for a known rename when the mini is offline with a cold identity
+  cache. Prefer letting `gh` follow the redirect. The identity cache lives at
+  `~/.hermes/state/repo_identity_cache.json` (7-day TTL, stale entries served
+  when `gh` is unreachable).
+
+```bash
+# The guard's canonical source is machine-setup/mini-scripts/pr_pipeline/validator_repo_guard.py.
+# It is manifest-managed — do NOT scp it by hand; deploy the whole boundary:
+python3 machine-setup/mini-scripts/reconcile_pr_pipeline.py install --host mini --source-commit <sha>
+# (installs both ~/.hermes/scripts/validator_repo_guard.py and
+#  ~/.hermes/scripts/pr_pipeline/validator_repo_guard.py — the CLI paths above
+#  are unchanged.)
+scp machine-setup/mini-scripts/repo-aliases.json      mini:~/.hermes/config/repo-aliases.json
+python3 machine-setup/mini-scripts/tests/test_validator_repo_guard.py            # hermetic
+HERMES_REPO_GUARD_LIVE=1 python3 machine-setup/mini-scripts/tests/test_validator_repo_guard.py  # + real gh
+```
+
+The PR review/merge closure is the exception to the manual-copy convention:
+its canonical sources, deterministic manifest, and deployment reconciler live
+under `pr_pipeline/`. Do not compare or copy those files one at a time.
 
 ## Files
 
@@ -190,6 +263,105 @@ vs this copy) to catch drift — nothing currently automates that check.
 - `tests/test_pr_staleness_alert.py` — covers the dedupe fingerprint, decide
   logic (unchanged/new/dropped/bucket-crossing/heartbeat), and fail-open
   state loading, both as pure functions and end to end through `run()`.
+- `pr_pipeline/` — canonical Mini PR-review, validation, tripwire, CI, risk,
+  Slack, and merge-guard closure. `manifest.json` resolves its source hashes
+  at deployment time, including every `pr_pipeline/*.py` trust-boundary
+  component. The legacy flat entry points and the package namespace are both
+  generated Mini artifacts from these sources.
+- `reconcile_pr_pipeline.py` — the only deploy/verify path for that closure.
+  It installs only manifest paths, records the supplying source commit plus
+  every deployed SHA-256 in `.pr_pipeline_deployment.json`, and reports
+  missing, extra, or drifted pipeline files. The snapshot is hard-shadowed:
+  this deployment surface never enables or invokes a live merge.
+- `github_app_cred.sh` — git credential helper for the Hermes Dev Assistant
+  GitHub App, wired up by `~/.hermes/gitconfig` (`GIT_CONFIG_GLOBAL`). Mints a
+  short-lived installation token per request via `op-run` +
+  `github_app_token.py`; never stores one.
+- `hermes-bin-gh` — **deploys to `~/.hermes/bin/gh`, not `~/.hermes/scripts/`.**
+  The `gh` wrapper that exports a freshly-minted `GH_TOKEN` before exec'ing the
+  real Homebrew `gh`.
+- `dot-profile` — **deploys to `~/.profile`.** Sourced by every `bash -l` the
+  terminal tool spawns for its session-env snapshot; hoists `~/.hermes/bin`
+  back to the front of `PATH` after `/etc/profile`'s `path_helper` demotes it.
+- `spend_guard.py` — hard $50/day spend cap gating every `opencode_exec.py`
+  delegation. Vendored 2026-07-26 as the canonical git home for what had been
+  a mini-only, untracked file; the live file already carried its fix, so
+  there is no separate vendor-verbatim base commit — see the module docstring
+  for the full before/after. Summary of the defect it fixes: `is_over_cap()`
+  used to catch every state.db/opencode-log read error and return `False`
+  ("not over cap"), identical to a genuinely healthy $0 day — the cap
+  silently stopped enforcing on any read hiccup. Fixed with a three-tier
+  policy: a clean read behaves exactly as before; a read failure within a
+  recent last-known-good window (`HERMES_SPEND_GUARD_STALENESS_SECONDS`,
+  default 900s) alarms loudly and decides from that cached figure; a read
+  failure with no usable cache alarms loudly and fails closed (blocks new
+  spend) rather than fail open indefinitely.
+- `spend_meter.py` — per-provider ($/provider/day) companion to
+  `spend_guard.py`'s global cap. Vendored 2026-07-26, live file already
+  fixed, same "no separate base commit" note as above. Fixes: a state.db
+  read failure used to be swallowed (`except Exception: return {}`), making
+  `is_over_threshold()` return `[]` — indistinguishable from "checked,
+  everyone's under cap." A read failure now raises `SpendDataUnavailable`,
+  which `main()` turns into a non-zero exit plus a loud message so the
+  `spend-meter` cron job's failure-delivery path actually fires instead of
+  going silent. This meter has no blocking power (unlike `spend_guard.py`),
+  so alarming loudly on "can't check" is the correct and sufficient fix.
+- `hermes_usage_alert.py` — zero-LLM Slack alarm for provider/credential
+  exhaustion, fallback-chain exhaustion, and cron jobs stuck or freshly
+  entered into an error `last_status`. Vendored 2026-07-26, live file already
+  fixed, same "no separate base commit" note as above. Two fixes: (RC1)
+  `_scan_cron_errors` used to alert only on a transition into error and
+  explicitly skip a job's first-ever observation, so a persistently-red job
+  alerted once and then went silent forever, and a state-file reset
+  re-silenced every already-red job by making "first observation" look like
+  "nothing to report." A job's first observed state is now itself
+  alert-worthy if it's `error`, and a standing-red job re-alerts on a bounded
+  cadence (`HERMES_CRON_ERROR_REALERT_MIN`, default 360min). (RC2)
+  `_scan_cron_errors` used to catch any `jobs.json` read/parse failure and
+  return `[]` — indistinguishable from "read fine, no errors." An unreadable
+  `jobs.json` now produces its own distinct `monitor_error` alert instead of
+  silently reporting all-clear.
+- `hermes_report_build.py` fix (2026-07-26): the status-email spend section
+  rendered a served-ledger read failure the same as a genuine $0.00 day —
+  `spend['total_cost']` stayed `None` on error but every formatter still ran
+  `f"${spend['total_cost']:.2f}"`. Added `_cost_display()` plus an explicit
+  `spend['error']` field threaded through the subject line, headline, HTML
+  render, text render, and JSON summary so an unreadable ledger renders as
+  "spend UNKNOWN (ledger unreadable)" and never as a silent zero.
+
+## Cron-context GitHub auth (2026-07-26)
+
+Symptom: every executor cron session logged
+`no oauth token found for github.com`; zero autonomous branches/PRs for ~2
+days, while interactive sessions worked fine.
+
+Root cause — one PATH fault with two independent effects. The terminal tool
+builds its session env from a `bash -l` login shell
+(`tools/environments/local.py::_resolve_shell_init_files`). `/etc/profile`
+runs `/usr/libexec/path_helper`, which rebuilds `PATH` as
+`/etc/paths` + `/etc/paths.d/*` first and appends the inherited entries after,
+so the gateway's leading `~/.hermes/bin` and release `venv/bin` were both
+demoted below `/usr/local/bin` and `/opt/homebrew/bin`. Therefore:
+
+1. `gh` resolved to `/opt/homebrew/bin/gh` — the real, unauthenticated CLI —
+   instead of the App-token wrapper.
+2. Even when the wrapper *was* invoked by absolute path, its bare `python3`
+   resolved to the python.org `/usr/local/bin/python3` 3.13 build, which has no
+   CA bundle: `URLError(SSL: CERTIFICATE_VERIFY_FAILED … unable to get local
+   issuer certificate)` against `api.github.com`. `2>/dev/null || true`
+   swallowed it, so `GH_TOKEN` was silently empty. `github_app_cred.sh` hit the
+   same interpreter fault and returned empty credentials, breaking `git push`
+   over HTTPS as well.
+
+Fix:
+
+- `dot-profile` re-hoists `~/.hermes/bin` to the front of `PATH` (removing any
+  demoted occurrence first, so a present-but-late entry is actually promoted).
+- `hermes-bin-gh` and `github_app_cred.sh` resolve the interpreter absolutely
+  (`~/.hermes/runtime-current/venv/bin/python`, falling back to
+  `/usr/bin/python3`) instead of trusting `PATH`.
+- Both log mint failures to `~/.hermes/logs/github-app-token.log` rather than
+  discarding stderr — the silent swallow is what hid this for two days.
 
 ## Claim retry cap (ClickUp 86e2ddcpb, 2026-07-24)
 
@@ -234,9 +406,9 @@ mini-run -- 'python3 -m py_compile ~/.hermes/scripts/claim_store.py \
 
 ## PR staleness dedupe (mini cron job pr-staleness-alert, 2026-07-24)
 
-Root cause: `pr_pipeline_improvements.check_staleness_and_alert()` (a
-separate, also mini-only, not-yet-vendored module) fingerprinted each stale
-PR on `round(age_hours, 2)` — a value that changes on almost every
+Root cause: `pr_pipeline_improvements.check_staleness_and_alert()` (then a
+separate Mini-only module, now included in the canonical PR-pipeline package)
+fingerprinted each stale PR on `round(age_hours, 2)` — a value that changes on almost every
 15-minute tick — so its `.pr_pipeline_state.json` comparison never matched
 two runs in a row. Confirmed byte-identical Slack payload across six
 consecutive runs (20:02-21:16 on 2026-07-23), 257 runs since 2026-07-22, for
@@ -273,6 +445,35 @@ scp machine-setup/mini-scripts/pr_staleness_alert.py \
     mac-mini-h.tail51ec1b.ts.net:~/.hermes/scripts/pr_staleness_alert.py
 mini-run -- 'python3 -m py_compile ~/.hermes/scripts/pr_staleness_alert.py'  # sanity check
 ```
+
+## PR-pipeline source and deployment integrity
+
+`machine-setup/mini-scripts/pr_pipeline/` is now the only authoritative
+source for the Mini PR-review/merge closure. The Mini copies at
+`~/.hermes/scripts/` and `~/.hermes/scripts/pr_pipeline/` are generated
+artifacts. The manifest includes the legacy flat entry points and every Python
+file in the package, so a newly added trust-boundary module cannot silently
+remain Mini-only.
+
+The focused verifier/reconciler is deliberately separate from the legacy
+patch checker: it stages the manifest sources to the Mini, writes only the
+manifest destinations and deployment marker, then checks SHA-256 parity and
+the recorded source commit. Supply the exact already-approved source commit;
+the tool never derives it from, or mutates, a Mini checkout.
+
+```bash
+python3 machine-setup/mini-scripts/reconcile_pr_pipeline.py reconcile \
+  --host mini --source-commit <approved-source-commit>
+
+python3 machine-setup/mini-scripts/reconcile_pr_pipeline.py verify \
+  --host mini --source-commit <approved-source-commit>
+```
+
+Both commands preserve shadow mode. They do not invoke `gh`, a merge command,
+or any PR pipeline cron; promotion to live merge behavior is a separate
+reviewed change. `verify` is read-only on the deployed scripts (apart from its
+temporary, removed source staging directory) and fails on a missing file,
+hash mismatch, recorded-commit mismatch, or unmanifested pipeline extra.
 
 **WARNING — do NOT rsync `~/.hermes/scripts/` wholesale.** That directory is
 hand-maintained on the mini and holds ~203 live-only scripts with no git

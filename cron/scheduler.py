@@ -33,7 +33,7 @@ except ImportError:
     except ImportError:
         msvcrt = None
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, List, NamedTuple, Optional
 
 # Add parent directory to path for imports BEFORE repo-level imports.
 # Without this, standalone invocations (e.g. after `hermes update` reloads
@@ -114,6 +114,15 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     text = (error or "unknown error").strip()
     lower = text.lower()
 
+    # This diagnostic intentionally lists possible causes including the word
+    # "timeout". It is not evidence of a provider timeout, so classify it
+    # before the generic timeout heuristic below.
+    if lower.startswith("agent completed but produced empty response"):
+        return (
+            f"⚠️ Cron '{job_name}' failed: agent produced no usable final response. "
+            "Full details saved in cron output."
+        )
+
     # Provider/API failures are the common noisy path. Keep these short.
     if "429" in text or "rate limit" in lower or "usage limit" in lower:
         reason = "rate limit"
@@ -166,6 +175,26 @@ class CronPromptInjectionBlocked(Exception):
     prompt field; skill content loaded at runtime was never scanned, so a
     malicious skill could carry an injection payload that reached the
     non-interactive (auto-approve) cron agent.
+    """
+
+
+class CronSkillUnresolvable(Exception):
+    """Raised by _build_job_prompt when a job names a skill/bundle in its
+    ``skill``/``skills`` fields that cannot be resolved on disk. Caught in
+    run_job so the job fails loudly (error status, no model turn) instead of
+    silently free-lancing on whatever prompt text happens to be left.
+
+    HERMES audit finding: a job with ``skill: "email-triage"`` (no such
+    skill anywhere on disk) and ``prompt: ""`` ran 135 times reporting
+    ``last_status: ok`` — the old code just logged a warning, appended a
+    "skill not found" notice to the (empty) prompt, and dispatched the
+    model turn anyway. The model free-lanced with zero task-specific
+    criteria and produced plausible-looking output every time, so nothing
+    ever alarmed. A job whose declared skill(s) don't resolve has nothing
+    reliable to instruct the model with and must not run at all — this is
+    distinct from a job that legitimately declares no skill (``skill:
+    None`` / ``skills: []``), which is normal and continues to run
+    unchanged.
     """
 
 
@@ -302,7 +331,12 @@ from cron.jobs import (
     mark_job_run,
     save_job_output,
 )
-from cron.executions import create_execution, finish_execution, mark_execution_running
+from cron.executions import (
+    create_execution,
+    finish_execution,
+    heartbeat_execution,
+    mark_execution_running,
+)
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -317,6 +351,40 @@ SILENT_MARKER = "[SILENT]"
 # NOT when a token merely appears mid-sentence in a genuine report (e.g.
 # "I considered staying [SILENT] but here is the summary…" must deliver).
 _CRON_SILENCE_TOKENS = frozenset({"[SILENT]", "SILENT", "NO_REPLY", "NO REPLY"})
+_EXECUTION_HEARTBEAT_SECONDS = 30.0
+
+
+class _ExecutionLeaseHeartbeat:
+    """Keep a durable execution lease alive while a worker is active."""
+
+    def __init__(self, execution_id: str, owner_token: str):
+        self._execution_id = execution_id
+        self._owner_token = owner_token
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="cron-execution-lease-heartbeat",
+            daemon=True,
+        )
+
+    def start(self) -> None:
+        # Refresh immediately so a queued worker gets a fresh full lease when
+        # it starts doing real work, then refresh independently of agent I/O.
+        heartbeat_execution(self._execution_id, owner_token=self._owner_token)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=1.0)
+
+    def _run(self) -> None:
+        while not self._stop.wait(_EXECUTION_HEARTBEAT_SECONDS):
+            try:
+                if not heartbeat_execution(self._execution_id, owner_token=self._owner_token):
+                    logger.warning("Execution %s lost its lease ownership", self._execution_id)
+                    return
+            except Exception:
+                logger.warning("Execution %s heartbeat failed", self._execution_id, exc_info=True)
 
 
 def _is_cron_silence_response(text: str) -> bool:
@@ -352,6 +420,196 @@ def _is_cron_silence_response(text: str) -> bool:
     if upper.startswith("[SILENT]"):
         return True
     return False
+
+
+class _CronExecutionOutcome(NamedTuple):
+    """The one authoritative execution result shared by every cron sink.
+
+    Delivery is intentionally separate from execution success: a completed job
+    does not become failed merely because its notification transport is down.
+    """
+
+    success: bool
+    error: Optional[str]
+    reason: str
+    delivery_error: Optional[str] = None
+
+
+def _configured_workdir_error(job: dict) -> Optional[str]:
+    """Return a preflight error for a configured but unusable workdir."""
+    configured = job.get("workdir")
+    if configured in (None, "", False):
+        return None
+    if not isinstance(configured, (str, os.PathLike)):
+        return f"Configured cron workdir is invalid: {configured!r}"
+    path_text = os.fspath(configured).strip()
+    if not path_text:
+        return None
+    try:
+        path = Path(path_text).expanduser()
+        if not path.is_dir() or not os.access(path, os.R_OK | os.X_OK):
+            return f"Configured cron workdir is unavailable: {path_text!r}"
+    except OSError as exc:
+        return f"Configured cron workdir is unavailable: {path_text!r} ({exc})"
+    return None
+
+
+def _cron_failure_reason(error: Optional[str], *, interrupted: bool = False) -> str:
+    """Classify a failure without changing execution-ledger ownership rules."""
+    if interrupted:
+        return "gateway_child_died"
+    text = (error or "").lower()
+    if "malformed cron runner result" in text:
+        return "malformed_result"
+    if "timeout" in text or "timed out" in text:
+        return "timeout"
+    if any(token in text for token in (
+        "configured cron workdir", "script", "skill", "credential",
+        "required environment", "no model configured",
+    )):
+        return "preflight_failed"
+    return "run_failed"
+
+
+def _normalize_cron_outcome(
+    runner_success: Any,
+    final_response: Any,
+    error: Any,
+    *,
+    pool_available: Optional[bool] = None,
+    interrupted: bool = False,
+) -> _CronExecutionOutcome:
+    """Apply machine-result precedence before any delivery or persistence."""
+    if runner_success is not True:
+        detail = error if isinstance(error, str) and error.strip() else (
+            "Cron runner reported failure without an error message"
+        )
+        if pool_available is False and "route chain exhausted" not in detail.lower():
+            detail = (
+                f"{detail} (route chain exhausted — no usable provider credential available)"
+            )
+        return _CronExecutionOutcome(
+            False, detail, _cron_failure_reason(detail, interrupted=interrupted)
+        )
+    if isinstance(error, str) and error.strip():
+        detail = f"Malformed cron runner result: success=True with error: {error}"
+        return _CronExecutionOutcome(False, detail, "malformed_result")
+    if not isinstance(final_response, str):
+        detail = "Malformed cron runner result: final_response must be a string"
+        return _CronExecutionOutcome(False, detail, "malformed_result")
+    if interrupted:
+        detail = "Interrupted by gateway shutdown before the run finished (tool subprocess was killed mid-flight)."
+        return _CronExecutionOutcome(False, detail, "gateway_child_died")
+    if not final_response.strip() and not _is_cron_silence_response(final_response):
+        detail = (
+            "route chain exhausted — no usable provider credential available; no objective work produced"
+            if _is_route_chain_exhausted_no_work(pool_available, final_response)
+            else "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
+        )
+        return _CronExecutionOutcome(False, detail, "run_failed")
+    return _CronExecutionOutcome(True, None, "completed")
+
+
+def _normalize_runner_result(
+    result: Any, *, pool_available: Optional[bool], interrupted: bool
+) -> tuple[_CronExecutionOutcome, str, str]:
+    """Validate the positional run_job contract before consuming it."""
+    if not isinstance(result, tuple) or len(result) != 4:
+        detail = "Malformed cron runner result: expected (success, output, final_response, error)"
+        return _CronExecutionOutcome(False, detail, "malformed_result"), "", ""
+    runner_success, output, final_response, error = result
+    if (
+        not isinstance(runner_success, bool)
+        or not isinstance(output, str)
+        or (error is not None and not isinstance(error, str))
+    ):
+        detail = (
+            "Malformed cron runner result: success must be bool, output must be a string, "
+            "and error must be a string or None"
+        )
+        return _CronExecutionOutcome(False, detail, "malformed_result"), "", ""
+    outcome = _normalize_cron_outcome(
+        runner_success,
+        final_response,
+        error,
+        pool_available=pool_available,
+        interrupted=interrupted,
+    )
+    return outcome, output, final_response if isinstance(final_response, str) else ""
+
+
+def _record_cron_outcome(
+    job: dict,
+    execution_id: str,
+    owner_token: str,
+    outcome: _CronExecutionOutcome,
+    *,
+    skip_job_status: bool = False,
+) -> bool:
+    """Persist the normalized result without re-entering execution delivery.
+
+    A status/ledger write can fail after the user has already received the
+    result.  That is an observability failure, not a new runner failure: do
+    not send a second alert or mutate the q7 terminal fact to a different
+    outcome.  Return False so callers fail closed when durability is uncertain.
+    """
+    persisted = True
+    if not skip_job_status:
+        try:
+            mark_job_run(
+                job["id"], outcome.success, outcome.error,
+                delivery_error=outcome.delivery_error,
+            )
+        except Exception:
+            persisted = False
+            logger.exception(
+                "Job '%s': could not persist scheduled-job outcome; execution was %s",
+                job["id"], "successful" if outcome.success else "failed",
+            )
+    try:
+        finish_execution(
+            execution_id,
+            owner_token=owner_token,
+            success=outcome.success,
+            error=outcome.error,
+            reason=outcome.reason,
+        )
+    except Exception:
+        persisted = False
+        logger.exception(
+            "Job '%s': execution ledger finalization failed; "
+            "leaving the normalized outcome unchanged",
+            job["id"],
+        )
+    return outcome.success and persisted
+
+
+def _deliver_cron_outcome(
+    job: dict,
+    outcome: _CronExecutionOutcome,
+    final_response: str,
+    *,
+    adapters=None,
+    loop=None,
+) -> _CronExecutionOutcome:
+    """Deliver an outcome without letting delivery rewrite execution status."""
+    content = (
+        final_response if outcome.success
+        else _summarize_cron_failure_for_delivery(job, outcome.error)
+    )
+    if not content.strip():
+        return outcome
+    if outcome.success and _is_cron_silence_response(content):
+        logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
+        return outcome
+    try:
+        delivery_error = _deliver_result(job, content, adapters=adapters, loop=loop)
+    except Exception as exc:
+        delivery_error = str(exc)
+        logger.error("Delivery failed for job %s: %s", job["id"], exc)
+    return outcome._replace(
+        delivery_error=delivery_error if isinstance(delivery_error, str) else None
+    )
 
 # ---------------------------------------------------------------------------
 # Persistent thread pool for parallel cron jobs.
@@ -2683,8 +2941,13 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
     from agent.skill_bundles import build_bundle_invocation_message, resolve_bundle_command_key
     from agent.skill_utils import normalize_skill_lookup_name
 
-    parts = []
+    # First pass: resolve every named skill/bundle WITHOUT any side effects
+    # (no bump_use, no prompt assembly) so we know up front whether the job
+    # is safe to run at all. `entries` replays the resolved content in the
+    # original order once we've confirmed nothing is missing.
+    entries: list[tuple[str, str, str]] = []  # (kind, skill_name, payload)
     skipped: list[str] = []
+    skipped_reasons: dict[str, str] = {}
     for skill_name in skill_names:
         # Cron jobs historically accepted only skill names here, but the CLI/gateway
         # slash-command path lets bundles shadow skills with the same slug. Mirror
@@ -2699,9 +2962,7 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
             )
             if bundle_payload:
                 bundle_message, _loaded_bundle_skills, _missing_bundle_skills = bundle_payload
-                if parts:
-                    parts.append("")
-                parts.append(bundle_message)
+                entries.append(("bundle", skill_name, bundle_message))
                 continue
             logger.warning(
                 "Cron job '%s': bundle '%s' could not load any skills, skipping",
@@ -2709,6 +2970,7 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
                 skill_name,
             )
             skipped.append(skill_name)
+            skipped_reasons[skill_name] = f"bundle '{skill_name}' could not load any skills"
             continue
 
         try:
@@ -2716,11 +2978,71 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
         except (json.JSONDecodeError, TypeError):
             logger.warning("Cron job '%s': skill '%s' returned invalid JSON, skipping", job.get("name", job.get("id")), skill_name)
             skipped.append(skill_name)
+            skipped_reasons[skill_name] = "skill_view() returned invalid JSON"
             continue
         if not loaded.get("success"):
             error = loaded.get("error") or f"Failed to load skill '{skill_name}'"
             logger.warning("Cron job '%s': skill not found, skipping — %s", job.get("name", job.get("id")), error)
             skipped.append(skill_name)
+            skipped_reasons[skill_name] = error
+            continue
+
+        content = str(loaded.get("content") or "").strip()
+        entries.append(("skill", skill_name, content))
+
+    if skipped:
+        # Fail loudly instead of silently free-lancing off whatever prompt
+        # text is left over. HERMES audit finding: this exact branch — log
+        # a warning, append a "not found" notice, and dispatch the model
+        # turn anyway — let a job with skill="email-triage" (no such skill
+        # anywhere on disk) and prompt="" run 135 times reporting
+        # last_status: ok. The model had zero task-specific instructions,
+        # free-lanced, and produced plausible-looking output every run, so
+        # nothing ever alarmed.
+        #
+        # Any unresolvable entry in `skill`/`skills` voids the whole job —
+        # even if other listed skills DID resolve, a job missing part of
+        # its declared instructions is not safe to run on the rest. This
+        # fires regardless of whether `prompt` is empty or populated: an
+        # unresolvable skill reference is a config error either way, not
+        # something the presence of prompt text can excuse. (A job that
+        # legitimately declares no skill at all — `skill: null` and empty
+        # `skills` — never reaches this branch; that case returns above,
+        # unchanged, even when its prompt is also empty. We deliberately do
+        # NOT add a new "empty prompt + no skill at all" error: that
+        # combination isn't the defect pattern here, and the existing
+        # empty-final-response guard in run_one_job already turns a
+        # genuinely instruction-less run into a failure after the fact.)
+        searched_dirs: list[str] = []
+        try:
+            from tools.skills_tool import _skills_dir as _cron_active_skills_dir
+            _active_dir = _cron_active_skills_dir()
+            if _active_dir:
+                searched_dirs.append(str(_active_dir))
+        except Exception:
+            logger.debug("Cron job: failed to resolve active skills dir for error message", exc_info=True)
+        try:
+            from agent.skill_utils import get_external_skills_dirs
+            searched_dirs.extend(str(d) for d in get_external_skills_dirs())
+        except Exception:
+            logger.debug("Cron job: failed to resolve external skills dirs for error message", exc_info=True)
+        searched = ", ".join(dict.fromkeys(searched_dirs)) or "(no skill search directories configured)"
+        detail = "; ".join(f"'{name}' — {skipped_reasons.get(name, 'not found')}" for name in skipped)
+        raise CronSkillUnresolvable(
+            f"Cron job '{job.get('name', job.get('id'))}' (id={job.get('id')}) names skill(s)/bundle(s) "
+            f"in its 'skill'/'skills' config that could not be resolved: {detail}. "
+            f"Searched: {searched}. Refusing to run the model — fix the skill "
+            f"reference (typo, moved/deleted/renamed skill) or remove it from this job's config."
+        )
+
+    # Second pass: nothing was missing — replay in original order, now with
+    # the bump_use side effect (identical to prior behavior).
+    parts = []
+    for kind, skill_name, payload in entries:
+        if kind == "bundle":
+            if parts:
+                parts.append("")
+            parts.append(payload)
             continue
 
         # Bump usage so the curator sees this skill as actively used.
@@ -2729,25 +3051,15 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
         except Exception:
             logger.debug("Cron job: failed to bump skill usage for '%s'", skill_name, exc_info=True)
 
-        content = str(loaded.get("content") or "").strip()
         if parts:
             parts.append("")
         parts.extend(
             [
                 f'[IMPORTANT: The user has invoked the "{skill_name}" skill, indicating they want you to follow its instructions. The full skill content is loaded below.]',
                 "",
-                content,
+                payload,
             ]
         )
-
-    if skipped:
-        notice = (
-            f"[IMPORTANT: The following skill(s) were listed for this job but could not be found "
-            f"and were skipped: {', '.join(skipped)}. "
-            f"Start your response with a brief notice so the user is aware, e.g.: "
-            f"'⚠️ Skill(s) not found and skipped: {', '.join(skipped)}']"
-        )
-        parts.insert(0, notice)
 
     if prompt:
         parts.extend(["", f"The user has provided the following instruction alongside the skill invocation: {prompt}"])
@@ -2936,6 +3248,22 @@ def run_job(
     """
     job_id = job["id"]
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
+
+    # Revalidate persisted workdirs immediately before either runner path. A
+    # project can disappear after create/update validation; silently using the
+    # scheduler cwd would execute unrelated commands (including no_agent jobs).
+    workdir_error = _configured_workdir_error(job)
+    if workdir_error:
+        logger.error("Job '%s': %s", job_id, workdir_error)
+        now_iso = _hermes_now().strftime("%Y-%m-%d %H:%M:%S")
+        doc = (
+            f"# Cron Job: {job_name}\n\n"
+            f"**Job ID:** {job_id}\n"
+            f"**Run Time:** {now_iso}\n"
+            "**Status:** preflight failed\n\n"
+            f"{workdir_error}\n"
+        )
+        return False, doc, "", workdir_error
 
     # ---------------------------------------------------------------
     # no_agent short-circuit — the script IS the job, no LLM involvement.
@@ -3136,6 +3464,19 @@ def run_job(
             ),
         )
         _ran_ok, _script_output = prerun_script
+        if not _ran_ok:
+            # A required data-collection/tool script is a machine preflight,
+            # not advisory context for an LLM to explain away.  Do not build
+            # a prompt or construct AIAgent after a non-zero exit/timeout.
+            script_error_doc = (
+                f"# Cron Job: {job_name}\n\n"
+                f"**Job ID:** {job_id}\n"
+                f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                "**Status:** pre-run script failed\n\n"
+                f"{_script_output}\n"
+            )
+            logger.error("Job '%s': pre-run script failed: %s", job_id, _script_output)
+            return False, script_error_doc, "", _script_output
         if _ran_ok and not _parse_wake_gate(_script_output):
             logger.info(
                 "Job '%s' (ID: %s): wakeAgent=false, skipping agent run",
@@ -3174,6 +3515,27 @@ def run_job(
             "the threat pattern (`tools/cronjob_tools.py::_CRON_THREAT_PATTERNS`)."
         )
         return False, blocked_doc, "", str(block_exc)
+    except CronSkillUnresolvable as skill_exc:
+        # Job names a skill/bundle that doesn't resolve on disk. Refuse to
+        # dispatch the model turn and surface a clear failure so the
+        # operator sees WHY the job didn't run instead of the job silently
+        # free-lancing off an empty/degraded prompt and reporting
+        # last_status: ok forever (the email-triage defect).
+        logger.error(
+            "Job '%s' (ID: %s): skill(s) unresolvable — %s",
+            job_name, job_id, skill_exc,
+        )
+        skill_error_doc = (
+            f"# Cron Job: {job_name}\n\n"
+            f"**Job ID:** {job_id}\n"
+            f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"**Status:** ERROR — skill unresolvable\n\n"
+            f"{skill_exc}\n\n"
+            "The agent was NOT run. Fix the skill reference (or remove it "
+            "from this job's config) and the job will resume on its next "
+            "scheduled tick."
+        )
+        return False, skill_error_doc, "", str(skill_exc)
     if prompt is None:
         logger.info("Job '%s': script produced no output, skipping AI call.", job_name)
         return True, "", SILENT_MARKER, None
@@ -4195,12 +4557,19 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
     under the file lock before dispatch; an external provider claims via the
     store CAS). This function only fires the given job once.
 
-    Returns True if the job was processed (even if the job itself failed —
-    failure is recorded via ``mark_job_run``), False only if processing raised.
+    Returns the normalized execution success.  Delivery failures remain
+    separately recorded and do not turn an otherwise-completed execution red.
     """
     execution_id = job.get("execution_id")
+    owner_token = job.get("execution_owner_token")
     if not execution_id:
-        execution_id = create_execution(job["id"], source="direct")["id"]
+        execution = create_execution(job["id"], source="direct")
+        execution_id = execution["id"]
+        owner_token = execution["owner_token"]
+    if not owner_token:
+        raise ValueError("execution owner token is required for cron finalization")
+    lease_heartbeat = None
+    interrupted_by_gateway = False
     try:
         # Pre-run dispatch claim (issue #38758): atomically commit a finite
         # one-shot's dispatch BEFORE its side effect runs, so a tick that dies
@@ -4214,16 +4583,19 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
                 "Job '%s': one-shot dispatch limit reached — skipping",
                 job.get("name", job["id"]),
             )
-            finish_execution(
-                execution_id,
-                success=False,
-                error="Dispatch claim rejected; execution was not started.",
+            outcome = _normalize_cron_outcome(
+                False, "", "Dispatch claim rejected; execution was not started."
+            )._replace(reason="dispatch_rejected")
+            return _record_cron_outcome(
+                job, execution_id, owner_token, outcome, skip_job_status=True
             )
-            return True  # not an error — already handled/removed
 
         # The attempt is claimed durably before executor/provider dispatch and
         # becomes running only immediately before the actual run.
-        mark_execution_running(execution_id)
+        if mark_execution_running(execution_id, owner_token=owner_token) is None:
+            raise RuntimeError("execution ownership was lost before the job started")
+        lease_heartbeat = _ExecutionLeaseHeartbeat(execution_id, owner_token)
+        lease_heartbeat.start()
 
         # Run the job under the profile's secret scope. get_secret() fails
         # closed outside a scope once profile isolation is in play (multiple
@@ -4268,9 +4640,7 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
                 )
             ):
                 try:
-                    success, output, final_response, error = run_job(
-                        job, defer_agent_teardown=_deferred_agents
-                    )
+                    result = run_job(job, defer_agent_teardown=_deferred_agents)
                 except TypeError as exc:
                     # unittest.mock and some legacy custom runners expose a
                     # permissive **kwargs signature while forwarding to a
@@ -4281,11 +4651,11 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
                         not in str(exc)
                     ):
                         raise
-                    success, output, final_response, error = run_job(job)
+                    result = run_job(job)
             else:
                 # Backward compatibility for custom/test replacements that
                 # implement the pre-deferred-teardown run_job contract.
-                success, output, final_response, error = run_job(job)
+                result = run_job(job)
         except BaseException:
             # run_job's finally still hands back the agent when it raises; tear
             # it down here so a failed run never leaks its async resources
@@ -4305,50 +4675,24 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         # / empty-response computation, or _deliver_result itself — raises, the
         # deferred agent is still torn down. Otherwise the outer `except` would
         # swallow the error and leak the agent's subprocesses/clients (#10200).
-        delivery_error = None
+        outcome, output, final_response = _normalize_runner_result(
+            result,
+            pool_available=_pool_available,
+            interrupted=_is_interrupted(job["id"]),
+        )
         try:
-            output_file = save_job_output(job["id"], output)
-            if verbose:
-                logger.info("Output saved to: %s", output_file)
-
-            # If the gateway shutdown killed this job's tool subprocess
-            # mid-flight (#60432), the agent may still have produced a
-            # plausible-looking final_response from the truncated output --
-            # force the failure path so the delivered message is an honest
-            # "this run was interrupted" summary instead of that response.
-            # Peek-only: the flag stays set for the authoritative check
-            # right before mark_job_run below.
-            if success and _is_interrupted(job["id"]):
-                success = False
-                error = (
-                    "Interrupted by gateway shutdown before the run finished "
-                    "(tool subprocess was killed mid-flight)."
+            try:
+                output_file = save_job_output(job["id"], output)
+                if verbose:
+                    logger.info("Output saved to: %s", output_file)
+            except Exception as exc:
+                outcome = _normalize_cron_outcome(
+                    False, "", f"Cron output save failed: {exc}",
+                    interrupted=_is_interrupted(job["id"]),
                 )
-
-            # Deliver the final response to the origin/target chat.
-            # If the agent responded with [SILENT], skip delivery (but
-            # output is already saved above).  Failed jobs always deliver.
-            deliver_content = final_response if success else _summarize_cron_failure_for_delivery(job, error)
-            # Treat whitespace-only final responses the same as empty
-            # responses: do not deliver a blank message, and let the
-            # empty-response guard below mark the run as a soft failure.
-            should_deliver = bool(deliver_content.strip())
-            # Cron silence suppression — see _is_cron_silence_response.  Replaces the
-            # old `SILENT_MARKER in ...upper()` substring check, which both leaked
-            # bracketless near-markers ("SILENT" / "NO_REPLY") and wrongly swallowed
-            # a real report that merely quoted "[SILENT]" mid-sentence (#51438,
-            # #46917).  Keeps the intentional bracketed-prefix / trailing-line
-            # tolerance the cron contract relies on.
-            if should_deliver and success and _is_cron_silence_response(deliver_content):
-                logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
-                should_deliver = False
-
-            if should_deliver:
-                try:
-                    delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
-                except Exception as de:
-                    delivery_error = str(de)
-                    logger.error("Delivery failed for job %s: %s", job["id"], de)
+            outcome = _deliver_cron_outcome(
+                job, outcome, final_response, adapters=adapters, loop=loop
+            )
         finally:
             # Tear down the deferred agent(s) now that save + delivery have run
             # (or raised). Must happen on every path so cron agents never leak
@@ -4356,48 +4700,45 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             for _deferred_agent in _deferred_agents:
                 _teardown_cron_agent(_deferred_agent, job["id"])
 
-        # Treat empty final_response as a soft failure so last_status
-        # is not "ok" — the agent ran but produced nothing useful.
-        # (issue #8585) Extended for the HERMES audit finding "last_status
-        # can still be 'ok' when the agent reports that zero work occurred":
-        # when the run_job()-resolved provider's credential pool was
-        # DEFINITELY fully exhausted (not merely indeterminate — see
-        # _is_route_chain_exhausted_no_work above) at the same time no
-        # objective work was produced, attribute the forced failure
-        # deterministically to chain exhaustion instead of the generic
-        # empty-response message, so operators get an actionable signal
-        # rather than a guess at model error/timeout/misconfiguration.
-        _chain_exhausted_no_work = _is_route_chain_exhausted_no_work(_pool_available, final_response)
-        if success and not final_response.strip():
-            success = False
-            error = (
-                "route chain exhausted — no usable provider credential available; "
-                "no objective work produced"
-                if _chain_exhausted_no_work
-                else "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
-            )
-        elif not success and _pool_available is False:
-            # Failure path: last_status is already non-ok (unchanged here).
-            # Attribute the recorded error clearly to chain exhaustion so
-            # operators get a deterministic signal instead of a generic
-            # upstream error string.
-            error = (
-                f"{error} (route chain exhausted — no usable provider credential available)"
-                if error
-                else "route chain exhausted — no usable provider credential available"
-            )
-
-        if not _consume_interrupted_flag(job["id"]):
-            mark_job_run(job["id"], success, error, delivery_error=delivery_error)
-        finish_execution(execution_id, success=success, error=error)
-        return True
+        return _record_cron_outcome(
+            job,
+            execution_id,
+            owner_token,
+            outcome,
+            skip_job_status=_consume_interrupted_flag(job["id"]),
+        )
 
     except Exception as e:
         logger.error("Error processing job %s: %s", job['id'], e)
-        if not _consume_interrupted_flag(job["id"]):
-            mark_job_run(job["id"], False, str(e))
-        finish_execution(execution_id, success=False, error=str(e))
-        return False
+        outcome = _normalize_cron_outcome(
+            False, "", str(e), interrupted=_is_interrupted(job["id"])
+        )
+        outcome = _deliver_cron_outcome(
+            job, outcome, "", adapters=adapters, loop=loop
+        )
+        return _record_cron_outcome(
+            job,
+            execution_id,
+            owner_token,
+            outcome,
+            skip_job_status=_consume_interrupted_flag(job["id"]),
+        )
+    except BaseException as e:
+        # Preserve q7's durable terminal fact even for signals/interpreter exits.
+        outcome = _normalize_cron_outcome(
+            False, "", f"{type(e).__name__}: {e}", interrupted=_is_interrupted(job["id"])
+        )._replace(reason="signal")
+        _record_cron_outcome(
+            job,
+            execution_id,
+            owner_token,
+            outcome,
+            skip_job_status=_consume_interrupted_flag(job["id"]),
+        )
+        raise
+    finally:
+        if lease_heartbeat is not None:
+            lease_heartbeat.stop()
 
 
 def _notify_provider_jobs_changed() -> None:
@@ -4564,10 +4905,15 @@ def tick(
                     logger.info("Job '%s' already running — skipping", job.get("name", job_id))
                     return None
                 _running_job_ids.add(job_id)
-            # Record the attempt before executor dispatch. Recovery classifies
-            # abandoned records as unknown; it never automatically retries them.
+            # Record the owned, leased attempt before executor dispatch. A
+            # restart can only terminalize a modern row after its lease expiry
+            # and exact owner death prove the worker cannot still report.
             execution = create_execution(job_id, source="builtin")
-            dispatched_job = dict(job, execution_id=execution["id"])
+            dispatched_job = dict(
+                job,
+                execution_id=execution["id"],
+                execution_owner_token=execution["owner_token"],
+            )
             _ctx = contextvars.copy_context()
 
             def _run_and_release(j=dispatched_job, ctx=_ctx):
@@ -4584,8 +4930,10 @@ def tick(
                     _running_job_ids.discard(job_id)
                 finish_execution(
                     execution["id"],
+                    owner_token=execution["owner_token"],
                     success=False,
                     error=f"Executor dispatch failed: {submit_err}",
+                    reason="dispatch_failed",
                 )
                 # Interpreter began finalizing between the guard above and the
                 # submit — release the in-flight claim we just took and skip.

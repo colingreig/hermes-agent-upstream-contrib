@@ -61,11 +61,12 @@ JOBS_JSON="$HOME/.hermes/cron/jobs.json"
 EXECUTOR_JOB_ID="${HERMES_EXECUTOR_JOB_ID:-62714b869845}"
 UID_NUM="$(id -u)"
 
-APPLY=0; RESTART=0
+APPLY=0; RESTART=0; PR_PIPELINE_ONLY=0
 for a in "$@"; do
   case "$a" in
     --apply)   APPLY=1 ;;
     --restart) RESTART=1 ;;
+    --pr-pipeline-only) PR_PIPELINE_ONLY=1 ;;
     --help|-h) sed -n '2,30p' "$0"; exit 0 ;;
   esac
 done
@@ -78,6 +79,30 @@ hdr()   { printf '\n\033[1m== %s ==\033[0m\n' "$*"; }
 FAIL=0; CHANGED=0
 
 cd "$REPO" || { red "Repo not found: $REPO"; exit 2; }
+
+# The historical checks below cover many unrelated, hand-maintained Mini
+# facilities.  The PR trust boundary has a separate source-controlled manifest
+# and must be independently verifiable while those older checks are repaired.
+# This mode never checks out PR code, contacts GitHub, or starts a service.
+if [ "$PR_PIPELINE_ONLY" -eq 1 ]; then
+  hdr "PR trust boundary (source-controlled, shadow-only)"
+  PR_PIPELINE_VERIFY="$HOME/.hermes/scripts/pr_pipeline/pipeline_verify.py"
+  PR_PIPELINE_PY="$REPO/venv/bin/python"
+  if [ ! -f "$PR_PIPELINE_VERIFY" ]; then
+    red "verifier   MISSING $PR_PIPELINE_VERIFY — reconcile the source-controlled PR pipeline first"
+    exit 1
+  fi
+  if [ ! -x "$PR_PIPELINE_PY" ]; then
+    red "verifier   MISSING $PR_PIPELINE_PY — the immutable Hermes runtime interpreter is required"
+    exit 1
+  fi
+  if "$PR_PIPELINE_PY" "$PR_PIPELINE_VERIFY" --scripts-dir "$HOME/.hermes/scripts"; then
+    grn "boundary   deployed manifest, SQLite fence, strict CI, sandbox, and shadow-only merge checks passed"
+    exit 0
+  fi
+  red "boundary   PR trust-boundary verification failed; no merge authority was granted"
+  exit 1
+fi
 
 # --- 1. Patch application state -------------------------------------------
 hdr "1. Patch application state"
@@ -1827,13 +1852,10 @@ fi
 # untrusted — a noisy false positive on every skill load that trains
 # log-readers to ignore real security warnings.
 #
-# CURRENT STATE (verified 2026-07-02): upstream already carries the fix —
-# commit 184c10cf97 (benbarclay) added `.resolve()` on both SKILLS_DIR and
-# skill_md before the relative_to() containment check (tools/skills_tool.py
-# ~line 1138/1145). `git status` on this file is clean (no local diff), so
-# there is no local .patch to re-apply here — this section exists purely as a
-# regression tripwire in case a future `hermes update` reintroduces an
-# unresolved comparison.
+# The trusted local root must come from the runtime profile-aware
+# active_skills_dir, not module-level SKILLS_DIR (which can be stale in a
+# long-lived process after the active profile changes). Resolve both the root
+# and candidate before strict relative_to() containment.
 #
 # NOTE: 'sentry-monitor' and 'grill-me' still legitimately warn in
 # agent.log/gateway.error.log — their SKILL.md files are THEMSELVES symlinks
@@ -1844,22 +1866,60 @@ fi
 # only the top-level-symlink-hop false positive is in scope.
 hdr "32. Skills-symlink trust check (resolve-before-compare, tools/skills_tool.py)"
 SKT="$REPO/tools/skills_tool.py"
-if grep -Fq 'SKILLS_DIR.resolve()' "$SKT" 2>/dev/null && grep -Fq 'skill_md.resolve().relative_to' "$SKT" 2>/dev/null; then
-  grn "structural resolve() present on both sides of the trust-prefix comparison"
+if grep -Fq '_trusted_dirs = [active_skills_dir.resolve()]' "$SKT" 2>/dev/null && grep -Fq 'skill_md.resolve().relative_to(_td)' "$SKT" 2>/dev/null; then
+  grn "structural profile-aware resolved root and strict resolved-path containment present"
 else
-  red "STRUCTURAL REGRESSION — trust-prefix comparison no longer resolves symlinks on both sides"
-  red "  Fix: in skill_view()'s trust check ($SKT), compare SKILLS_DIR.resolve() against skill_md.resolve() before relative_to()"
+  red "STRUCTURAL REGRESSION — trust check no longer uses active_skills_dir.resolve() with resolved-path containment"
+  red "  Fix: in skill_view()'s trust check ($SKT), seed trusted dirs with active_skills_dir.resolve() and compare skill_md.resolve() via relative_to(_td)"
   FAIL=1
 fi
 # Behavioral: replicate the trust check against every real skill dir under the
-# (possibly symlinked) SKILLS_DIR and confirm skills that live under the
+# (possibly symlinked) active profile skills directory and confirm skills that live under the
 # resolved trusted target are NOT flagged outside-trusted purely because of
 # the top-level symlink hop. A skill whose SKILL.md is itself individually
 # symlinked elsewhere (sentry-monitor, grill-me) is excluded from the
 # false-positive count — that's a different, legitimate warning.
 SK_RESULT=$("$REPO/venv/bin/python" - "$HOME/.hermes/skills" <<'PY' 2>/dev/null
 import sys
+import tempfile
 from pathlib import Path
+
+
+def is_within_resolved_root(candidate, root):
+    try:
+        candidate.resolve().relative_to(root.resolve())
+    except ValueError:
+        return False
+    return True
+
+
+with tempfile.TemporaryDirectory() as tmp:
+    fixture = Path(tmp)
+    real_root = fixture / "profile-skills"
+    real_root.mkdir()
+    active_skills_dir = fixture / "active-profile-skills"
+    active_skills_dir.symlink_to(real_root, target_is_directory=True)
+
+    positive = real_root / "trusted" / "SKILL.md"
+    positive.parent.mkdir()
+    positive.write_text("---\nname: trusted\n---\n", encoding="utf-8")
+
+    escaped = fixture / "outside" / "SKILL.md"
+    escaped.parent.mkdir()
+    escaped.write_text("---\nname: escaped\n---\n", encoding="utf-8")
+    escaped_link = real_root / "escaped" / "SKILL.md"
+    escaped_link.parent.mkdir()
+    escaped_link.symlink_to(escaped)
+
+    print(f"FIXTURE_RESOLVED_ROOT {'PASS' if is_within_resolved_root(positive, active_skills_dir) else 'FAIL'}")
+    try:
+        positive.resolve().relative_to(active_skills_dir)
+    except ValueError:
+        print("FIXTURE_UNRESOLVED_PREFIX PASS")
+    else:
+        print("FIXTURE_UNRESOLVED_PREFIX FAIL")
+    print(f"FIXTURE_ESCAPED_ROOT {'PASS' if not is_within_resolved_root(escaped_link, active_skills_dir) else 'FAIL'}")
+
 skills_dir = Path(sys.argv[1])
 if not skills_dir.exists():
     print("SKIP")
@@ -1888,15 +1948,22 @@ for f in false_positives:
     print(f"  {f}")
 PY
 )
-if [ "$SK_RESULT" = "SKIP" ]; then
-  ylw "behavior   $HOME/.hermes/skills does not exist — skipped"
+sk_fixture=$(printf '%s\n' "$SK_RESULT" | awk '/^FIXTURE_/{print $2}' | tr '\n' ' ')
+if [ "$sk_fixture" != "PASS PASS PASS " ]; then
+  red "behavior   resolved-root containment fixtures failed: ${sk_fixture:-no fixture output}"
+  FAIL=1
+else
+  grn "behavior   resolved-root positive passes; unresolved-prefix and escaped-root negatives fail"
+fi
+if printf '%s\n' "$SK_RESULT" | grep -Fxq "SKIP"; then
+  ylw "behavior   $HOME/.hermes/skills does not exist — real-skill scan skipped"
 elif [ -z "$SK_RESULT" ]; then
   red "behavior   sentinel script produced no output — venv python or skills_tool import may be broken"; FAIL=1
 else
   sk_checked=$(printf '%s\n' "$SK_RESULT" | awk '/^CHECKED /{print $2}')
   sk_fp=$(printf '%s\n' "$SK_RESULT" | awk '/^FALSE_POSITIVES /{print $2}')
   if [ "${sk_fp:-1}" = "0" ]; then
-    grn "behavior   $sk_checked skill(s) under the (symlinked) skills dir all resolve inside the trusted tree (no top-level-hop false positives)"
+  grn "behavior   $sk_checked skill(s) under the (symlinked) active profile skills dir all resolve inside the trusted tree (no top-level-hop false positives)"
   else
     red "behavior   $sk_fp of ${sk_checked:-?} skill(s) false-flag outside-trusted purely from the top-level symlink hop:"
     printf '%s\n' "$SK_RESULT" | sed -n '3,$p' | while IFS= read -r fpline; do red "             $fpline"; done

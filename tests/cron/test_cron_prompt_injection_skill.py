@@ -263,7 +263,11 @@ class TestBuildJobPromptScansSkillContent:
         with pytest.raises(scheduler.CronPromptInjectionBlocked):
             scheduler._build_job_prompt(job)
 
-    def test_missing_skill_does_not_crash(self, cron_env):
+    def test_missing_skill_raises_unresolvable(self, cron_env):
+        """HERMES audit fix: an unresolvable skill must fail the job loudly
+        instead of silently free-lancing off a degraded prompt (the
+        email-triage defect — 135 runs with an unresolvable skill and an
+        empty prompt, all reporting last_status: ok)."""
         _, scheduler = cron_env
         job = {
             "id": "job-missing",
@@ -271,10 +275,9 @@ class TestBuildJobPromptScansSkillContent:
             "prompt": "run task",
             "skills": ["does-not-exist"],
         }
-        # Should not raise — missing skills are skipped with a notice.
-        prompt = scheduler._build_job_prompt(job)
-        assert prompt is not None
-        assert "could not be found" in prompt
+        with pytest.raises(scheduler.CronSkillUnresolvable) as exc_info:
+            scheduler._build_job_prompt(job)
+        assert "does-not-exist" in str(exc_info.value)
 
     def test_skill_bundle_in_job_skills_loads_referenced_skills(self, cron_env):
         hermes_home, scheduler = cron_env

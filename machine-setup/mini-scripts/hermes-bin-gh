@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# gh CLI wrapper for the Hermes Dev Assistant GitHub App.
+# MINI DESTINATION: ~/.hermes/bin/gh  (NOT ~/.hermes/scripts/)
+#
+# Mints a fresh short-lived installation token per invocation via op-run
+# (never caches/stores a token) so `gh` works non-interactively from any
+# ssh/cron context and survives reboots without depending on the GUI login
+# keychain or a static PAT. Falls back to real gh's own auth if minting fails
+# (e.g. so `gh --version`/`gh help` still work offline).
+#
+# 2026-07-26 (cron-auth outage): the interpreter is now resolved ABSOLUTELY.
+# The terminal tool builds its session env from a `bash -l` login shell, and
+# /etc/profile's /usr/libexec/path_helper REORDERS PATH so /usr/local/bin and
+# /opt/homebrew/bin land ahead of the Hermes venv. Bare `python3` therefore
+# resolved to the python.org /usr/local/bin/python3 3.13 build, which has no
+# CA bundle installed -> every mint died with
+#   URLError(SSL: CERTIFICATE_VERIFY_FAILED ... unable to get local issuer certificate)
+# and `2>/dev/null || true` swallowed it, leaving GH_TOKEN unset and every
+# cron `gh` call reporting "no oauth token found for github.com".
+# Mint failures are now logged instead of being silently discarded.
+set -euo pipefail
+REAL_GH="/opt/homebrew/bin/gh"
+
+# Absolute interpreter: never trust PATH here (see header).
+HERMES_PY="$HOME/.hermes/runtime-current/venv/bin/python"
+[ -x "$HERMES_PY" ] || HERMES_PY="/usr/bin/python3"
+
+MINT_LOG="$HOME/.hermes/logs/github-app-token.log"
+ERR_FILE="$(mktemp -t hermes-gh-mint)"
+TOKEN="$("$HOME/.local/bin/op-run" \
+  --env-file "$HOME/.hermes/github-app.op-env" -- \
+  "$HERMES_PY" "$HOME/.hermes/scripts/github_app_token.py" 2>"$ERR_FILE" || true)"
+
+if [ -n "$TOKEN" ]; then
+  export GH_TOKEN="$TOKEN"
+else
+  # Never silent: a swallowed mint failure is what made the 2026-07-26
+  # cron-auth outage invisible for two days.
+  printf '%s gh-wrapper: GitHub App token mint FAILED (py=%s): %s\n' \
+    "$(date -u +%FT%TZ)" "$HERMES_PY" \
+    "$(tr '\n' ' ' <"$ERR_FILE" | tail -c 600)" >>"$MINT_LOG" 2>/dev/null || true
+fi
+rm -f "$ERR_FILE"
+
+exec "$REAL_GH" "$@"

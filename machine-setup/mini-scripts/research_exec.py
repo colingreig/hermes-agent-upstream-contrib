@@ -33,6 +33,11 @@ from typing import Any, Callable
 
 SEARCH_ENDPOINT = "https://app.scrapingbee.com/api/v1/fast_search"
 FETCH_ENDPOINT = "https://app.scrapingbee.com/api/v1"
+# Provider names are deliberately separate from endpoint URLs. Receipts retain
+# these stable, content-free identifiers so the monitor can distinguish a
+# provider incident from an analyzer, key-resolution, or target-site failure.
+SEARCH_PROVIDER = "scrapingbee"
+FETCH_PROVIDER = "scrapingbee"
 DEFAULT_LEDGER = Path("~/.hermes/logs/research-served.jsonl").expanduser()
 DEFAULT_BASELINE = Path("~/.hermes/scripts/content-research-baseline.json").expanduser()
 DEFAULT_RESOLVER_PYTHON = Path("~/.hermes/runtime-current/venv/bin/python").expanduser()
@@ -805,6 +810,8 @@ def write_ledger(path: Path, record: dict[str, Any]) -> None:
                 str(record.get("severity")) if record.get("severity") is not None else None
             ),
             "search_failed": bool(record.get("search_failed", False)),
+            "search_provider": record.get("search_provider", SEARCH_PROVIDER),
+            "fetch_provider": record.get("fetch_provider", FETCH_PROVIDER),
             "failure_reason": (
                 str(record.get("failure_reason")) if record.get("failure_reason") is not None else None
             ),
@@ -912,6 +919,8 @@ def main(argv: list[str] | None = None) -> int:
             "degraded": False,
             "partial_degraded": False,
             "severity": "none",
+            "search_provider": SEARCH_PROVIDER,
+            "fetch_provider": FETCH_PROVIDER,
             "grounded_pages": 0,
             "attempted_fetches": 0,
             "js_render_retries": 0,
@@ -972,6 +981,8 @@ def main(argv: list[str] | None = None) -> int:
             "degraded": material_degraded,
             "partial_degraded": partial_degraded,
             "severity": severity,
+            "search_provider": SEARCH_PROVIDER,
+            "fetch_provider": FETCH_PROVIDER,
             "grounded_pages": 0,
             "attempted_fetches": 0,
             "js_render_retries": 0,
@@ -1049,6 +1060,8 @@ def main(argv: list[str] | None = None) -> int:
             "degraded": material_degraded,
             "partial_degraded": partial_degraded,
             "severity": severity,
+            "search_provider": SEARCH_PROVIDER,
+            "fetch_provider": FETCH_PROVIDER,
             "search_results": len(results),
             "fetched_pages": len(fetched),
             "blocked_pages": len(page_blocked),
@@ -1170,6 +1183,8 @@ def main(argv: list[str] | None = None) -> int:
         "degraded": degraded,
         "partial_degraded": partial_degraded,
         "severity": severity,
+        "search_provider": SEARCH_PROVIDER,
+        "fetch_provider": FETCH_PROVIDER,
         "search_results": len(results),
         "fetched_pages": len(fetched),
         "blocked_pages": len(page_blocked),
