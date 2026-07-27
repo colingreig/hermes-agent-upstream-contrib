@@ -1427,7 +1427,8 @@ fi
 #   (b) the helper losing a load-bearing guard (OPENCODE_DISABLE_CLAUDE_CODE=1
 #       prevents the ~/.claude/skills init-hang + 35k-token bloat;
 #       --dangerously-skip-permissions prevents the headless permission-hang;
-#       doppler run is the only auth path), or
+#       scoped 1Password SDK resolution plus child-env allowlisting prevents
+#       broad credential injection into the skip-perms child), or
 #   (c) the executor skill's STEP 4 reverting to self-coding.
 # This section is the structural tripwire. The live model smoke (network + ~$;
 # ~15s) is OPT-IN via HERMES_VERIFY_OPENCODE_SMOKE=1. Refs: brain
@@ -1458,43 +1459,193 @@ if [ -f "$OC_EXEC" ] && "$HOOK_PY" -c "import ast; ast.parse(open('$OC_EXEC').re
   grep -qE 'OPENCODE_DISABLE_CLAUDE_CODE=1' "$OC_EXEC" || miss="$miss OPENCODE_DISABLE_CLAUDE_CODE=1"
   # --dangerously-skip-permissions must appear in the CLI args (executable context)
   grep -qF -- '--dangerously-skip-permissions' "$OC_EXEC" || miss="$miss --dangerously-skip-permissions"
-  # SCOPED secret injection (S1 2026-06-23 hardening): fetch only the needed keys via
-  # `doppler secrets get`, NOT a blanket `doppler run` that injects all ~134 secrets into
-  # the --dangerously-skip-permissions child (prompt-injection exfil path).
-  grep -qE '"doppler", *"secrets", *"get"' "$OC_EXEC" || miss="$miss scoped-secret-fetch"
-  # child_env MUST be an explicit allowlist; a blanket dict(os.environ) is a full-credential
-  # leak into the skip-perms child — fail CLOSED if it ever reverts.
-  if grep -qE 'child_env *= *dict\(os\.environ\)' "$OC_EXEC"; then miss="$miss env-allowlist(FULL-ENV-LEAK)"; fi
-  grep -qE 'child_env *= *\{' "$OC_EXEC" || miss="$miss child_env-allowlist"
+  # SCOPED secret injection (S1 2026-06-23 hardening, migrated 2026-07-05):
+  # resolve only the needed 1Password refs through op_sdk_resolve.py, then pass
+  # an explicit child_env allowlist. Any broad os.environ inheritance into the
+  # --dangerously-skip-permissions child remains a hard failure.
+  env_report=$("$HOOK_PY" - "$OC_EXEC" <<'PY' 2>/dev/null
+import ast
+import re
+import sys
+
+path = sys.argv[1]
+source = open(path, encoding="utf-8").read()
+tree = ast.parse(source)
+miss = []
+
+strings = [n.value for n in ast.walk(tree) if isinstance(n, ast.Constant) and isinstance(n.value, str)]
+if "op_sdk_resolve.py" not in strings:
+    miss.append("op_sdk_resolve.py")
+if not any(isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "resolve_refs" for n in ast.walk(tree)):
+    miss.append("resolve_refs")
+if not any(s.startswith("op://") for s in strings):
+    miss.append("op:// scoped refs")
+
+def is_os_environ(node):
+    return (
+        isinstance(node, ast.Attribute)
+        and node.attr == "environ"
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "os"
+    )
+
+def is_child_env_target(target):
+    return isinstance(target, ast.Name) and target.id == "child_env"
+
+child_env_keys = None
+popen_uses_child_env = False
+broad_env = False
+retired_doppler = False
+for node in ast.walk(tree):
+    if isinstance(node, ast.Assign) and any(is_child_env_target(t) for t in node.targets):
+        if isinstance(node.value, ast.Dict):
+            child_env_keys = {
+                k.value for k in node.value.keys
+                if isinstance(k, ast.Constant) and isinstance(k.value, str)
+            }
+        elif is_os_environ(node.value):
+            broad_env = True
+        elif isinstance(node.value, ast.Call):
+            if isinstance(node.value.func, ast.Name) and node.value.func.id == "dict" and node.value.args and is_os_environ(node.value.args[0]):
+                broad_env = True
+            if isinstance(node.value.func, ast.Attribute) and node.value.func.attr == "copy" and is_os_environ(node.value.func.value):
+                broad_env = True
+    if isinstance(node, ast.Call):
+        if isinstance(node.func, ast.Attribute) and node.func.attr == "update" and isinstance(node.func.value, ast.Name) and node.func.value.id == "child_env":
+            if node.args and is_os_environ(node.args[0]):
+                broad_env = True
+        if isinstance(node.func, ast.Attribute) and node.func.attr == "Popen":
+            for kw in node.keywords:
+                if kw.arg == "env":
+                    popen_uses_child_env = isinstance(kw.value, ast.Name) and kw.value.id == "child_env"
+                    if is_os_environ(kw.value):
+                        broad_env = True
+        if isinstance(node.func, ast.Attribute) and node.func.attr == "run":
+            for kw in node.keywords:
+                if kw.arg == "env" and is_os_environ(kw.value):
+                    broad_env = True
+    if isinstance(node, (ast.List, ast.Tuple)):
+        vals = [e.value for e in node.elts if isinstance(e, ast.Constant) and isinstance(e.value, str)]
+        joined = " ".join(vals)
+        if joined in ("doppler secrets get", "doppler run"):
+            retired_doppler = True
+
+required_child_keys = {
+    "PATH", "HOME", "TMPDIR", "OPENAI_API_KEY", "ANTHROPIC_API_KEY",
+    "GH_TOKEN", "OPENCODE_DISABLE_CLAUDE_CODE", "OC_PROMPT", "HERMES_WRITER_CODEX",
+}
+if child_env_keys is None:
+    miss.append("child_env explicit dict")
+else:
+    missing_keys = sorted(required_child_keys - child_env_keys)
+    if missing_keys:
+        miss.append("child_env keys:" + ",".join(missing_keys))
+if not popen_uses_child_env:
+    miss.append("Popen env=child_env")
+if broad_env:
+    miss.append("FULL-ENV-LEAK")
+if retired_doppler:
+    miss.append("retired-doppler-child-auth")
+
+print("OK" if not miss else "MISS " + " ".join(miss))
+PY
+)
+  if [ "$env_report" = "OK" ]; then
+    :
+  else
+    miss="$miss ${env_report#MISS }"
+  fi
   # real wall-clock watchdog timeout (kills a silent hang that emits no stdout)
   grep -qE '_watchdog|threading\.(Thread|Timer)|signal\.alarm' "$OC_EXEC" || miss="$miss watchdog-timeout"
-  # openai/gpt-5 must appear as the model string in the MODEL_FALLBACK_ORDER / args
-  grep -qE '"openai/gpt-5"' "$OC_EXEC" || miss="$miss \"openai/gpt-5\""
+  # openai/gpt-5.x must be present in the writer cascade; exact minor is checked
+  # below by deriving the active primary tuple from WRITER_CASCADE.
+  grep -qE '"openai/gpt-5(\.|\")' "$OC_EXEC" || miss="$miss \"openai/gpt-5.x\""
   if [ -z "$miss" ]; then
-    grn "helper     opencode_exec.py parse-ok + all guards present (OPENCODE_DISABLE=1, skip-perms, scoped-secret-fetch, env-allowlist, watchdog, gpt-5 literal)"
+    grn "helper     opencode_exec.py parse-ok + all guards present (OPENCODE_DISABLE=1, skip-perms, scoped-1Password-SDK, env-allowlist, watchdog, gpt-5.x cascade)"
   else
     red "helper     opencode_exec.py MISSING guard(s):$miss — delegation will hang/bloat/mis-auth"; FAIL=1
   fi
 else
   red "helper     MISSING/UNPARSEABLE $OC_EXEC — executor has no code-writing delegate"; FAIL=1
 fi
-# 18b-codex (2026-06-25): the opt-in Codex WRITER tier. opencode_exec.py must
-# carry (a) the HERMES_WRITER_CODEX gate (default OFF) in _provider_enabled and
-# the child_env passthrough, and (b) the ("openai/gpt-5.4","openai-codex") cascade
-# tier. This is the writer counterpart to the validator chain's codex tier. The
-# tier is BEHIND glm-5.2 so a missing/disabled flag is safe (falls to glm-5.2),
-# but if the tier string or flag is dropped the opt-in path silently dies.
+# 18b-codex: the opt-in Codex WRITER tier. opencode_exec.py must carry
+# (a) the HERMES_WRITER_CODEX gate (default OFF) in _provider_enabled and the
+# child_env passthrough, and (b) a current openai-codex primary at the head of
+# WRITER_CASCADE. Derive the model/provider tuple instead of freezing another
+# stale gpt-5 minor version into this verifier.
 if [ -f "$OC_EXEC" ]; then
-  cmiss=""
-  grep -qE 'HERMES_WRITER_CODEX' "$OC_EXEC" || cmiss="$cmiss HERMES_WRITER_CODEX-flag"
-  grep -qE '"openai/gpt-5\.4", *"openai-codex"' "$OC_EXEC" || cmiss="$cmiss codex-cascade-tier"
-  # HERMES-PATCH 27: the flag must be re-resolved from Doppler (the subprocess
-  # sanitizer scrubs the bare env var, so without this gpt-5.4 is silently skipped).
-  grep -qE 'HERMES-PATCH 27' "$OC_EXEC" || cmiss="$cmiss patch27-doppler-resolve"
-  if [ -z "$cmiss" ]; then
-    grn "writer     opencode_exec.py carries opt-in Codex writer tier (HERMES_WRITER_CODEX gate + openai/gpt-5.4→openai-codex cascade + patch27 Doppler-resolve)"
+  codex_report=$("$HOOK_PY" - "$OC_EXEC" <<'PY' 2>/dev/null
+import ast
+import re
+import sys
+
+path = sys.argv[1]
+tree = ast.parse(open(path, encoding="utf-8").read())
+miss = []
+primary = None
+provider_gate = False
+expected_primary_derived = False
+
+for node in ast.walk(tree):
+    if isinstance(node, ast.Assign):
+        for target in node.targets:
+            if isinstance(target, ast.Name) and target.id == "WRITER_CASCADE" and isinstance(node.value, (ast.List, ast.Tuple)) and node.value.elts:
+                first = node.value.elts[0]
+                if isinstance(first, (ast.Tuple, ast.List)) and len(first.elts) >= 2:
+                    vals = []
+                    for elt in first.elts[:2]:
+                        vals.append(elt.value if isinstance(elt, ast.Constant) and isinstance(elt.value, str) else None)
+                    primary = tuple(vals)
+            if isinstance(target, ast.Name) and target.id == "_EXPECTED_PRIMARY":
+                value = node.value
+                expected_primary_derived = (
+                    isinstance(value, ast.Subscript)
+                    and isinstance(value.value, ast.Subscript)
+                    and isinstance(value.value.value, ast.Name)
+                    and value.value.value.id == "WRITER_CASCADE"
+                )
+    if isinstance(node, ast.If):
+        test = node.test
+        is_codex_provider_branch = (
+            isinstance(test, ast.Compare)
+            and isinstance(test.left, ast.Name)
+            and test.left.id == "provider"
+            and any(isinstance(op, ast.Eq) for op in test.ops)
+            and any(isinstance(c, ast.Constant) and c.value == "openai-codex" for c in test.comparators)
+        )
+        body_has_codex_flag = any(
+            isinstance(child, ast.Constant) and child.value == "HERMES_WRITER_CODEX"
+            for stmt in node.body
+            for child in ast.walk(stmt)
+        )
+        if is_codex_provider_branch and body_has_codex_flag:
+            provider_gate = True
+
+if primary is None:
+    miss.append("WRITER_CASCADE-primary")
+else:
+    model, provider = primary
+    if provider != "openai-codex":
+        miss.append("primary-provider:" + str(provider))
+    if not isinstance(model, str) or not re.match(r"^openai/gpt-5(\.|$)", model):
+        miss.append("primary-model:" + str(model))
+if not provider_gate:
+    miss.append("HERMES_WRITER_CODEX-provider-gate")
+if not expected_primary_derived:
+    miss.append("EXPECTED_PRIMARY-not-derived")
+
+if miss:
+    print("MISS " + " ".join(miss))
+else:
+    print("OK %s %s" % primary)
+PY
+)
+  if [ "${codex_report%% *}" = "OK" ]; then
+    codex_model=$(printf '%s\n' "$codex_report" | awk '{print $2}')
+    codex_provider=$(printf '%s\n' "$codex_report" | awk '{print $3}')
+    grn "writer     opencode_exec.py derives current Codex primary from WRITER_CASCADE (${codex_model}→${codex_provider}) + HERMES_WRITER_CODEX gate + SDK flag self-heal"
   else
-    red "writer     opencode_exec.py MISSING Codex writer wiring:$cmiss — the HERMES_WRITER_CODEX opt-in path is dead (re-apply patch 26/27 companion)"; FAIL=1
+    red "writer     opencode_exec.py MISSING Codex writer wiring:${codex_report#MISS } — the HERMES_WRITER_CODEX opt-in path is dead"; FAIL=1
   fi
 fi
 # 18b-proxy (2026-06-25): the codex-proxy launchd service. opencode's Codex writer
@@ -1596,7 +1747,7 @@ if [ "${HERMES_VERIFY_OPENCODE_SMOKE:-0}" = "1" ] && [ -x "$OC_BIN" ]; then
   smoke_dir="$(mktemp -d)"; printf 'Create a file ok.txt containing exactly READYCHECK_OK and nothing else.' > "$smoke_dir/p.txt"
   smoke=$(python3 "$OC_EXEC" --workdir "$smoke_dir" --prompt-file "$smoke_dir/p.txt" --task-id verifysmoke 2>/dev/null)
   if echo "$smoke" | grep -q '"ok": *true'; then
-    grn "smoke      live opencode delegation wrote code under doppler (cost: $(echo "$smoke" | sed -n 's/.*"cost_usd": *\([0-9.e-]*\).*/\1/p'))"
+    grn "smoke      live opencode delegation wrote code through scoped OpenCode auth (cost: $(echo "$smoke" | sed -n 's/.*"cost_usd": *\([0-9.e-]*\).*/\1/p'))"
   else
     red "smoke      live opencode delegation FAILED: $(echo "$smoke" | head -c 200)"; FAIL=1
   fi
