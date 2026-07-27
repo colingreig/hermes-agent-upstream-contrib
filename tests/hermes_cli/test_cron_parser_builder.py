@@ -54,7 +54,7 @@ def test_cron_create_options():
         "cron", "create", "0 9 * * *", "daily task prompt",
         "--name", "daily", "--deliver", "origin", "--repeat", "3",
         "--skill", "a", "--skill", "b", "--no-agent",
-        "--workdir", "/tmp/x",
+        "--workdir", "/tmp/x", "--lane-weights", "code=0.7,content=0.3",
     ])
     assert ns.schedule == "0 9 * * *"
     assert ns.prompt == "daily task prompt"
@@ -64,6 +64,7 @@ def test_cron_create_options():
     assert ns.skills == ["a", "b"]
     assert ns.no_agent is True
     assert ns.workdir == "/tmp/x"
+    assert ns.lane_weights == "code=0.7,content=0.3"
 
 
 def test_cron_edit_no_agent_tristate():
@@ -72,6 +73,17 @@ def test_cron_edit_no_agent_tristate():
     assert parser.parse_args(["cron", "edit", "j", "--no-agent"]).no_agent is True
     assert parser.parse_args(["cron", "edit", "j", "--agent"]).no_agent is False
     assert parser.parse_args(["cron", "edit", "j"]).no_agent is None
+
+
+def test_cron_edit_lane_weights_options():
+    parser = _build()
+    ns = parser.parse_args(["cron", "edit", "j", "--lane-weights", "code=3,content=1"])
+    assert ns.lane_weights == "code=3,content=1"
+    assert ns.clear_lane_weights is False
+
+    ns = parser.parse_args(["cron", "edit", "j", "--clear-lane-weights"])
+    assert ns.lane_weights is None
+    assert ns.clear_lane_weights is True
 
 
 def test_cron_dispatch_func_is_injected_handler():

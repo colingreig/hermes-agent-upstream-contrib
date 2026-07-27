@@ -768,6 +768,41 @@ class TestCronPromptScanParity:
                 assert mock_create.call_args[1]["prompt"] == self.BENIGN_PROMPT
 
     @pytest.mark.asyncio
+    async def test_create_job_passes_lane_weights(self, adapter):
+        app = _create_app(adapter)
+        mock_create = MagicMock(return_value={**SAMPLE_JOB, "lane_weights": {"code": 0.7, "content": 0.3}})
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+                f"{_MOD}._cron_create", mock_create
+            ):
+                resp = await cli.post("/api/jobs", json={
+                    "name": "lane-job",
+                    "schedule": "every 5m",
+                    "prompt": "Run the {lane} lane",
+                    "lane_weights": {"code": 0.7, "content": 0.3},
+                })
+                assert resp.status == 200
+                assert mock_create.call_args[1]["lane_weights"] == {"code": 0.7, "content": 0.3}
+
+    @pytest.mark.asyncio
+    async def test_create_job_lane_weight_validation_returns_400(self, adapter):
+        app = _create_app(adapter)
+        mock_create = MagicMock(side_effect=ValueError("lane_weights must contain exactly 'code' and 'content'"))
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+                f"{_MOD}._cron_create", mock_create
+            ):
+                resp = await cli.post("/api/jobs", json={
+                    "name": "lane-job",
+                    "schedule": "every 5m",
+                    "prompt": "Run the {lane} lane",
+                    "lane_weights": {"code": 1},
+                })
+                assert resp.status == 400
+                data = await resp.json()
+                assert "lane_weights" in data["error"]
+
+    @pytest.mark.asyncio
     async def test_update_job_rejects_malicious_prompt(self, adapter):
         """PATCH /api/jobs/{id} with an exfiltration prompt returns 400 and
         never reaches update_job."""
@@ -784,6 +819,35 @@ class TestCronPromptScanParity:
                 data = await resp.json()
                 assert "Blocked" in data["error"] or "threat" in data["error"].lower()
                 mock_update.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_update_job_allows_lane_weights_clear(self, adapter):
+        app = _create_app(adapter)
+        mock_update = MagicMock(return_value={**SAMPLE_JOB})
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+                f"{_MOD}._cron_update", mock_update
+            ):
+                resp = await cli.patch(f"/api/jobs/{VALID_JOB_ID}", json={
+                    "lane_weights": None,
+                })
+                assert resp.status == 200
+                mock_update.assert_called_once_with(VALID_JOB_ID, {"lane_weights": None})
+
+    @pytest.mark.asyncio
+    async def test_update_job_lane_weight_validation_returns_400(self, adapter):
+        app = _create_app(adapter)
+        mock_update = MagicMock(side_effect=ValueError("lane_weights requires the prompt to contain {lane}"))
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+                f"{_MOD}._cron_update", mock_update
+            ):
+                resp = await cli.patch(f"/api/jobs/{VALID_JOB_ID}", json={
+                    "lane_weights": {"code": 0.7, "content": 0.3},
+                })
+                assert resp.status == 400
+                data = await resp.json()
+                assert "lane_weights" in data["error"]
 
     @pytest.mark.asyncio
     async def test_update_job_allows_benign_prompt(self, adapter):

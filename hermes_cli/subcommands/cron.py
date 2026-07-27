@@ -70,6 +70,10 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         "--workdir",
         help="Absolute path for the job to run from. Injects AGENTS.md / CLAUDE.md / .cursorrules from that directory and uses it as the cwd for terminal/file/code_exec tools. Omit to preserve old behaviour (no project context files).",
     )
+    cron_create.add_argument(
+        "--lane-weights",
+        help="Per-run lane mix as code=0.7,content=0.3. Prompt must include {lane} or {{lane}}.",
+    )
 
     # cron edit
     cron_edit = cron_subparsers.add_parser(
@@ -133,6 +137,15 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     cron_edit.add_argument(
         "--workdir",
         help="Absolute path for the job to run from (injects AGENTS.md etc. and sets terminal cwd). Pass empty string to clear.",
+    )
+    cron_edit.add_argument(
+        "--lane-weights",
+        help="Replace per-run lane mix as code=0.7,content=0.3. Prompt must include {lane} or {{lane}}.",
+    )
+    cron_edit.add_argument(
+        "--clear-lane-weights",
+        action="store_true",
+        help="Remove per-run lane weights from the job.",
     )
 
     # lifecycle actions

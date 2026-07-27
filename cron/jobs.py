@@ -9,8 +9,10 @@ import contextlib
 import copy
 from contextvars import ContextVar
 from dataclasses import dataclass
+from fractions import Fraction
 import json
 import logging
+import math
 import shutil
 import tempfile
 import threading
@@ -463,6 +465,155 @@ def _coerce_job_bool(value: Any, default: bool = False) -> bool:
     if s in ("false", "0", "no", "off", ""):
         return False
     return default
+
+
+_LANE_WEIGHT_KEYS = ("code", "content")
+_LANE_PLACEHOLDER_RE = re.compile(r"\{\{lane\}\}|\{lane\}")
+_IGNITE_EXECUTE_LANE_RE = re.compile(
+    r"(?P<prefix>\bignite-execute\b(?:(?!\b--lane\b).)*?\s--lane(?:\s+|=))"
+    r"(?P<quote>[\"']?)(?:code|content)(?P=quote)(?=\s|$)",
+    re.DOTALL,
+)
+
+
+def _prompt_supports_weighted_lane(prompt: Any) -> bool:
+    text = _coerce_job_text(prompt)
+    return bool(_LANE_PLACEHOLDER_RE.search(text) or _IGNITE_EXECUTE_LANE_RE.search(text))
+
+
+def _normalize_lane_weights(value: Any, *, prompt: Any, no_agent: Any = False) -> Optional[Dict[str, float]]:
+    """Validate and normalize optional per-job code/content lane weights.
+
+    The compatible prompt contract is explicit: either include a ``{lane}`` or
+    ``{{lane}}`` placeholder, or include an existing ``ignite-execute --lane
+    code|content`` argument that the scheduler can safely replace at dispatch.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("lane_weights must be a mapping with code and content weights")
+    keys = set(value)
+    expected = set(_LANE_WEIGHT_KEYS)
+    if keys != expected:
+        raise ValueError("lane_weights must contain exactly 'code' and 'content'")
+    if _coerce_job_bool(no_agent, default=False):
+        raise ValueError("lane_weights are only supported for agent cron jobs, not no_agent scripts")
+
+    weights: Dict[str, float] = {}
+    for lane in _LANE_WEIGHT_KEYS:
+        raw = value.get(lane)
+        if isinstance(raw, bool):
+            raise ValueError(f"lane_weights.{lane} must be a positive number")
+        try:
+            number = float(raw)
+        except (TypeError, ValueError):
+            raise ValueError(f"lane_weights.{lane} must be a positive number") from None
+        if not math.isfinite(number) or number <= 0:
+            raise ValueError(f"lane_weights.{lane} must be a positive number")
+        weights[lane] = number
+
+    total = sum(weights.values())
+    if total <= 0:
+        raise ValueError("lane_weights must include at least one positive weight")
+    if not _prompt_supports_weighted_lane(prompt):
+        raise ValueError(
+            "lane_weights requires the prompt to contain {lane}/{{lane}} or "
+            "an ignite-execute --lane code|content argument"
+        )
+    return {lane: weights[lane] / total for lane in _LANE_WEIGHT_KEYS}
+
+
+def _lane_weight_counts(lane_weights: Dict[str, Any]) -> Dict[str, int]:
+    normalized = _normalize_lane_weights(lane_weights, prompt="run {lane}")
+    fractions = {
+        lane: Fraction(str(normalized[lane])).limit_denominator(100)
+        for lane in _LANE_WEIGHT_KEYS
+    }
+    denominator = 1
+    for fraction in fractions.values():
+        denominator = math.lcm(denominator, fraction.denominator)
+    counts = {
+        lane: max(1, int(fractions[lane] * denominator))
+        for lane in _LANE_WEIGHT_KEYS
+    }
+    divisor = math.gcd(*counts.values())
+    return {lane: count // divisor for lane, count in counts.items()}
+
+
+def _lane_sequence(lane_weights: Dict[str, Any]) -> List[str]:
+    counts = _lane_weight_counts(lane_weights)
+    remaining = dict(counts)
+    current = {lane: 0 for lane in _LANE_WEIGHT_KEYS}
+    total = sum(counts.values())
+    sequence: List[str] = []
+    for _ in range(total):
+        for lane in _LANE_WEIGHT_KEYS:
+            current[lane] += counts[lane]
+        lane = max(_LANE_WEIGHT_KEYS, key=lambda name: (current[name], -_LANE_WEIGHT_KEYS.index(name)))
+        current[lane] -= total
+        remaining[lane] -= 1
+        sequence.append(lane)
+    if any(remaining.values()):  # pragma: no cover - defensive invariant guard
+        raise RuntimeError(f"invalid lane sequence generated: {remaining}")
+    return sequence
+
+
+def render_weighted_lane_prompt(prompt: Any, lane: str) -> str:
+    """Render the dispatch prompt for a selected lane.
+
+    Compatible contracts, in order:
+      1. replace every ``{lane}`` or ``{{lane}}`` placeholder;
+      2. replace an existing ``ignite-execute --lane code|content`` argument.
+    """
+    text = _coerce_job_text(prompt)
+    if lane not in _LANE_WEIGHT_KEYS:
+        raise ValueError(f"Unsupported cron lane: {lane!r}")
+    if _LANE_PLACEHOLDER_RE.search(text):
+        return _LANE_PLACEHOLDER_RE.sub(lane, text)
+    replaced, count = _IGNITE_EXECUTE_LANE_RE.subn(
+        lambda match: f"{match.group('prefix')}{match.group('quote')}{lane}{match.group('quote')}",
+        text,
+        count=1,
+    )
+    if count:
+        return replaced
+    raise ValueError(
+        "lane_weights requires the prompt to contain {lane}/{{lane}} or "
+        "an ignite-execute --lane code|content argument"
+    )
+
+
+def choose_weighted_lane(job_id: str) -> Optional[str]:
+    """Advance and persist a job's deterministic weighted lane counter.
+
+    Returns None when the persisted job has no lane_weights, preserving legacy
+    behavior for every existing cron job.
+    """
+    with _jobs_lock():
+        jobs = load_jobs()
+        for job in jobs:
+            if job.get("id") != job_id:
+                continue
+            lane_weights = job.get("lane_weights")
+            if lane_weights is None:
+                return None
+            lane_weights = _normalize_lane_weights(
+                lane_weights,
+                prompt=job.get("prompt"),
+                no_agent=job.get("no_agent"),
+            )
+            sequence = _lane_sequence(lane_weights)
+            state = job.get("lane_state") if isinstance(job.get("lane_state"), dict) else {}
+            try:
+                counter = int(state.get("counter", 0))
+            except (TypeError, ValueError):
+                counter = 0
+            lane = sequence[counter % len(sequence)]
+            job["lane_weights"] = lane_weights
+            job["lane_state"] = {"counter": counter + 1}
+            save_jobs(jobs)
+            return lane
+    return None
 
 
 def _schedule_display_for_job(job: Dict[str, Any]) -> str:
@@ -1203,6 +1354,7 @@ def create_job(
     attach_to_session: Optional[bool] = None,
     skill_scope: Optional[str] = None,
     required_environment_variables: Optional[List[str]] = None,
+    lane_weights: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -1251,6 +1403,9 @@ def create_job(
                      preserves the historical unfiltered catalog.
         required_environment_variables: Exact child credentials required by
                      the job, stored as ordered unique shell variable names.
+        lane_weights: Optional explicit code/content ratio for deterministic
+                      weighted lane selection. Requires a compatible prompt
+                      placeholder or ignite-execute --lane argument.
 
     Returns:
         The created job dict
@@ -1284,8 +1439,14 @@ def create_job(
     normalized_no_agent = bool(no_agent)
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
     normalized_skill_scope = normalize_skill_scope(skill_scope)
+    prompt_text = _coerce_job_text(prompt)
     normalized_required_env = _normalize_required_environment_variables(
         required_environment_variables
+    )
+    normalized_lane_weights = _normalize_lane_weights(
+        lane_weights,
+        prompt=prompt_text,
+        no_agent=normalized_no_agent,
     )
 
     # no_agent jobs are meaningless without a script — the script IS the job.
@@ -1304,8 +1465,6 @@ def create_job(
         context_from = [str(j).strip() for j in context_from if str(j).strip()] or None
     else:
         context_from = None
-
-    prompt_text = _coerce_job_text(prompt)
 
     # Reject cron jobs that schedule gateway-lifecycle commands. Prevents
     # agent-driven SIGTERM-respawn loops under launchd/systemd KeepAlive
@@ -1402,6 +1561,9 @@ def create_job(
         job["attach_to_session"] = normalized_attach
     if normalized_skill_scope is not None:
         job["skill_scope"] = normalized_skill_scope
+    if normalized_lane_weights is not None:
+        job["lane_weights"] = normalized_lane_weights
+        job["lane_state"] = {"counter": 0}
 
     with _jobs_lock():
         jobs = load_jobs()
@@ -1515,6 +1677,23 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
 
             previous_inference_axes = _normalized_inference_axes(job)
             updated = _apply_skill_fields({**job, **updates})
+
+            lane_config_changed = bool({"lane_weights", "prompt", "no_agent"}.intersection(updates))
+            if lane_config_changed:
+                if updated.get("lane_weights") is None:
+                    updated.pop("lane_weights", None)
+                    updated.pop("lane_state", None)
+                else:
+                    updated["lane_weights"] = _normalize_lane_weights(
+                        updated.get("lane_weights"),
+                        prompt=updated.get("prompt"),
+                        no_agent=updated.get("no_agent"),
+                    )
+                    if "lane_weights" in updates:
+                        updated["lane_state"] = {"counter": 0}
+                    elif "lane_state" not in updated:
+                        updated["lane_state"] = {"counter": 0}
+
             schedule_changed = "schedule" in updates
             inference_fields_changed = bool(
                 {"provider", "model", "base_url", "no_agent"}.intersection(updates)

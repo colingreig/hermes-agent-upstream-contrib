@@ -220,6 +220,27 @@ class CronRequiredEnvironmentError(RuntimeError):
         )
 
 
+class CronLaneConfigurationError(Exception):
+    """Raised when a weighted-lane cron job cannot render a lane safely."""
+
+
+def _apply_weighted_lane_to_job(job: dict) -> tuple[dict, Optional[str]]:
+    """Return a per-run job copy with its prompt rendered for the selected lane."""
+    if not job.get("lane_weights"):
+        return job, None
+    try:
+        lane = choose_weighted_lane(str(job.get("id") or ""))
+        if lane is None:
+            return job, None
+        prompt = render_weighted_lane_prompt(job.get("prompt"), lane)
+    except ValueError as exc:
+        raise CronLaneConfigurationError(str(exc)) from exc
+    rendered = dict(job)
+    rendered["prompt"] = prompt
+    rendered["selected_lane"] = lane
+    return rendered, lane
+
+
 def _resolve_cron_disabled_toolsets(cfg: dict) -> list[str]:
     """Toolsets a cron-spawned agent must never receive.
 
@@ -348,10 +369,12 @@ from cron.jobs import (
     _coerce_job_bool,
     _resolve_runtime_current_workdir_alias,
     advance_next_run,
+    choose_weighted_lane,
     claim_dispatch,
     get_due_jobs,
     heartbeat_run_claim,
     mark_job_run,
+    render_weighted_lane_prompt,
     save_job_output,
 )
 from cron.executions import (
@@ -3602,6 +3625,22 @@ def run_job(
             f"{workdir_error}\n"
         )
         return False, doc, "", workdir_error
+
+    try:
+        job, selected_lane = _apply_weighted_lane_to_job(job)
+    except CronLaneConfigurationError as lane_exc:
+        logger.error("Job '%s': weighted lane configuration invalid: %s", job_id, lane_exc)
+        now_iso = _hermes_now().strftime("%Y-%m-%d %H:%M:%S")
+        doc = (
+            f"# Cron Job: {job_name}\n\n"
+            f"**Job ID:** {job_id}\n"
+            f"**Run Time:** {now_iso}\n"
+            "**Status:** preflight failed\n\n"
+            f"Weighted lane configuration invalid: {lane_exc}\n"
+        )
+        return False, doc, "", str(lane_exc)
+    if selected_lane:
+        logger.info("Job '%s' (ID: %s): selected cron lane '%s'", job_name, job_id, selected_lane)
 
     # ---------------------------------------------------------------
     # no_agent short-circuit — the script IS the job, no LLM involvement.
