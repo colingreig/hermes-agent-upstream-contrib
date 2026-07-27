@@ -244,6 +244,33 @@ def test_refuses_dest_outside_hermes(bundle):
         _install(bundle)
 
 
+def test_refuses_dest_with_dotdot_traversal(bundle):
+    # Path.relative_to is lexical and does not collapse "..", so a naive
+    # bounds check would let this manifest entry walk out of ~/.hermes into
+    # ~/.ssh. Must be refused before anything is written.
+    bundle["manifest"]["files"][0]["dest_abs"] = "~/.hermes/scripts/../../.ssh/x"
+    with pytest.raises(install_mod.InstallError):
+        _install(bundle)
+    assert not (bundle["home"] / ".ssh").exists()
+    assert not (bundle["home"] / ".hermes" / "logs").exists()
+
+
+def test_refuses_symlinked_parent_escape(bundle):
+    # Even without a literal ".." in the manifest, a symlinked intermediate
+    # directory under ~/.hermes/scripts could redirect the write outside
+    # ~/.hermes. The bounds check must resolve the closest existing ancestor
+    # and catch that too.
+    outside = bundle["home"].parent / "outside-target"
+    outside.mkdir()
+    scripts = bundle["home"] / ".hermes" / "scripts"
+    (scripts / "evil-link").symlink_to(outside, target_is_directory=True)
+    bundle["manifest"]["files"][0]["dest_abs"] = "~/.hermes/scripts/evil-link/x.py"
+    with pytest.raises(install_mod.InstallError):
+        _install(bundle)
+    assert not (outside / "x.py").exists()
+    assert not (bundle["home"] / ".hermes" / "logs").exists()
+
+
 def test_refuses_protected_basename(bundle):
     bundle["manifest"]["files"][0]["dest_abs"] = "~/.hermes/scripts/claim_store.py"
     with pytest.raises(install_mod.InstallError):

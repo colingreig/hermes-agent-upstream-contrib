@@ -89,6 +89,51 @@ def load_manifest(manifest_path: Path) -> dict:
         return json.load(fh)
 
 
+def _check_dest_in_bounds(dest: Path, dest_abs: str, allowed_root: Path) -> None:
+    """Refuse any dest that could resolve outside ``allowed_root``.
+
+    ``Path.relative_to`` is purely lexical and does not collapse ``..``
+    components, so a manifest entry like ``~/.hermes/scripts/../../.ssh/x``
+    would otherwise pass the bounds check while landing outside
+    ``allowed_root``. Two independent guards close that:
+
+    1. Refuse a literal ``..`` path component outright, before any
+       normalization — the manifest is not allowed to even spell traversal.
+    2. Normalize the path and resolve the closest existing ancestor
+       directory, then re-check the bound against the resolved root, so a
+       symlinked intermediate directory can't redirect the write outside
+       ``allowed_root`` either.
+    """
+    if ".." in dest.parts:
+        raise InstallError(
+            f"manifest destination {dest_abs!r} contains a '..' path "
+            "component — refusing"
+        )
+
+    normalized = Path(os.path.normpath(str(dest)))
+    try:
+        normalized.relative_to(allowed_root)
+    except ValueError as exc:
+        raise InstallError(
+            f"manifest destination {dest_abs!r} resolves to {normalized} "
+            f"which is outside {allowed_root} — refusing"
+        ) from exc
+
+    resolved_root = allowed_root.resolve()
+    ancestor = normalized
+    while not ancestor.exists() and ancestor.parent != ancestor:
+        ancestor = ancestor.parent
+    resolved_ancestor = ancestor.resolve()
+    try:
+        resolved_ancestor.relative_to(resolved_root)
+    except ValueError as exc:
+        raise InstallError(
+            f"manifest destination {dest_abs!r} resolves (via ancestor "
+            f"{ancestor}) to {resolved_ancestor} which is outside "
+            f"{resolved_root} — refusing"
+        ) from exc
+
+
 def build_plan(
     manifest: dict,
     *,
@@ -115,13 +160,7 @@ def build_plan(
                 f"manifest destination {entry['dest_abs']!r} targets protected "
                 f"file {dest.name!r} — refusing"
             )
-        try:
-            dest.relative_to(allowed_root)
-        except ValueError as exc:
-            raise InstallError(
-                f"manifest destination {entry['dest_abs']!r} resolves to {dest} "
-                f"which is outside {allowed_root} — refusing"
-            ) from exc
+        _check_dest_in_bounds(dest, entry["dest_abs"], allowed_root)
 
         src = _resolve_src(entry, mirror_root, brain_path)
         if not src.is_file():
