@@ -850,6 +850,22 @@ prune_releases() {
   done
 }
 
+RELEASE_PYTHON_IMPORTS=(
+  hermes_cli.main
+  google.genai
+  psycopg2
+)
+
+verify_release_python_imports() {
+  local python_bin="${1:-}" release_dir="${2:-}" module
+  [ -x "$python_bin" ] || die "build verify failed: venv python missing or not executable: $python_bin"
+  [ -d "$release_dir" ] || die "build verify failed: release dir missing: $release_dir"
+  for module in "${RELEASE_PYTHON_IMPORTS[@]}"; do
+    ( cd "$release_dir" && "$python_bin" -c "import ${module}" ) \
+      || die "build verify failed: venv python cannot import ${module}"
+  done
+}
+
 # The focused shell harness sources only the helpers above. This is deliberately
 # an opt-in no-op for a production invocation: it cannot cause a release cut.
 if [ "${MINI_RELEASE_CUT_TEST_LIB:-0}" = "1" ]; then
@@ -1165,11 +1181,10 @@ fi
 
 # --- Verify the build BEFORE any switch ------------------------------------
 if [ "$DRY_RUN" -eq 1 ]; then
-  printf '\033[35m[DRY-RUN]\033[0m verify: venv import + web_dist + governed refresh/launchd sources compile\n'
+  printf '\033[35m[DRY-RUN]\033[0m verify: release venv imports + web_dist + governed refresh/launchd sources compile\n'
 else
   log "verifying build artifacts"
-  ( cd "$NEW_DIR" && "$NEW_DIR/venv/bin/python" -c "import hermes_cli.main" ) \
-    || die "build verify failed: venv python cannot import hermes_cli.main"
+  verify_release_python_imports "$NEW_DIR/venv/bin/python" "$NEW_DIR"
   [ -f "$NEW_DIR/hermes_cli/web_dist/index.html" ] \
     || die "build verify failed: missing $NEW_DIR/hermes_cli/web_dist/index.html"
   [ -f "$NEW_DIR/$VENDORED_REFRESH_REL" ] && [ ! -L "$NEW_DIR/$VENDORED_REFRESH_REL" ] \

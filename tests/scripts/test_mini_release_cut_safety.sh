@@ -168,6 +168,23 @@ receipt_name_hash="${receipt_name_hash%.json}"
   || fail "receipt filename is not its content SHA-256"
 cmp -s "$first_receipt" "$LAST_RECEIPT_FILE" || fail "stable receipt pointer differs from addressed receipt"
 
+# The pre-swap release verifier must import every operational module that the
+# Mini release venv is expected to carry before runtime-current is repointed.
+IMPORT_RELEASE="$RELEASES_DIR/v1.0.0-imports"
+mkdir -p "$IMPORT_RELEASE/venv/bin"
+cat > "$IMPORT_RELEASE/venv/bin/python" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$HERMES_HOME/import-checks"
+SH
+chmod 0755 "$IMPORT_RELEASE/venv/bin/python"
+verify_release_python_imports "$IMPORT_RELEASE/venv/bin/python" "$IMPORT_RELEASE"
+grep -Fq 'import hermes_cli.main' "$HERMES_HOME/import-checks" \
+  || fail "release import verifier did not check hermes_cli.main"
+grep -Fq 'import google.genai' "$HERMES_HOME/import-checks" \
+  || fail "release import verifier did not check google.genai"
+grep -Fq 'import psycopg2' "$HERMES_HOME/import-checks" \
+  || fail "release import verifier did not check psycopg2"
+
 # Governed refresh deployment stages the old exact bytes, atomically installs
 # the release source, and can restore bootstrap-era bytes when the old release
 # predates vendoring.

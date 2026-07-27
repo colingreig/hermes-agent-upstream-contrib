@@ -323,6 +323,12 @@ all = [
   "hermes-agent[google]",
   "hermes-agent[web]",
   "hermes-agent[youtube]",
+  # Mac mini operational release lanes. The immutable release cut builds with
+  # `uv sync --extra all --locked`, then verifies these imports before the
+  # runtime-current symlink swap. Keep exact-pinned here so fresh release venvs
+  # cannot silently drop the Gemini blog-hero rung or cron DB-publish lane.
+  "google-genai==2.12.1",
+  "psycopg2-binary==2.9.12",
 ]
 
 [project.scripts]

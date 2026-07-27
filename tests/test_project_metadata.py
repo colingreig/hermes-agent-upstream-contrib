@@ -11,6 +11,25 @@ def _load_optional_dependencies():
     return project["optional-dependencies"]
 
 
+def _load_lock_versions(*package_names: str) -> dict[str, str]:
+    wanted = {name.lower().replace("_", "-") for name in package_names}
+    lock_path = Path(__file__).resolve().parents[1] / "uv.lock"
+    versions = {}
+    current = None
+    with lock_path.open("r", encoding="utf-8") as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if line == "[[package]]":
+                current = None
+            elif line.startswith('name = "'):
+                name = line.split('"', 2)[1].lower().replace("_", "-")
+                current = name if name in wanted else None
+            elif current and line.startswith('version = "'):
+                versions[current] = line.split('"', 2)[1]
+                current = None
+    return versions
+
+
 def _load_package_data():
     pyproject_path = Path(__file__).resolve().parents[1] / "pyproject.toml"
     with pyproject_path.open("rb") as handle:
@@ -230,6 +249,22 @@ def test_nemo_relay_extra_uses_supported_official_distribution_range():
         spec == "hermes-agent[nemo-relay]"
         for spec in optional_dependencies["all"]
     )
+
+
+def test_mini_release_operational_import_deps_are_in_all_and_locked():
+    """The immutable Mini release venv is built with [all] and --locked."""
+    optional_dependencies = _load_optional_dependencies()
+
+    expected = {
+        "google-genai": "2.12.1",
+        "psycopg2-binary": "2.9.12",
+    }
+    all_pins = _exact_pins(optional_dependencies["all"])
+    locked = _load_lock_versions(*expected)
+
+    for package, version in expected.items():
+        assert all_pins.get(package) == version
+        assert locked.get(package) == version
 
 
 def test_dashboard_plugin_manifests_and_assets_are_packaged():
