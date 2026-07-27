@@ -193,12 +193,40 @@ def _run_behavioral_proofs(scripts_dir: Path) -> None:
         shadow_merge = MergeActor(object(), lambda *_args: False).merge(candidate, execute=False)
         if shadow_merge.status != "shadow":
             raise VerificationError("a deployed merge surface can escape shadow mode")
-        # autonomous_merge._shadow() is now the env-derived, default-activated
-        # switch (HERMES_MERGE_SHADOW) shared with merge_guard and
-        # hermes_validate_ops — it is no longer a permanent True, so it is not
-        # asserted here. MergeActor.merge(execute=False) above is still the
-        # structural proof that this deployed payload cannot mutate anything
-        # without an explicit, reviewed execute=True caller.
+        # Deployment-mode coherence: every merge gate must agree with the ONE
+        # env-derived switch (validator_verdict.merge_shadow_active(): shadow
+        # by default, HERMES_MERGE_ACTIVE activates, HERMES_MERGE_SHADOW
+        # force-overrides). Equality — not a hard-coded value — so the proof
+        # holds in both shadow and activated deployments while still catching
+        # any gate that drifts to its own env parsing. The gate modules are
+        # loaded directly from the exact deployed files (never trusting an
+        # already-imported/stubbed sys.modules entry) so the proof binds to
+        # this deployment.
+        # MergeActor.merge(execute=False) above remains the structural proof
+        # that this deployed payload cannot mutate anything without an
+        # explicit, reviewed execute=True caller.
+        import importlib.util
+
+        def _load_deployed_gate(stem: str):
+            spec = importlib.util.spec_from_file_location(
+                f"_pipeline_verify_gate_{stem}", scripts_dir / f"{stem}.py"
+            )
+            if spec is None or spec.loader is None:
+                raise VerificationError(f"cannot load deployed gate module: {stem}")
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            return module
+
+        deployed_autonomous_merge = _load_deployed_gate("autonomous_merge")
+        deployed_merge_guard = _load_deployed_gate("merge_guard")
+        deployed_validate_ops = _load_deployed_gate("hermes_validate_ops")
+        expected_shadow = validator_verdict.merge_shadow_active()
+        if deployed_autonomous_merge._shadow() != expected_shadow:
+            raise VerificationError("autonomous_merge._shadow() disagrees with merge_shadow_active()")
+        if deployed_merge_guard._shadow() != expected_shadow:
+            raise VerificationError("merge_guard._shadow() disagrees with merge_shadow_active()")
+        if deployed_validate_ops.VALIDATE_SHADOW != expected_shadow:
+            raise VerificationError("hermes_validate_ops.VALIDATE_SHADOW disagrees with merge_shadow_active()")
     finally:
         try:
             sys.path.remove(str(scripts_dir))
@@ -216,7 +244,7 @@ def verify(scripts_dir: Path) -> dict[str, Any]:
         "deployment_mode": marker["deployment_mode"],
         "manifest_sha256": marker["manifest_sha256"],
         "source_commit": marker["source_commit"],
-        "checks": ["manifest-hash-parity", "sqlite-wal-fence", "json-verdict-retired", "required-ci-fail-closed", "sandbox-default-deny", "shadow-only-merge"],
+        "checks": ["manifest-hash-parity", "sqlite-wal-fence", "json-verdict-retired", "required-ci-fail-closed", "sandbox-default-deny", "shadow-only-merge", "merge-gate-mode-coherence"],
     }
 
 

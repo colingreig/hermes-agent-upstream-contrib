@@ -337,7 +337,9 @@ def validate(
         else:
             # panel suppressed (e.g. shadow smoke test) but risk >= medium:
             # deterministic-clean but unreviewed -> conservative BLOCK for high,
-            # PASS-with-warning for medium.
+            # PASS-with-warning for medium. NOTE: a panel-suppressed run is
+            # ALWAYS finalized as a shadow verdict (force_shadow below), so
+            # this PASS is never merge-eligible.
             verdict = "BLOCK" if tier == "high" else "PASS"
             model_used, panel = "tripwires(no-panel)", None
             _log(f"[validate_pr] {repo}#{pr} {verdict} (tier={tier}, panel suppressed)")
@@ -388,12 +390,21 @@ def validate(
         # Commit through the active SQLite fencing token. There is deliberately no
         # JSON write or JSON fallback: a failed finalization leaves no mergeable
         # verdict and the outer finally releases only this worker's lease.
+        #
+        # validator_review=True marks this as the validator's own fenced review
+        # flow — the ONLY caller allowed to finalize a merge-eligible
+        # (non-shadow) verdict, and only while its lease is provably live.
+        # force_shadow: a caller-requested --shadow run OR a panel-suppressed
+        # (--no-panel) run must ALWAYS produce a shadow verdict — a zero-LLM
+        # smoke test can never mint a merge-eligible PASS, regardless of tier
+        # or env.
         kept, immutable = validator_verdict.finalize_shadow_review(session, {
             "verdict": verdict, "tier": tier, "task_id": task,
             "head_sha": identity.head_sha, "expected_repo": identity.canonical_repo,
             "model_used": model_used, "findings": findings, "shadow": shadow,
             "ts": validator_verdict._now_iso(),
-        })
+        }, validator_review=True, force_shadow=bool(shadow) or not allow_panel)
+        result["shadow"] = kept.get("shadow", True)
         if immutable:
             _log(f"[validate_pr] {repo}#{pr} immutable terminal verdict held for "
                  f"head {kept.get('head_sha','')[:8]}; this result was ignored (fail-closed)")

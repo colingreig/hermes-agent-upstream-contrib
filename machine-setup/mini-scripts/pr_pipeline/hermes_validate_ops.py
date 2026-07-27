@@ -67,10 +67,11 @@ SLACK_ESCALATION_CHANNEL = os.environ.get("SLACK_ESCALATION_CHANNEL", "slack:her
 SLACK_MENTION = "<@UN4CQ1EGG>"
 
 DRY_RUN = bool(os.environ.get("DRY_RUN"))
-# Activation switch (Task: autonomous-merge activation). Default is ACTIVATED
-# (False, not shadow) unless HERMES_MERGE_SHADOW is explicitly truthy — the
-# SAME env-derived helper autonomous_merge._shadow(), merge_guard._shadow(),
-# and the verdict writer's "shadow" stamp all call
+# Activation switch (Task: autonomous-merge activation). FAIL-CLOSED default:
+# SHADOW unless HERMES_MERGE_ACTIVE is explicitly truthy, and the emergency
+# HERMES_MERGE_SHADOW override forces shadow back on even then (shadow wins)
+# — the SAME env-derived helper autonomous_merge._shadow(),
+# merge_guard._shadow(), and the verdict writer's "shadow" stamp all call
 # (validator_verdict.merge_shadow_active()), so none of them can disagree
 # about which mode the pipeline is in. Read once at import time: this module
 # runs as a fresh process per invocation, same as the DRY_RUN pattern above.
@@ -357,8 +358,10 @@ def cmd_merge_pr(a):
     # the verdict gate, so a no-verdict PR refused for the "wrong" reason.
     if VALIDATE_SHADOW:
         print(
-            "[VALIDATE_SHADOW] merge REFUSED: validator is in shadow mode; a "
-            "live merge while ClickUp writeback is muzzled would strand the task.",
+            "[merge-shadow] merge REFUSED: pipeline is in shadow mode "
+            "(HERMES_MERGE_ACTIVE not enabled, or the emergency "
+            "HERMES_MERGE_SHADOW override is set); a live merge while ClickUp "
+            "writeback is muzzled would strand the task.",
             file=sys.stderr,
         )
         return 1
@@ -401,12 +404,38 @@ def cmd_merge_pr(a):
         return 1
     # The authoritative SQLite verdict is candidate-bound.  Do not accept a
     # PASS until GitHub has supplied the exact current head it must match.
-    ok, why = validator_verdict.is_pass_fresh(
-        a.repo, a.pr_number, (ci_info.get("head") or "")
-    )
+    validated_head = ci_info.get("head") or ""
+    ok, why = validator_verdict.is_pass_fresh(a.repo, a.pr_number, validated_head)
     if not ok:
         print(f"ERROR: validator verdict gate refuses merge of {a.repo}#{a.pr_number}: "
               f"{why}", file=sys.stderr)
+        return 1
+    # TIER GATE (defense-in-depth; same policy source autonomous_merge.evaluate
+    # and merge_guard use): a direct `merge-pr` invocation must not bypass the
+    # per-risk-tier autonomy policy. Resolve the tier from the fenced verdict
+    # for the exact validated head; refuse fail-closed if it cannot be
+    # determined. Tier 'high' (and unknown) is NEVER autonomously mergeable.
+    try:
+        tier_verdict = validator_verdict.verdict_for(
+            a.repo, a.pr_number, head_sha=validated_head
+        )
+    except Exception as e:  # noqa: BLE001
+        print(f"ERROR: tier gate could not read the verdict ({e!r}); refusing "
+              f"merge (fail-closed).", file=sys.stderr)
+        return 1
+    tier = (tier_verdict or {}).get("tier")
+    if not isinstance(tier, str) or tier.strip().lower() not in ("low", "medium", "high"):
+        print(f"ERROR: risk tier for {a.repo}#{a.pr_number} could not be determined "
+              f"(got {tier!r}); refusing merge (fail-closed).", file=sys.stderr)
+        return 1
+    if not _am._tier_autonomy_enabled(tier):
+        if tier.strip().lower() == "high":
+            print(f"ERROR: risk tier 'high' is NEVER autonomously mergeable — "
+                  f"{a.repo}#{a.pr_number} requires a human merge. Merge blocked.",
+                  file=sys.stderr)
+        else:
+            print(f"ERROR: autonomous merge is not enabled for risk tier '{tier}' "
+                  f"on {a.repo}#{a.pr_number}. Merge blocked.", file=sys.stderr)
         return 1
     if ci_info.get("failing"):
         print(f"ERROR: gating checks FAILING on {a.repo}#{a.pr_number}: "
@@ -424,8 +453,12 @@ def cmd_merge_pr(a):
         return 1
 
     merge_flag = "--squash" if a.squash else "--merge"
+    # Pin the merge to the exact head that was validated: if anyone pushes a
+    # new commit between validation and this merge, GitHub rejects the merge
+    # instead of silently merging an unvalidated commit.
     cmd = ["gh", "pr", "merge", str(a.pr_number),
-           "--repo", a.repo, merge_flag, "--delete-branch"]
+           "--repo", a.repo, merge_flag, "--delete-branch",
+           "--match-head-commit", validated_head]
 
     if DRY_RUN:
         print(f"[DRY_RUN] would run: {' '.join(cmd)}")

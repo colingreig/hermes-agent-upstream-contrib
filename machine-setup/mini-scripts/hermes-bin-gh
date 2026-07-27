@@ -21,6 +21,44 @@
 set -euo pipefail
 REAL_GH="/opt/homebrew/bin/gh"
 
+# --- merge-shadow gate (defense-in-depth; merge_guard hook is PRIMARY) --------
+# A PR merge through this wrapper is refused (exit 13) unless the merge
+# pipeline is ACTIVE. Mirrors validator_verdict.merge_shadow_active():
+#   - absence of env = SHADOW  -> refuse (fail-closed default)
+#   - HERMES_MERGE_ACTIVE truthy ({1,true,yes,on}) -> allow
+#   - HERMES_MERGE_SHADOW truthy (emergency override) -> refuse, even when
+#     HERMES_MERGE_ACTIVE is set — shadow always wins
+#   - legacy VALIDATE_SHADOW truthy also refuses (kept as a closing-only var)
+# The retired HERMES_AUTONOMOUS_MERGE master switch is deliberately NOT
+# consulted here: tier policy is enforced upstream (merge_guard +
+# hermes_validate_ops), and high-tier PRs are never autonomously mergeable.
+_truthy() {
+  case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
+    1|true|yes|on) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+_is_merge_attempt() {
+  local prev="" arg
+  for arg in "$@"; do
+    case "$arg" in
+      merge) [ "$prev" = "pr" ] && return 0 ;;
+      *pulls/*/merge*|*/merges|*/merges\?*) return 0 ;;
+    esac
+    prev="$arg"
+  done
+  return 1
+}
+if _is_merge_attempt "$@"; then
+  if _truthy "${HERMES_MERGE_SHADOW:-}" || _truthy "${VALIDATE_SHADOW:-}" \
+      || ! _truthy "${HERMES_MERGE_ACTIVE:-}"; then
+    echo "gh-wrapper: PR merge REFUSED (shadow mode: HERMES_MERGE_ACTIVE not" \
+      "enabled, or HERMES_MERGE_SHADOW/VALIDATE_SHADOW override set)." \
+      "High-risk-tier PRs always require a human merge." >&2
+    exit 13
+  fi
+fi
+
 # Absolute interpreter: never trust PATH here (see header).
 HERMES_PY="$HOME/.hermes/runtime-current/venv/bin/python"
 [ -x "$HERMES_PY" ] || HERMES_PY="/usr/bin/python3"

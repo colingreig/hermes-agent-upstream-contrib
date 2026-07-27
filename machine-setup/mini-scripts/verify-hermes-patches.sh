@@ -1117,11 +1117,22 @@ if echo "$val_out" | grep -qiE 'HERMES_MERGE_SHADOW|verdict gate refuses|refuses
 else
   red "validator  cmd_merge_pr did NOT refuse live merge — live merge possible while writeback muzzled"; FAIL=1
 fi
-# 10e. BEHAVIORAL: gh shim refuses pr merge under shadow (refuses before exec)
-if [ -x "$GH_SHIM" ] && VALIDATE_SHADOW=true HERMES_AUTONOMOUS_MERGE= "$GH_SHIM" pr merge 999999 --squash >/dev/null 2>&1; [ "$?" = "13" ]; then
-  grn "shim       ~/.hermes/bin/gh refuses pr merge (defense-in-depth, exit 13)"
+# 10e. BEHAVIORAL: gh shim refuses pr merge (refuses before exec) under the
+# activation contract: (1) no env at all = SHADOW = refuse (fail-closed
+# default), and (2) the emergency HERMES_MERGE_SHADOW=1 override closes the
+# shim even when HERMES_MERGE_ACTIVE=1 is set (shadow wins). The retired
+# HERMES_AUTONOMOUS_MERGE master switch must NOT be required by the shim.
+shim_default_rc=99; shim_override_rc=99
+if [ -x "$GH_SHIM" ]; then
+  env -u HERMES_MERGE_ACTIVE -u HERMES_MERGE_SHADOW -u VALIDATE_SHADOW \
+    "$GH_SHIM" pr merge 999999 --squash >/dev/null 2>&1 && shim_default_rc=0 || shim_default_rc=$?
+  HERMES_MERGE_ACTIVE=1 HERMES_MERGE_SHADOW=1 \
+    "$GH_SHIM" pr merge 999999 --squash >/dev/null 2>&1 && shim_override_rc=0 || shim_override_rc=$?
+fi
+if [ "$shim_default_rc" = "13" ] && [ "$shim_override_rc" = "13" ]; then
+  grn "shim       ~/.hermes/bin/gh refuses pr merge (default-shadow + HERMES_MERGE_SHADOW override, exit 13)"
 else
-  ylw "shim       ~/.hermes/bin/gh merge refuse not firing (secondary layer; hook is primary)"
+  ylw "shim       ~/.hermes/bin/gh merge refuse not firing (default=$shim_default_rc override=$shim_override_rc; secondary layer; hook is primary)"
 fi
 
 # --- 11. Git commit identity guard (blocks -c user.email=<non-bot>) ----------
@@ -1192,15 +1203,21 @@ hdr "12. Autonomous-merge fail-closed CI gate (require green gating check)"
 AM="$HOME/.hermes/scripts/autonomous_merge.py"
 HOOK_PY="$REPO/venv/bin/python"
 if [ -f "$AM" ] && "$HOOK_PY" -c "import ast; ast.parse(open('$AM').read())" 2>/dev/null; then
-  am_verdict=$(HERMES_AUTONOMOUS_MERGE=1 VALIDATE_SHADOW=false "$HOOK_PY" - "$AM" <<'PY' 2>/dev/null
+  am_verdict=$(HERMES_MERGE_ACTIVE=1 HERMES_MERGE_SHADOW= HERMES_AUTONOMOUS_MERGE=1 "$HOOK_PY" - "$AM" <<'PY' 2>/dev/null
 import sys,importlib.util
 spec=importlib.util.spec_from_file_location("autonomous_merge",sys.argv[1])
 am=importlib.util.module_from_spec(spec); spec.loader.exec_module(am)
 sys.modules["autonomous_merge"]=am  # so cmd_merge_pr's `import autonomous_merge` gets THIS (monkeypatched) instance
-am.validator_verdict.is_pass_fresh=lambda repo,pr:(True,"fresh")
-base=dict(state="OPEN",head="abc123",mergeable="MERGEABLE",merge_state="CLEAN",
-          failing=[],pending=[],ignored=["Vercel"])
-v={"tier":"low","head_sha":"abc123"}; al={"r/r"}
+HEAD="a"*40
+am.validator_verdict.is_pass_fresh=lambda repo,pr,head_sha="",*a,**k:(True,"fresh")
+am._head_trips_tripwire=lambda repo,pr:(False,[],"")
+base=dict(state="OPEN",head=HEAD,mergeable="MERGEABLE",merge_state="CLEAN",
+          draft=False,labels=[],failing=[],pending=[],ignored=["Vercel"])
+v={"tier":"low","head_sha":HEAD,
+   "identity":{"canonical_repo":"r/r","pr_number":1,"trusted_task_id":"pr-1",
+               "base_sha":"b"*40,"head_sha":HEAD,"tested_merge_sha":"c"*40,
+               "ci_policy_id":"policy-v1","ci_run_ids":["ci:unit"]}}
+al={"r/r"}
 # Point 1: the sweep ACTOR (autonomous_merge.evaluate).
 am._pr_state=lambda repo,pr:(dict(base,gating_green=[]),None)
 no_gate=am.evaluate("r/r",1,v,al)[0]
@@ -1212,7 +1229,9 @@ import types
 import hermes_validate_ops as ops
 ops.VALIDATE_SHADOW=False; ops.DRY_RUN=True
 ops.load_allowlist=lambda:{"r/r"}; ops.repo_allowed=lambda r,a:True
-ops.validator_verdict=types.SimpleNamespace(is_pass_fresh=lambda r,p:(True,"fresh"))
+ops.validator_verdict=types.SimpleNamespace(
+    is_pass_fresh=lambda r,p,head_sha="",*a,**k:(True,"fresh"),
+    verdict_for=lambda r,p,path=None,head_sha="",*a,**k:{"tier":"low","head_sha":head_sha})
 arg=types.SimpleNamespace(repo="r/r",pr_number=1,squash=True)
 import io,contextlib
 _sink=io.StringIO()

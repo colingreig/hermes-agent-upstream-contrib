@@ -22,6 +22,7 @@ _COUNTER = 0
 # HERMES_AUTONOMOUS_MERGE=1 already exported) can never make them flaky.
 _MERGE_ENV_KEYS = (
     "HERMES_MERGE_SHADOW",
+    "HERMES_MERGE_ACTIVE",
     "VALIDATE_SHADOW",
     "HERMES_AUTONOMOUS_MERGE",
     "HERMES_AUTONOMOUS_MERGE_LOW",
@@ -101,10 +102,13 @@ class PipelineDeploymentTests(unittest.TestCase):
         try:
             autonomous_merge = _load(self.destination / "autonomous_merge.py", "installed_autonomous_merge")
 
-            # Default contract: activated (NOT shadow) unless HERMES_MERGE_SHADOW
-            # is explicitly truthy. Clear the ambient env so this is deterministic
-            # regardless of the host shell's own HERMES_AUTONOMOUS_MERGE* exports.
+            # Default contract: SHADOW (fail-closed) when no env is set;
+            # activation requires an explicit HERMES_MERGE_ACTIVE truthy. Clear
+            # the ambient env so this is deterministic regardless of the host
+            # shell's own HERMES_AUTONOMOUS_MERGE* exports.
             with mock.patch.dict(os.environ, _cleared_merge_env()):
+                self.assertTrue(autonomous_merge._shadow())
+            with mock.patch.dict(os.environ, _cleared_merge_env(HERMES_MERGE_ACTIVE="1")):
                 self.assertFalse(autonomous_merge._shadow())
             self.assertEqual(
                 Path(autonomous_merge.validator_verdict.__file__).resolve(),
@@ -118,11 +122,12 @@ class PipelineDeploymentTests(unittest.TestCase):
                 validator_repo_guard.parse_repo_ref("https://github.com/acme/widget/pull/7"),
                 "acme/widget",
             )
-            # No tier-autonomy env enabled -> the fenced MergeActor shadow plan
-            # still runs cleanly (proving the deployed wiring is intact), but the
-            # merge is refused at the tier-autonomy gate rather than the shadow
-            # gate now that shadow defaults to activated.
-            with mock.patch.dict(os.environ, _cleared_merge_env()):
+            # Pipeline explicitly activated but no tier-autonomy env enabled ->
+            # the fenced MergeActor shadow plan still runs cleanly (proving the
+            # deployed wiring is intact), and the merge is refused at the
+            # tier-autonomy gate (the verdict has no tier -> defaults to
+            # 'high', which is never autonomously mergeable).
+            with mock.patch.dict(os.environ, _cleared_merge_env(HERMES_MERGE_ACTIVE="1")):
                 action, detail = autonomous_merge.evaluate(
                     "acme/widget",
                     7,
@@ -195,10 +200,13 @@ class PipelineDeploymentTests(unittest.TestCase):
 
 
 class MergeActivationTests(unittest.TestCase):
-    """Autonomous-merge activation contract: default is ACTIVATED (not
-    shadow); HERMES_MERGE_SHADOW is the one env kill switch that forces shadow
-    back on; and activation is necessary but never sufficient — a merge is
-    still refused without a fresh non-shadow PASS verdict for the exact head.
+    """Autonomous-merge activation contract (fail-closed): absence of env =
+    SHADOW; activation requires an explicit HERMES_MERGE_ACTIVE truthy;
+    HERMES_MERGE_SHADOW is the emergency override that forces shadow back on
+    even when HERMES_MERGE_ACTIVE is set (shadow wins); tier 'high' is NEVER
+    autonomously mergeable by any switch; and activation is necessary but
+    never sufficient — a merge is still refused without a fresh non-shadow
+    PASS verdict for the exact head.
     """
 
     def setUp(self):
@@ -206,18 +214,33 @@ class MergeActivationTests(unittest.TestCase):
         os.sys.path.insert(0, str(PIPELINE))
         self.addCleanup(lambda: setattr(os.sys, "path", self.old_path))
 
-    def test_default_is_activated_not_shadow(self):
+    def test_unset_env_means_shadow_fail_closed(self):
         with mock.patch.dict(os.environ, _cleared_merge_env()):
             autonomous_merge = _load(PIPELINE / "autonomous_merge.py", "autonomous_merge_default")
             merge_guard = _load(PIPELINE / "merge_guard.py", "merge_guard_default")
             validate_ops = _load(PIPELINE / "hermes_validate_ops.py", "validate_ops_default")
 
+            self.assertTrue(autonomous_merge._shadow())
+            self.assertTrue(merge_guard._shadow())
+            self.assertTrue(validate_ops.VALIDATE_SHADOW)
+            self.assertEqual(
+                validate_ops.cmd_merge_pr(SimpleNamespace(repo="org/repo", pr_number=1)), 1
+            )
+
+    def test_hermes_merge_active_truthy_activates(self):
+        with mock.patch.dict(os.environ, _cleared_merge_env(HERMES_MERGE_ACTIVE="1")):
+            autonomous_merge = _load(PIPELINE / "autonomous_merge.py", "autonomous_merge_active")
+            merge_guard = _load(PIPELINE / "merge_guard.py", "merge_guard_active")
+            validate_ops = _load(PIPELINE / "hermes_validate_ops.py", "validate_ops_active")
+
             self.assertFalse(autonomous_merge._shadow())
             self.assertFalse(merge_guard._shadow())
             self.assertFalse(validate_ops.VALIDATE_SHADOW)
 
-    def test_hermes_merge_shadow_env_forces_shadow_back_on(self):
-        with mock.patch.dict(os.environ, _cleared_merge_env(HERMES_MERGE_SHADOW="1")):
+    def test_hermes_merge_shadow_override_beats_hermes_merge_active(self):
+        with mock.patch.dict(
+            os.environ, _cleared_merge_env(HERMES_MERGE_ACTIVE="1", HERMES_MERGE_SHADOW="1")
+        ):
             autonomous_merge = _load(PIPELINE / "autonomous_merge.py", "autonomous_merge_forced_shadow")
             merge_guard = _load(PIPELINE / "merge_guard.py", "merge_guard_forced_shadow")
             validate_ops = _load(PIPELINE / "hermes_validate_ops.py", "validate_ops_forced_shadow")
@@ -229,6 +252,27 @@ class MergeActivationTests(unittest.TestCase):
                 validate_ops.cmd_merge_pr(SimpleNamespace(repo="org/repo", pr_number=1)), 1
             )
 
+    def test_high_tier_is_never_autonomous_even_with_every_switch_set(self):
+        every_switch = _cleared_merge_env(
+            HERMES_MERGE_ACTIVE="1",
+            HERMES_AUTONOMOUS_MERGE="1",
+            HERMES_AUTONOMOUS_MERGE_HIGH="1",
+        )
+        with mock.patch.dict(os.environ, every_switch):
+            autonomous_merge = _load(PIPELINE / "autonomous_merge.py", "autonomous_merge_high_tier")
+            merge_guard = _load(PIPELINE / "merge_guard.py", "merge_guard_high_tier")
+
+            for module in (autonomous_merge, merge_guard):
+                self.assertFalse(module._tier_autonomy_enabled("high"))
+                self.assertFalse(module._tier_autonomy_enabled("HIGH"))
+                # Unknown/unparseable tier defaults to high => refused.
+                self.assertFalse(module._tier_autonomy_enabled(""))
+                self.assertFalse(module._tier_autonomy_enabled(None))
+                self.assertFalse(module._tier_autonomy_enabled("weird"))
+                # low/medium remain master-switch enabled.
+                self.assertTrue(module._tier_autonomy_enabled("low"))
+                self.assertTrue(module._tier_autonomy_enabled("medium"))
+
     def test_activated_merge_still_refused_without_a_fresh_pass_verdict(self):
         """Green CI is necessary but never sufficient. With the pipeline fully
         activated (not shadow) and tier autonomy enabled, a PR whose trust
@@ -237,7 +281,10 @@ class MergeActivationTests(unittest.TestCase):
         never bypassed by, the shadow/tier gates opening."""
         with tempfile.TemporaryDirectory() as directory:
             empty_ledger = Path(directory) / "empty.sqlite3"
-            with mock.patch.dict(os.environ, _cleared_merge_env(HERMES_AUTONOMOUS_MERGE="1")):
+            with mock.patch.dict(
+                os.environ,
+                _cleared_merge_env(HERMES_MERGE_ACTIVE="1", HERMES_AUTONOMOUS_MERGE="1"),
+            ):
                 autonomous_merge = _load(PIPELINE / "autonomous_merge.py", "autonomous_merge_no_verdict")
                 self.assertFalse(autonomous_merge._shadow())
 
