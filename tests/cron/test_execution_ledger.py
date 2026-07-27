@@ -422,6 +422,251 @@ def test_recovery_finalizes_only_modern_proven_dead_records(monkeypatch, tmp_pat
     assert executions.latest_execution("legacy")["status"] == "claimed"
 
 
+def _seed_historical_reconciliation_rows(executions, *, outside_id="outside-approved-set"):
+    with executions._connect() as conn:
+        for index, execution_id in enumerate(
+            executions.HISTORICAL_RECONCILIATION_EXECUTION_IDS
+        ):
+            conn.execute(
+                """INSERT INTO executions
+                   (id, job_id, source, process_id, pid, process_started_at,
+                    status, claimed_at, started_at)
+                   VALUES (?, ?, 'builtin', ?, ?, ?, 'running', ?, ?)""",
+                (
+                    execution_id,
+                    f"legacy-{index}",
+                    f"legacy-process-{index}",
+                    900000 + index,
+                    1000 + index,
+                    f"2026-01-01T00:00:0{index}+00:00",
+                    f"2026-01-01T00:00:0{index}+00:00",
+                ),
+            )
+        conn.execute(
+            """INSERT INTO executions
+               (id, job_id, source, process_id, pid, process_started_at,
+                status, claimed_at, started_at)
+               VALUES (?, 'outside', 'builtin', 'outside-process', 999999, 999,
+                       'running', '2026-01-01T00:01:00+00:00',
+                       '2026-01-01T00:01:00+00:00')""",
+            (outside_id,),
+        )
+    return outside_id
+
+
+def _historical_manifest(executions):
+    return executions.build_historical_reconciliation_manifest(
+        database_snapshot_sha256="a" * 64,
+        runtime_release="mini-release-20260727",
+        runtime_commit="1" * 40,
+    )
+
+
+def _apply_historical_manifest(executions, manifest):
+    return executions.apply_historical_execution_reconciliation(
+        manifest,
+        manifest_hash=manifest["content_hash"],
+        database_snapshot_sha256="a" * 64,
+        runtime_release="mini-release-20260727",
+        runtime_commit="1" * 40,
+    )
+
+
+def test_historical_manifest_is_fixed_allow_list_and_non_mutating(
+    monkeypatch, tmp_path,
+):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    outside_id = _seed_historical_reconciliation_rows(executions)
+    monkeypatch.setattr("gateway.status._pid_exists", lambda _pid: False)
+    before = executions.list_executions(limit=100)
+
+    manifest = _historical_manifest(executions)
+
+    assert executions.list_executions(limit=100) == before
+    assert manifest["mutated"] is False
+    assert manifest["approved_execution_ids"] == list(
+        executions.HISTORICAL_RECONCILIATION_EXECUTION_IDS
+    )
+    assert [entry["execution_id"] for entry in manifest["entries"]] == list(
+        executions.HISTORICAL_RECONCILIATION_EXECUTION_IDS
+    )
+    assert all(entry["eligible"] for entry in manifest["entries"])
+    assert outside_id not in manifest["approved_execution_ids"]
+    assert manifest["content_hash"] == executions._historical_manifest_hash(manifest)
+
+
+def test_historical_apply_rejects_snapshot_drift_without_partial_mutation(
+    monkeypatch, tmp_path,
+):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    _seed_historical_reconciliation_rows(executions)
+    monkeypatch.setattr("gateway.status._pid_exists", lambda _pid: False)
+    manifest = _historical_manifest(executions)
+    changed_id = executions.HISTORICAL_RECONCILIATION_EXECUTION_IDS[-1]
+    with sqlite3.connect(executions.EXECUTIONS_FILE) as conn:
+        conn.execute(
+            "UPDATE executions SET heartbeat_at='drifted' WHERE id=?",
+            (changed_id,),
+        )
+
+    with __import__("pytest").raises(
+        executions.HistoricalReconciliationError,
+        match="snapshot preconditions changed",
+    ):
+        _apply_historical_manifest(executions, manifest)
+
+    rows = executions.list_executions(limit=100)
+    approved = {
+        row["id"]: row for row in rows
+        if row["id"] in executions.HISTORICAL_RECONCILIATION_EXECUTION_IDS
+    }
+    assert {row["status"] for row in approved.values()} == {"running"}
+    assert all(row["terminal_at"] is None for row in approved.values())
+
+
+def test_historical_apply_refuses_pid_reuse_or_live_owner(monkeypatch, tmp_path):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    _seed_historical_reconciliation_rows(executions)
+    reused_pid = 900002
+    monkeypatch.setattr("gateway.status._pid_exists", lambda pid: pid == reused_pid)
+    monkeypatch.setattr(
+        executions,
+        "_process_start_time",
+        lambda pid: 7777 if pid == reused_pid else None,
+    )
+
+    manifest = _historical_manifest(executions)
+    by_id = {entry["execution_id"]: entry for entry in manifest["entries"]}
+    reused_id = executions.HISTORICAL_RECONCILIATION_EXECUTION_IDS[2]
+    assert by_id[reused_id]["owner_pid_evidence"]["state"] == "pid_reused"
+    assert by_id[reused_id]["eligible"] is False
+    with __import__("pytest").raises(
+        executions.HistoricalReconciliationError,
+        match="ineligible approved execution",
+    ):
+        _apply_historical_manifest(executions, manifest)
+    assert {
+        row["status"] for row in executions.list_executions(limit=100)
+    } == {"running"}
+
+
+def test_historical_apply_rejects_manifest_allow_list_tampering(
+    monkeypatch, tmp_path,
+):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    _seed_historical_reconciliation_rows(executions)
+    monkeypatch.setattr("gateway.status._pid_exists", lambda _pid: False)
+    manifest = _historical_manifest(executions)
+    manifest["approved_execution_ids"][-1] = "outside-approved-set"
+    manifest["entries"][-1]["execution_id"] = "outside-approved-set"
+    manifest["content_hash"] = executions._historical_manifest_hash(manifest)
+
+    with __import__("pytest").raises(
+        executions.HistoricalReconciliationError,
+        match="fixed approved set",
+    ):
+        _apply_historical_manifest(executions, manifest)
+    assert executions.latest_execution("outside")["status"] == "running"
+
+
+def test_historical_apply_requires_exact_hash_snapshot_and_runtime_identity(
+    monkeypatch, tmp_path,
+):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    _seed_historical_reconciliation_rows(executions)
+    monkeypatch.setattr("gateway.status._pid_exists", lambda _pid: False)
+    manifest = _historical_manifest(executions)
+
+    attempts = (
+        {"manifest_hash": "b" * 64},
+        {"database_snapshot_sha256": "b" * 64},
+        {"runtime_release": "different-release"},
+        {"runtime_commit": "2" * 40},
+    )
+    base = {
+        "manifest_hash": manifest["content_hash"],
+        "database_snapshot_sha256": "a" * 64,
+        "runtime_release": "mini-release-20260727",
+        "runtime_commit": "1" * 40,
+    }
+    for override in attempts:
+        with __import__("pytest").raises(executions.HistoricalReconciliationError):
+            executions.apply_historical_execution_reconciliation(
+                manifest, **(base | override)
+            )
+
+    approved = [
+        row for row in executions.list_executions(limit=100)
+        if row["id"] in executions.HISTORICAL_RECONCILIATION_EXECUTION_IDS
+    ]
+    assert all(row["status"] == "running" for row in approved)
+    assert all(row["terminal_at"] is None for row in approved)
+
+
+def test_historical_apply_rolls_back_all_rows_on_update_failure(
+    monkeypatch, tmp_path,
+):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    _seed_historical_reconciliation_rows(executions)
+    monkeypatch.setattr("gateway.status._pid_exists", lambda _pid: False)
+    manifest = _historical_manifest(executions)
+    blocked_id = executions.HISTORICAL_RECONCILIATION_EXECUTION_IDS[3]
+    with sqlite3.connect(executions.EXECUTIONS_FILE) as conn:
+        conn.execute(
+            f"""CREATE TRIGGER reject_historical_update
+                BEFORE UPDATE ON executions
+                WHEN NEW.id='{blocked_id}'
+                BEGIN SELECT RAISE(ABORT, 'fixture update failure'); END"""
+        )
+
+    with __import__("pytest").raises(sqlite3.IntegrityError, match="fixture update failure"):
+        _apply_historical_manifest(executions, manifest)
+
+    approved = [
+        row for row in executions.list_executions(limit=100)
+        if row["id"] in executions.HISTORICAL_RECONCILIATION_EXECUTION_IDS
+    ]
+    assert len(approved) == len(executions.HISTORICAL_RECONCILIATION_EXECUTION_IDS)
+    assert all(row["status"] == "running" for row in approved)
+    assert all(row["terminal_at"] is None for row in approved)
+
+
+def test_historical_apply_is_atomic_idempotent_and_preserves_outside_rows(
+    monkeypatch, tmp_path,
+):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    outside_id = _seed_historical_reconciliation_rows(executions)
+    monkeypatch.setattr("gateway.status._pid_exists", lambda _pid: False)
+    manifest = _historical_manifest(executions)
+
+    first = _apply_historical_manifest(executions, manifest)
+    after_first = {
+        row["id"]: row for row in executions.list_executions(limit=100)
+    }
+    second = _apply_historical_manifest(executions, manifest)
+    after_second = {
+        row["id"]: row for row in executions.list_executions(limit=100)
+    }
+
+    assert first["mutated"] == 6
+    assert first["already_reconciled"] == 0
+    assert second["mutated"] == 0
+    assert second["already_reconciled"] == 6
+    assert second["entries"] == first["entries"]
+    for execution_id in executions.HISTORICAL_RECONCILIATION_EXECUTION_IDS:
+        row = after_second[execution_id]
+        assert row == after_first[execution_id]
+        assert row["status"] == "interrupted"
+        assert row["finished_at"] == row["terminal_at"]
+        assert (
+            row["terminal_reason"]
+            == executions.HISTORICAL_RECONCILIATION_REASON
+        )
+        assert manifest["content_hash"] in row["error"]
+    assert after_second[outside_id] == after_first[outside_id]
+    assert after_second[outside_id]["status"] == "running"
+
+
 def test_concurrent_finalizers_keep_one_terminal_fact(monkeypatch, tmp_path):
     executions = _point_ledger(monkeypatch, tmp_path)
     record = executions.create_execution("race", source="builtin")
