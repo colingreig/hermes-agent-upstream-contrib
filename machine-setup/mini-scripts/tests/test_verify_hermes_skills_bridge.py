@@ -29,6 +29,22 @@ def _probe_source() -> str:
 
 
 class SkillsBridgeVerifierTests(unittest.TestCase):
+    def test_reconciler_verification_uses_explicit_release_source_root(self):
+        source = VERIFIER.read_text(encoding="utf-8")
+        self.assertIn(
+            'SKILLS_RECONCILER="$REPO/machine-setup/mini-scripts/'
+            'reconcile_marketplace_skills.py"',
+            source,
+        )
+        self.assertIn('[ ! -L "$SKILLS_RECONCILER" ]', source)
+        self.assertIn('"$REPO/venv/bin/python" "$SKILLS_RECONCILER" verify', source)
+        self.assertIn('--source-root "$REPO/machine-setup/mini-scripts"', source)
+        self.assertNotIn(
+            '"$REPO/venv/bin/python" "$HOME/.hermes/scripts/'
+            'reconcile_marketplace_skills.py"',
+            source,
+        )
+
     def test_live_index_parser_strips_yaml_delimiter_from_skill_names(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
