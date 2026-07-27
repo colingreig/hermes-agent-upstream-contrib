@@ -1268,7 +1268,7 @@ class TestRunJobSessionPersistence:
 
         processed = scheduler.run_one_job(job)
 
-        assert processed is True
+        assert processed is False
         assert model_client.chat.completions.create.call_count == 1
         assert len(prompt_write_attempts) == 1
         assert prompt_write_attempts[0][0].startswith(f"cron_{job['id']}_")
@@ -3611,8 +3611,8 @@ class TestSilentDelivery:
         save_mock.assert_called_once_with("monitor-job", "# full output")
         deliver_mock.assert_not_called()
 
-    def test_whitespace_only_response_is_marked_failed_not_delivered(self):
-        """Whitespace-only final responses should behave like empty responses."""
+    def test_whitespace_only_response_is_marked_failed_and_delivers_alert(self):
+        """Whitespace-only final responses are red and alertable."""
         with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
              patch("cron.scheduler.run_job", return_value=(True, "# output", "   \n\t  ", None)), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
@@ -3621,7 +3621,7 @@ class TestSilentDelivery:
             from cron.scheduler import tick
             tick(verbose=False)
 
-        deliver_mock.assert_not_called()
+        deliver_mock.assert_called_once()
         mark_mock.assert_called_once_with(
             "monitor-job",
             False,
@@ -3743,7 +3743,7 @@ class TestRouteChainExhaustedNoWork:
             from cron.scheduler import tick
             tick(verbose=False)
 
-        deliver_mock.assert_not_called()
+        deliver_mock.assert_called_once()
         mark_mock.assert_called_once_with(
             "monitor-job",
             False,
@@ -4046,9 +4046,8 @@ class TestRunJobWakeGate:
 
         assert call_count == 1, f"script ran {call_count}x, expected exactly 1"
 
-    def test_script_failure_does_not_trigger_gate(self):
-        """If _run_job_script returns success=False, the gate is NOT evaluated
-        and the agent still runs (the failure is reported as context)."""
+    def test_script_failure_is_terminal_before_agent(self):
+        """A failed required pre-run script cannot be rehabilitated by prose."""
         import cron.scheduler as scheduler
 
         # Malicious or broken script whose stderr happens to contain the
@@ -4062,7 +4061,29 @@ class TestRunJobWakeGate:
              patch("run_agent.AIAgent", return_value=agent) as agent_cls:
             success, doc, final, err = scheduler.run_job(self._make_job())
 
-        agent_cls.assert_called_once()  # Agent DID wake despite the gate-like text
+        agent_cls.assert_not_called()
+        assert success is False
+        assert err == '{"wakeAgent": false}'
+        assert "pre-run script failed" in doc
+
+    def test_missing_workdir_is_terminal_for_no_agent_before_script(self, tmp_path):
+        """A persisted no_agent job must not silently run from another cwd."""
+        import cron.scheduler as scheduler
+
+        missing = tmp_path / "deleted-project"
+        job = {
+            "id": "missing-workdir",
+            "name": "watchdog",
+            "no_agent": True,
+            "script": "watchdog.py",
+            "workdir": str(missing),
+        }
+        with patch.object(scheduler, "_run_job_script") as script:
+            success, _doc, _final, error = scheduler.run_job(job)
+
+        assert success is False
+        assert "workdir" in error.lower()
+        script.assert_not_called()
 
     def test_no_script_path_runs_agent_normally(self):
         """Regression: jobs without a script still work."""

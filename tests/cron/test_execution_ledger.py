@@ -467,11 +467,11 @@ def test_runner_terminal_reasons_cover_timeout_signal_and_gateway_child_death(mo
         return scheduler.run_one_job(job), executions.latest_execution("reason")
 
     ok, timeout = run_with((False, "", "", "hard timeout while running"))
-    assert ok is True
+    assert ok is False
     assert timeout["terminal_reason"] == "timeout"
 
     ok, child_died = run_with((True, "output", "response", None), interrupted=True)
-    assert ok is True
+    assert ok is False
     assert child_died["terminal_reason"] == "gateway_child_died"
 
     record = executions.create_execution("signal", source="direct")
@@ -484,3 +484,37 @@ def test_runner_terminal_reasons_cover_timeout_signal_and_gateway_child_death(mo
             "execution_owner_token": record["owner_token"],
         })
     assert executions.latest_execution("signal")["terminal_reason"] == "signal"
+
+
+def test_outer_runner_exception_preserves_normalized_timeout_and_interrupt_reason(monkeypatch, tmp_path):
+    """The exception boundary must not flatten q8 outcomes to runner_exception."""
+    executions = _point_ledger(monkeypatch, tmp_path)
+    import cron.scheduler as scheduler
+
+    monkeypatch.setattr(scheduler, "claim_dispatch", lambda _job_id: True)
+    monkeypatch.setattr(scheduler, "mark_job_run", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(scheduler, "_deliver_result", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(scheduler, "_ExecutionLeaseHeartbeat", type("Lease", (), {
+        "__init__": lambda self, *_args: None,
+        "start": lambda self: None,
+        "stop": lambda self: None,
+    }))
+
+    def run_raising(job_id, error, *, interrupted=False):
+        record = executions.create_execution(job_id, source="direct")
+        monkeypatch.setattr(
+            scheduler, "run_job", lambda _job: (_ for _ in ()).throw(RuntimeError(error))
+        )
+        monkeypatch.setattr(scheduler, "_is_interrupted", lambda _job_id: interrupted)
+        monkeypatch.setattr(scheduler, "_consume_interrupted_flag", lambda _job_id: interrupted)
+        assert scheduler.run_one_job({
+            "id": job_id,
+            "execution_id": record["id"],
+            "execution_owner_token": record["owner_token"],
+        }) is False
+        return executions.latest_execution(job_id)
+
+    timeout = run_raising("outer-timeout", "provider timeout")
+    interrupted = run_raising("outer-interrupted", "worker stopped", interrupted=True)
+    assert timeout["terminal_reason"] == "timeout"
+    assert interrupted["terminal_reason"] == "gateway_child_died"
