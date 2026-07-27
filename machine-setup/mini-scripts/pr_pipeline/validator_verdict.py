@@ -214,6 +214,24 @@ def _latest_finalization(
     return None
 
 
+def finalization_count(path: str | os.PathLike[str] | None = None) -> int | None:
+    """Return the raw terminal-verdict count without creating or repairing a ledger.
+
+    ``None`` means the ledger cannot be read (including a missing file or a
+    schemaless SQLite file); a numeric result, including ``0``, is a verified
+    count from the authoritative ``finalizations`` table.
+    """
+    ledger = _ledger_path(path)
+    if not ledger.exists():
+        return None
+    try:
+        with sqlite3.connect(f"{ledger.resolve().as_uri()}?mode=ro", uri=True) as conn:
+            row = conn.execute("SELECT COUNT(*) FROM finalizations").fetchone()
+    except (OSError, sqlite3.DatabaseError):
+        return None
+    return int(row[0]) if row is not None else None
+
+
 def begin_shadow_review(
     identity: TrustedMergeIdentity, *, path: str | os.PathLike[str] | None = None, holder: str | None = None
 ) -> ShadowReviewSession:

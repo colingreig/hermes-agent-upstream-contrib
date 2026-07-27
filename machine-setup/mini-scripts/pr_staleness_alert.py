@@ -48,10 +48,12 @@ from typing import Any
 if __package__:
     from . import autonomous_merge
     from . import pr_pipeline_improvements as ppi
+    from .pr_pipeline.validator_verdict import finalization_count
 else:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import autonomous_merge
     import pr_pipeline_improvements as ppi
+    from pr_pipeline.validator_verdict import finalization_count
 
 DEFAULT_STATE_PATH = Path.home() / ".hermes/state/pr_staleness_last.json"
 DEFAULT_DIGEST_HOURS = 24.0
@@ -187,17 +189,34 @@ def _build_message(stale_prs: list[dict[str, Any]], reason: str):
             next_step="No action needed.",
             max_words=40,
         )
+    per_repo: dict[str, list[dict[str, Any]]] = {}
+    for pr in stale_prs:
+        per_repo.setdefault(str(pr["repo"]), []).append(pr)
     facts = [
-        f"{pr['repo']}#{pr['pr']} — age {pr['age_hours']:.1f}h, merge_state {pr['merge_state']}"
-        for pr in stale_prs
+        f"{repo} — {len(prs)} PR(s), oldest {max(pr['age_hours'] for pr in prs):.1f}h"
+        for repo, prs in sorted(per_repo.items())
     ]
-    headline = f"{len(stale_prs)} PR(s) stale without a fresh verdict ({reason})."
+    facts.extend(
+        f"{pr['repo']}#{pr['pr']} — {pr['age_hours']:.1f}h"
+        for pr in sorted(stale_prs, key=lambda item: item["age_hours"], reverse=True)[:3]
+    )
+    count = finalization_count()
+    footer = (
+        "Verdict ledger: could not read the ledger."
+        if count is None
+        else (
+            "Verdict ledger: 0 finalizations — the fresh-verdict gate is inert; this alert reports PR age only."
+            if count == 0
+            else f"Verdict ledger: {count} finalizations."
+        )
+    )
+    headline = f"{len(stale_prs)} PR(s) at least {_min_age_hours():g}h old ({reason})."
     return smb.build_alert_message(
         "⏰",
         headline,
         facts=facts,
-        next_step="Open the PR(s) and re-run validation or merge if already clear.",
-        max_words=200,
+        footer=footer,
+        max_words=300,
     )
 
 

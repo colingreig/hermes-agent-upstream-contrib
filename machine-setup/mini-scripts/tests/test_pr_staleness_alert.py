@@ -57,10 +57,19 @@ def _install_stub_deps() -> types.ModuleType:
     ppi.ALERT_LOG_PATH = Path("/tmp/pr_wake_alerts.log")
     sys.modules["pr_pipeline_improvements"] = ppi
 
+    pipeline = types.ModuleType("pr_pipeline")
+    pipeline.__path__ = []
+    verdicts = types.ModuleType("pr_pipeline.validator_verdict")
+    verdicts.finalization_count = lambda: 0
+    pipeline.validator_verdict = verdicts
+    sys.modules["pr_pipeline"] = pipeline
+    sys.modules["pr_pipeline.validator_verdict"] = verdicts
+
     smb = types.ModuleType("slack_msg_builder")
     smb.build_status_message = lambda emoji, headline, **kw: f"{emoji} {headline}"
     smb.build_alert_message = lambda emoji, headline, **kw: (
         f"{emoji} {headline}\n" + "\n".join(kw.get("facts") or [])
+        + (f"\n{kw['footer']}" if kw.get("footer") else "")
     )
     sys.modules["slack_msg_builder"] = smb
 
@@ -88,6 +97,10 @@ def _pr_state(repo: str, number: int, age_hours: float, now: datetime):
         mergeable_state="dirty",
         latest_verdict_at=None,
     )
+
+
+def _alert_pr(repo: str, number: int, age_hours: float) -> dict[str, object]:
+    return {"repo": repo, "pr": number, "age_hours": age_hours}
 
 
 class AgeBucketAndFingerprintTests(unittest.TestCase):
@@ -291,6 +304,53 @@ class RunEndToEndTests(unittest.TestCase):
             self._set_states([_pr_state("org/repo", 1, age_hours=13, now=self.now)])
             self.mod.run(["org/repo"])
         self.ppi.notify.assert_called_once()
+
+
+class DigestMessageTests(unittest.TestCase):
+    def setUp(self):
+        self.mod, self.ppi = _load_module()
+
+    def test_zero_repos_keeps_the_resolved_message(self):
+        self.assertIn("Previously stale PR", self.mod._build_message([], "stale set changed"))
+
+    def test_one_repo_digest_and_zero_ledger_footer(self):
+        self.mod.finalization_count = lambda: 0
+        message = self.mod._build_message(
+            [_alert_pr("org/repo", 7, age_hours=60)], "heartbeat"
+        )
+        self.assertIn("1 PR(s) at least 48h old", message)
+        self.assertIn("org/repo — 1 PR(s), oldest 60.0h", message)
+        self.assertIn("org/repo#7 — 60.0h", message)
+        self.assertIn("Verdict ledger: 0 finalizations", message)
+
+    def test_many_repos_cap_individual_prs_at_three(self):
+        self.mod.finalization_count = lambda: 5
+        message = self.mod._build_message(
+            [
+                _alert_pr("org/a", 1, age_hours=50),
+                _alert_pr("org/a", 2, age_hours=80),
+                _alert_pr("org/b", 3, age_hours=70),
+                _alert_pr("org/c", 4, age_hours=60),
+            ],
+            "stale set changed",
+        )
+        self.assertIn("org/a — 2 PR(s), oldest 80.0h", message)
+        self.assertIn("org/b — 1 PR(s), oldest 70.0h", message)
+        self.assertIn("org/c — 1 PR(s), oldest 60.0h", message)
+        self.assertIn("org/a#2 — 80.0h", message)
+        self.assertIn("org/b#3 — 70.0h", message)
+        self.assertIn("org/c#4 — 60.0h", message)
+        self.assertNotIn("org/a#1 — 50.0h", message)
+        self.assertIn("Verdict ledger: 5 finalizations.", message)
+
+    def test_unreadable_ledger_footer_does_not_change_digest_shape(self):
+        self.mod.finalization_count = lambda: None
+        message = self.mod._build_message(
+            [_alert_pr("org/repo", 7, age_hours=60)], "heartbeat"
+        )
+        self.assertIn("org/repo — 1 PR(s), oldest 60.0h", message)
+        self.assertIn("org/repo#7 — 60.0h", message)
+        self.assertIn("Verdict ledger: could not read the ledger.", message)
 
 
 if __name__ == "__main__":
