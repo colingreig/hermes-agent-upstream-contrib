@@ -115,6 +115,30 @@ class AgeBucketAndFingerprintTests(unittest.TestCase):
         )
 
 
+class MinAgeHoursTests(unittest.TestCase):
+    def setUp(self):
+        self.mod, self.ppi = _load_module()
+
+    def _set_min_age_env(self, raw: str):
+        patcher = mock.patch.dict("os.environ", {"PR_STALENESS_MIN_AGE_HOURS": raw})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_default_is_48_hours_when_unset(self):
+        self._set_min_age_env("")
+        self.assertEqual(self.mod._min_age_hours(), 48.0)
+
+    def test_valid_override_is_honoured(self):
+        self._set_min_age_env("12")
+        self.assertEqual(self.mod._min_age_hours(), 12.0)
+
+    def test_invalid_overrides_fall_back_to_48_hours(self):
+        for raw in ("garbage", "", "0", "-1"):
+            with self.subTest(raw=raw):
+                self._set_min_age_env(raw)
+                self.assertEqual(self.mod._min_age_hours(), 48.0)
+
+
 class DecideTests(unittest.TestCase):
     """decide() is the pure dedupe/heartbeat decision — no I/O."""
 
@@ -223,26 +247,26 @@ class RunEndToEndTests(unittest.TestCase):
         self.ppi.scan_repos = lambda repos, now, gh, errors: (states, 0)
 
     def test_first_run_with_stale_pr_posts_and_saves_state(self):
-        self._set_states([_pr_state("org/repo", 1, age_hours=10, now=self.now)])
+        self._set_states([_pr_state("org/repo", 1, age_hours=49, now=self.now)])
         self.mod.run(["org/repo"])
         self.ppi.notify.assert_called_once()
         saved = json.loads(self.state_path.read_text(encoding="utf-8"))
-        self.assertEqual(saved["fingerprint"], {"org/repo#1": 0})
+        self.assertEqual(saved["fingerprint"], {"org/repo#1": 1})
 
     def test_unchanged_stale_set_stays_silent_on_second_run(self):
-        self._set_states([_pr_state("org/repo", 1, age_hours=10, now=self.now)])
+        self._set_states([_pr_state("org/repo", 1, age_hours=49, now=self.now)])
         self.mod.run(["org/repo"])
         self.ppi.notify.reset_mock()
         # Same PR, still same age bucket, run again a minute later.
         self.mod.ppi.utcnow = lambda: self.now + timedelta(minutes=1)
-        self._set_states([_pr_state("org/repo", 1, age_hours=10.02, now=self.now)])
+        self._set_states([_pr_state("org/repo", 1, age_hours=49.02, now=self.now)])
         self.mod.run(["org/repo"])
         self.ppi.notify.assert_not_called()
 
     def test_corrupt_state_file_fails_open_and_still_posts(self):
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         self.state_path.write_text("{not valid json", encoding="utf-8")
-        self._set_states([_pr_state("org/repo", 1, age_hours=10, now=self.now)])
+        self._set_states([_pr_state("org/repo", 1, age_hours=49, now=self.now)])
         self.mod.run(["org/repo"])
         self.ppi.notify.assert_called_once()
 
@@ -251,6 +275,22 @@ class RunEndToEndTests(unittest.TestCase):
         self.mod.run(["org/repo"])
         self.ppi.notify.assert_not_called()
         self.assertFalse(self.state_path.exists())
+
+    def test_pr_selection_is_age_only_at_the_48_hour_default(self):
+        self.ppi.stale_without_verdict = mock.Mock(side_effect=AssertionError("must not be called"))
+        self._set_states([_pr_state("org/repo", 1, age_hours=47, now=self.now)])
+        self.mod.run(["org/repo"])
+        self.ppi.notify.assert_not_called()
+
+        self._set_states([_pr_state("org/repo", 1, age_hours=49, now=self.now)])
+        self.mod.run(["org/repo"])
+        self.ppi.notify.assert_called_once()
+
+    def test_ambient_min_age_override_changes_pr_selection(self):
+        with mock.patch.dict("os.environ", {"PR_STALENESS_MIN_AGE_HOURS": "12"}):
+            self._set_states([_pr_state("org/repo", 1, age_hours=13, now=self.now)])
+            self.mod.run(["org/repo"])
+        self.ppi.notify.assert_called_once()
 
 
 if __name__ == "__main__":

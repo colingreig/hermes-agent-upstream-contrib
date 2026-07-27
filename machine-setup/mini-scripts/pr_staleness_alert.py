@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 """pr_staleness_alert.py — notify Colin on Slack when an open PR on an
-allowlisted repo sits for more than the no-verdict SLA (6h) without a fresh
-validator verdict.
+allowlisted repo remains open past the alert's minimum age threshold.
 
-This is a thin, Slack-delivered cron wrapper. It uses the lower-level
-scan/staleness primitives that already live in pr_pipeline_improvements.py /
-pr_wake_and_sweep.py (GitHubClient, scan_repos, stale_without_verdict,
-utcnow, notify) but owns its OWN dedupe and delivery decision end to end —
+This is a thin, Slack-delivered cron wrapper. It uses lower-level repository
+scan primitives from pr_pipeline_improvements.py (GitHubClient, scan_repos,
+utcnow, notify) but owns its OWN age predicate, dedupe, and delivery decision end to end —
 it does NOT call pr_pipeline_improvements.check_staleness_and_alert()
 anymore.
 
@@ -57,6 +55,7 @@ else:
 
 DEFAULT_STATE_PATH = Path.home() / ".hermes/state/pr_staleness_last.json"
 DEFAULT_DIGEST_HOURS = 24.0
+DEFAULT_MIN_AGE_HOURS = 48.0
 DEFAULT_AGE_BUCKET_HOURS = (24.0, 72.0, 168.0)
 
 
@@ -74,6 +73,17 @@ def _digest_hours() -> float:
     except (TypeError, ValueError):
         return DEFAULT_DIGEST_HOURS
     return value if value > 0 else DEFAULT_DIGEST_HOURS
+
+
+def _min_age_hours() -> float:
+    raw = os.environ.get("PR_STALENESS_MIN_AGE_HOURS")
+    if not raw:
+        return DEFAULT_MIN_AGE_HOURS
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_MIN_AGE_HOURS
+    return value if value > 0 else DEFAULT_MIN_AGE_HOURS
 
 
 def _age_bucket_thresholds() -> tuple[float, ...]:
@@ -198,6 +208,7 @@ def run(allowlist: list[str]) -> int:
     states, _ = ppi.scan_repos(allowlist, now, gh, errors)
     for error in errors:
         print(f"[pr-staleness-alert] {error}", file=sys.stderr)
+    min_age_hours = _min_age_hours()
     stale_prs = [
         {
             "repo": pr_state.repo,
@@ -207,7 +218,7 @@ def run(allowlist: list[str]) -> int:
             "age_hours": round((now - pr_state.created_at).total_seconds() / 3600.0, 2),
         }
         for pr_state in states
-        if ppi.stale_without_verdict(pr_state.created_at, pr_state.latest_verdict_at, now)
+        if (now - pr_state.created_at).total_seconds() / 3600.0 >= min_age_hours
     ]
 
     thresholds = _age_bucket_thresholds()
