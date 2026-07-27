@@ -110,6 +110,16 @@ under `pr_pipeline/`. Do not compare or copy those files one at a time.
 
 ## Files
 
+- `mini_health_attestation.py` — authoritative, machine-readable live Mini
+  attestation. It binds the active release commit and cleanliness, launchd
+  PIDs and loaded runtime files, content-addressed release receipts, config
+  schema and migration proof, governed source/deployed assets, fenced
+  executions, skill/credential preflights, and every enabled cron job. A
+  rejected latest release attempt remains a visible warning while the newest
+  valid activation matching `runtime-current` remains authoritative. Real
+  research-stage threshold breaches remain failing checks. `--migrate-config`
+  uses the ordinary noninteractive migration path with a private backup and
+  content-addressed receipt; `--snapshot` evaluates deterministic fixtures.
 - `reconcile_launchd_environment.py` — governed installer for
   itself, `gateway_secrets_wrap.sh`, `dashboard_secrets_wrap.sh`,
   `gateway_launch_inner.sh`, `github_app_token.py`, `op_sdk_resolve.py`, the

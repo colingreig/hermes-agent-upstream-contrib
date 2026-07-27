@@ -265,6 +265,7 @@ class LaunchdEnvironmentTests(unittest.TestCase):
             "SLACK_BOT_TOKEN=op://Gateway/slack/bot-token\n"
             "DATABASE_URL=op://Dev/database/url\n"
             "THERMAL_APP_DATABASE_URL=op://Thermal/database/url\n"
+            "HERMES_VALIDATOR_FINALIZE_TOKEN=op://Hermes/flags/finalize\n"
             "D365GROUP_DATABASE_URL=op://D365/database/url\n"
             "D365GROUP_DATABASE_URL_UNPOOLED=op://D365/database/unpooled\n"
             "OPENAI_API_KEY_HERMES=op://Legacy/openai/key\n",
@@ -287,6 +288,7 @@ class LaunchdEnvironmentTests(unittest.TestCase):
         )
         self.assertNotIn("DATABASE_URL", deployed)
         self.assertNotIn("THERMAL_APP_DATABASE_URL", deployed)
+        self.assertNotIn("HERMES_VALIDATOR_FINALIZE_TOKEN", deployed)
         self.assertEqual(
             deployed["D365GROUP_DATABASE_URL"],
             "op://D365/database/url",

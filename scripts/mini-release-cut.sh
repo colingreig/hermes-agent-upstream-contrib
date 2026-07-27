@@ -1192,6 +1192,7 @@ PY
   "$NEW_DIR/venv/bin/python" -m py_compile \
     "$LAUNCHD_SOURCE_ROOT/reconcile_launchd_environment.py" \
     "$LAUNCHD_SOURCE_ROOT/reconcile_marketplace_skills.py" \
+    "$LAUNCHD_SOURCE_ROOT/mini_health_attestation.py" \
     "$LAUNCHD_SOURCE_ROOT/record_skill_pull_success.py" \
     "$LAUNCHD_SOURCE_ROOT/skill_pull_guard.py" \
     "$LAUNCHD_SOURCE_ROOT/github_app_token.py" \
