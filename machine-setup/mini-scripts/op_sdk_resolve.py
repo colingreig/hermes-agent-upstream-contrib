@@ -39,9 +39,11 @@ Importable usage:
     #    subprocess.run(...) + `except Exception: pass` pattern).
 
 Exit codes (CLI only):
-    0  authentication + resolution ran (even if some individual keys failed)
-    1  could not authenticate to 1Password at all (token missing/invalid) or
-       the SDK itself errored in a way that blocks all resolution
+    0   authentication + resolution ran (even if some individual keys failed)
+    1   non-authentication, non-transient fatal resolver failure
+    75  transient timeout/rate-limit/5xx exhausted bounded retries and had no
+        complete usable stale cache
+    77  permanent authentication/authorization/invalid-token failure
 """
 from __future__ import annotations
 
@@ -183,15 +185,24 @@ TRANSIENT_ERROR_MARKERS = (
 )
 
 AUTH_ERROR_MARKERS = (
-    "auth",
+    "authentication",
+    "unauthenticated",
     "unauthorized",
-    "invalid",
     "forbidden",
-    "expired",
-    "token",
+    "invalid token",
+    "token invalid",
+    "token invalidated",
+    "token revoked",
+    "token is not valid",
+    "expired token",
+    "token expired",
+    "permission denied",
 )
 
 _OP_ID_RE = re.compile(r"^[a-z0-9]{26}$")
+EXIT_FATAL = 1
+EXIT_TRANSIENT = 75
+EXIT_AUTH = 77
 
 
 def _looks_like_op_id(value: str) -> bool:
@@ -202,7 +213,31 @@ def _looks_like_op_id(value: str) -> bool:
 
 def _is_auth_error(exc: BaseException) -> bool:
     msg = str(exc).lower()
-    return any(marker in msg for marker in AUTH_ERROR_MARKERS)
+    # SDK/HTTP payloads commonly encode auth statuses with separators rather
+    # than spaces (``invalid_token``, ``token-invalidated``,
+    # ``PERMISSION_DENIED``). Normalize those spellings before matching so a
+    # mixed payload that also mentions timeout/503 cannot fall through to the
+    # transient retry path.
+    normalized = re.sub(r"[_-]+", " ", msg)
+    return (
+        bool(re.search(r"\b(401|403)\b", normalized))
+        or bool(
+            re.search(
+                r"\b(?:auth|authentication|authorization|"
+                r"unauthenticated|unauthorized|forbidden)\b",
+                normalized,
+            )
+        )
+        or bool(
+            re.search(
+                r"\b(?:invalid|expired|revoked)\b.{0,48}\btoken\b"
+                r"|\btoken\b.{0,48}\b(?:invalid|invalidated|expired|revoked)\b"
+                r"|\btoken\b.{0,24}\bnot\s+valid\b",
+                normalized,
+            )
+        )
+        or any(marker in normalized for marker in AUTH_ERROR_MARKERS)
+    )
 
 
 def _is_transient_error(exc: BaseException) -> bool:
@@ -212,7 +247,18 @@ def _is_transient_error(exc: BaseException) -> bool:
     # transient-looking marker such as "timeout".
     if _is_auth_error(exc):
         return False
-    return any(marker in msg for marker in TRANSIENT_ERROR_MARKERS)
+    return bool(re.search(r"\b5\d\d\b", msg)) or any(
+        marker in msg for marker in TRANSIENT_ERROR_MARKERS
+    )
+
+
+def _fatal_exit_code(exc: BaseException) -> int:
+    """Map a terminal resolver failure to the launcher-visible contract."""
+    if _is_auth_error(exc):
+        return EXIT_AUTH
+    if _is_transient_error(exc):
+        return EXIT_TRANSIENT
+    return EXIT_FATAL
 
 
 async def _with_retry(coro_fn, *args, retry_delays: tuple[float, ...] = _RETRY_DELAYS,
@@ -513,7 +559,7 @@ async def _resolve_all(refs: dict[str, str]) -> dict[str, str]:
             if not _is_transient_error(exc):
                 # Non-transient (auth/invalid-token/etc.) failure must not be
                 # swallowed into an empty/stale result — propagate so main()'s
-                # `except Exception` still produces the FATAL/exit-1 page.
+                # `except Exception` produces the classified permanent failure.
                 # Only a transient error that has exhausted _with_retry's
                 # bounded attempts may use a complete stale fallback.
                 raise
@@ -574,8 +620,20 @@ def main() -> int:
     try:
         resolved = asyncio.run(_resolve_all(refs))
     except Exception as e:
-        sys.stderr.write(f"[op_sdk_resolve] FATAL: authentication/resolution failed: {e!r}\n")
-        return 1
+        exit_code = _fatal_exit_code(e)
+        classification = (
+            "permanent-auth"
+            if exit_code == EXIT_AUTH
+            else "transient-exhausted"
+            if exit_code == EXIT_TRANSIENT
+            else "fatal"
+        )
+        sys.stderr.write(
+            "[op_sdk_resolve] FATAL "
+            f"classification={classification} exit={exit_code}: "
+            f"authentication/resolution failed: {e!r}\n"
+        )
+        return exit_code
 
     sys.stderr.write(
         f"[op_sdk_resolve] resolved {len(resolved)}/{len(refs)} secrets via SDK\n"

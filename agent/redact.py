@@ -536,6 +536,25 @@ def redact_sensitive_text(
     if not (force or _REDACT_ENABLED):
         return text
 
+    # Child-only secret values never live in os.environ, so pattern-based
+    # redaction cannot reliably discover opaque values echoed by a subprocess.
+    # Replace the exact values registered in this ContextVar scope before the
+    # general regex passes.  Longest-first avoids partially masking overlapping
+    # values.
+    try:
+        from tools.env_passthrough import get_child_env_redaction_values
+
+        for secret_value in sorted(
+            get_child_env_redaction_values(), key=len, reverse=True
+        ):
+            if secret_value and secret_value in text:
+                text = text.replace(secret_value, "«redacted-secret»")
+    except Exception:
+        # Redaction's established contract is best-effort and import-safe; the
+        # ordinary regex policy below remains active if the optional
+        # context-local registry is unavailable.
+        pass
+
     # file_read content shouldn't hit the source-code ENV/JSON false-positive
     # paths either (it's config/data, not log lines).
     if file_read:

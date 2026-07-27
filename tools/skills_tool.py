@@ -103,6 +103,11 @@ _SKILLS_CACHE_KEY_DISABLED = "with_disabled"
 _SKILLS_CACHE_KEY_FILTERED = "filtered"
 
 
+def clear_skills_discovery_cache() -> None:
+    """Invalidate future skill catalog listings without touching live agents."""
+    _SKILLS_CACHE.clear()
+
+
 def _skills_scan_signature(dirs_to_scan, disabled) -> tuple:
     """Cheap change-signature for the skill scan inputs.
 

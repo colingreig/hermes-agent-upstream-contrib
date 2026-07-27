@@ -12,9 +12,14 @@
 # or reproduced. This script IS that automation. It builds a brand-new
 # release directory in full, verifies it, and only then atomically repoints
 # the `runtime-current` symlink and restarts the services. It NEVER mutates
-# live runtime state (DBs, config, cron, scripts, logs, LaunchAgents).
+# persistent runtime state (DBs, config, cron, logs, LaunchAgents). The sole
+# operational-file exceptions are exact-path, hash-verified, rollback-safe
+# deployments of clickup_workspace_refresh.py and the canonical launchd
+# wrappers/plists through reconcile_launchd_environment.py, plus canonical
+# external-skill config/wrappers/plists through reconcile_marketplace_skills.py.
 #
-# Tracked in ClickUp 86e2ddah5.
+# Tracked in ClickUp 86e2ddah5; conditional polling/governed script deployment
+# added under 86e2gdfwc.
 #
 # TARGET: the Hermes Mac mini (macOS, uv-managed venv, node at /opt/homebrew).
 # Do NOT run this anywhere else.
@@ -29,10 +34,16 @@ RELEASES_DIR="$HERMES_HOME/releases"
 CURRENT_LINK="$HERMES_HOME/runtime-current"
 PREV_FILE="$RELEASES_DIR/.previous"
 CUT_LOCK_DIR="$RELEASES_DIR/.mini-release-cut.lock"
+LAST_RECEIPT_FILE="$RELEASES_DIR/.mini-release-last-receipt.json"
+REFRESH_BACKUP_FILE="$RELEASES_DIR/.clickup_workspace_refresh.previous"
 GATEWAY_LOG="$HERMES_HOME/logs/gateway.log"
 LOCAL_BIN_DIR="$HOME/.local/bin"
 CLICKUP_CLI_PATH_DIR="/opt/homebrew/bin"
 CLICKUP_CLI_NAME="cu-clickup"
+VENDORED_REFRESH_REL="machine-setup/mini-scripts/clickup_workspace_refresh.py"
+DEPLOYED_REFRESH="$HERMES_HOME/scripts/clickup_workspace_refresh.py"
+VENDORED_LAUNCHD_RECONCILER_REL="machine-setup/mini-scripts/reconcile_launchd_environment.py"
+VENDORED_SKILLS_RECONCILER_REL="machine-setup/mini-scripts/reconcile_marketplace_skills.py"
 
 UID_NUM="$(id -u)"
 GUI_DOMAIN="gui/${UID_NUM}"
@@ -61,12 +72,22 @@ DO_ROLLBACK=0
 DRY_RUN=0
 DO_PRUNE=0
 OFFLINE=0
+IF_ADVANCED=0
+LAUNCHD_ENV_CHANGED=0
+MARKETPLACE_SKILLS_CHANGED=0
+PREFLIGHT=0
 
 usage() {
   cat <<'EOF'
-Usage: mini-release-cut.sh [--ref <branch-or-sha>] [--rollback] [--prune] [--dry-run] [--offline]
+Usage: mini-release-cut.sh [--ref <branch-or-sha>] [--if-advanced] [--preflight] [--rollback] [--prune] [--dry-run] [--offline]
 
   --ref <ref>   Branch or sha to cut (default: prod-live-patches).
+  --if-advanced Cut only when the resolved ref is a strict descendant of the
+                active runtime commit. Equal is a successful structured no-op;
+                behind or diverged refs fail closed.
+  --preflight   Acquire the real cut lock, fetch origin, and validate the
+                requested ref as equal or a strict descendant, then exit
+                without building, switching, or writing a receipt.
   --rollback    Repoint runtime-current to the previous release and restart.
                 No build. Uses ~/.hermes/releases/.previous.
   --prune       After a successful cut, delete releases older than the newest
@@ -91,6 +112,8 @@ while [ $# -gt 0 ]; do
     --prune)    DO_PRUNE=1; shift ;;
     --dry-run)  DRY_RUN=1; shift ;;
     --offline)  OFFLINE=1; shift ;;
+    --if-advanced) IF_ADVANCED=1; shift ;;
+    --preflight) PREFLIGHT=1; IF_ADVANCED=1; shift ;;
     -h|--help)  usage; exit 0 ;;
     *) echo "ERROR: unknown argument: ${1:-}" >&2; usage >&2; exit 2 ;;
   esac
@@ -195,6 +218,286 @@ assert_not_forbidden() {
 }
 
 git_current() { git -C "$CURRENT_LINK" "$@"; }
+
+sha256_file() {
+  local path="${1:-}"
+  [ -f "$path" ] || return 1
+  shasum -a 256 "$path" | awk '{print $1}'
+}
+
+# Classify a candidate relative to the active runtime commit. The caller has
+# already fetched and resolved both values while holding CUT_LOCK_DIR.
+classify_ref_advancement() {
+  local active_sha="${1:-}" target_sha="${2:-}"
+  [ -n "$active_sha" ] && [ -n "$target_sha" ] \
+    || die "cannot classify advancement with an empty commit"
+  if [ "$active_sha" = "$target_sha" ]; then
+    printf 'equal\n'
+  elif git_current merge-base --is-ancestor "$active_sha" "$target_sha"; then
+    printf 'advance\n'
+  elif git_current merge-base --is-ancestor "$target_sha" "$active_sha"; then
+    printf 'behind\n'
+  else
+    printf 'diverged\n'
+  fi
+}
+
+# Persist a deterministic, content-addressed receipt. The payload deliberately
+# contains state, source identities, and hashes but no wall-clock timestamp:
+# repeated no-op polls for the same state reuse the same immutable receipt.
+# launchd's append-only stdout supplies observation timestamps.
+write_release_receipt() {
+  local event="${1:-}" from_sha="${2:-}" to_sha="${3:-}"
+  local runtime_dir="${4:-}" source_hash="${5:-}" deployed_hash="${6:-}"
+  local detail="${7:-}"
+  local payload receipt_hash receipt_file tmp last_tmp
+
+  case "$event" in
+    noop|rejected|advanced|cut|rollback) ;;
+    *) warn "invalid release receipt event: $event"; return 1 ;;
+  esac
+  [[ "$from_sha" =~ ^[0-9a-f]{40,64}$ ]] \
+    && [[ "$to_sha" =~ ^[0-9a-f]{40,64}$ ]] || {
+      warn "release receipt commit identity is not a full lowercase object id"
+      return 1
+    }
+  [ -z "$source_hash" ] || [[ "$source_hash" =~ ^[0-9a-f]{64}$ ]] \
+    || { warn "invalid governed refresh source SHA-256"; return 1; }
+  [ -z "$deployed_hash" ] || [[ "$deployed_hash" =~ ^[0-9a-f]{64}$ ]] \
+    || { warn "invalid governed refresh deployed SHA-256"; return 1; }
+  # Receipt validation must be catchable by post-switch callers. The generic
+  # path assertions deliberately call die(), which is appropriate before a
+  # switch but would exit the whole process here before the caller can roll
+  # back. Isolate them in a subshell so an explicit die becomes a normal
+  # nonzero result.
+  if ! (
+    assert_release_target "$runtime_dir"
+    assert_regular_release_file "$LAST_RECEIPT_FILE"
+  ); then
+    warn "release receipt target validation failed"
+    return 1
+  fi
+
+  payload="$(python3 - "$event" "$REF" "$from_sha" "$to_sha" "$runtime_dir" \
+    "$source_hash" "$deployed_hash" "$detail" <<'PY'
+import json
+import sys
+
+event, ref, from_sha, to_sha, runtime_dir, source_hash, deployed_hash, detail = sys.argv[1:]
+print(json.dumps({
+    "schema_version": 1,
+    "event": event,
+    "ref": ref,
+    "from_commit": from_sha,
+    "to_commit": to_sha,
+    "runtime_target": runtime_dir,
+    "refresh_source_sha256": source_hash,
+    "refresh_deployed_sha256": deployed_hash,
+    "detail": detail,
+}, sort_keys=True, separators=(",", ":")))
+PY
+  )" || return 1
+  receipt_hash="$(printf '%s\n' "$payload" | shasum -a 256 | awk '{print $1}')"
+  [ "${#receipt_hash}" -eq 64 ] || return 1
+  receipt_file="$RELEASES_DIR/.mini-release-receipt-${receipt_hash}.json"
+  if ! ( assert_regular_release_file "$receipt_file" ); then
+    warn "release receipt addressed target validation failed: $receipt_file"
+    return 1
+  fi
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '\033[35m[DRY-RUN]\033[0m receipt sha256=%s %s\n' "$receipt_hash" "$payload"
+    return 0
+  fi
+
+  if [ ! -f "$receipt_file" ]; then
+    tmp="$(mktemp "$RELEASES_DIR/.mini-release-receipt.swap.XXXXXX")" || return 1
+    printf '%s\n' "$payload" > "$tmp" || { rm -f "$tmp"; return 1; }
+    chmod 0644 "$tmp" || { rm -f "$tmp"; return 1; }
+    mv -fh "$tmp" "$receipt_file" || { rm -f "$tmp"; return 1; }
+  fi
+  [ "$(sha256_file "$receipt_file")" = "$receipt_hash" ] || {
+    warn "content-addressed receipt hash mismatch: $receipt_file"
+    return 1
+  }
+  last_tmp="$(mktemp "$RELEASES_DIR/.mini-release-last.swap.XXXXXX")" || return 1
+  cp "$receipt_file" "$last_tmp" || { rm -f "$last_tmp"; return 1; }
+  chmod 0644 "$last_tmp" || { rm -f "$last_tmp"; return 1; }
+  mv -fh "$last_tmp" "$LAST_RECEIPT_FILE" || { rm -f "$last_tmp"; return 1; }
+  ok "release receipt sha256=$receipt_hash event=$event"
+}
+
+# The only governed ~/.hermes/scripts write. Source and destination must both
+# be regular non-symlink files, the destination parent must resolve to the
+# exact protected scripts directory, and replacement is a same-directory
+# atomic rename. No other caller is allowed to bypass assert_not_forbidden.
+install_governed_refresh_from_source() {
+  local source="${1:-}" scripts_dir target tmp expected actual
+  [ -f "$source" ] && [ ! -L "$source" ] || {
+    warn "governed refresh source missing or symlinked: $source"
+    return 1
+  }
+  scripts_dir="$(canonical_existing_dir "$HERMES_HOME/scripts")" || {
+    warn "protected scripts directory missing: $HERMES_HOME/scripts"
+    return 1
+  }
+  [ "$scripts_dir" = "$HERMES_HOME/scripts" ] || {
+    warn "protected scripts directory is not canonical: $HERMES_HOME/scripts -> $scripts_dir"
+    return 1
+  }
+  target="$scripts_dir/clickup_workspace_refresh.py"
+  [ ! -L "$target" ] || {
+    warn "refusing to replace symlinked governed refresh script: $target"
+    return 1
+  }
+  expected="$(sha256_file "$source")" || return 1
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '\033[35m[DRY-RUN]\033[0m atomic install %s -> %s (sha256=%s)\n' \
+      "$source" "$target" "$expected"
+    return 0
+  fi
+
+  tmp="$(mktemp "$scripts_dir/.clickup_workspace_refresh.swap.XXXXXX")" || return 1
+  cp "$source" "$tmp" || { rm -f "$tmp"; return 1; }
+  chmod 0755 "$tmp" || { rm -f "$tmp"; return 1; }
+  actual="$(sha256_file "$tmp")" || { rm -f "$tmp"; return 1; }
+  [ "$actual" = "$expected" ] || {
+    rm -f "$tmp"
+    warn "governed refresh staging hash mismatch"
+    return 1
+  }
+  mv -fh "$tmp" "$target" || { rm -f "$tmp"; return 1; }
+  [ ! -L "$target" ] && [ "$(sha256_file "$target")" = "$expected" ] || {
+    warn "governed refresh post-install verification failed: $target"
+    return 1
+  }
+  ok "governed refresh installed: $target (sha256=$expected)"
+}
+
+install_governed_refresh() {
+  local release_dir="${1:-}"
+  install_governed_refresh_from_source "$release_dir/$VENDORED_REFRESH_REL"
+}
+
+# Save the exact pre-cut deployed bytes under releases/ before any switch. A
+# previous release created before vendoring may not contain the governed source,
+# so this backup is the rollback authority for the bootstrap cut.
+stage_refresh_backup() {
+  local source="$DEPLOYED_REFRESH" tmp expected
+  [ -f "$source" ] && [ ! -L "$source" ] \
+    || die "governed deployed refresh missing or symlinked: $source"
+  assert_regular_release_file "$REFRESH_BACKUP_FILE"
+  expected="$(sha256_file "$source")" || die "could not hash deployed refresh: $source"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '\033[35m[DRY-RUN]\033[0m backup %s -> %s (sha256=%s)\n' \
+      "$source" "$REFRESH_BACKUP_FILE" "$expected"
+    return 0
+  fi
+  tmp="$(mktemp "$RELEASES_DIR/.clickup-refresh-backup.swap.XXXXXX")" \
+    || die "could not create governed refresh backup"
+  cp "$source" "$tmp" || { rm -f "$tmp"; die "could not stage governed refresh backup"; }
+  chmod 0644 "$tmp" || { rm -f "$tmp"; die "could not secure governed refresh backup"; }
+  [ "$(sha256_file "$tmp")" = "$expected" ] \
+    || { rm -f "$tmp"; die "governed refresh backup hash mismatch"; }
+  mv -fh "$tmp" "$REFRESH_BACKUP_FILE" \
+    || { rm -f "$tmp"; die "could not atomically record governed refresh backup"; }
+}
+
+restore_governed_refresh_for_release() {
+  local release_dir="${1:-}"
+  local source="$release_dir/$VENDORED_REFRESH_REL"
+  if [ ! -f "$source" ]; then
+    source="$REFRESH_BACKUP_FILE"
+  fi
+  install_governed_refresh_from_source "$source"
+}
+
+# Deploy the release-owned launchd wrappers, token minter, resolver, reference
+# template, and generated plists through their transactional reconciler. The
+# reconciler owns exact pre-install snapshots and source/deployed hash receipts.
+install_governed_launchd_environment() {
+  local release_dir="${1:-}"
+  local reconciler="$release_dir/$VENDORED_LAUNCHD_RECONCILER_REL"
+  local source_root
+  source_root="$(dirname "$reconciler")"
+  [ -f "$reconciler" ] && [ ! -L "$reconciler" ] \
+    || { warn "launchd environment reconciler missing or symlinked: $reconciler"; return 1; }
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '\033[35m[DRY-RUN]\033[0m %s %s install --source-root %s --home %s --hermes-home %s --reload\n' \
+      "$release_dir/venv/bin/python" "$reconciler" "$source_root" "$HOME" "$HERMES_HOME"
+    return 0
+  fi
+  if ! "$release_dir/venv/bin/python" "$reconciler" install \
+    --source-root "$source_root" --home "$HOME" --hermes-home "$HERMES_HOME" --reload; then
+    return 1
+  fi
+  LAUNCHD_ENV_CHANGED=1
+}
+
+rollback_governed_launchd_environment() {
+  local reason="${1:-automatic}"
+  local reconciler="$HERMES_HOME/scripts/reconcile_launchd_environment.py"
+  if [ "$LAUNCHD_ENV_CHANGED" -ne 1 ] && [ "$reason" != "explicit --rollback" ]; then
+    return 0
+  fi
+  if [ ! -f "$reconciler" ] || [ -L "$reconciler" ]; then
+    [ "$LAUNCHD_ENV_CHANGED" -eq 1 ] && return 1
+    warn "no governed launchd snapshot available; leaving pre-contract launchd files unchanged"
+    return 0
+  fi
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '\033[35m[DRY-RUN]\033[0m %s %s rollback --home %s --hermes-home %s --reload\n' \
+      "$CURRENT_LINK/venv/bin/python" "$reconciler" "$HOME" "$HERMES_HOME"
+    return 0
+  fi
+  "$CURRENT_LINK/venv/bin/python" "$reconciler" rollback \
+    --home "$HOME" --hermes-home "$HERMES_HOME" --reload
+  LAUNCHD_ENV_CHANGED=0
+}
+
+# Install canonical external-skill roots and pull jobs through an independent
+# transaction. Its snapshot includes config.yaml, the retired legacy plist,
+# deployed assets, and the prior manifest receipt.
+install_governed_marketplace_skills() {
+  local release_dir="${1:-}"
+  local reconciler="$release_dir/$VENDORED_SKILLS_RECONCILER_REL"
+  local source_root
+  source_root="$(dirname "$reconciler")"
+  [ -f "$reconciler" ] && [ ! -L "$reconciler" ] \
+    || { warn "marketplace skills reconciler missing or symlinked: $reconciler"; return 1; }
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '\033[35m[DRY-RUN]\033[0m %s %s install --source-root %s --home %s --hermes-home %s --reload\n' \
+      "$release_dir/venv/bin/python" "$reconciler" "$source_root" "$HOME" "$HERMES_HOME"
+    return 0
+  fi
+  if ! "$release_dir/venv/bin/python" "$reconciler" install \
+    --source-root "$source_root" --home "$HOME" --hermes-home "$HERMES_HOME" --reload; then
+    return 1
+  fi
+  MARKETPLACE_SKILLS_CHANGED=1
+}
+
+rollback_governed_marketplace_skills() {
+  local reason="${1:-automatic}"
+  local reconciler="$HERMES_HOME/scripts/reconcile_marketplace_skills.py"
+  if [ "$MARKETPLACE_SKILLS_CHANGED" -ne 1 ] && [ "$reason" != "explicit --rollback" ]; then
+    return 0
+  fi
+  if [ ! -f "$reconciler" ] || [ -L "$reconciler" ]; then
+    [ "$MARKETPLACE_SKILLS_CHANGED" -eq 1 ] && return 1
+    warn "no governed marketplace-skills snapshot available; leaving pre-contract files unchanged"
+    return 0
+  fi
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '\033[35m[DRY-RUN]\033[0m %s %s rollback --home %s --hermes-home %s --reload\n' \
+      "$CURRENT_LINK/venv/bin/python" "$reconciler" "$HOME" "$HERMES_HOME"
+    return 0
+  fi
+  "$CURRENT_LINK/venv/bin/python" "$reconciler" rollback \
+    --home "$HOME" --hermes-home "$HERMES_HOME" --reload
+  MARKETPLACE_SKILLS_CHANGED=0
+}
 
 # Install the release-owned ClickUp wrapper as a stable user command.  The
 # wrapper itself calls the protected live refresh script, so it remains valid
@@ -439,6 +742,14 @@ rollback_to_previous() {
   local offset
   offset="$(log_offset)"
   repoint_symlink "$prev"
+  restore_governed_refresh_for_release "$prev" \
+    || die "rollback could not restore governed ClickUp refresh — MANUAL INTERVENTION REQUIRED"
+  install_clickup_cli "$prev" \
+    || die "rollback could not restore managed ClickUp CLI — MANUAL INTERVENTION REQUIRED"
+  rollback_governed_marketplace_skills "$reason" \
+    || die "rollback could not restore governed marketplace skills — MANUAL INTERVENTION REQUIRED"
+  rollback_governed_launchd_environment "$reason" \
+    || die "rollback could not restore governed launchd environment — MANUAL INTERVENTION REQUIRED"
   kickstart "$GATEWAY_TARGET"
   if verify_gateway "$prev" "$offset"; then
     kickstart "$DASHBOARD_TARGET"
@@ -447,6 +758,18 @@ rollback_to_previous() {
     return 0
   fi
   die "rollback restart did NOT verify healthy — MANUAL INTERVENTION REQUIRED (release: $prev)"
+}
+
+record_cut_receipt_or_rollback() {
+  local event="${1:-}" from_sha="${2:-}" to_sha="${3:-}"
+  local runtime_dir="${4:-}" source_hash="${5:-}" deployed_hash="${6:-}"
+  local detail="${7:-}"
+  if ! write_release_receipt "$event" "$from_sha" "$to_sha" "$runtime_dir" \
+    "$source_hash" "$deployed_hash" "$detail"; then
+    warn "release receipt recording failed — rolling back"
+    rollback_to_previous "release receipt recording failed"
+    die "cut aborted and rolled back to previous release"
+  fi
 }
 
 # A post-switch restart failure must be handled explicitly: under `set -e`, a
@@ -511,6 +834,15 @@ RELEASES_DIR="$(canonical_existing_dir "$RELEASES_DIR")" \
   || die "could not canonicalize releases dir: $RELEASES_DIR"
 PREV_FILE="$RELEASES_DIR/.previous"
 CUT_LOCK_DIR="$RELEASES_DIR/.mini-release-cut.lock"
+LAST_RECEIPT_FILE="$RELEASES_DIR/.mini-release-last-receipt.json"
+REFRESH_BACKUP_FILE="$RELEASES_DIR/.clickup_workspace_refresh.previous"
+
+if [ "$PREFLIGHT" -eq 1 ] && {
+  [ "$DRY_RUN" -eq 1 ] || [ "$DO_ROLLBACK" -eq 1 ] \
+    || [ "$DO_PRUNE" -eq 1 ] || [ "$OFFLINE" -eq 1 ]
+}; then
+  die "--preflight cannot be combined with --dry-run, --rollback, --prune, or --offline"
+fi
 
 # This trap owns both failure cleanup and lock release. NEW_DIR remains empty
 # for an explicit rollback, so that mode only releases its lock.
@@ -559,8 +891,10 @@ fi
 # ===========================================================================
 [ -L "$CURRENT_LINK" ] || die "no runtime-current symlink at $CURRENT_LINK — refusing to bootstrap a layout from scratch"
 command -v git  >/dev/null || die "git not found"
-command -v npm  >/dev/null || die "npm not found on PATH (expected /opt/homebrew/bin)"
-command -v uv   >/dev/null || warn "uv not found — will fall back to python venv+pip if needed"
+if [ "$PREFLIGHT" -ne 1 ]; then
+  command -v npm  >/dev/null || die "npm not found on PATH (expected /opt/homebrew/bin)"
+  command -v uv   >/dev/null || warn "uv not found — will fall back to python venv+pip if needed"
+fi
 
 log "fetching origin in current release clone: $CURRENT_LINK"
 # Disable background maintenance (auto-gc/repack) for this fetch: a
@@ -581,6 +915,54 @@ else
   die "could not resolve ref '$REF' to a commit (tried origin/$REF and $REF)"
 fi
 SHORT_SHA="${SHA:0:12}"
+
+# Polling mode is evaluated under the same lock as the eventual cut, after the
+# fetch and immutable commit resolution. This closes the check-then-cut race.
+ACTIVE_SHA="$(git_current rev-parse --verify "HEAD^{commit}")" \
+  || die "could not resolve active runtime commit"
+if [ "$IF_ADVANCED" -eq 1 ]; then
+  ADVANCEMENT="$(classify_ref_advancement "$ACTIVE_SHA" "$SHA")"
+  ACTIVE_TARGET="$(readlink "$CURRENT_LINK")"
+  ACTIVE_REFRESH_SOURCE_HASH=""
+  [ -f "$CURRENT_LINK/$VENDORED_REFRESH_REL" ] \
+    && ACTIVE_REFRESH_SOURCE_HASH="$(sha256_file "$CURRENT_LINK/$VENDORED_REFRESH_REL")"
+  ACTIVE_REFRESH_DEPLOYED_HASH=""
+  [ -f "$DEPLOYED_REFRESH" ] \
+    && ACTIVE_REFRESH_DEPLOYED_HASH="$(sha256_file "$DEPLOYED_REFRESH")"
+  case "$ADVANCEMENT" in
+    equal)
+      if [ "$PREFLIGHT" -eq 1 ]; then
+        ok "release preflight passed: $REF already active at $SHA"
+        exit 0
+      fi
+      write_release_receipt "noop" "$ACTIVE_SHA" "$SHA" "$ACTIVE_TARGET" \
+        "$ACTIVE_REFRESH_SOURCE_HASH" "$ACTIVE_REFRESH_DEPLOYED_HASH" \
+        "resolved ref already active" \
+        || die "could not record no-op release receipt"
+      ok "release poll no-op: $REF already active at $SHA"
+      exit 0
+      ;;
+    advance)
+      ok "validated strict descendant advance: $ACTIVE_SHA -> $SHA"
+      if [ "$PREFLIGHT" -eq 1 ]; then
+        ok "release preflight passed: $REF is a strict descendant"
+        exit 0
+      fi
+      ;;
+    behind|diverged)
+      if [ "$PREFLIGHT" -ne 1 ]; then
+        write_release_receipt "rejected" "$ACTIVE_SHA" "$SHA" "$ACTIVE_TARGET" \
+          "$ACTIVE_REFRESH_SOURCE_HASH" "$ACTIVE_REFRESH_DEPLOYED_HASH" \
+          "resolved ref is $ADVANCEMENT relative to active runtime" \
+          || die "could not record rejected release receipt"
+      fi
+      die "ref '$REF' is $ADVANCEMENT relative to active runtime; refusing non-descendant release"
+      ;;
+    *)
+      die "unexpected advancement classification: $ADVANCEMENT"
+      ;;
+  esac
+fi
 
 # Derive version from pyproject.toml AT THE TARGET REF (not the working tree).
 VERSION="$(git_current show "${SHA}:pyproject.toml" 2>/dev/null \
@@ -741,15 +1123,63 @@ fi
 
 # --- Verify the build BEFORE any switch ------------------------------------
 if [ "$DRY_RUN" -eq 1 ]; then
-  printf '\033[35m[DRY-RUN]\033[0m verify: venv python imports hermes_cli.main + web_dist/index.html present\n'
+  printf '\033[35m[DRY-RUN]\033[0m verify: venv import + web_dist + governed refresh/launchd sources compile\n'
 else
   log "verifying build artifacts"
   ( cd "$NEW_DIR" && "$NEW_DIR/venv/bin/python" -c "import hermes_cli.main" ) \
     || die "build verify failed: venv python cannot import hermes_cli.main"
   [ -f "$NEW_DIR/hermes_cli/web_dist/index.html" ] \
     || die "build verify failed: missing $NEW_DIR/hermes_cli/web_dist/index.html"
-  ok "build verified (import OK, web_dist/index.html present)"
+  [ -f "$NEW_DIR/$VENDORED_REFRESH_REL" ] && [ ! -L "$NEW_DIR/$VENDORED_REFRESH_REL" ] \
+    || die "build verify failed: governed refresh source missing or symlinked"
+  if ! "$NEW_DIR/venv/bin/python" - "$NEW_DIR/$VENDORED_REFRESH_REL" <<'PY'
+from pathlib import Path
+import sys
+
+source = Path(sys.argv[1]).read_text(encoding="utf-8")
+compile(source, sys.argv[1], "exec")
+PY
+  then
+    die "build verify failed: governed refresh source does not compile"
+  fi
+  LAUNCHD_SOURCE_ROOT="$NEW_DIR/$(dirname "$VENDORED_LAUNCHD_RECONCILER_REL")"
+  for wrapper in gateway_secrets_wrap.sh dashboard_secrets_wrap.sh gateway_launch_inner.sh; do
+    bash -n "$LAUNCHD_SOURCE_ROOT/$wrapper" \
+      || die "build verify failed: launchd wrapper syntax invalid: $wrapper"
+  done
+  "$NEW_DIR/venv/bin/python" -m py_compile \
+    "$LAUNCHD_SOURCE_ROOT/reconcile_launchd_environment.py" \
+    "$LAUNCHD_SOURCE_ROOT/reconcile_marketplace_skills.py" \
+    "$LAUNCHD_SOURCE_ROOT/record_skill_pull_success.py" \
+    "$LAUNCHD_SOURCE_ROOT/skill_pull_guard.py" \
+    "$LAUNCHD_SOURCE_ROOT/github_app_token.py" \
+    || die "build verify failed: governed launchd Python source does not compile"
+  for wrapper in ignite-skills-pull.sh pull_anthropic_agent_skills.sh; do
+    bash -n "$LAUNCHD_SOURCE_ROOT/$wrapper" \
+      || die "build verify failed: skill pull wrapper syntax invalid: $wrapper"
+  done
+  "$NEW_DIR/venv/bin/python" - "$LAUNCHD_SOURCE_ROOT/launchd" <<'PY' \
+    || die "build verify failed: skill pull plist contract invalid"
+import plistlib
+import sys
+from pathlib import Path
+root = Path(sys.argv[1])
+expected = {
+    "com.colingreig.ignite-skills-pull": 10800,
+    "com.colingreig.pull_anthropic_skills": 86400,
+}
+for label, cadence in expected.items():
+    payload = plistlib.loads((root / f"{label}.plist").read_bytes())
+    assert payload["Label"] == label
+    assert payload["StartInterval"] == cadence
+    assert payload["RunAtLoad"] is True
+PY
+  ok "build verified (import, web dist, governed refresh, launchd sources)"
 fi
+
+# Preserve the exact pre-cut deployed script for bootstrap rollback before
+# runtime-current or any protected operational file changes.
+stage_refresh_backup
 
 # --- Record previous target for rollback (lives under releases/, allowed) --
 PREV_TARGET="$(readlink "$CURRENT_LINK")"
@@ -764,25 +1194,48 @@ else
 fi
 
 # --- Switch: atomic symlink swap + restart + verify ------------------------
-GW_OFFSET="$(log_offset)"
+LAUNCHD_GW_OFFSET="$(log_offset)"
 repoint_symlink "$NEW_DIR"
-kickstart_after_switch "$GATEWAY_TARGET" "gateway"
-
-if ! verify_gateway "$NEW_DIR" "$GW_OFFSET"; then
-  warn "gateway did not verify healthy on new release — rolling back"
-  rollback_to_previous "gateway verify failed"
+if ! install_governed_launchd_environment "$NEW_DIR"; then
+  warn "governed launchd environment install/reload failed — rolling back"
+  rollback_to_previous "governed launchd environment install failed"
+  die "cut aborted and rolled back to previous release"
+fi
+if ! install_governed_marketplace_skills "$NEW_DIR"; then
+  warn "governed marketplace skills install/reload failed — rolling back"
+  rollback_to_previous "governed marketplace skills install failed"
+  die "cut aborted and rolled back to previous release"
+fi
+if ! verify_gateway "$NEW_DIR" "$LAUNCHD_GW_OFFSET" || ! verify_dashboard; then
+  warn "services did not verify through governed launchd environment — rolling back"
+  rollback_to_previous "governed launchd environment verify failed"
   die "cut aborted and rolled back to previous release"
 fi
 
-kickstart_after_switch "$DASHBOARD_TARGET" "dashboard"
-if ! verify_dashboard; then
-  warn "dashboard did not verify healthy on new release — rolling back"
-  rollback_to_previous "dashboard verify failed"
+if ! install_governed_refresh "$NEW_DIR"; then
+  warn "governed ClickUp refresh install failed — rolling back"
+  rollback_to_previous "governed refresh install failed"
   die "cut aborted and rolled back to previous release"
 fi
 
-install_clickup_cli "$NEW_DIR" \
-  || die "release is healthy, but managed ClickUp CLI install failed"
+if ! install_clickup_cli "$NEW_DIR"; then
+  warn "managed ClickUp CLI install failed — rolling back"
+  rollback_to_previous "managed ClickUp CLI install failed"
+  die "cut aborted and rolled back to previous release"
+fi
+
+REFRESH_SOURCE_HASH="$(sha256_file "$NEW_DIR/$VENDORED_REFRESH_REL" 2>/dev/null || true)"
+REFRESH_DEPLOYED_HASH="$(sha256_file "$DEPLOYED_REFRESH" 2>/dev/null || true)"
+if [ -z "$REFRESH_SOURCE_HASH" ] || [ "$REFRESH_SOURCE_HASH" != "$REFRESH_DEPLOYED_HASH" ]; then
+  warn "governed refresh source/deployed hash verification failed — rolling back"
+  rollback_to_previous "governed refresh hash verification failed"
+  die "cut aborted and rolled back to previous release"
+fi
+RECEIPT_EVENT="cut"
+[ "$IF_ADVANCED" -eq 1 ] && RECEIPT_EVENT="advanced"
+record_cut_receipt_or_rollback "$RECEIPT_EVENT" "$ACTIVE_SHA" "$SHA" "$NEW_DIR" \
+  "$REFRESH_SOURCE_HASH" "$REFRESH_DEPLOYED_HASH" \
+  "release cut and governed script deployment verified"
 
 ok "release cut complete: runtime-current → $NEW_DIR (v${VERSION}-${SHORT_SHA})"
 

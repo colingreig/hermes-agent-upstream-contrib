@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
 
-from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt, _resolve_cron_enabled_toolsets, _merge_mcp_into_per_job_toolsets, _is_route_chain_exhausted_no_work, CronSkillUnresolvable
+from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt, _resolve_cron_enabled_toolsets, _merge_mcp_into_per_job_toolsets, _is_route_chain_exhausted_no_work, CronSkillRootConflict, CronSkillUnresolvable
 from tools.env_passthrough import clear_env_passthrough
 from tools.credential_files import clear_credential_files
 
@@ -4254,6 +4254,170 @@ class TestBuildJobPromptBumpUse:
         assert "go" in result
         # The error should be logged at DEBUG level, not crash
         assert any("failed to bump" in r.message for r in caplog.records)
+
+
+class TestBuildJobPromptChildEnvironment:
+    """Cron skill loading installs a child-only, profile-scoped environment."""
+
+    def test_derives_plugin_root_and_injects_only_declared_scoped_secret(
+        self, tmp_path, monkeypatch
+    ):
+        from agent.secret_scope import reset_secret_scope, set_secret_scope
+        from tools.env_passthrough import clear_env_passthrough
+        from tools.environments.local import _make_run_env
+
+        plugin_root = tmp_path / "ignite"
+        skill_dir = plugin_root / "skills" / "clickup"
+        skill_dir.mkdir(parents=True)
+        declared = "THERMAL_TEST_DATABASE_URL"
+        undeclared = "UNDECLARED_CRON_SECRET"
+        monkeypatch.delenv("CLAUDE_PLUGIN_ROOT", raising=False)
+        monkeypatch.delenv(declared, raising=False)
+        monkeypatch.delenv(undeclared, raising=False)
+        scope_token = set_secret_scope(
+            {
+                declared: "postgresql://user:scoped-secret@db/test",
+                undeclared: "must-not-pass",
+            }
+        )
+
+        loaded = {
+            "success": True,
+            "content": "# ClickUp\nExecute.",
+            "skill_dir": str(skill_dir),
+            "required_environment_variables": [{"name": declared}],
+        }
+        try:
+            with patch("tools.skills_tool.skill_view", return_value=json.dumps(loaded)):
+                _build_job_prompt({"skills": ["clickup"], "prompt": "go"})
+            child_env = _make_run_env({})
+        finally:
+            reset_secret_scope(scope_token)
+            clear_env_passthrough()
+
+        assert child_env["CLAUDE_PLUGIN_ROOT"] == str(plugin_root.resolve())
+        assert child_env[declared] == "postgresql://user:scoped-secret@db/test"
+        assert undeclared not in child_env
+        assert "CLAUDE_PLUGIN_ROOT" not in os.environ
+        assert declared not in os.environ
+
+    def test_conflicting_successful_skill_roots_fail_closed(self, tmp_path):
+        roots = [tmp_path / "one", tmp_path / "two"]
+        responses = {}
+        for index, root in enumerate(roots):
+            skill_dir = root / "skills" / f"skill-{index}"
+            skill_dir.mkdir(parents=True)
+            responses[f"skill-{index}"] = json.dumps(
+                {
+                    "success": True,
+                    "content": f"# skill-{index}",
+                    "skill_dir": str(skill_dir),
+                }
+            )
+
+        with patch(
+            "tools.skills_tool.skill_view",
+            side_effect=lambda name: responses[name],
+        ):
+            with pytest.raises(CronSkillRootConflict) as exc_info:
+                _build_job_prompt(
+                    {"skills": ["skill-0", "skill-1"], "prompt": "go"}
+                )
+
+        assert "conflicting plugin roots" in str(exc_info.value)
+        assert str(roots[0].resolve()) in str(exc_info.value)
+        assert str(roots[1].resolve()) in str(exc_info.value)
+
+    def test_sequential_direct_builds_replace_prior_plugin_root(self, tmp_path):
+        from tools.env_passthrough import (
+            clear_env_passthrough,
+            get_child_env_overlay,
+        )
+
+        roots = {
+            "first": tmp_path / "home-first",
+            "second": tmp_path / "home-second",
+        }
+        for name, root in roots.items():
+            (root / "skills" / name).mkdir(parents=True)
+
+        def _skill_view(name):
+            return json.dumps(
+                {
+                    "success": True,
+                    "content": f"# {name}",
+                    "skill_dir": str(roots[name] / "skills" / name),
+                }
+            )
+
+        try:
+            with patch("tools.skills_tool.skill_view", side_effect=_skill_view):
+                _build_job_prompt({"skills": ["first"], "prompt": "go"})
+                assert get_child_env_overlay()["CLAUDE_PLUGIN_ROOT"] == str(
+                    roots["first"].resolve()
+                )
+
+                # Same Python context, independent direct build. The first
+                # root must be replaced rather than treated as a same-build
+                # conflict.
+                _build_job_prompt({"skills": ["second"], "prompt": "go"})
+                assert get_child_env_overlay()["CLAUDE_PLUGIN_ROOT"] == str(
+                    roots["second"].resolve()
+                )
+        finally:
+            clear_env_passthrough()
+
+    def test_concurrent_direct_builds_keep_plugin_roots_context_local(
+        self, tmp_path
+    ):
+        import contextvars
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+
+        from tools.env_passthrough import (
+            clear_env_passthrough,
+            get_child_env_overlay,
+        )
+
+        roots = {
+            "alpha": tmp_path / "home-alpha",
+            "beta": tmp_path / "home-beta",
+        }
+        for name, root in roots.items():
+            (root / "skills" / name).mkdir(parents=True)
+        barrier = threading.Barrier(2)
+
+        def _skill_view(name):
+            return json.dumps(
+                {
+                    "success": True,
+                    "content": f"# {name}",
+                    "skill_dir": str(roots[name] / "skills" / name),
+                }
+            )
+
+        def _build(name):
+            barrier.wait(timeout=5)
+            _build_job_prompt({"skills": [name], "prompt": "go"})
+            return get_child_env_overlay()["CLAUDE_PLUGIN_ROOT"]
+
+        clear_env_passthrough()
+        with patch("tools.skills_tool.skill_view", side_effect=_skill_view):
+            contexts = [contextvars.Context(), contextvars.Context()]
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                futures = [
+                    pool.submit(context.run, _build, name)
+                    for context, name in zip(contexts, roots)
+                ]
+                observed = {
+                    name: future.result(timeout=10)
+                    for name, future in zip(roots, futures)
+                }
+
+        assert observed == {
+            name: str(root.resolve()) for name, root in roots.items()
+        }
+        assert get_child_env_overlay() == {}
 
 
 class TestSendMediaViaAdapter:

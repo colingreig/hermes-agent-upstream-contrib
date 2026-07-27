@@ -20,25 +20,33 @@ Both ``code_execution_tool.py`` and ``tools/environments/local.py`` consult
 from __future__ import annotations
 
 import logging
+import re
 from contextvars import ContextVar
-from typing import Iterable
+from typing import Iterable, Mapping
 from hermes_cli.config import cfg_get
 
 logger = logging.getLogger(__name__)
 
-# Session-scoped set of env var names that should pass through to sandboxes.
-# Backed by ContextVar to prevent cross-session data bleed in the gateway pipeline.
-_allowed_env_vars_var: ContextVar[set[str]] = ContextVar("_allowed_env_vars")
+# Session-scoped env names and child-only values.  Values are never copied into
+# ``os.environ``: subprocess builders merge the overlay after sanitizing the
+# inherited environment.  Both ContextVars use immutable tuple/frozenset
+# snapshots so a copied context cannot mutate the object held by its parent or
+# a sibling context.
+_allowed_env_vars_var: ContextVar[frozenset[str]] = ContextVar(
+    "_allowed_env_vars", default=frozenset()
+)
+_child_env_overlay_var: ContextVar[tuple[tuple[str, str], ...]] = ContextVar(
+    "_child_env_overlay", default=()
+)
+_child_env_redaction_values_var: ContextVar[frozenset[str]] = ContextVar(
+    "_child_env_redaction_values", default=frozenset()
+)
+_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
-def _get_allowed() -> set[str]:
-    """Get or create the allowed env vars set for the current context/session."""
-    try:
-        return _allowed_env_vars_var.get()
-    except LookupError:
-        val: set[str] = set()
-        _allowed_env_vars_var.set(val)
-        return val
+def _get_allowed() -> frozenset[str]:
+    """Return the env allowlist for the current context/session."""
+    return _allowed_env_vars_var.get()
 
 
 # Cache for the config-based allowlist, keyed on the config file's
@@ -115,9 +123,12 @@ def register_env_passthrough(var_names: Iterable[str]) -> None:
     Non-Hermes third-party API keys (TENOR_API_KEY, NOTION_TOKEN, etc.)
     pass through normally — they were never in the sandbox scrub list.
     """
+    allowed = set(_get_allowed())
     for name in var_names:
+        if not isinstance(name, str):
+            continue
         name = name.strip()
-        if not name:
+        if not name or not _ENV_NAME_RE.fullmatch(name):
             continue
         if _is_hermes_provider_credential(name):
             logger.warning(
@@ -128,8 +139,107 @@ def register_env_passthrough(var_names: Iterable[str]) -> None:
                 name,
             )
             continue
-        _get_allowed().add(name)
+        allowed.add(name)
         logger.debug("env passthrough: registered %s", name)
+    _allowed_env_vars_var.set(frozenset(allowed))
+
+
+def register_child_env_overlay(
+    values: Mapping[str, str],
+    *,
+    redact_values: bool = True,
+) -> None:
+    """Register context-local values to inject into child processes.
+
+    This is deliberately stricter than passing an ``extra_env`` mapping at a
+    call site: every name is first registered through the existing provider
+    credential guard, and only accepted names are stored.  Callers therefore
+    cannot use the value overlay to bypass the Hermes provider/internal-secret
+    blocklists.  The overlay is consumed by the local foreground and
+    background/PTY subprocess sanitizers and never mutates ``os.environ``.
+
+    ``redact_values`` marks the values as literal secrets for terminal/process
+    output redaction.  Non-secret routing values such as
+    ``CLAUDE_PLUGIN_ROOT`` should pass ``False``.
+    """
+    if not isinstance(values, Mapping):
+        return
+
+    normalized: dict[str, str] = {}
+    for raw_name, raw_value in values.items():
+        if not isinstance(raw_name, str) or not isinstance(raw_value, str):
+            continue
+        name = raw_name.strip()
+        if not name or not _ENV_NAME_RE.fullmatch(name):
+            continue
+        normalized[name] = raw_value
+
+    if not normalized:
+        return
+
+    register_env_passthrough(normalized)
+    accepted = {
+        name: value
+        for name, value in normalized.items()
+        if name in _get_allowed()
+    }
+    if not accepted:
+        return
+
+    overlay = dict(_child_env_overlay_var.get())
+    overlay.update(accepted)
+    _child_env_overlay_var.set(tuple(overlay.items()))
+
+    if redact_values:
+        redactions = set(_child_env_redaction_values_var.get())
+        redactions.update(value for value in accepted.values() if value)
+        _child_env_redaction_values_var.set(frozenset(redactions))
+
+
+def get_child_env_overlay() -> dict[str, str]:
+    """Return a copy of the current context's child-process value overlay."""
+    return dict(_child_env_overlay_var.get())
+
+
+def get_child_env_redaction_values() -> frozenset[str]:
+    """Return literal child-only secret values that output must redact."""
+    return _child_env_redaction_values_var.get()
+
+
+def reset_env_passthrough_context() -> None:
+    """Replace this context's skill/child environment state with an empty one.
+
+    Unlike :func:`clear_env_passthrough`, this does not invalidate the
+    process-wide config cache.  Prompt builders use it when beginning an
+    independent job so sequential direct builds cannot inherit a prior job's
+    plugin root or allowlist.  The immutable ContextVar snapshots ensure the
+    reset affects only the current context, never concurrent sibling jobs.
+    """
+    _allowed_env_vars_var.set(frozenset())
+    _child_env_overlay_var.set(())
+    _child_env_redaction_values_var.set(frozenset())
+
+
+def begin_env_passthrough_scope() -> tuple:
+    """Start an empty child-env scope and return tokens for restoration.
+
+    Cron calls this once per dispatched job.  Resetting the returned tokens
+    restores the caller's prior state rather than globally clearing it, which
+    is important when concurrent jobs run in copied contexts.
+    """
+    return (
+        _allowed_env_vars_var.set(frozenset()),
+        _child_env_overlay_var.set(()),
+        _child_env_redaction_values_var.set(frozenset()),
+    )
+
+
+def reset_env_passthrough_scope(tokens: tuple) -> None:
+    """Restore a scope created by :func:`begin_env_passthrough_scope`."""
+    allowed_token, overlay_token, redaction_token = tokens
+    _child_env_redaction_values_var.reset(redaction_token)
+    _child_env_overlay_var.reset(overlay_token)
+    _allowed_env_vars_var.reset(allowed_token)
 
 
 def _load_config_passthrough() -> frozenset[str]:
@@ -220,8 +330,6 @@ def clear_env_passthrough() -> None:
     next lookup, rather than serving a possibly-stale cached value.
     """
     global _config_passthrough, _config_passthrough_sig
-    _get_allowed().clear()
+    reset_env_passthrough_context()
     _config_passthrough = None
     _config_passthrough_sig = None
-
-

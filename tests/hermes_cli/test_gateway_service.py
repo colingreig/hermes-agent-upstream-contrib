@@ -1,6 +1,7 @@
 """Tests for gateway service management helpers."""
 
 import os
+import plistlib
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -529,6 +530,9 @@ class TestGeneratedSystemdUnits:
         # The wrapper owns exec'ing the real launch command — plist must not
         # also pass it `gateway run --replace` args meant for the bare path.
         assert "hermes_cli.main" not in plist
+        parsed = plistlib.loads(plist.encode("utf-8"))
+        assert parsed["ProgramArguments"] == ["/bin/bash", str(wrapper)]
+        assert parsed["KeepAlive"] == {"SuccessfulExit": False}
 
     def test_launchd_plist_falls_back_when_configured_wrapper_missing(self, tmp_path, monkeypatch):
         missing_wrapper = tmp_path / "does-not-exist.sh"
@@ -3630,6 +3634,8 @@ class TestServiceWorkingDirIsStable:
         # The old conditional dict form must NOT appear
         assert "SuccessfulExit" not in plist
         assert "<key>KeepAlive</key>\n    <dict>" not in plist
+        parsed = plistlib.loads(plist.encode("utf-8"))
+        assert parsed["KeepAlive"] is True
 
 
 class TestLaunchctlBootstrapEioRetry:
