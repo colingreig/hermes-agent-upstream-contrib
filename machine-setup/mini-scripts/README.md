@@ -531,3 +531,69 @@ for "Claim retry cap" above, or just `pr_staleness_alert.py` for "PR
 staleness dedupe" above) — never the directory. The same caution applies to
 `~/.hermes/skills/clickup-queue-poller/scripts/` — copy only `claim_next.py`,
 never the directory.
+
+## hermes-self-report bundle (ClickUp 86e2gnz60)
+
+The `hermes-self-report` cron builds and delivers Colin's status email. Its
+seven artifacts now deploy through one **declared bundle + manifest-verified
+installer** rather than ad-hoc `scp`. This directory is the deploy mirror; the
+authored source of truth is Brain (`hermes/skills/hermes-self-report/`), which
+mirrors these exact bytes and does not deploy anything itself.
+
+**The bundle** (`self_report_manifest.json`) records `src_rel`, `src_base`,
+`dest_abs`, `sha256`, `role`, and `deploy_mode` for each file:
+
+| File | dest | canon |
+|---|---|---|
+| `hermes_report_build.py` | `~/.hermes/scripts/` | live RC4 |
+| `hermes_report_build_v1lib.py` | `~/.hermes/scripts/` | live (load-bearing library) |
+| `hermes_report_build_v2.py` | `~/.hermes/scripts/` | live (compat-only orphan, retirement pending) |
+| `hermes-metrics.py` | `~/.hermes/scripts/` | live (standalone CLI, no cron caller) |
+| `postmark_send_report.py` | `~/.hermes/scripts/` | deploy-mirror bytes (live behavior + `encoding="utf-8"`) |
+| `hermes_self_report_delivery_probe.py` | `~/.hermes/scripts/` | deploy-mirror bytes (live behavior + `encoding="utf-8"`) |
+| `SKILL.md` | `~/.hermes/skills/hermes-self-report/` | live RC4 (Brain source; installed only with `--include-skill --brain-path`) |
+
+**The installer** (`install_self_report.py`, stdlib only, `no_agent`-safe) is
+the **sole writer** of these files. It:
+
+- verifies every source's sha256 against the manifest and **fails closed** on
+  drift (never installs unverified bytes);
+- snapshots each existing destination into
+  `~/.hermes/logs/self-report-installs/<UTC-ts>/` (plus a
+  `<dest>.bak-self-report-install-<ts>` sibling) before writing;
+- installs atomically (`write .tmp` → `os.replace`) and **re-reads the deployed
+  bytes**, restoring the snapshot and exiting nonzero on any deployed-vs-manifest
+  mismatch;
+- writes a durable `install-receipt.json` recording every file's src/dest,
+  expected/deployed sha, snapshot location, and overall result;
+- refuses any destination outside `~/.hermes/` or named `claim_store.py` /
+  `queue_snapshot.json`, and **warns (never installs)** if the required co-exist
+  files `claim_store.py` / `queue_snapshot.json` are absent — the builder's
+  work-stoppage verdict imports `claim_store` and degrades to UNKNOWN without it.
+
+```bash
+# preview: verify all source hashes, print the plan, write nothing
+python3 machine-setup/mini-scripts/install_self_report.py --dry-run
+
+# scripts only (default home = ~)
+python3 machine-setup/mini-scripts/install_self_report.py
+
+# scripts + SKILL.md from a Brain checkout
+python3 machine-setup/mini-scripts/install_self_report.py \
+  --include-skill --brain-path /path/to/brain-checkout
+```
+
+**Never** rsync `~/.hermes/scripts/` (see the wholesale-rsync warning above):
+this installer copies only the seven declared files by name and touches nothing
+else — in particular it never writes `claim_store.py`, `queue_snapshot.json`, or
+the release venv. Because release/reconcile passes are known to clobber hand
+edits, this manifest + installer must be the ONLY writer of these seven files
+going forward.
+
+**Delivery-probe cron.** `hermes_self_report_delivery_probe.py` runs as its own
+`no_agent` cron job (offset from the `0 */6 * * *` report tick). It reads the
+receipt `~/.hermes/logs/hermes-self-report-last-send.json` and exits `0`
+(fresh + sent), `1` (both channels failed), or `2` (missing / stale / unreadable)
+— no LLM, no send. The postmark sender's fallback target `slack:D0BA2PM9CFM` is
+a Slack DM channel id (not a secret); `hermes send --list` on the mini is the
+source of truth if it rotates.
