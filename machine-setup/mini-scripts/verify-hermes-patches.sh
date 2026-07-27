@@ -1852,10 +1852,14 @@ fi
 # untrusted — a noisy false positive on every skill load that trains
 # log-readers to ignore real security warnings.
 #
-# The trusted local root must come from the runtime profile-aware
-# active_skills_dir, not module-level SKILLS_DIR (which can be stale in a
-# long-lived process after the active profile changes). Resolve both the root
-# and candidate before strict relative_to() containment.
+# CURRENT STATE: the runtime resolves the active profile's root through
+# _skills_dir(), then builds `_trusted_dirs = [active_skills_dir.resolve()]`
+# and checks `skill_md.resolve().relative_to(_td)`. The verifier must assert
+# that profile-aware shape, not the stale module-level SKILLS_DIR expression:
+# long-lived runtimes can import before the active profile selects HERMES_HOME.
+# Resolve both the active root and candidate before strict relative_to()
+# containment. This section is a regression tripwire against an unresolved or
+# import-time-stale comparison.
 #
 # NOTE: 'sentry-monitor' and 'grill-me' still legitimately warn in
 # agent.log/gateway.error.log — their SKILL.md files are THEMSELVES symlinks
@@ -1866,23 +1870,25 @@ fi
 # only the top-level-symlink-hop false positive is in scope.
 hdr "32. Skills-symlink trust check (resolve-before-compare, tools/skills_tool.py)"
 SKT="$REPO/tools/skills_tool.py"
-if grep -Fq '_trusted_dirs = [active_skills_dir.resolve()]' "$SKT" 2>/dev/null && grep -Fq 'skill_md.resolve().relative_to(_td)' "$SKT" 2>/dev/null; then
-  grn "structural profile-aware resolved root and strict resolved-path containment present"
+if grep -Fq '_trusted_dirs = [active_skills_dir.resolve()]' "$SKT" 2>/dev/null \
+   && grep -Fq 'skill_md.resolve().relative_to(_td)' "$SKT" 2>/dev/null; then
+  grn "structural active-profile resolve() present on both sides of the trust-prefix comparison"
 else
-  red "STRUCTURAL REGRESSION — trust check no longer uses active_skills_dir.resolve() with resolved-path containment"
-  red "  Fix: in skill_view()'s trust check ($SKT), seed trusted dirs with active_skills_dir.resolve() and compare skill_md.resolve() via relative_to(_td)"
+  red "STRUCTURAL REGRESSION — active-profile trust-prefix comparison no longer resolves symlinks on both sides"
+  red "  Fix: in skill_view()'s trust check ($SKT), seed _trusted_dirs from active_skills_dir.resolve() and compare skill_md.resolve().relative_to(_td)"
   FAIL=1
 fi
 # Behavioral: replicate the trust check against every real skill dir under the
-# (possibly symlinked) active profile skills directory and confirm skills that live under the
+# runtime-selected (possibly symlinked) active skills dir and confirm skills that live under the
 # resolved trusted target are NOT flagged outside-trusted purely because of
 # the top-level symlink hop. A skill whose SKILL.md is itself individually
 # symlinked elsewhere (sentry-monitor, grill-me) is excluded from the
 # false-positive count — that's a different, legitimate warning.
-SK_RESULT=$("$REPO/venv/bin/python" - "$HOME/.hermes/skills" <<'PY' 2>/dev/null
+SK_RESULT=$(cd "$REPO" && "$REPO/venv/bin/python" - <<'PY' 2>/dev/null
 import sys
 import tempfile
 from pathlib import Path
+from tools.skills_tool import _skills_dir
 
 
 def is_within_resolved_root(candidate, root):
@@ -1920,32 +1926,43 @@ with tempfile.TemporaryDirectory() as tmp:
         print("FIXTURE_UNRESOLVED_PREFIX FAIL")
     print(f"FIXTURE_ESCAPED_ROOT {'PASS' if not is_within_resolved_root(escaped_link, active_skills_dir) else 'FAIL'}")
 
-skills_dir = Path(sys.argv[1])
-if not skills_dir.exists():
+active_skills_dir = _skills_dir()
+if not active_skills_dir.exists():
     print("SKIP")
     sys.exit(0)
-trusted = skills_dir.resolve()
+_trusted_dirs = [active_skills_dir.resolve()]
 false_positives = []
+outside_trust = []
 checked = 0
-for d in sorted(p for p in skills_dir.iterdir() if p.is_dir()):
-    smd = d / "SKILL.md"
-    if not smd.exists():
+for d in sorted(p for p in active_skills_dir.iterdir() if p.is_dir()):
+    skill_md = d / "SKILL.md"
+    if not skill_md.exists():
         continue
     checked += 1
-    try:
-        smd.resolve().relative_to(trusted)
-    except ValueError:
+    is_trusted = False
+    for _td in _trusted_dirs:
         try:
-            d.resolve().relative_to(trusted)
-            is_dir_trusted = True
+            skill_md.resolve().relative_to(_td)
+            is_trusted = True
+            break
         except ValueError:
-            is_dir_trusted = False
-        if is_dir_trusted and not smd.is_symlink():
-            false_positives.append(str(smd))
+            continue
+    if is_trusted:
+        continue
+    try:
+        d.resolve().relative_to(_trusted_dirs[0])
+        is_dir_trusted = True
+    except ValueError:
+        is_dir_trusted = False
+    if is_dir_trusted and not skill_md.is_symlink():
+        false_positives.append(str(skill_md))
+    else:
+        outside_trust.append(str(skill_md))
 print(f"CHECKED {checked}")
 print(f"FALSE_POSITIVES {len(false_positives)}")
+print(f"OUTSIDE_TRUST {len(outside_trust)}")
 for f in false_positives:
-    print(f"  {f}")
+    print(f"FALSE_POSITIVE {f}")
 PY
 )
 sk_fixture=$(printf '%s\n' "$SK_RESULT" | awk '/^FIXTURE_/{print $2}' | tr '\n' ' ')
@@ -1956,17 +1973,17 @@ else
   grn "behavior   resolved-root positive passes; unresolved-prefix and escaped-root negatives fail"
 fi
 if printf '%s\n' "$SK_RESULT" | grep -Fxq "SKIP"; then
-  ylw "behavior   $HOME/.hermes/skills does not exist — real-skill scan skipped"
+  ylw "behavior   runtime _skills_dir() does not exist — skipped"
 elif [ -z "$SK_RESULT" ]; then
   red "behavior   sentinel script produced no output — venv python or skills_tool import may be broken"; FAIL=1
 else
   sk_checked=$(printf '%s\n' "$SK_RESULT" | awk '/^CHECKED /{print $2}')
   sk_fp=$(printf '%s\n' "$SK_RESULT" | awk '/^FALSE_POSITIVES /{print $2}')
   if [ "${sk_fp:-1}" = "0" ]; then
-  grn "behavior   $sk_checked skill(s) under the (symlinked) active profile skills dir all resolve inside the trusted tree (no top-level-hop false positives)"
+    grn "behavior   $sk_checked skill(s) under runtime _skills_dir() have no resolved-root false positives"
   else
     red "behavior   $sk_fp of ${sk_checked:-?} skill(s) false-flag outside-trusted purely from the top-level symlink hop:"
-    printf '%s\n' "$SK_RESULT" | sed -n '3,$p' | while IFS= read -r fpline; do red "             $fpline"; done
+    printf '%s\n' "$SK_RESULT" | sed -n 's/^FALSE_POSITIVE /  /p' | while IFS= read -r fpline; do red "             $fpline"; done
     FAIL=1
   fi
 fi
