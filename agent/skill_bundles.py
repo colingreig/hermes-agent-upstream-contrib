@@ -255,11 +255,15 @@ def build_bundle_invocation_message(
     user_instruction: str = "",
     task_id: str | None = None,
     platform: str | None = None,
-) -> Optional[Tuple[str, List[str], List[str]]]:
+    include_member_metadata: bool = False,
+) -> Optional[tuple]:
     """Build the user message content for a bundle slash command invocation.
 
     Returns ``(message, loaded_skill_names, missing_skill_names)`` or
-    ``None`` if the bundle wasn't found.
+    ``None`` if the bundle wasn't found. When ``include_member_metadata`` is
+    true, appends a fourth tuple item containing each loaded member's
+    environment declarations and resolved skill directory. This opt-in shape
+    preserves the public three-item contract for existing callers.
 
     A bundle that references skills the user doesn't have installed still
     loads — the agent gets a note about which ones were skipped. This is
@@ -295,6 +299,7 @@ def build_bundle_invocation_message(
     missing: List[str] = []
     disabled: List[str] = []
     skill_blocks: List[str] = []
+    member_metadata: List[Dict[str, Any]] = []
     seen: set[str] = set()
 
     bundle_name = info["name"]
@@ -337,6 +342,15 @@ def build_bundle_invocation_message(
             )
         )
         loaded_names.append(skill_name)
+        member_metadata.append(
+            {
+                "name": skill_name,
+                "skill_dir": str(skill_dir) if skill_dir is not None else None,
+                "required_environment_variables": loaded_skill.get(
+                    "required_environment_variables"
+                ),
+            }
+        )
 
     if not skill_blocks:
         return None
@@ -365,7 +379,10 @@ def build_bundle_invocation_message(
         )
 
     header = "\n".join(header_lines)
-    return ("\n\n".join([header, *skill_blocks]), loaded_names, missing)
+    result = ("\n\n".join([header, *skill_blocks]), loaded_names, missing)
+    if include_member_metadata:
+        return (*result, member_metadata)
+    return result
 
 
 # ---------------------------------------------------------------------------

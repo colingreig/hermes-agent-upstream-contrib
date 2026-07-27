@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
 
-from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt, _resolve_cron_enabled_toolsets, _merge_mcp_into_per_job_toolsets, _is_route_chain_exhausted_no_work, CronSkillRootConflict, CronSkillUnresolvable
+from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt, _resolve_cron_enabled_toolsets, _merge_mcp_into_per_job_toolsets, _is_route_chain_exhausted_no_work, CronRequiredEnvironmentError, CronSkillRootConflict, CronSkillUnresolvable
 from tools.env_passthrough import clear_env_passthrough
 from tools.credential_files import clear_credential_files
 
@@ -3084,7 +3084,15 @@ class TestRunJobSkillBacked:
             from tools.env_passthrough import register_env_passthrough
 
             register_env_passthrough(["NOTION_API_KEY"])
-            return json.dumps({"success": True, "content": "# notion\nUse Notion."})
+            return json.dumps(
+                {
+                    "success": True,
+                    "content": "# notion\nUse Notion.",
+                    "required_environment_variables": [
+                        {"name": "NOTION_API_KEY"}
+                    ],
+                }
+            )
 
         def _run_conversation(prompt):
             from tools.env_passthrough import get_all_passthrough
@@ -3097,6 +3105,10 @@ class TestRunJobSkillBacked:
              patch("hermes_cli.env_loader.load_hermes_dotenv"), \
              patch("hermes_cli.env_loader.reset_secret_source_cache"), \
              patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "agent.lazy_secret_resolver.get_required",
+                 return_value="notion-test-token",
+             ), \
              patch(
                  "hermes_cli.runtime_provider.resolve_runtime_provider",
                  return_value={
@@ -3152,6 +3164,10 @@ class TestRunJobSkillBacked:
              patch("hermes_cli.env_loader.reset_secret_source_cache"), \
              patch("hermes_state.SessionDB", return_value=fake_db), \
              patch(
+                 "agent.lazy_secret_resolver.get_required",
+                 return_value="clickup-test-token",
+             ), \
+             patch(
                  "hermes_cli.runtime_provider.resolve_runtime_provider",
                  return_value={
                      "api_key": "***",
@@ -3188,7 +3204,11 @@ class TestRunJobSkillBacked:
         }
 
         try:
-            _build_job_prompt(job)
+            with patch(
+                "agent.lazy_secret_resolver.get_required",
+                return_value="clickup-test-token",
+            ):
+                _build_job_prompt(job)
             assert is_env_passthrough("CLICKUP_API_TOKEN") is True
         finally:
             clear_env_passthrough()
@@ -4234,6 +4254,21 @@ class TestBuildJobPromptBumpUse:
 class TestBuildJobPromptChildEnvironment:
     """Cron skill loading installs a child-only, profile-scoped environment."""
 
+    def test_environment_normalization_preserves_optional_metadata(self):
+        from cron.scheduler import _normalize_environment_variable_declarations
+
+        declarations = _normalize_environment_variable_declarations(
+            [
+                {"name": "OPTIONAL_TOKEN", "optional": True},
+                {"name": "REQUIRED_TOKEN"},
+            ]
+        )
+
+        assert [(item.name, item.optional) for item in declarations] == [
+            ("OPTIONAL_TOKEN", True),
+            ("REQUIRED_TOKEN", False),
+        ]
+
     def test_derives_plugin_root_and_injects_only_declared_scoped_secret(
         self, tmp_path, monkeypatch
     ):
@@ -4275,6 +4310,320 @@ class TestBuildJobPromptChildEnvironment:
         assert undeclared not in child_env
         assert "CLAUDE_PLUGIN_ROOT" not in os.environ
         assert declared not in os.environ
+
+    def test_absent_optional_skill_environment_does_not_abort(self, monkeypatch):
+        from tools.env_passthrough import (
+            clear_env_passthrough,
+            get_child_env_overlay,
+        )
+
+        optional_name = "OPTIONAL_CRON_INTEGRATION_TOKEN"
+        monkeypatch.delenv(optional_name, raising=False)
+        loaded = {
+            "success": True,
+            "content": "# Optional integration",
+            "required_environment_variables": [
+                {"name": optional_name, "optional": True}
+            ],
+        }
+        try:
+            with (
+                patch(
+                    "tools.skills_tool.skill_view",
+                    return_value=json.dumps(loaded),
+                ),
+                patch(
+                    "agent.lazy_secret_resolver.get_required"
+                ) as strict_resolver,
+                patch("agent.lazy_secret_resolver.get", return_value=None),
+            ):
+                prompt = _build_job_prompt(
+                    {"skills": ["optional-integration"], "prompt": "go"}
+                )
+            assert "Optional integration" in prompt
+            assert optional_name not in get_child_env_overlay()
+            strict_resolver.assert_not_called()
+        finally:
+            clear_env_passthrough()
+
+    def test_present_optional_skill_environment_is_injected(self, monkeypatch):
+        from tools.env_passthrough import (
+            clear_env_passthrough,
+            get_child_env_overlay,
+        )
+
+        optional_name = "OPTIONAL_CRON_INTEGRATION_TOKEN"
+        monkeypatch.setenv(optional_name, "optional-present-value")
+        loaded = {
+            "success": True,
+            "content": "# Optional integration",
+            "required_environment_variables": [
+                {"name": optional_name, "optional": True}
+            ],
+        }
+        try:
+            with (
+                patch(
+                    "tools.skills_tool.skill_view",
+                    return_value=json.dumps(loaded),
+                ),
+                patch(
+                    "agent.lazy_secret_resolver.get_required"
+                ) as strict_resolver,
+            ):
+                _build_job_prompt(
+                    {"skills": ["optional-integration"], "prompt": "go"}
+                )
+            assert get_child_env_overlay()[optional_name] == "optional-present-value"
+            strict_resolver.assert_not_called()
+        finally:
+            clear_env_passthrough()
+
+    def test_later_required_resolution_failure_leaves_overlay_empty(
+        self, monkeypatch
+    ):
+        from agent.lazy_secret_resolver import RequiredSecretMissingError
+        from tools.env_passthrough import (
+            clear_env_passthrough,
+            get_child_env_overlay,
+        )
+
+        first = "FIRST_SKILL_REQUIRED_TOKEN"
+        second = "SECOND_SKILL_REQUIRED_TOKEN"
+        monkeypatch.delenv(first, raising=False)
+        monkeypatch.delenv(second, raising=False)
+        responses = {
+            "first": json.dumps(
+                {
+                    "success": True,
+                    "content": "# first",
+                    "required_environment_variables": [{"name": first}],
+                }
+            ),
+            "second": json.dumps(
+                {
+                    "success": True,
+                    "content": "# second",
+                    "required_environment_variables": [{"name": second}],
+                }
+            ),
+        }
+
+        def resolve(name):
+            if name == first:
+                return "first-value-must-not-install"
+            raise RequiredSecretMissingError(name)
+
+        try:
+            with (
+                patch(
+                    "tools.skills_tool.skill_view",
+                    side_effect=lambda name: responses[name],
+                ),
+                patch(
+                    "agent.lazy_secret_resolver.get_required",
+                    side_effect=resolve,
+                ),
+                pytest.raises(CronRequiredEnvironmentError),
+            ):
+                _build_job_prompt(
+                    {"skills": ["first", "second"], "prompt": "go"}
+                )
+            assert get_child_env_overlay() == {}
+        finally:
+            clear_env_passthrough()
+
+    def test_later_skill_load_failure_leaves_job_overlay_empty(
+        self, monkeypatch
+    ):
+        from tools.env_passthrough import (
+            clear_env_passthrough,
+            get_child_env_overlay,
+        )
+
+        job_required = "JOB_REQUIRED_BEFORE_SKILLS_TOKEN"
+        monkeypatch.setenv(job_required, "must-not-install")
+        responses = {
+            "first": json.dumps({"success": True, "content": "# first"}),
+            "missing": json.dumps({"success": False, "error": "not found"}),
+        }
+        try:
+            with (
+                patch(
+                    "tools.skills_tool.skill_view",
+                    side_effect=lambda name: responses[name],
+                ),
+                pytest.raises(CronSkillUnresolvable),
+            ):
+                _build_job_prompt(
+                    {
+                        "skills": ["first", "missing"],
+                        "prompt": "go",
+                        "required_environment_variables": [job_required],
+                    }
+                )
+            assert get_child_env_overlay() == {}
+        finally:
+            clear_env_passthrough()
+
+    def test_bundle_member_required_and_optional_environment_is_transactional(
+        self, tmp_path, monkeypatch
+    ):
+        from agent.secret_scope import reset_secret_scope, set_secret_scope
+        from tools.env_passthrough import (
+            clear_env_passthrough,
+            get_child_env_overlay,
+        )
+
+        required = "BUNDLE_REQUIRED_TOKEN"
+        optional = "BUNDLE_OPTIONAL_TOKEN"
+        plugin_root = tmp_path / "bundle-plugin"
+        skill_dir = plugin_root / "skills" / "credentialed-member"
+        skill_dir.mkdir(parents=True)
+        monkeypatch.delenv(required, raising=False)
+        monkeypatch.delenv(optional, raising=False)
+        scope_token = set_secret_scope({required: "bundle-required-value"})
+        payload = (
+            "# bundle",
+            ["credentialed-member"],
+            [],
+            [
+                {
+                    "name": "credentialed-member",
+                    "skill_dir": str(skill_dir),
+                    "required_environment_variables": [
+                        {"name": required},
+                        {"name": optional, "optional": True},
+                    ],
+                }
+            ],
+        )
+        try:
+            with (
+                patch(
+                    "agent.skill_bundles.resolve_bundle_command_key",
+                    return_value="/credentialed-bundle",
+                ),
+                patch(
+                    "agent.skill_bundles.build_bundle_invocation_message",
+                    return_value=payload,
+                ) as build_bundle,
+                patch(
+                    "agent.lazy_secret_resolver.get_required"
+                ) as strict_resolver,
+                patch("agent.lazy_secret_resolver.get", return_value=None),
+            ):
+                _build_job_prompt(
+                    {"skills": ["credentialed-bundle"], "prompt": "go"}
+                )
+            overlay = get_child_env_overlay()
+            assert overlay[required] == "bundle-required-value"
+            assert optional not in overlay
+            assert overlay["CLAUDE_PLUGIN_ROOT"] == str(plugin_root.resolve())
+            strict_resolver.assert_not_called()
+            assert build_bundle.call_args.kwargs["include_member_metadata"] is True
+        finally:
+            reset_secret_scope(scope_token)
+            clear_env_passthrough()
+
+    def test_bundle_member_required_failure_leaves_overlay_empty(
+        self, monkeypatch
+    ):
+        from agent.lazy_secret_resolver import RequiredSecretMissingError
+        from tools.env_passthrough import (
+            clear_env_passthrough,
+            get_child_env_overlay,
+        )
+
+        first = "FIRST_BUNDLE_REQUIRED_TOKEN"
+        second = "SECOND_BUNDLE_REQUIRED_TOKEN"
+        monkeypatch.delenv(first, raising=False)
+        monkeypatch.delenv(second, raising=False)
+        payload = (
+            "# bundle",
+            ["first-member", "second-member"],
+            [],
+            [
+                {
+                    "name": "first-member",
+                    "required_environment_variables": [{"name": first}],
+                },
+                {
+                    "name": "second-member",
+                    "required_environment_variables": [{"name": second}],
+                },
+            ],
+        )
+
+        def resolve(name):
+            if name == first:
+                return "must-not-install"
+            raise RequiredSecretMissingError(name)
+
+        try:
+            with (
+                patch(
+                    "agent.skill_bundles.resolve_bundle_command_key",
+                    return_value="/credentialed-bundle",
+                ),
+                patch(
+                    "agent.skill_bundles.build_bundle_invocation_message",
+                    return_value=payload,
+                ),
+                patch(
+                    "agent.lazy_secret_resolver.get_required",
+                    side_effect=resolve,
+                ),
+                pytest.raises(CronRequiredEnvironmentError),
+            ):
+                _build_job_prompt(
+                    {"skills": ["credentialed-bundle"], "prompt": "go"}
+                )
+            assert get_child_env_overlay() == {}
+        finally:
+            clear_env_passthrough()
+
+    def test_bundle_missing_member_leaves_overlay_empty(self, monkeypatch):
+        from tools.env_passthrough import (
+            clear_env_passthrough,
+            get_child_env_overlay,
+        )
+
+        job_required = "BUNDLE_JOB_REQUIRED_TOKEN"
+        monkeypatch.setenv(job_required, "must-not-install")
+        payload = (
+            "# partial bundle",
+            ["present-member"],
+            ["missing-member"],
+            [
+                {
+                    "name": "present-member",
+                    "required_environment_variables": [],
+                }
+            ],
+        )
+        try:
+            with (
+                patch(
+                    "agent.skill_bundles.resolve_bundle_command_key",
+                    return_value="/partial-bundle",
+                ),
+                patch(
+                    "agent.skill_bundles.build_bundle_invocation_message",
+                    return_value=payload,
+                ),
+                pytest.raises(CronSkillUnresolvable),
+            ):
+                _build_job_prompt(
+                    {
+                        "skills": ["partial-bundle"],
+                        "prompt": "go",
+                        "required_environment_variables": [job_required],
+                    }
+                )
+            assert get_child_env_overlay() == {}
+        finally:
+            clear_env_passthrough()
 
     def test_conflicting_successful_skill_roots_fail_closed(self, tmp_path):
         roots = [tmp_path / "one", tmp_path / "two"]

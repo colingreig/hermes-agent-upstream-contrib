@@ -208,6 +208,18 @@ class CronSkillRootConflict(CronSkillUnresolvable):
     """
 
 
+class CronRequiredEnvironmentError(RuntimeError):
+    """Sanitized fail-closed error for a declared child credential."""
+
+    def __init__(self, variable_name: str, classification: str) -> None:
+        self.variable_name = variable_name
+        self.classification = classification
+        super().__init__(
+            f"required environment variable {variable_name!r} is unavailable "
+            f"(classification={classification})"
+        )
+
+
 def _resolve_cron_disabled_toolsets(cfg: dict) -> list[str]:
     """Toolsets a cron-spawned agent must never receive.
 
@@ -2383,8 +2395,15 @@ def _get_script_timeout() -> int:
     return _DEFAULT_SCRIPT_TIMEOUT
 
 
-def _normalize_required_environment_variables(value: Any) -> tuple[str, ...]:
-    """Return valid, unique env names from cron job declaration metadata.
+class _EnvironmentVariableDeclaration(NamedTuple):
+    name: str
+    optional: bool
+
+
+def _normalize_environment_variable_declarations(
+    value: Any,
+) -> tuple[_EnvironmentVariableDeclaration, ...]:
+    """Preserve optionality while normalizing shell environment declarations.
 
     ``required_environment_variables`` follows the skill-frontmatter shape:
     callers may provide plain names or mappings with a ``name`` key. Invalid
@@ -2398,7 +2417,8 @@ def _normalize_required_environment_variables(value: Any) -> tuple[str, ...]:
     else:
         return ()
 
-    names: list[str] = []
+    declarations: list[_EnvironmentVariableDeclaration] = []
+    indexes: dict[str, int] = {}
     for entry in entries:
         raw_name = entry.get("name") if isinstance(entry, dict) else entry
         if not isinstance(raw_name, str):
@@ -2406,9 +2426,27 @@ def _normalize_required_environment_variables(value: Any) -> tuple[str, ...]:
         name = raw_name.strip()
         if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
             continue
-        if name not in names:
-            names.append(name)
-    return tuple(names)
+        optional = bool(entry.get("optional")) if isinstance(entry, dict) else False
+        existing_index = indexes.get(name)
+        if existing_index is None:
+            indexes[name] = len(declarations)
+            declarations.append(_EnvironmentVariableDeclaration(name, optional))
+        elif declarations[existing_index].optional and not optional:
+            # Any required declaration wins over an optional duplicate.
+            declarations[existing_index] = _EnvironmentVariableDeclaration(
+                name,
+                False,
+            )
+    return tuple(declarations)
+
+
+def _normalize_required_environment_variables(value: Any) -> tuple[str, ...]:
+    """Return ordered unique names whose declarations are not optional."""
+    return tuple(
+        declaration.name
+        for declaration in _normalize_environment_variable_declarations(value)
+        if not declaration.optional
+    )
 
 
 def _plugin_root_from_skill_dir(skill_dir: Any) -> Optional[Path]:
@@ -2433,6 +2471,7 @@ def _plugin_root_from_skill_dir(skill_dir: Any) -> Optional[Path]:
 def _install_cron_child_env(
     required_names: Any,
     *,
+    optional_names: Any = None,
     plugin_roots: Optional[Iterable[Path]] = None,
 ) -> None:
     """Install declared scoped values into this cron context's child overlay.
@@ -2456,31 +2495,144 @@ def _install_cron_child_env(
             "Cron job resolved skills from conflicting plugin roots: "
             f"{rendered}. Refusing to choose a CLAUDE_PLUGIN_ROOT."
         )
+    names = _normalize_required_environment_variables(required_names)
+    required_values = _resolve_cron_required_environment(names)
+    optional_values = _resolve_cron_optional_environment(optional_names)
+
+    # Resolve every required value before mutating the child overlay. A job
+    # either receives its complete declared environment or receives none.
+    combined_overlay = {**optional_values, **required_values}
     if roots:
+        combined_overlay["CLAUDE_PLUGIN_ROOT"] = next(iter(roots))
+    if combined_overlay:
+        # One ContextVar write after every requirement and root has validated.
+        # Marking the non-secret plugin root as redactable is harmless and keeps
+        # the transaction atomic.
         register_child_env_overlay(
-            {"CLAUDE_PLUGIN_ROOT": next(iter(roots))},
-            redact_values=False,
+            combined_overlay,
+            redact_values=bool(required_values or optional_values),
         )
 
+
+def _resolve_cron_required_environment(
+    required_names: Any,
+) -> dict[str, str]:
+    """Resolve a complete, exact declared child environment.
+
+    Profile scope wins over every process-global source. In multiplex mode an
+    authoritative profile miss fails closed and never consults the ambient
+    environment or process-global 1Password manifest. Outside multiplex mode,
+    ambient values retain precedence before strict lazy resolution.
+    """
     names = _normalize_required_environment_variables(required_names)
     if not names:
-        return
+        return {}
+
     try:
-        from agent.secret_scope import current_secret_scope
+        from tools.environments.local import (
+            _HERMES_PROVIDER_ENV_BLOCKLIST,
+            _is_hermes_internal_secret,
+        )
+    except Exception:
+        raise CronRequiredEnvironmentError(names[0], "fatal") from None
+
+    try:
+        from agent.secret_scope import current_secret_scope, is_multiplex_active
 
         scope = current_secret_scope()
+        multiplex_active = is_multiplex_active()
     except Exception:
         scope = None
-    if scope is None:
-        return
+        multiplex_active = False
 
-    scoped_values = {
-        name: value
-        for name in names
-        if isinstance((value := scope.get(name)), str) and value
-    }
-    if scoped_values:
-        register_child_env_overlay(scoped_values, redact_values=True)
+    resolved: dict[str, str] = {}
+    for name in names:
+        if (
+            name in _HERMES_PROVIDER_ENV_BLOCKLIST
+            or _is_hermes_internal_secret(name)
+        ):
+            raise CronRequiredEnvironmentError(name, "fatal")
+
+        if multiplex_active and scope is None:
+            raise CronRequiredEnvironmentError(name, "missing")
+
+        if scope is not None:
+            scoped_value = scope.get(name)
+            if isinstance(scoped_value, str) and scoped_value:
+                resolved[name] = scoped_value
+                continue
+            if multiplex_active:
+                raise CronRequiredEnvironmentError(name, "missing")
+
+        ambient_value = os.environ.get(name)
+        if isinstance(ambient_value, str) and ambient_value:
+            resolved[name] = ambient_value
+            continue
+
+        try:
+            from agent.lazy_secret_resolver import RequiredSecretError, get_required
+        except Exception:
+            raise CronRequiredEnvironmentError(name, "fatal") from None
+        try:
+            resolved[name] = get_required(name)
+        except RequiredSecretError as exc:
+            raise CronRequiredEnvironmentError(name, exc.classification) from None
+        except Exception:
+            raise CronRequiredEnvironmentError(name, "fatal") from None
+
+    return resolved
+
+
+def _resolve_cron_optional_environment(optional_names: Any) -> dict[str, str]:
+    """Best-effort counterpart for declarations marked ``optional: true``."""
+    names = tuple(
+        declaration.name
+        for declaration in _normalize_environment_variable_declarations(optional_names)
+    )
+    if not names:
+        return {}
+
+    try:
+        from tools.environments.local import (
+            _HERMES_PROVIDER_ENV_BLOCKLIST,
+            _is_hermes_internal_secret,
+        )
+        from agent.secret_scope import current_secret_scope, is_multiplex_active
+
+        scope = current_secret_scope()
+        multiplex_active = is_multiplex_active()
+    except Exception:
+        return {}
+
+    resolved: dict[str, str] = {}
+    for name in names:
+        if (
+            name in _HERMES_PROVIDER_ENV_BLOCKLIST
+            or _is_hermes_internal_secret(name)
+        ):
+            continue
+        if multiplex_active and scope is None:
+            continue
+        if scope is not None:
+            value = scope.get(name)
+            if isinstance(value, str) and value:
+                resolved[name] = value
+                continue
+            if multiplex_active:
+                continue
+        ambient_value = os.environ.get(name)
+        if isinstance(ambient_value, str) and ambient_value:
+            resolved[name] = ambient_value
+            continue
+        try:
+            from agent.lazy_secret_resolver import get
+
+            lazy_value = get(name)
+        except Exception:
+            lazy_value = None
+        if isinstance(lazy_value, str) and lazy_value:
+            resolved[name] = lazy_value
+    return resolved
 
 
 def _read_windows_pyvenv_cfg(venv_dir: Path) -> dict[str, str]:
@@ -2572,15 +2724,12 @@ def _run_job_script(
     third-party integration tokens (e.g. ``CLICKUP_API_TOKEN``), which that
     heuristic would otherwise strip.
 
-    When ``HERMES_LAZY_SECRET_RESOLUTION`` is enabled, names explicitly
-    declared by the job in ``required_environment_variables`` are resolved
-    through the active profile secret scope and injected only into this child
-    environment. An active scope is authoritative over inherited boot env; a
-    multiplexed scoped miss therefore stays absent, while a single-profile
-    scoped miss may reach the flag-gated lazy resolver. Resolution is
-    fail-open: an unavailable resolver or individual missing secret leaves the
-    script runnable. With the flag disabled this path is not imported or
-    evaluated, preserving the legacy subprocess environment byte-for-byte.
+    Names explicitly declared by the job in
+    ``required_environment_variables`` are resolved profile-first and injected
+    only into this child environment. The declaration is strict and
+    all-or-nothing: a missing/auth/transient/fatal resolution error prevents
+    the child from starting. A multiplexed profile miss never consults ambient
+    boot state or the process-global 1Password manifest.
 
     Args:
         script_path: Path to the script.  Relative paths are resolved
@@ -2648,66 +2797,17 @@ def _run_job_script(
 
     try:
         from tools.environments.local import (
-            _HERMES_PROVIDER_ENV_BLOCKLIST,
-            _is_hermes_internal_secret,
             _sanitize_subprocess_env,
         )
 
         subprocess_env = _sanitize_subprocess_env(
             os.environ.copy(), apply_secret_shape_gate=False
         )
-        injected_secret_values: list[str] = []
-
-        # Resolve only operator-declared names, only behind the rollout flag,
-        # and only into the child env dict. Ambient values keep precedence.
-        # The unconditional sanitizer blocks remain load-bearing: a job
-        # declaration must not turn into a bypass for model-provider or
-        # Hermes-internal credentials.
-        if os.getenv("HERMES_LAZY_SECRET_RESOLUTION", "").strip().lower() in (
-            "1",
-            "true",
-            "yes",
-        ):
-            try:
-                from agent.secret_scope import (
-                    current_secret_scope as _current_secret_scope,
-                    get_secret as _get_secret,
-                )
-
-                scope_is_active = _current_secret_scope() is not None
-
-                for name in _normalize_required_environment_variables(
-                    required_environment_variables
-                ):
-                    if (
-                        name in _HERMES_PROVIDER_ENV_BLOCKLIST
-                        or _is_hermes_internal_secret(name)
-                    ):
-                        continue
-                    if scope_is_active:
-                        # The profile scope is authoritative. Never let a
-                        # boot-resident default-profile value beat the routed
-                        # profile's value (or survive an authoritative miss).
-                        subprocess_env.pop(name, None)
-                    elif name in subprocess_env:
-                        # Unscoped/single-process legacy path: ambient env
-                        # keeps its historical precedence over lazy lookup.
-                        continue
-                    try:
-                        # Route through the active profile scope. A scoped
-                        # multiplex miss stays absent instead of consulting
-                        # the process-global 1Password manifest; a
-                        # single-profile scoped miss may use the lazy tier.
-                        value = _get_secret(name)
-                    except Exception:
-                        value = None
-                    if isinstance(value, str) and value:
-                        subprocess_env[name] = value
-                        injected_secret_values.append(value)
-            except Exception:
-                # Fail open: resolver import/setup failures must not turn a
-                # previously runnable cron script into a scheduler failure.
-                pass
+        required_values = _resolve_cron_required_environment(
+            required_environment_variables
+        )
+        injected_secret_values = list(required_values.values())
+        subprocess_env.update(required_values)
 
         popen_kwargs = {}
         if sys.platform == "win32":
@@ -2785,7 +2885,9 @@ def _run_job_script_with_claim_heartbeat(
         # Preserve the historical one-positional-argument call shape when the
         # job has no env passthrough. This keeps custom/test script runners
         # compatible while still forwarding declared production secrets.
-        if required_environment_variables is None:
+        if not _normalize_required_environment_variables(
+            required_environment_variables
+        ):
             return _run_job_script(script_path)
         return _run_job_script(
             script_path,
@@ -2904,11 +3006,6 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
     job_required_env = _normalize_required_environment_variables(
         job.get("required_environment_variables")
     )
-    if job_required_env:
-        from tools.env_passthrough import register_env_passthrough
-        register_env_passthrough(job_required_env)
-        _install_cron_child_env(job_required_env)
-
     skills = job.get("skills")
     # True when runtime-collected DATA (script stdout, upstream-job output)
     # has been injected into the prompt. Data content legitimately quotes
@@ -3022,6 +3119,8 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
 
     skill_names = [str(name).strip() for name in skills if str(name).strip()]
     if not skill_names:
+        if job_required_env:
+            _install_cron_child_env(job_required_env)
         return _scan_assembled_cron_prompt(
             prompt,
             job,
@@ -3040,7 +3139,7 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
     # is safe to run at all. `entries` replays the resolved content in the
     # original order once we've confirmed nothing is missing.
     entries: list[tuple[str, str, str]] = []  # (kind, skill_name, payload)
-    skill_required_env: list[str] = []
+    skill_env_declarations: list[_EnvironmentVariableDeclaration] = []
     plugin_roots: set[Path] = set()
     skipped: list[str] = []
     skipped_reasons: dict[str, str] = {}
@@ -3051,13 +3150,42 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
         # of being treated as a missing skill.
         bundle_key = resolve_bundle_command_key(skill_name.lstrip("/"))
         if bundle_key:
-            bundle_payload = build_bundle_invocation_message(
-                bundle_key,
-                user_instruction="",
-                task_id=str(job.get("id") or "") or None,
-            )
+            try:
+                bundle_payload = build_bundle_invocation_message(
+                    bundle_key,
+                    user_instruction="",
+                    task_id=str(job.get("id") or "") or None,
+                    include_member_metadata=True,
+                )
+            finally:
+                reset_env_passthrough_context()
             if bundle_payload:
-                bundle_message, _loaded_bundle_skills, _missing_bundle_skills = bundle_payload
+                (
+                    bundle_message,
+                    _loaded_bundle_skills,
+                    _missing_bundle_skills,
+                    bundle_member_metadata,
+                ) = bundle_payload
+                if _missing_bundle_skills:
+                    skipped.append(skill_name)
+                    skipped_reasons[skill_name] = (
+                        f"bundle '{skill_name}' has unavailable member(s): "
+                        + ", ".join(_missing_bundle_skills)
+                    )
+                    continue
+                for member in bundle_member_metadata:
+                    if not isinstance(member, dict):
+                        continue
+                    skill_env_declarations.extend(
+                        _normalize_environment_variable_declarations(
+                            member.get("required_environment_variables")
+                        )
+                    )
+                    plugin_root = _plugin_root_from_skill_dir(
+                        member.get("skill_dir")
+                    )
+                    if plugin_root is not None:
+                        plugin_roots.add(plugin_root)
                 entries.append(("bundle", skill_name, bundle_message))
                 continue
             logger.warning(
@@ -3070,7 +3198,14 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
             continue
 
         try:
-            loaded = json.loads(skill_view(normalize_skill_lookup_name(skill_name)))
+            try:
+                loaded = json.loads(
+                    skill_view(normalize_skill_lookup_name(skill_name))
+                )
+            finally:
+                # skill_view() eagerly registers available declarations. Keep
+                # those reads provisional until every skill has validated.
+                reset_env_passthrough_context()
         except (json.JSONDecodeError, TypeError):
             logger.warning("Cron job '%s': skill '%s' returned invalid JSON, skipping", job.get("name", job.get("id")), skill_name)
             skipped.append(skill_name)
@@ -3084,17 +3219,19 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
             continue
 
         content = str(loaded.get("content") or "").strip()
-        for env_name in _normalize_required_environment_variables(
+        for declaration in _normalize_environment_variable_declarations(
             loaded.get("required_environment_variables")
         ):
-            if env_name not in skill_required_env:
-                skill_required_env.append(env_name)
+            skill_env_declarations.append(declaration)
         plugin_root = _plugin_root_from_skill_dir(loaded.get("skill_dir"))
         if plugin_root is not None:
             plugin_roots.add(plugin_root)
         entries.append(("skill", skill_name, content))
 
     if skipped:
+        # skill_view() registers available declarations as it reads each skill.
+        # Roll those provisional ContextVar mutations back before failing.
+        reset_env_passthrough_context()
         # Fail loudly instead of silently free-lancing off whatever prompt
         # text is left over. HERMES audit finding: this exact branch — log
         # a warning, append a "not found" notice, and dispatch the model
@@ -3139,10 +3276,40 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
             f"reference (typo, moved/deleted/renamed skill) or remove it from this job's config."
         )
 
-    # All skills resolved successfully.  Install one unambiguous plugin root
-    # and only the explicitly declared values available in this profile's
-    # current secret scope before the model can launch its first subprocess.
-    _install_cron_child_env(skill_required_env, plugin_roots=plugin_roots)
+    # All skills resolved successfully. Resolve the union of job- and
+    # skill-declared requirements before making any child-overlay mutation.
+    # Optional skill declarations are preserved by normalization but excluded
+    # from this strict set.
+    all_declarations = _normalize_environment_variable_declarations(
+        [
+            *job_required_env,
+            *(
+                {
+                    "name": declaration.name,
+                    "optional": declaration.optional,
+                }
+                for declaration in skill_env_declarations
+            ),
+        ]
+    )
+    all_required_env = tuple(
+        declaration.name
+        for declaration in all_declarations
+        if not declaration.optional
+    )
+    all_optional_env = tuple(
+        declaration.name
+        for declaration in all_declarations
+        if declaration.optional
+    )
+    # Discard skill_view()'s per-skill provisional passthrough registrations.
+    # The following single commit installs the complete validated transaction.
+    reset_env_passthrough_context()
+    _install_cron_child_env(
+        all_required_env,
+        optional_names=all_optional_env,
+        plugin_roots=plugin_roots,
+    )
 
     # Second pass: nothing was missing — replay in original order, now with
     # the bump_use side effect (identical to prior behavior).
