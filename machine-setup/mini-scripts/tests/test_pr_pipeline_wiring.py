@@ -36,6 +36,27 @@ def identity() -> TrustedMergeIdentity:
 
 
 class RuntimeWiringTests(unittest.TestCase):
+    def test_finalization_count_is_read_only_and_distinguishes_unreadable_from_zero(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            missing = Path(directory) / "missing.sqlite3"
+            self.assertIsNone(validator_verdict.finalization_count(missing))
+            self.assertFalse(missing.exists())
+
+            schemaless = Path(directory) / "schemaless.sqlite3"
+            with sqlite3.connect(schemaless):
+                pass
+            self.assertIsNone(validator_verdict.finalization_count(schemaless))
+
+            ledger = Path(directory) / "ledger.sqlite3"
+            with sqlite3.connect(ledger) as connection:
+                connection.execute("CREATE TABLE finalizations (id INTEGER PRIMARY KEY)")
+            before = ledger.stat().st_mtime_ns
+            self.assertEqual(validator_verdict.finalization_count(ledger), 0)
+            self.assertEqual(ledger.stat().st_mtime_ns, before)
+            with sqlite3.connect(ledger) as connection:
+                connection.execute("INSERT INTO finalizations DEFAULT VALUES")
+            self.assertEqual(validator_verdict.finalization_count(ledger), 1)
+
     def test_legacy_status_reordering_keeps_the_trusted_identity_stable(self) -> None:
         base_sha, head_sha, merge_sha = "a" * 40, "b" * 40, "c" * 40
         path_prefix = "repos/acme/widget"
