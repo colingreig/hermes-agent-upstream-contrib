@@ -219,6 +219,35 @@ assert_not_forbidden() {
 
 git_current() { git -C "$CURRENT_LINK" "$@"; }
 
+# Dry-run release directories are intentionally never cloned or built. Verify
+# a governed source against the resolved target commit's immutable tree instead
+# of inspecting the planned (and therefore nonexistent) release path. This
+# reads tree metadata only: it must never fetch or materialize a blob.
+dry_run_target_regular_file_metadata() {
+  local relative_path="${1:-}" entry metadata listed_path
+  [ "$DRY_RUN" -eq 1 ] || return 0
+  [ -n "$relative_path" ] || {
+    warn "dry-run governed source path is empty"
+    return 1
+  }
+  entry="$(git_current ls-tree "$SHA" -- "$relative_path")" || {
+    warn "dry-run target tree lookup failed: $relative_path"
+    return 1
+  }
+  if [ -z "$entry" ] || [[ "$entry" == *$'\n'* ]] || [[ "$entry" != *$'\t'* ]]; then
+    warn "dry-run target tree entry missing or malformed: $relative_path"
+    return 1
+  fi
+  metadata="${entry%%$'\t'*}"
+  listed_path="${entry#*$'\t'}"
+  if [ "$listed_path" != "$relative_path" ] \
+    || ! [[ "$metadata" =~ ^(100644|100755)[[:space:]]+blob[[:space:]][0-9a-f]{40,64}$ ]]; then
+    warn "dry-run governed source is not a regular file in target tree: $relative_path"
+    return 1
+  fi
+  return 0
+}
+
 sha256_file() {
   local path="${1:-}"
   [ -f "$path" ] || return 1
@@ -333,6 +362,11 @@ PY
 # atomic rename. No other caller is allowed to bypass assert_not_forbidden.
 install_governed_refresh_from_source() {
   local source="${1:-}" scripts_dir target tmp expected actual
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '\033[35m[DRY-RUN]\033[0m atomic install %s -> %s (target-tree regular-file metadata verified)\n' \
+      "$source" "$HERMES_HOME/scripts/clickup_workspace_refresh.py"
+    return 0
+  fi
   [ -f "$source" ] && [ ! -L "$source" ] || {
     warn "governed refresh source missing or symlinked: $source"
     return 1
@@ -351,12 +385,6 @@ install_governed_refresh_from_source() {
     return 1
   }
   expected="$(sha256_file "$source")" || return 1
-
-  if [ "$DRY_RUN" -eq 1 ]; then
-    printf '\033[35m[DRY-RUN]\033[0m atomic install %s -> %s (sha256=%s)\n' \
-      "$source" "$target" "$expected"
-    return 0
-  fi
 
   tmp="$(mktemp "$scripts_dir/.clickup_workspace_refresh.swap.XXXXXX")" || return 1
   cp "$source" "$tmp" || { rm -f "$tmp"; return 1; }
@@ -377,6 +405,9 @@ install_governed_refresh_from_source() {
 
 install_governed_refresh() {
   local release_dir="${1:-}"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    dry_run_target_regular_file_metadata "$VENDORED_REFRESH_REL" || return 1
+  fi
   install_governed_refresh_from_source "$release_dir/$VENDORED_REFRESH_REL"
 }
 
@@ -421,13 +452,14 @@ install_governed_launchd_environment() {
   local reconciler="$release_dir/$VENDORED_LAUNCHD_RECONCILER_REL"
   local source_root
   source_root="$(dirname "$reconciler")"
-  [ -f "$reconciler" ] && [ ! -L "$reconciler" ] \
-    || { warn "launchd environment reconciler missing or symlinked: $reconciler"; return 1; }
   if [ "$DRY_RUN" -eq 1 ]; then
+    dry_run_target_regular_file_metadata "$VENDORED_LAUNCHD_RECONCILER_REL" || return 1
     printf '\033[35m[DRY-RUN]\033[0m %s %s install --source-root %s --home %s --hermes-home %s --reload\n' \
       "$release_dir/venv/bin/python" "$reconciler" "$source_root" "$HOME" "$HERMES_HOME"
     return 0
   fi
+  [ -f "$reconciler" ] && [ ! -L "$reconciler" ] \
+    || { warn "launchd environment reconciler missing or symlinked: $reconciler"; return 1; }
   if ! "$release_dir/venv/bin/python" "$reconciler" install \
     --source-root "$source_root" --home "$HOME" --hermes-home "$HERMES_HOME" --reload; then
     return 1
@@ -464,13 +496,14 @@ install_governed_marketplace_skills() {
   local reconciler="$release_dir/$VENDORED_SKILLS_RECONCILER_REL"
   local source_root
   source_root="$(dirname "$reconciler")"
-  [ -f "$reconciler" ] && [ ! -L "$reconciler" ] \
-    || { warn "marketplace skills reconciler missing or symlinked: $reconciler"; return 1; }
   if [ "$DRY_RUN" -eq 1 ]; then
+    dry_run_target_regular_file_metadata "$VENDORED_SKILLS_RECONCILER_REL" || return 1
     printf '\033[35m[DRY-RUN]\033[0m %s %s install --source-root %s --home %s --hermes-home %s --reload\n' \
       "$release_dir/venv/bin/python" "$reconciler" "$source_root" "$HOME" "$HERMES_HOME"
     return 0
   fi
+  [ -f "$reconciler" ] && [ ! -L "$reconciler" ] \
+    || { warn "marketplace skills reconciler missing or symlinked: $reconciler"; return 1; }
   if ! "$release_dir/venv/bin/python" "$reconciler" install \
     --source-root "$source_root" --home "$HOME" --hermes-home "$HERMES_HOME" --reload; then
     return 1
@@ -964,13 +997,22 @@ if [ "$IF_ADVANCED" -eq 1 ]; then
   esac
 fi
 
-# Derive version from pyproject.toml AT THE TARGET REF (not the working tree).
-VERSION="$(git_current show "${SHA}:pyproject.toml" 2>/dev/null \
-             | grep -m1 -E '^version = "' | sed -E 's/^version = "([^"]+)".*/\1/')"
-[ -n "$VERSION" ] || die "could not read [project] version from pyproject.toml at $SHA"
-valid_release_version "$VERSION" \
-  || die "invalid project version (must be an ASCII PEP 440-safe path component): $VERSION"
-log "version at target ref: $VERSION"
+# A dry-run deliberately reads target tree metadata only: never materialize a
+# blob merely to derive a release directory that will not be created. The
+# placeholder is visibly non-authoritative; a real cut resolves the exact
+# target version below before creating the release directory.
+if [ "$DRY_RUN" -eq 1 ]; then
+  VERSION="0.0.0-dry-run"
+  log "dry-run planned version placeholder (target pyproject.toml not read): $VERSION"
+else
+  # Derive version from pyproject.toml AT THE TARGET REF (not the working tree).
+  VERSION="$(git_current show "${SHA}:pyproject.toml" 2>/dev/null \
+               | grep -m1 -E '^version = "' | sed -E 's/^version = "([^"]+)".*/\1/')"
+  [ -n "$VERSION" ] || die "could not read [project] version from pyproject.toml at $SHA"
+  valid_release_version "$VERSION" \
+    || die "invalid project version (must be an ASCII PEP 440-safe path component): $VERSION"
+  log "version at target ref: $VERSION"
+fi
 
 NEW_DIR="$(release_target "v${VERSION}-${SHORT_SHA}")"
 assert_release_target "$NEW_DIR"
@@ -1224,12 +1266,21 @@ if ! install_clickup_cli "$NEW_DIR"; then
   die "cut aborted and rolled back to previous release"
 fi
 
-REFRESH_SOURCE_HASH="$(sha256_file "$NEW_DIR/$VENDORED_REFRESH_REL" 2>/dev/null || true)"
-REFRESH_DEPLOYED_HASH="$(sha256_file "$DEPLOYED_REFRESH" 2>/dev/null || true)"
-if [ -z "$REFRESH_SOURCE_HASH" ] || [ "$REFRESH_SOURCE_HASH" != "$REFRESH_DEPLOYED_HASH" ]; then
-  warn "governed refresh source/deployed hash verification failed — rolling back"
-  rollback_to_previous "governed refresh hash verification failed"
-  die "cut aborted and rolled back to previous release"
+if [ "$DRY_RUN" -eq 1 ]; then
+  # The planned release was never built, and the deployed script intentionally
+  # remains untouched. A byte comparison here would compare undeployed state,
+  # not validate the cut. The real-cut branch below verifies the atomic swap.
+  printf '\033[35m[DRY-RUN]\033[0m verify governed refresh post-install SHA-256 equality (deferred to real cut)\n'
+  REFRESH_SOURCE_HASH=""
+  REFRESH_DEPLOYED_HASH=""
+else
+  REFRESH_SOURCE_HASH="$(sha256_file "$NEW_DIR/$VENDORED_REFRESH_REL" 2>/dev/null || true)"
+  REFRESH_DEPLOYED_HASH="$(sha256_file "$DEPLOYED_REFRESH" 2>/dev/null || true)"
+  if [ -z "$REFRESH_SOURCE_HASH" ] || [ "$REFRESH_SOURCE_HASH" != "$REFRESH_DEPLOYED_HASH" ]; then
+    warn "governed refresh source/deployed hash verification failed — rolling back"
+    rollback_to_previous "governed refresh hash verification failed"
+    die "cut aborted and rolled back to previous release"
+  fi
 fi
 RECEIPT_EVENT="cut"
 [ "$IF_ADVANCED" -eq 1 ] && RECEIPT_EVENT="advanced"
