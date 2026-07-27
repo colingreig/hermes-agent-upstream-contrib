@@ -1,0 +1,19 @@
+{
+  "_comment": "Governance rules for validate_tripwires.py. Merged with the built-in _SEED_POLICY. Keyed by 'owner/repo' or '*' (all repos). Each rule: {id, pattern (python regex, matched case-insensitively against each ADDED diff line), severity (high|medium), message}. Add repo-specific 'never do X' invariants here as they are discovered — this is the cheap, deterministic layer that runs before any LLM.",
+  "*": [
+    {
+      "id": "force-push-main",
+      "pattern": "git\\s+push\\s+(--force|-f)\\b.*\\b(origin\\s+)?(main|master)\\b",
+      "severity": "high",
+      "message": "force-push to main/master in a diff — never permitted"
+    }
+  ],
+  "colingreig/oec-web-oeconnection-com": [
+    {
+      "id": "oec-no-machine-approve",
+      "pattern": "(translationStatus|reviewStatus)\\s*[:=]\\s*['\"]approved['\"]",
+      "severity": "high",
+      "message": "OEC: in-review->approved is a human step (docs/translation-runbook.md); a script must not flip it"
+    }
+  ]
+}

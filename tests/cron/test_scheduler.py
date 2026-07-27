@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
 
-from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt, _resolve_cron_enabled_toolsets, _merge_mcp_into_per_job_toolsets, _is_route_chain_exhausted_no_work
+from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt, _resolve_cron_enabled_toolsets, _merge_mcp_into_per_job_toolsets, _is_route_chain_exhausted_no_work, CronSkillUnresolvable
 from tools.env_passthrough import clear_env_passthrough
 from tools.credential_files import clear_credential_files
 
@@ -1268,7 +1268,7 @@ class TestRunJobSessionPersistence:
 
         processed = scheduler.run_one_job(job)
 
-        assert processed is True
+        assert processed is False
         assert model_client.chat.completions.create.call_count == 1
         assert len(prompt_write_attempts) == 1
         assert prompt_write_attempts[0][0].startswith(f"cron_{job['id']}_")
@@ -3346,6 +3346,147 @@ class TestRunJobSkillBacked:
         assert "Combine the results." in prompt_arg
 
 
+class TestRunJobUnresolvableSkillFailsLoudly:
+    """HERMES audit fix, end-to-end via run_job().
+
+    Root cause: the `email-triage` cron job declared `skill: "email-triage"`
+    (no such skill anywhere on disk) and `prompt: ""`. The old
+    `_build_job_prompt` logged a warning, appended a "not found" notice to
+    the (still-empty) prompt, and returned normally — `run_job` dispatched
+    the model turn anyway. The agent free-lanced with zero task-specific
+    criteria, produced plausible-looking output, and `last_status` recorded
+    "ok" for 135 consecutive runs.
+
+    Fix: an unresolvable `skill`/`skills` entry now raises
+    `CronSkillUnresolvable` out of `_build_job_prompt`, which `run_job`
+    catches BEFORE constructing `AIAgent` — no model turn happens, and
+    `run_job` returns `success=False` with a descriptive `error` so
+    `mark_job_run` records a non-"ok" `last_status` that surfaces in the
+    fleet alarm.
+
+    This class covers the four load-bearing cases: a resolvable skill
+    (unchanged), an unresolvable skill (errors, no model turn), no skill at
+    all (unchanged, even with an empty prompt), and the exact defect
+    combination — empty prompt + unresolvable skill (errors for the skill,
+    not suppressed by the prompt being empty).
+    """
+
+    _RUNTIME_PROVIDER = {
+        "api_key": "***",
+        "base_url": "https://example.invalid/v1",
+        "provider": "openrouter",
+        "api_mode": "chat_completions",
+    }
+
+    def _run(self, job, *, skill_view=None):
+        fake_db = MagicMock()
+        patches = [
+            patch("cron.scheduler._resolve_origin", return_value=None),
+            patch("hermes_cli.env_loader.load_hermes_dotenv"),
+            patch("hermes_cli.env_loader.reset_secret_source_cache"),
+            patch("hermes_state.SessionDB", return_value=fake_db),
+            patch(
+                "hermes_cli.runtime_provider.resolve_runtime_provider",
+                return_value=self._RUNTIME_PROVIDER,
+            ),
+        ]
+        if skill_view is not None:
+            patches.append(patch("tools.skills_tool.skill_view", side_effect=skill_view))
+        with contextlib.ExitStack() as stack:
+            for p in patches:
+                stack.enter_context(p)
+            mock_agent_cls = stack.enter_context(patch("run_agent.AIAgent"))
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent_cls.return_value = mock_agent
+            success, output, final_response, error = run_job(job)
+        return success, output, final_response, error, mock_agent_cls
+
+    def test_resolvable_skill_runs_agent_normally(self):
+        """Case 1 — unchanged: a skill that resolves still dispatches the
+        model turn and reports success."""
+
+        def _skill_view(name):
+            assert name == "email-triage"
+            return json.dumps({"success": True, "content": "# email-triage\nTriage the inbox."})
+
+        job = {
+            "id": "job-resolvable",
+            "name": "email triage (fixed)",
+            "prompt": "Run the daily triage.",
+            "skill": "email-triage",
+        }
+        success, output, final_response, error, mock_agent_cls = self._run(job, skill_view=_skill_view)
+
+        mock_agent_cls.assert_called_once()
+        assert success is True
+        assert error is None
+        assert final_response == "ok"
+
+    def test_unresolvable_skill_errors_no_model_turn(self):
+        """Case 2 — the defect fix: an unresolvable skill must fail the job
+        and must NOT construct the agent at all."""
+
+        def _skill_view(name):
+            return json.dumps({"success": False, "error": f"Skill '{name}' not found."})
+
+        job = {
+            "id": "job-unresolvable",
+            "name": "email-triage",
+            "prompt": "Run the daily triage.",
+            "skill": "email-triage",
+        }
+        success, output, final_response, error, mock_agent_cls = self._run(job, skill_view=_skill_view)
+
+        mock_agent_cls.assert_not_called()
+        assert success is False
+        assert error is not None
+        assert "email-triage" in error
+        assert "ERROR" in output
+
+    def test_no_skill_at_all_runs_agent_unchanged(self):
+        """Case 3 — unchanged: a job that legitimately declares no skill
+        (skill is None, skills is empty) keeps working, even with an empty
+        prompt. This proves the fix does NOT introduce a new "empty prompt"
+        error class for jobs that were never naming a skill in the first
+        place — only an unresolvable skill reference is an error."""
+        job = {
+            "id": "job-no-skill",
+            "name": "no skill at all",
+            "prompt": "",
+            "skill": None,
+            "skills": [],
+        }
+        success, output, final_response, error, mock_agent_cls = self._run(job)
+
+        mock_agent_cls.assert_called_once()
+        assert success is True
+        assert error is None
+        assert final_response == "ok"
+
+    def test_empty_prompt_and_unresolvable_skill_errors(self):
+        """Case 4 — the exact email-triage defect shape: prompt="" AND an
+        unresolvable named skill. Must error (same as case 2) and must NOT
+        be excused by the prompt being empty — the empty prompt makes the
+        old silent-freelance failure mode worse, not more acceptable."""
+
+        def _skill_view(name):
+            return json.dumps({"success": False, "error": f"Skill '{name}' not found."})
+
+        job = {
+            "id": "job-empty-prompt-unresolvable",
+            "name": "email-triage",
+            "prompt": "",
+            "skill": "email-triage",
+        }
+        success, output, final_response, error, mock_agent_cls = self._run(job, skill_view=_skill_view)
+
+        mock_agent_cls.assert_not_called()
+        assert success is False
+        assert error is not None
+        assert "email-triage" in error
+
+
 class TestSilentDelivery:
     """Verify that [SILENT] responses suppress delivery while still saving output."""
 
@@ -3470,8 +3611,8 @@ class TestSilentDelivery:
         save_mock.assert_called_once_with("monitor-job", "# full output")
         deliver_mock.assert_not_called()
 
-    def test_whitespace_only_response_is_marked_failed_not_delivered(self):
-        """Whitespace-only final responses should behave like empty responses."""
+    def test_whitespace_only_response_is_marked_failed_and_delivers_alert(self):
+        """Whitespace-only final responses are red and alertable."""
         with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
              patch("cron.scheduler.run_job", return_value=(True, "# output", "   \n\t  ", None)), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
@@ -3480,7 +3621,7 @@ class TestSilentDelivery:
             from cron.scheduler import tick
             tick(verbose=False)
 
-        deliver_mock.assert_not_called()
+        deliver_mock.assert_called_once()
         mark_mock.assert_called_once_with(
             "monitor-job",
             False,
@@ -3602,7 +3743,7 @@ class TestRouteChainExhaustedNoWork:
             from cron.scheduler import tick
             tick(verbose=False)
 
-        deliver_mock.assert_not_called()
+        deliver_mock.assert_called_once()
         mark_mock.assert_called_once_with(
             "monitor-job",
             False,
@@ -3905,9 +4046,8 @@ class TestRunJobWakeGate:
 
         assert call_count == 1, f"script ran {call_count}x, expected exactly 1"
 
-    def test_script_failure_does_not_trigger_gate(self):
-        """If _run_job_script returns success=False, the gate is NOT evaluated
-        and the agent still runs (the failure is reported as context)."""
+    def test_script_failure_is_terminal_before_agent(self):
+        """A failed required pre-run script cannot be rehabilitated by prose."""
         import cron.scheduler as scheduler
 
         # Malicious or broken script whose stderr happens to contain the
@@ -3921,7 +4061,29 @@ class TestRunJobWakeGate:
              patch("run_agent.AIAgent", return_value=agent) as agent_cls:
             success, doc, final, err = scheduler.run_job(self._make_job())
 
-        agent_cls.assert_called_once()  # Agent DID wake despite the gate-like text
+        agent_cls.assert_not_called()
+        assert success is False
+        assert err == '{"wakeAgent": false}'
+        assert "pre-run script failed" in doc
+
+    def test_missing_workdir_is_terminal_for_no_agent_before_script(self, tmp_path):
+        """A persisted no_agent job must not silently run from another cwd."""
+        import cron.scheduler as scheduler
+
+        missing = tmp_path / "deleted-project"
+        job = {
+            "id": "missing-workdir",
+            "name": "watchdog",
+            "no_agent": True,
+            "script": "watchdog.py",
+            "workdir": str(missing),
+        }
+        with patch.object(scheduler, "_run_job_script") as script:
+            success, _doc, _final, error = scheduler.run_job(job)
+
+        assert success is False
+        assert "workdir" in error.lower()
+        script.assert_not_called()
 
     def test_no_script_path_runs_agent_normally(self):
         """Regression: jobs without a script still work."""
@@ -3942,34 +4104,46 @@ class TestRunJobWakeGate:
 
 
 class TestBuildJobPromptMissingSkill:
-    """Verify that a missing skill logs a warning and does not crash the job."""
+    """HERMES audit fix: a job naming a skill that cannot be resolved must
+    fail loudly (CronSkillUnresolvable, no model turn) instead of silently
+    free-lancing off a degraded prompt. Root cause: the `email-triage` cron
+    job (skill="email-triage", prompt="") ran 135 times reporting
+    last_status: ok — the old code just logged a warning, appended a
+    "not found" notice to the (empty) prompt, and dispatched the model turn
+    anyway. See tests/cron/test_cron_prompt_injection_skill.py for the
+    resolvable/no-skill/empty-prompt companion cases.
+    """
 
     def _missing_skill_view(self, name: str) -> str:
         return json.dumps({"success": False, "error": f"Skill '{name}' not found."})
 
-    def test_missing_skill_does_not_raise(self):
-        """Job should run even when a referenced skill is not installed."""
+    def test_missing_skill_raises_unresolvable(self):
+        """Job must NOT run when a referenced skill is not installed."""
         with patch("tools.skills_tool.skill_view", side_effect=self._missing_skill_view):
-            result = _build_job_prompt({"skills": ["ghost-skill"], "prompt": "do something"})
-        # prompt is preserved even though skill was skipped
-        assert "do something" in result
+            with pytest.raises(CronSkillUnresolvable) as exc_info:
+                _build_job_prompt({"skills": ["ghost-skill"], "prompt": "do something"})
+        assert "ghost-skill" in str(exc_info.value)
 
-    def test_missing_skill_injects_user_notice_into_prompt(self):
-        """A system notice about the missing skill is injected into the prompt."""
+    def test_missing_skill_error_names_the_skill(self):
+        """The raised error names the missing skill so the operator can act."""
         with patch("tools.skills_tool.skill_view", side_effect=self._missing_skill_view):
-            result = _build_job_prompt({"skills": ["ghost-skill"], "prompt": "do something"})
-        assert "ghost-skill" in result
-        assert "not found" in result.lower() or "skipped" in result.lower()
+            with pytest.raises(CronSkillUnresolvable) as exc_info:
+                _build_job_prompt({"skills": ["ghost-skill"], "prompt": "do something"})
+        assert "ghost-skill" in str(exc_info.value)
+        assert "not found" in str(exc_info.value).lower()
 
     def test_missing_skill_logs_warning(self, caplog):
-        """A warning is logged when a skill cannot be found."""
+        """A warning is logged (per-skill) before the job-level error is raised."""
         with caplog.at_level(logging.WARNING, logger="cron.scheduler"):
             with patch("tools.skills_tool.skill_view", side_effect=self._missing_skill_view):
-                _build_job_prompt({"name": "My Job", "skills": ["ghost-skill"], "prompt": "do something"})
+                with pytest.raises(CronSkillUnresolvable):
+                    _build_job_prompt({"name": "My Job", "skills": ["ghost-skill"], "prompt": "do something"})
         assert any("ghost-skill" in record.message for record in caplog.records)
 
-    def test_valid_skill_loaded_alongside_missing(self):
-        """A valid skill is still loaded when another skill in the list is missing."""
+    def test_valid_skill_alongside_missing_still_raises(self):
+        """A partially-valid skill list still voids the whole job — a job
+        missing part of its declared instructions is not safe to run on
+        the rest."""
 
         def _mixed_skill_view(name: str) -> str:
             if name == "real-skill":
@@ -3977,9 +4151,34 @@ class TestBuildJobPromptMissingSkill:
             return json.dumps({"success": False, "error": f"Skill '{name}' not found."})
 
         with patch("tools.skills_tool.skill_view", side_effect=_mixed_skill_view):
-            result = _build_job_prompt({"skills": ["ghost-skill", "real-skill"], "prompt": "go"})
-        assert "Real skill content." in result
-        assert "go" in result
+            with pytest.raises(CronSkillUnresolvable) as exc_info:
+                _build_job_prompt({"skills": ["ghost-skill", "real-skill"], "prompt": "go"})
+        assert "ghost-skill" in str(exc_info.value)
+
+
+class TestBuildJobPromptAbsoluteSkillPath:
+    """Cron jobs may store absolute skill paths; normalize before skill_view."""
+
+    def test_absolute_skill_path_normalized_before_skill_view(self, tmp_path):
+        skills_dir = tmp_path / "skills"
+        skill_dir = skills_dir / "alpha-skill"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text("# Alpha\nDo alpha.")
+        absolute_path = str(skill_dir)
+        seen_names: list[str] = []
+
+        def _skill_view(name: str) -> str:
+            seen_names.append(name)
+            if name == "alpha-skill":
+                return json.dumps({"success": True, "content": "# Alpha\nDo alpha."})
+            return json.dumps({"success": False, "error": f"Skill '{name}' not found."})
+
+        with patch("tools.skills_tool.SKILLS_DIR", skills_dir), \
+             patch("tools.skills_tool.skill_view", side_effect=_skill_view):
+            result = _build_job_prompt({"skills": [absolute_path], "prompt": "go"})
+
+        assert seen_names == ["alpha-skill"]
+        assert "Do alpha." in result
 
 
 class TestBuildJobPromptAbsoluteSkillPath:
@@ -4026,14 +4225,16 @@ class TestBuildJobPromptBumpUse:
         assert "beta" in calls
 
     def test_bump_use_not_called_for_missing_skill(self):
-        """bump_use is NOT called when a skill fails to load."""
+        """bump_use is NOT called when a skill fails to load (the job raises
+        before the usage-bumping second pass ever runs)."""
 
         def _missing_view(name: str) -> str:
             return json.dumps({"success": False, "error": "not found"})
 
         with patch("tools.skills_tool.skill_view", side_effect=_missing_view), \
              patch("tools.skill_usage.bump_use") as mock_bump:
-            _build_job_prompt({"skills": ["ghost"], "prompt": "go"})
+            with pytest.raises(CronSkillUnresolvable):
+                _build_job_prompt({"skills": ["ghost"], "prompt": "go"})
 
         assert mock_bump.call_count == 0
 

@@ -19,6 +19,13 @@ response shapes.
 This is a decision to defer implementation, not to accept an unmonitored
 single point of failure. The monitor thresholds below are the reopen signal.
 
+Provider attribution is now durable rather than inferred from an aggregate
+status: each content-free receipt records `search_provider` and
+`fetch_provider`. The monitor exposes provider-attributed search-outage
+clusters and their 30-day counts. It intentionally does **not** attribute
+`ungrounded` or `fetch-degraded` to a provider, because target-site blocking,
+analyzer failures, or key resolution can produce those states.
+
 ## Evidence
 
 ### Current safeguards absorb the observed failure class
@@ -116,12 +123,21 @@ content pipeline.
 Reopen this decision when any one of these conditions is observed:
 
 1. The production monitor returns `status: "search-outage"` after the built-in
-   retry policy is exhausted.
-2. Two provider-attributed `search-outage` incidents occur within 30 days,
-   even if each recovers before a manual investigation.
-3. A provider-attributed outage materially reduces grounding, observed as
-   `status: "ungrounded"` or `status: "fetch-degraded"`, rather than merely
-   producing a transient request error.
+   retry policy is exhausted. The incident is attributable only when its
+   `provider_search_outage_incidents_30d` record names a provider; legacy or
+   malformed receipts remain explicitly counted as `unattributed`.
+2. `provider_search_outage_incident_counts_30d[provider] >= 2`. One incident
+   is a cluster of at least three `search_failed=true` receipts for that named
+   provider, with no adjacent receipt gap over four hours; clusters separated
+   by a longer gap are separate incidents. This makes the 30-day decision
+   reproducible from the content-free ledger, rather than from alert memory.
+3. `status: "ungrounded"` or `status: "fetch-degraded"` opens a manual
+   investigation only. It is not vendor evidence. Preserve the monitor JSON
+   and inspect the matching receipt fields (`failure_class`, `search_failed`,
+   `search_provider`, `fetch_provider`, `attempted_fetches`, and
+   `grounded_pages`). Attribute the event to a provider only if the evidence
+   shows failed provider requests; otherwise classify it as target-site,
+   analyzer, key-resolution, or unknown and do not advance the fallback gate.
 4. A product requirement changes the contract so research availability must
    block delivery; the present fail-open risk calculation would then no longer
    apply.
@@ -138,6 +154,16 @@ activating Tavily:
    the receipt ledger; and
 5. enable fallback only if the shadow results meet the existing grounding and
    safety contracts.
+
+The shadow trial has an explicit stop and rollback rule: stop without
+activation if any shadow receipt contains query/content/credential material,
+if the shadow path changes writer routing, or if its grounded-page rate is
+below the primary cohort by more than 10 percentage points after 20 paired
+non-smoke attempts. Any future activation must ship behind a default-off
+`content_pipeline.research.fallback.enabled` flag. If an activated fallback
+violates any stop condition or causes a new `search-outage`, set that flag to
+`false`, restart the stage job, and retain only the content-free receipts for
+the postmortem; do not switch providers automatically.
 
 ## Reproducible verification
 
@@ -165,7 +191,11 @@ ssh mini 'python3 ~/.hermes/scripts/research_stage_monitor.py'
 
 The output should be treated literally. `insufficient-data` is not healthy,
 but it also is not evidence of an outage. `search-outage` is the explicit
-reopen signal.
+reopen signal. Save the JSON produced when a trigger fires with the incident
+ticket or task comment; its `provider_search_outage_incidents_30d` and
+`provider_search_outage_incident_counts_30d` values are the durable query used
+for trigger 2. Do not infer provider history from `ungrounded` or
+`fetch-degraded` alone.
 
 Verify the contingency's existing Hermes capability:
 

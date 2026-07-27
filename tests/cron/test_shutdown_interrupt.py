@@ -186,7 +186,7 @@ class TestRunOneJobHonoursInterruptedFlag:
              patch("cron.scheduler.mark_job_run") as mock_mark:
             result = sched.run_one_job(job)
 
-        assert result is True
+        assert result is False
         # The would-be "success" write must NOT happen -- the shutdown
         # path already wrote the authoritative interrupted status.
         mock_mark.assert_not_called()
@@ -225,7 +225,7 @@ class TestRunOneJobHonoursInterruptedFlag:
              patch("cron.scheduler.mark_job_run"):
             result = sched.run_one_job(job)
 
-        assert result is True
+        assert result is False
         mock_summarize.assert_called_once()
         # The summarizer's error argument must mention the interruption,
         # not be silently None / the agent's own (possibly absent) error.

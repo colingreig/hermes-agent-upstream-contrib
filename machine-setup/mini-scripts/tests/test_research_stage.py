@@ -313,6 +313,8 @@ def test_served_degraded_gets_code_injected_banner_and_structured_ledger_fields(
     assert record["grounded_pages"] == 0
     assert record["attempted_fetches"] == 0
     assert record["search_failed"] is True
+    assert record["search_provider"] == "scrapingbee"
+    assert record["fetch_provider"] == "scrapingbee"
     assert record["blocked_pages"] == 0  # a search outage is not a "page blocked" count
     assert record["failure_class"] == "search-http"
     assert record["failure_reason"] == "search HTTP 503"

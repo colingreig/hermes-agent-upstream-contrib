@@ -1,0 +1,10 @@
+{
+  "_doc": "OFFLINE LAST-RESORT repo-name equivalence groups for validator_repo_guard.py. PRIMARY mechanism is canonical GitHub identity (gh api repos/<owner>/<name> --jq .node_id), which follows renames automatically and needs NO entry here. Add a group ONLY for a repo gh can no longer resolve at all (deleted/transferred away), or to keep a known rename resolvable when the mini is offline with a cold identity cache. Each inner array is one equivalence group of owner/name spellings that address ONE repository.",
+  "_see": "~/.hermes/scripts/validator_repo_guard.py (RC2 header) and machine-setup/mini-scripts/README.md in colingreig/hermes-agent-upstream-contrib",
+  "aliases": [
+    [
+      "colingreig/hermes-agent",
+      "colingreig/hermes-agent-upstream-contrib"
+    ]
+  ]
+}
