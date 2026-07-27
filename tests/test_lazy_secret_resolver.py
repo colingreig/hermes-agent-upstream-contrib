@@ -235,3 +235,159 @@ def test_concurrent_get_for_same_name_single_flights_the_resolver(manifest, monk
     assert results[0] == "sk-shared-secret"
     assert results[1] == "sk-shared-secret"
     assert len(calls) == 1
+
+
+def test_manifest_is_refreshed_after_atomic_replacement(manifest, monkeypatch):
+    calls = []
+
+    def fake_resolve_required(ref: str) -> str:
+        calls.append(ref)
+        return f"value-{len(calls)}"
+
+    monkeypatch.setattr(lsr, "_resolve_ref_required", fake_resolve_required)
+    assert lsr.get_required("FOO_KEY") == "value-1"
+
+    replacement = manifest.with_suffix(".replacement")
+    replacement.write_text(
+        "FOO_KEY=op://vault/item-rotated/field\n",
+        encoding="utf-8",
+    )
+    replacement.replace(manifest)
+
+    assert lsr.get_required("FOO_KEY") == "value-2"
+    assert calls == [
+        "op://vault/item-foo/field",
+        "op://vault/item-rotated/field",
+    ]
+
+
+def test_get_required_missing_is_typed_and_does_not_call_resolver(
+    manifest, monkeypatch
+):
+    resolver = pytest.fail
+    monkeypatch.setattr(lsr, "_resolve_ref_required", resolver)
+
+    with pytest.raises(lsr.RequiredSecretMissingError) as excinfo:
+        lsr.get_required("NOT_DECLARED")
+
+    assert excinfo.value.classification == "missing"
+    assert excinfo.value.name == "NOT_DECLARED"
+
+
+def test_get_required_retries_only_transient_three_attempts(manifest, monkeypatch):
+    calls = []
+    sleeps = []
+
+    def transient(_ref: str) -> str:
+        calls.append("call")
+        raise lsr.RequiredSecretTransientError("")
+
+    monkeypatch.setattr(lsr, "_resolve_ref_required", transient)
+    monkeypatch.setattr(lsr.time, "sleep", sleeps.append)
+
+    with pytest.raises(lsr.RequiredSecretTransientError) as excinfo:
+        lsr.get_required("FOO_KEY")
+
+    assert excinfo.value.name == "FOO_KEY"
+    assert len(calls) == 3
+    assert sleeps == [0.2, 0.5]
+
+
+@pytest.mark.parametrize(
+    "error_type",
+    [
+        lsr.RequiredSecretMissingError,
+        lsr.RequiredSecretAuthError,
+        lsr.RequiredSecretFatalError,
+    ],
+)
+def test_get_required_non_transient_error_is_not_retried(
+    manifest, monkeypatch, error_type
+):
+    calls = []
+
+    def fail(_ref: str) -> str:
+        calls.append("call")
+        raise error_type("")
+
+    monkeypatch.setattr(lsr, "_resolve_ref_required", fail)
+    with pytest.raises(error_type):
+        lsr.get_required("FOO_KEY")
+    assert calls == ["call"]
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "401 unauthenticated",
+        "403 authorization failed",
+        "unauthorized",
+        "forbidden",
+        "PERMISSION_DENIED",
+        "invalid_token",
+        "token-invalidated",
+        "token is not valid",
+        "token revoked",
+        "revoked",
+        "revoked service account token",
+        "503 unavailable: permission denied for invalid token",
+        "timeout while authorization failed",
+    ],
+)
+def test_common_auth_forms_classify_auth_and_win_over_transient(message):
+    error = RuntimeError(message)
+    assert lsr._classify_required_exception(error) is lsr.RequiredSecretAuthError
+
+
+def test_required_error_never_contains_secret_or_reference(manifest, monkeypatch):
+    raw_secret = "opaque-secret-that-must-not-leak"
+    raw_ref = "op://vault/item-foo/field"
+
+    def fail(_ref: str) -> str:
+        raise RuntimeError(f"503 network failure {raw_secret} {raw_ref}")
+
+    monkeypatch.setattr(lsr, "_resolve_ref_required", fail)
+    with pytest.raises(lsr.RequiredSecretFatalError) as excinfo:
+        lsr.get_required("FOO_KEY")
+
+    rendered = str(excinfo.value)
+    assert raw_secret not in rendered
+    assert raw_ref not in rendered
+    assert "FOO_KEY" in rendered
+
+
+def test_concurrent_required_auth_failure_is_single_flight_and_not_retried(
+    manifest, monkeypatch
+):
+    calls = []
+    entered = threading.Event()
+    release = threading.Event()
+
+    def auth_failure(_ref: str) -> str:
+        calls.append("call")
+        entered.set()
+        release.wait(timeout=2)
+        raise lsr.RequiredSecretAuthError("")
+
+    monkeypatch.setattr(lsr, "_resolve_ref_required", auth_failure)
+    errors = []
+
+    def resolve() -> None:
+        try:
+            lsr.get_required("FOO_KEY")
+        except lsr.RequiredSecretError as exc:
+            errors.append(exc)
+
+    leader = threading.Thread(target=resolve)
+    follower = threading.Thread(target=resolve)
+    leader.start()
+    assert entered.wait(timeout=2)
+    follower.start()
+    time.sleep(0.05)
+    release.set()
+    leader.join(timeout=2)
+    follower.join(timeout=2)
+
+    assert calls == ["call"]
+    assert len(errors) == 2
+    assert all(isinstance(exc, lsr.RequiredSecretAuthError) for exc in errors)

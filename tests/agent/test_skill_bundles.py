@@ -200,6 +200,54 @@ class TestBuildBundleInvocationMessage:
         assert "Skill B content." in msg
         assert "combo" in msg
 
+    def test_opt_in_member_metadata_preserves_environment_and_skill_dir(
+        self, bundles_env
+    ):
+        bundles_dir, skills_dir = bundles_env
+        skill_dir = skills_dir / "credentialed"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\n"
+            "name: credentialed\n"
+            "description: Credentialed member\n"
+            "required_environment_variables:\n"
+            "  - name: BUNDLE_REQUIRED_TOKEN\n"
+            "  - name: BUNDLE_OPTIONAL_TOKEN\n"
+            "    optional: true\n"
+            "---\n\n"
+            "# credentialed\n",
+            encoding="utf-8",
+        )
+        _make_bundle_yaml(bundles_dir, "combo", ["credentialed"])
+        scan_bundles()
+
+        result = build_bundle_invocation_message(
+            "/combo",
+            include_member_metadata=True,
+        )
+
+        assert result is not None
+        _message, loaded, missing, metadata = result
+        assert loaded == ["credentialed"]
+        assert missing == []
+        assert metadata == [
+            {
+                "name": "credentialed",
+                "skill_dir": str(skill_dir),
+                "required_environment_variables": [
+                    {
+                        "name": "BUNDLE_REQUIRED_TOKEN",
+                        "prompt": "Enter value for BUNDLE_REQUIRED_TOKEN",
+                    },
+                    {
+                        "name": "BUNDLE_OPTIONAL_TOKEN",
+                        "prompt": "Enter value for BUNDLE_OPTIONAL_TOKEN",
+                        "optional": True,
+                    },
+                ],
+            }
+        ]
+
     def test_skips_missing_skills(self, bundles_env):
         bundles_dir, skills_dir = bundles_env
         _make_skill(skills_dir, "skill-a")

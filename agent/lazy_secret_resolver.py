@@ -36,9 +36,11 @@ import asyncio
 import logging
 import os
 import queue
+import re
 import threading
 import time
-from typing import Dict, Optional, Tuple
+import weakref
+from typing import Dict, Optional, Tuple, Type
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +67,12 @@ _DEFAULT_TTL_SECONDS = 600
 # short because a cold/expired ref can be resolved from a gateway
 # event-loop thread — this is the worst-case blocking window.
 _DEFAULT_RESOLVE_TIMEOUT_SECONDS = 10
+
+# Strict callers are used only for explicitly declared, required child
+# credentials.  A transient 1Password failure gets two bounded retries; auth,
+# missing, and fatal failures do not become retry loops.
+_REQUIRED_ATTEMPTS = 3
+_REQUIRED_RETRY_DELAYS = (0.2, 0.5)
 
 # Secrets consumed by spawned external CLIs (vercel/wrangler/git/gh) rather
 # than in-process. Resolved lazily at subprocess-spawn time and injected
@@ -95,8 +103,9 @@ C2_EXTERNAL_CLI_SECRETS = (
 # the lock hostage.
 _lock = threading.Lock()
 
-# name -> op:// ref, parsed once from the manifest file.
+# name -> op:// ref, refreshed when the manifest's stat identity changes.
 _name_to_ref: Optional[Dict[str, str]] = None
+_manifest_identity: Optional[Tuple[str, Optional[int], Optional[int], Optional[int], Optional[int]]] = None
 
 # ref -> (value, expiry_monotonic)
 _cache: Dict[str, Tuple[str, float]] = {}
@@ -106,6 +115,39 @@ _cache: Dict[str, Tuple[str, float]] = {}
 # removes it and sets the Event once resolution finishes (success or
 # failure), waking any followers waiting on the same ref.
 _inflight: Dict[str, threading.Event] = {}
+_inflight_errors: "weakref.WeakKeyDictionary[threading.Event, RequiredSecretError]"
+
+
+class RequiredSecretError(RuntimeError):
+    """Base class for sanitized strict-resolution failures."""
+
+    classification = "fatal"
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        super().__init__(
+            f"required secret {name!r} is unavailable "
+            f"(classification={self.classification})"
+        )
+
+
+class RequiredSecretMissingError(RequiredSecretError):
+    classification = "missing"
+
+
+class RequiredSecretAuthError(RequiredSecretError):
+    classification = "auth"
+
+
+class RequiredSecretTransientError(RequiredSecretError):
+    classification = "transient"
+
+
+class RequiredSecretFatalError(RequiredSecretError):
+    classification = "fatal"
+
+
+_inflight_errors = weakref.WeakKeyDictionary()
 
 
 # ---------------------------------------------------------------------------
@@ -136,13 +178,48 @@ def get(name: str) -> Optional[str]:
         return None
 
 
+def get_required(name: str) -> str:
+    """Resolve a declared required secret or raise a typed, sanitized error.
+
+    Unlike :func:`get`, this API is intentionally fail-closed.  It is for
+    callers that have explicitly declared that a child process cannot run
+    safely without the value.  Only transient failures are retried, for a
+    fixed maximum of three attempts with short bounded delays.
+    """
+    try:
+        with _lock:
+            ref = _get_name_to_ref_map().get(name)
+        if ref is None:
+            raise RequiredSecretMissingError(name)
+
+        for attempt in range(_REQUIRED_ATTEMPTS):
+            try:
+                return _resolve_required_cached(ref)
+            except RequiredSecretTransientError:
+                if attempt >= _REQUIRED_ATTEMPTS - 1:
+                    raise RequiredSecretTransientError(name) from None
+                time.sleep(_REQUIRED_RETRY_DELAYS[attempt])
+            except RequiredSecretError as exc:
+                raise type(exc)(name) from None
+    except RequiredSecretError:
+        raise
+    except Exception:
+        raise RequiredSecretFatalError(name) from None
+
+    # The loop either returns or raises. Keep a defensive terminal branch for
+    # type checkers and future edits.
+    raise RequiredSecretFatalError(name)
+
+
 def clear_cache() -> None:
     """Clear the in-memory manifest map and value cache. For tests."""
-    global _name_to_ref
+    global _manifest_identity, _name_to_ref
     with _lock:
         _name_to_ref = None
+        _manifest_identity = None
         _cache.clear()
         _inflight.clear()
+        _inflight_errors.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -173,17 +250,39 @@ def _resolve_timeout_seconds() -> float:
 
 
 def _get_name_to_ref_map() -> Dict[str, str]:
-    """Return the cached name->ref map, parsing the manifest on first use.
+    """Return the name->ref map, refreshing when the manifest identity changes.
 
-    Must be called with ``_lock`` held. A missing/unreadable manifest yields
-    an empty map (fail-open) rather than raising.
+    The identity includes path, device, inode, size, and nanosecond mtime.
+    Rotation by atomic replace is therefore visible immediately, even when
+    the replacement happens inside a value-cache TTL. Must be called with
+    ``_lock`` held. A missing/unreadable manifest yields an empty map
+    (fail-open) rather than raising.
     """
-    global _name_to_ref
-    if _name_to_ref is not None:
+    global _manifest_identity, _name_to_ref
+    path = _manifest_path()
+    identity = _manifest_stat_identity(path)
+    if _name_to_ref is not None and identity == _manifest_identity:
         return _name_to_ref
 
-    _name_to_ref = _parse_manifest(_manifest_path())
+    _name_to_ref = _parse_manifest(path)
+    _manifest_identity = identity
     return _name_to_ref
+
+
+def _manifest_stat_identity(
+    path: str,
+) -> Tuple[str, Optional[int], Optional[int], Optional[int], Optional[int]]:
+    try:
+        stat_result = os.stat(path)
+    except OSError:
+        return (os.path.abspath(path), None, None, None, None)
+    return (
+        os.path.abspath(path),
+        stat_result.st_dev,
+        stat_result.st_ino,
+        stat_result.st_size,
+        stat_result.st_mtime_ns,
+    )
 
 
 def _parse_manifest(path: str) -> Dict[str, str]:
@@ -313,6 +412,89 @@ def _resolve_with_timeout(ref: str, timeout: float) -> Optional[str]:
         return None
 
 
+def _resolve_required_cached(ref: str) -> str:
+    """Strict counterpart to ``_resolve_cached`` with the same cache/flight."""
+    timeout = _resolve_timeout_seconds()
+
+    with _lock:
+        cached = _cache.get(ref)
+        if cached is not None and cached[1] > time.monotonic():
+            return cached[0]
+
+        event = _inflight.get(ref)
+        is_leader = event is None
+        if is_leader:
+            event = threading.Event()
+            _inflight[ref] = event
+
+    if not is_leader:
+        if event.wait(timeout=timeout):
+            with _lock:
+                cached = _cache.get(ref)
+                if cached is not None and cached[1] > time.monotonic():
+                    return cached[0]
+                prior_error = _inflight_errors.get(event)
+            if prior_error is not None:
+                raise type(prior_error)("")
+        raise RequiredSecretTransientError("")
+
+    value: Optional[str] = None
+    error: Optional[RequiredSecretError] = None
+    try:
+        value = _resolve_required_with_timeout(ref, timeout)
+    except RequiredSecretError as exc:
+        error = exc
+    finally:
+        with _lock:
+            if value is not None:
+                _cache[ref] = (value, time.monotonic() + _ttl_seconds())
+            elif error is not None:
+                _inflight_errors[event] = error
+            _inflight.pop(ref, None)
+            event.set()
+
+    if error is not None:
+        raise error
+    if value is None:
+        raise RequiredSecretMissingError("")
+    return value
+
+
+def _resolve_required_with_timeout(ref: str, timeout: float) -> str:
+    result_queue: "queue.Queue[Tuple[str, object]]" = queue.Queue(maxsize=1)
+
+    def _run() -> None:
+        try:
+            result: Tuple[str, object] = ("value", _resolve_ref_required(ref))
+        except RequiredSecretError as exc:
+            result = ("error", exc)
+        except Exception:
+            result = ("error", RequiredSecretFatalError(""))
+        try:
+            result_queue.put_nowait(result)
+        except queue.Full:
+            pass
+
+    thread = threading.Thread(
+        target=_run,
+        name="op-secret-resolve-required",
+        daemon=True,
+    )
+    thread.start()
+
+    try:
+        kind, payload = result_queue.get(timeout=timeout)
+    except queue.Empty:
+        raise RequiredSecretTransientError("") from None
+    if kind == "error":
+        if isinstance(payload, RequiredSecretError):
+            raise payload
+        raise RequiredSecretFatalError("")
+    if not isinstance(payload, str) or not payload:
+        raise RequiredSecretMissingError("")
+    return payload
+
+
 # ---------------------------------------------------------------------------
 # SDK resolution boundary
 # ---------------------------------------------------------------------------
@@ -344,6 +526,13 @@ def _resolve_ref(ref: str) -> Optional[str]:
         return None
 
 
+def _resolve_ref_required(ref: str) -> str:
+    token = _read_token()
+    if not token:
+        raise RequiredSecretAuthError("")
+    return _resolve_ref_in_new_loop_required(token, ref)
+
+
 def _read_token() -> Optional[str]:
     try:
         with open(_TOKEN_PATH, "r", encoding="utf-8") as f:
@@ -368,6 +557,14 @@ def _resolve_ref_in_new_loop(token: str, ref: str) -> Optional[str]:
         loop.close()
 
 
+def _resolve_ref_in_new_loop_required(token: str, ref: str) -> str:
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(_resolve_ref_async_required(token, ref))
+    finally:
+        loop.close()
+
+
 async def _resolve_ref_async(token: str, ref: str) -> Optional[str]:
     try:
         from onepassword import Client
@@ -385,6 +582,143 @@ async def _resolve_ref_async(token: str, ref: str) -> Optional[str]:
     )
     results = await client.secrets.resolve_all([ref])
     return _extract_resolved_value(results, ref)
+
+
+async def _resolve_ref_async_required(token: str, ref: str) -> str:
+    try:
+        from onepassword import Client
+    except ImportError:
+        raise RequiredSecretFatalError("") from None
+
+    try:
+        client = await Client.authenticate(
+            auth=token,
+            integration_name=_INTEGRATION_NAME,
+            integration_version=_INTEGRATION_VERSION,
+        )
+        results = await client.secrets.resolve_all([ref])
+    except Exception as exc:
+        error_type = _classify_required_exception(exc)
+        raise error_type("") from None
+
+    value = _extract_resolved_value(results, ref)
+    if isinstance(value, str) and value:
+        return value
+
+    entry_error = _extract_entry_error(results, ref)
+    if entry_error is not None:
+        error_type = _classify_required_exception(entry_error)
+        # A per-item unknown/not-found response is a missing declaration, not
+        # an infrastructure retry. Auth still wins when both signals appear.
+        if error_type is RequiredSecretFatalError and _looks_missing(entry_error):
+            error_type = RequiredSecretMissingError
+        raise error_type("") from None
+    raise RequiredSecretMissingError("")
+
+
+def _exception_fingerprint(exc: object) -> str:
+    """Return classification-only metadata; never returned or logged."""
+    parts = [type(exc).__name__]
+    for attr in ("status", "status_code", "code"):
+        try:
+            value = getattr(exc, attr, None)
+        except Exception:
+            value = None
+        if value is not None:
+            parts.append(str(value))
+    try:
+        parts.append(str(exc))
+    except Exception:
+        pass
+    return " ".join(parts).lower()
+
+
+def _classify_required_exception(
+    exc: object,
+) -> Type[RequiredSecretError]:
+    fingerprint = _exception_fingerprint(exc)
+    normalized = re.sub(r"[_-]+", " ", fingerprint)
+
+    # Authentication/authorization is checked first so a mixed server message
+    # cannot be misclassified as retryable.
+    auth_markers = (
+        "authentication",
+        "authorization",
+        "unauthenticated",
+        "unauthorized",
+        "forbidden",
+        "invalid token",
+        "token invalid",
+        "token invalidated",
+        "token revoked",
+        "revoked",
+        "token is not valid",
+        "expired token",
+        "token expired",
+        "permission denied",
+    )
+    if (
+        re.search(r"\b(401|403)\b", normalized)
+        or re.search(
+            r"\b(?:auth|authentication|authorization|unauthenticated|"
+            r"unauthorized|forbidden)\b",
+            normalized,
+        )
+        or re.search(
+            r"\b(?:invalid|expired|revoked)\b.{0,48}\btoken\b"
+            r"|\btoken\b.{0,48}\b(?:invalid|invalidated|expired|revoked)\b"
+            r"|\btoken\b.{0,24}\bnot\s+valid\b",
+            normalized,
+        )
+        or any(marker in normalized for marker in auth_markers)
+    ):
+        return RequiredSecretAuthError
+
+    transient_markers = (
+        "408",
+        "409",
+        "425",
+        "429",
+        "500",
+        "502",
+        "503",
+        "504",
+        "timeout",
+        "timed out",
+        "temporar",
+        "unavailable",
+        "rate limit",
+        "connection",
+        "network",
+        "transport",
+    )
+    if isinstance(exc, (TimeoutError, ConnectionError, OSError)) or any(
+        marker in normalized for marker in transient_markers
+    ):
+        return RequiredSecretTransientError
+    return RequiredSecretFatalError
+
+
+def _looks_missing(exc: object) -> bool:
+    fingerprint = _exception_fingerprint(exc)
+    return any(
+        marker in fingerprint
+        for marker in ("404", "not found", "unknown item", "missing secret")
+    )
+
+
+def _extract_entry_error(results: object, ref: str) -> Optional[object]:
+    try:
+        if isinstance(results, dict):
+            entry = results.get(ref)
+        else:
+            individual = getattr(results, "individual_responses", None)
+            entry = individual.get(ref) if isinstance(individual, dict) else None
+        if entry is None:
+            return None
+        return getattr(entry, "error", None)
+    except Exception:
+        return None
 
 
 def _extract_resolved_value(results, ref: str) -> Optional[str]:

@@ -398,12 +398,40 @@ def _normalize_skill_list(skill: Optional[str] = None, skills: Optional[Any] = N
 
 
 def _apply_skill_fields(job: Dict[str, Any]) -> Dict[str, Any]:
-    """Return a job dict with canonical `skills` and legacy `skill` fields aligned."""
+    """Return a job dict with canonical declaration fields aligned."""
     normalized = dict(job)
     skills = _normalize_skill_list(normalized.get("skill"), normalized.get("skills"))
     normalized["skills"] = skills
     normalized["skill"] = skills[0] if skills else None
+    if "required_environment_variables" in normalized:
+        normalized["required_environment_variables"] = (
+            _normalize_required_environment_variables(
+                normalized.get("required_environment_variables")
+            )
+        )
     return normalized
+
+
+def _normalize_required_environment_variables(value: Any) -> List[str]:
+    """Return an ordered, unique list of valid shell environment names."""
+    if isinstance(value, str):
+        entries = [value]
+    elif isinstance(value, (list, tuple)):
+        entries = value
+    else:
+        return []
+
+    names: List[str] = []
+    for entry in entries:
+        raw_name = entry.get("name") if isinstance(entry, dict) else entry
+        if not isinstance(raw_name, str):
+            continue
+        name = raw_name.strip()
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+            continue
+        if name not in names:
+            names.append(name)
+    return names
 
 
 def _coerce_job_text(value: Any, fallback: str = "") -> str:
@@ -463,6 +491,12 @@ def _normalize_job_record(job: Dict[str, Any]) -> Dict[str, Any]:
     prompt = _coerce_job_text(normalized.get("prompt"))
     normalized["id"] = job_id
     normalized["prompt"] = prompt
+    if "required_environment_variables" in normalized:
+        normalized["required_environment_variables"] = (
+            _normalize_required_environment_variables(
+                normalized.get("required_environment_variables")
+            )
+        )
 
     name = _coerce_job_text(normalized.get("name")).strip()
     if not name:
@@ -1134,6 +1168,7 @@ def create_job(
     no_fallback: bool = False,
     attach_to_session: Optional[bool] = None,
     skill_scope: Optional[str] = None,
+    required_environment_variables: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -1180,6 +1215,8 @@ def create_job(
                 watchdogs and periodic alerts that don't need LLM reasoning.
         skill_scope: Optional role-based external skill catalog scope. Omitted
                      preserves the historical unfiltered catalog.
+        required_environment_variables: Exact child credentials required by
+                     the job, stored as ordered unique shell variable names.
 
     Returns:
         The created job dict
@@ -1213,6 +1250,9 @@ def create_job(
     normalized_no_agent = bool(no_agent)
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
     normalized_skill_scope = normalize_skill_scope(skill_scope)
+    normalized_required_env = _normalize_required_environment_variables(
+        required_environment_variables
+    )
 
     # no_agent jobs are meaningless without a script — the script IS the job.
     # Surface this as a clear ValueError at create time so bad configs never
@@ -1319,6 +1359,7 @@ def create_job(
         "origin": origin,  # Tracks where job was created for "origin" delivery
         "enabled_toolsets": normalized_toolsets,
         "workdir": normalized_workdir,
+        "required_environment_variables": normalized_required_env,
     }
     # Only persist attach_to_session when explicitly set, so existing jobs and
     # the common case stay byte-identical (absent key => fall back to the
@@ -1431,6 +1472,12 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 updates["no_fallback"] = _coerce_job_bool(updates["no_fallback"], default=False)
             if "skill_scope" in updates:
                 updates["skill_scope"] = normalize_skill_scope(updates["skill_scope"])
+            if "required_environment_variables" in updates:
+                updates["required_environment_variables"] = (
+                    _normalize_required_environment_variables(
+                        updates["required_environment_variables"]
+                    )
+                )
 
             previous_inference_axes = _normalized_inference_axes(job)
             updated = _apply_skill_fields({**job, **updates})

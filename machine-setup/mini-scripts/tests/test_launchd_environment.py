@@ -263,6 +263,10 @@ class LaunchdEnvironmentTests(unittest.TestCase):
         comprehensive.write_text(
             "SLACK_APP_TOKEN=op://Gateway/slack/app-token\n"
             "SLACK_BOT_TOKEN=op://Gateway/slack/bot-token\n"
+            "DATABASE_URL=op://Dev/database/url\n"
+            "THERMAL_APP_DATABASE_URL=op://Thermal/database/url\n"
+            "D365GROUP_DATABASE_URL=op://D365/database/url\n"
+            "D365GROUP_DATABASE_URL_UNPOOLED=op://D365/database/unpooled\n"
             "OPENAI_API_KEY_HERMES=op://Legacy/openai/key\n",
             encoding="utf-8",
         )
@@ -281,9 +285,21 @@ class LaunchdEnvironmentTests(unittest.TestCase):
             deployed["OPENAI_API_KEY_HERMES"],
             required["OPENAI_API_KEY_HERMES"],
         )
+        self.assertNotIn("DATABASE_URL", deployed)
+        self.assertNotIn("THERMAL_APP_DATABASE_URL", deployed)
+        self.assertEqual(
+            deployed["D365GROUP_DATABASE_URL"],
+            "op://D365/database/url",
+        )
+        self.assertEqual(
+            deployed["D365GROUP_DATABASE_URL_UNPOOLED"],
+            "op://D365/database/unpooled",
+        )
         self.assertEqual(set(deployed), set(required) | {
             "SLACK_APP_TOKEN",
             "SLACK_BOT_TOKEN",
+            "D365GROUP_DATABASE_URL",
+            "D365GROUP_DATABASE_URL_UNPOOLED",
         })
 
     def test_complete_reference_inventory_rejects_non_op_values(self):

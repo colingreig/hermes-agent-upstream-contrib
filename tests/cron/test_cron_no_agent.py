@@ -355,7 +355,10 @@ def test_run_job_script_lazy_injects_declared_secret_into_child_only(
     monkeypatch.setenv("HERMES_LAZY_SECRET_RESOLUTION", "1")
     monkeypatch.delenv("CLICKUP_API_TOKEN", raising=False)
 
-    with patch("agent.lazy_secret_resolver.get", return_value="pk_test_clickup") as lazy_get:
+    with patch(
+        "agent.lazy_secret_resolver.get_required",
+        return_value="pk_test_clickup",
+    ) as lazy_get:
         ok, output = _run_job_script(
             "clickup_probe.py",
             required_environment_variables=["CLICKUP_API_TOKEN"],
@@ -390,7 +393,7 @@ def test_run_job_script_injects_declared_secret_from_profile_scope(
     )
     try:
         with patch(
-            "agent.lazy_secret_resolver.get", return_value="wrong-global-token"
+            "agent.lazy_secret_resolver.get_required", return_value="wrong-global-token"
         ) as lazy_get:
             ok, output = _run_job_script(
                 "profile_scope_probe.py",
@@ -421,7 +424,8 @@ def test_run_job_script_multiplex_scope_miss_never_uses_global_lazy_resolver(
     scope_token = ss.set_secret_scope({})
     try:
         with patch(
-            "agent.lazy_secret_resolver.get", return_value="must-not-cross-profiles"
+            "agent.lazy_secret_resolver.get_required",
+            return_value="must-not-cross-profiles",
         ) as lazy_get:
             ok, output = _run_job_script(
                 "multiplex_miss_probe.py",
@@ -431,8 +435,43 @@ def test_run_job_script_multiplex_scope_miss_never_uses_global_lazy_resolver(
         ss.reset_secret_scope(scope_token)
         ss.set_multiplex_active(prior_multiplex)
 
-    assert ok is True
-    assert output == "ABSENT"
+    assert ok is False
+    assert "CLICKUP_API_TOKEN" in output
+    assert "classification=missing" in output
+    assert "default-profile-boot-token" not in output
+    assert "must-not-cross-profiles" not in output
+    lazy_get.assert_not_called()
+
+
+def test_run_job_script_unscoped_multiplex_never_uses_global_sources(
+    hermes_env, monkeypatch
+):
+    from agent import secret_scope as ss
+    from cron.scheduler import _run_job_script
+
+    _write_secret_probe(hermes_env, "unscoped_multiplex.py", "CLICKUP_API_TOKEN")
+    monkeypatch.setenv("CLICKUP_API_TOKEN", "default-profile-boot-token")
+
+    prior_multiplex = ss.is_multiplex_active()
+    ss.set_multiplex_active(True)
+    scope_token = ss.set_secret_scope(None)
+    try:
+        with patch(
+            "agent.lazy_secret_resolver.get_required",
+            return_value="must-not-cross-profiles",
+        ) as lazy_get:
+            ok, output = _run_job_script(
+                "unscoped_multiplex.py",
+                required_environment_variables=["CLICKUP_API_TOKEN"],
+            )
+    finally:
+        ss.reset_secret_scope(scope_token)
+        ss.set_multiplex_active(prior_multiplex)
+
+    assert ok is False
+    assert "classification=missing" in output
+    assert "default-profile-boot-token" not in output
+    assert "must-not-cross-profiles" not in output
     lazy_get.assert_not_called()
 
 
@@ -451,7 +490,7 @@ def test_run_job_script_unscoped_ambient_secret_keeps_precedence(
     scope_token = ss.set_secret_scope(None)
     try:
         with patch(
-            "agent.lazy_secret_resolver.get", return_value="unused-lazy-token"
+            "agent.lazy_secret_resolver.get_required", return_value="unused-lazy-token"
         ) as lazy_get:
             ok, output = _run_job_script(
                 "ambient_precedence.py",
@@ -466,7 +505,7 @@ def test_run_job_script_unscoped_ambient_secret_keeps_precedence(
     lazy_get.assert_not_called()
 
 
-def test_run_job_script_lazy_resolution_is_inert_when_flag_off(
+def test_run_job_script_required_resolution_is_strict_when_flag_off(
     hermes_env, monkeypatch
 ):
     from cron.scheduler import _run_job_script
@@ -475,18 +514,21 @@ def test_run_job_script_lazy_resolution_is_inert_when_flag_off(
     monkeypatch.delenv("HERMES_LAZY_SECRET_RESOLUTION", raising=False)
     monkeypatch.delenv("CLICKUP_API_TOKEN", raising=False)
 
-    with patch("agent.lazy_secret_resolver.get", return_value="must-not-resolve") as lazy_get:
+    with patch(
+        "agent.lazy_secret_resolver.get_required",
+        return_value="required-value",
+    ) as lazy_get:
         ok, output = _run_job_script(
             "flag_off_probe.py",
             required_environment_variables=["CLICKUP_API_TOKEN"],
         )
 
     assert ok is True
-    assert output == "ABSENT"
-    lazy_get.assert_not_called()
+    assert output == "PRESENT"
+    lazy_get.assert_called_once_with("CLICKUP_API_TOKEN")
 
 
-def test_run_job_script_lazy_resolution_failure_is_fail_open(
+def test_run_job_script_required_resolution_failure_is_fail_closed(
     hermes_env, monkeypatch
 ):
     from cron.scheduler import _run_job_script
@@ -496,16 +538,18 @@ def test_run_job_script_lazy_resolution_failure_is_fail_open(
     monkeypatch.delenv("CLICKUP_API_TOKEN", raising=False)
 
     with patch(
-        "agent.lazy_secret_resolver.get",
-        side_effect=RuntimeError("resolver unavailable"),
+        "agent.lazy_secret_resolver.get_required",
+        side_effect=RuntimeError("resolver unavailable secret-payload"),
     ):
         ok, output = _run_job_script(
             "resolver_failure.py",
             required_environment_variables=["CLICKUP_API_TOKEN"],
         )
 
-    assert ok is True
-    assert output == "ABSENT"
+    assert ok is False
+    assert "CLICKUP_API_TOKEN" in output
+    assert "classification=fatal" in output
+    assert "secret-payload" not in output
 
 
 def test_run_job_script_redacts_child_only_lazy_secret(hermes_env, monkeypatch):
@@ -517,7 +561,7 @@ def test_run_job_script_redacts_child_only_lazy_secret(hermes_env, monkeypatch):
     monkeypatch.setenv("HERMES_LAZY_SECRET_RESOLUTION", "1")
     monkeypatch.delenv("CLICKUP_API_TOKEN", raising=False)
 
-    with patch("agent.lazy_secret_resolver.get", return_value=opaque_secret):
+    with patch("agent.lazy_secret_resolver.get_required", return_value=opaque_secret):
         ok, output = _run_job_script(
             "print_secret.py",
             required_environment_variables=["CLICKUP_API_TOKEN"],
@@ -541,7 +585,10 @@ def test_run_job_script_accepts_skill_style_secret_declarations(
         {"name": "CLICKUP_API_TOKEN", "help": "ClickUp personal token"},
         {"name": "not a valid env name"},
     ]
-    with patch("agent.lazy_secret_resolver.get", return_value="pk_test_clickup") as lazy_get:
+    with patch(
+        "agent.lazy_secret_resolver.get_required",
+        return_value="pk_test_clickup",
+    ) as lazy_get:
         ok, output = _run_job_script(
             "mapping_declaration.py",
             required_environment_variables=declarations,
@@ -561,15 +608,54 @@ def test_run_job_script_declaration_does_not_bypass_provider_blocklist(
     monkeypatch.setenv("HERMES_LAZY_SECRET_RESOLUTION", "1")
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
 
-    with patch("agent.lazy_secret_resolver.get", return_value="provider-secret") as lazy_get:
+    with patch(
+        "agent.lazy_secret_resolver.get_required",
+        return_value="provider-secret",
+    ) as lazy_get:
         ok, output = _run_job_script(
             "provider_probe.py",
             required_environment_variables=["ANTHROPIC_API_KEY"],
         )
 
-    assert ok is True
-    assert output == "ABSENT"
+    assert ok is False
+    assert "ANTHROPIC_API_KEY" in output
+    assert "classification=fatal" in output
+    assert "provider-secret" not in output
     lazy_get.assert_not_called()
+
+
+def test_run_job_script_required_environment_is_all_or_nothing(
+    hermes_env, monkeypatch
+):
+    from agent.lazy_secret_resolver import RequiredSecretMissingError
+    from cron.scheduler import _run_job_script
+
+    _write_secret_probe(hermes_env, "all_or_nothing.py", "FIRST_REQUIRED_TOKEN")
+    monkeypatch.delenv("FIRST_REQUIRED_TOKEN", raising=False)
+    monkeypatch.delenv("SECOND_REQUIRED_TOKEN", raising=False)
+
+    def resolve(name):
+        if name == "FIRST_REQUIRED_TOKEN":
+            return "first-secret-must-not-leak"
+        raise RequiredSecretMissingError(name)
+
+    with (
+        patch("agent.lazy_secret_resolver.get_required", side_effect=resolve),
+        patch("cron.scheduler.subprocess.run") as run,
+    ):
+        ok, output = _run_job_script(
+            "all_or_nothing.py",
+            required_environment_variables=[
+                "FIRST_REQUIRED_TOKEN",
+                "SECOND_REQUIRED_TOKEN",
+            ],
+        )
+
+    assert ok is False
+    assert "SECOND_REQUIRED_TOKEN" in output
+    assert "classification=missing" in output
+    assert "first-secret-must-not-leak" not in output
+    run.assert_not_called()
 
 
 @pytest.mark.parametrize(

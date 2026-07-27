@@ -341,6 +341,42 @@ class TestJobCRUD:
         job = create_job(prompt="Test", schedule="30m")
         assert job["deliver"] == "local"
 
+    def test_required_environment_declaration_is_canonical(self, tmp_cron_dir):
+        job = create_job(
+            prompt="Refresh",
+            schedule="every 1h",
+            required_environment_variables=[
+                " CLICKUP_API_TOKEN ",
+                "CLICKUP_API_TOKEN",
+                "D365GROUP_DATABASE_URL",
+                "not valid",
+            ],
+        )
+
+        assert job["required_environment_variables"] == [
+            "CLICKUP_API_TOKEN",
+            "D365GROUP_DATABASE_URL",
+        ]
+        assert get_job(job["id"])["required_environment_variables"] == [
+            "CLICKUP_API_TOKEN",
+            "D365GROUP_DATABASE_URL",
+        ]
+
+    def test_legacy_required_environment_declaration_normalizes_on_read(
+        self, tmp_cron_dir
+    ):
+        job = create_job(prompt="Refresh", schedule="every 1h")
+        job["required_environment_variables"] = [
+            {"name": "CLICKUP_API_TOKEN"},
+            "CLICKUP_API_TOKEN",
+            None,
+        ]
+        save_jobs([job])
+
+        assert get_job(job["id"])["required_environment_variables"] == [
+            "CLICKUP_API_TOKEN"
+        ]
+
 
 class TestUpdateJob:
     def test_update_name(self, tmp_cron_dir):
@@ -357,6 +393,21 @@ class TestUpdateJob:
         # Verify persisted to disk
         fetched = get_job(job["id"])
         assert fetched["name"] == "New Name"
+
+    def test_update_required_environment_empty_list_clears(self, tmp_cron_dir):
+        job = create_job(
+            prompt="Refresh",
+            schedule="every 1h",
+            required_environment_variables=["CLICKUP_API_TOKEN"],
+        )
+
+        updated = update_job(
+            job["id"],
+            {"required_environment_variables": []},
+        )
+
+        assert updated["required_environment_variables"] == []
+        assert get_job(job["id"])["required_environment_variables"] == []
 
     def test_update_schedule(self, tmp_cron_dir):
         job = create_job(prompt="Daily report", schedule="every 1h")
