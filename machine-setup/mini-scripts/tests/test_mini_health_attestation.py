@@ -19,11 +19,22 @@ def healthy_snapshot() -> dict:
         "generated_at": "2026-07-27T00:00:00+00:00",
         "runtime": {
             "symlink": True,
-            "target": "/home/test/.hermes/releases/v1-aaaaaaaaaaaa",
+            "target": "/home/test/.hermes/releases/v1.0.0-aaaaaaaaaaaa",
             "target_under_releases": True,
             "actual_sha": commit,
             "expected_sha": commit,
             "dirty_paths": [],
+            "source_binding": {
+                "release_dir": "v1.0.0-aaaaaaaaaaaa",
+                "release_name_binds_sha": True,
+                "sources": {
+                    "attestor": {"path": "/rt/machine-setup/mini-scripts/x.py", "under_runtime": True},
+                    "hermes_cli.config": {"path": "/rt/hermes_cli/config.py", "under_runtime": True},
+                    "cron.jobs": {"path": "/rt/cron/jobs.py", "under_runtime": True},
+                    "cron.executions": {"path": "/rt/cron/executions.py", "under_runtime": True},
+                },
+                "bound": True,
+            },
         },
         "services": {
             "gateway": {
@@ -32,7 +43,8 @@ def healthy_snapshot() -> dict:
                 "pid": 100,
                 "alive": True,
                 "command_ok": True,
-                "runtime_file_count": 3,
+                "runtime_code_file_count": 3,
+                "executable_in_release": True,
                 "http_required": False,
             },
             "dashboard": {
@@ -41,7 +53,8 @@ def healthy_snapshot() -> dict:
                 "pid": 101,
                 "alive": True,
                 "command_ok": True,
-                "runtime_file_count": 4,
+                "runtime_code_file_count": 4,
+                "executable_in_release": True,
                 "http_required": True,
                 "http_url": "http://127.0.0.1:9119/health",
                 "http_status": 200,
@@ -259,7 +272,8 @@ def test_stale_or_pid_reused_process_fails_closed() -> None:
     assert_fails(snapshot, "service.gateway.command")
 
     snapshot = healthy_snapshot()
-    snapshot["services"]["gateway"]["runtime_file_count"] = 0
+    snapshot["services"]["gateway"]["runtime_code_file_count"] = 0
+    snapshot["services"]["gateway"]["executable_in_release"] = False
     assert_fails(snapshot, "service.gateway.runtime")
 
 
@@ -344,3 +358,175 @@ def test_snapshot_cli_exit_code_matches_report(tmp_path: Path, monkeypatch, caps
     monkeypatch.setattr("sys.argv", ["mini-health", "--snapshot", str(path)])
     assert module.main() == 0
     assert json.loads(capsys.readouterr().out)["healthy"] is True
+
+
+def test_unbound_source_tree_fails_closed() -> None:
+    snapshot = healthy_snapshot()
+    snapshot["runtime"]["source_binding"]["sources"]["cron.jobs"]["under_runtime"] = False
+    snapshot["runtime"]["source_binding"]["bound"] = False
+    assert_fails(snapshot, "runtime.source-binding")
+    check = next(
+        item for item in result(snapshot)["checks"]
+        if item["id"] == "runtime.source-binding"
+    )
+    assert "cron.jobs" in check["detail"]["unbound_sources"]
+
+    snapshot = healthy_snapshot()
+    snapshot["runtime"]["source_binding"]["release_name_binds_sha"] = False
+    snapshot["runtime"]["source_binding"]["bound"] = False
+    assert_fails(snapshot, "runtime.source-binding")
+
+
+def test_missing_source_binding_fails_closed() -> None:
+    snapshot = healthy_snapshot()
+    snapshot["runtime"].pop("source_binding")
+    assert_fails(snapshot, "runtime.source-binding")
+
+
+def test_empty_inventories_fail_closed() -> None:
+    for section, check_id in (
+        ("services", "inventory.services"),
+        ("governed", "inventory.governed"),
+        ("skills", "inventory.skills"),
+        ("credentials", "inventory.credentials"),
+        ("cron", "inventory.cron"),
+    ):
+        snapshot = healthy_snapshot()
+        snapshot[section] = type(snapshot[section])()
+        assert_fails(snapshot, check_id)
+
+
+def test_missing_expected_service_or_governed_asset_fails_closed() -> None:
+    snapshot = healthy_snapshot()
+    snapshot["services"].pop("dashboard")
+    assert_fails(snapshot, "inventory.services")
+    check = next(
+        item for item in result(snapshot)["checks"]
+        if item["id"] == "inventory.services"
+    )
+    assert "dashboard" in check["detail"]["missing"]
+
+    snapshot = healthy_snapshot()
+    snapshot["governed"].pop("pr-pipeline")
+    assert_fails(snapshot, "inventory.governed")
+
+
+def test_all_disabled_cron_inventory_fails_closed() -> None:
+    snapshot = healthy_snapshot()
+    for job in snapshot["cron"]:
+        job["enabled"] = False
+    assert_fails(snapshot, "inventory.cron")
+
+
+def test_invalid_monitor_output_is_not_accepted() -> None:
+    snapshot = healthy_snapshot()
+    snapshot["cron"][1]["monitor_status"] = "invalid-output"
+    assert_fails(snapshot, "cron.research-stage-monitor")
+
+
+class _Result:
+    def __init__(self, returncode: int = 0, stdout: str = "") -> None:
+        self.returncode = returncode
+        self.stdout = stdout
+
+
+def test_source_binding_release_name_gates_commit(tmp_path: Path) -> None:
+    commit = "abcdef1234567890abcdef1234567890abcdef12"
+    runtime = tmp_path / "releases" / f"v1.2.3-{commit[:7]}"
+    runtime.mkdir(parents=True)
+    binding = module._source_binding(runtime, commit)
+    assert binding["release_name_binds_sha"] is True
+    # The real attestor/module files are not under the throwaway runtime, so the
+    # overall binding must fail closed even when the directory name matches.
+    assert binding["bound"] is False
+    assert "attestor" in binding["sources"]
+
+    stale = tmp_path / "releases" / "hand-checkout"
+    stale.mkdir()
+    assert module._source_binding(stale, commit)["release_name_binds_sha"] is False
+
+
+def test_collect_service_requires_loaded_release_code(tmp_path: Path, monkeypatch) -> None:
+    commit = "abcdef1234567890abcdef1234567890abcdef12"
+    runtime = tmp_path / "releases" / f"v1.2.3-{commit[:7]}"
+    runtime.mkdir(parents=True)
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    command = (
+        f"{hermes_home / 'runtime-current'}/venv/bin/python "
+        "-m hermes_cli.main gateway run"
+    )
+    lsof = "\n".join(
+        [
+            "p100",
+            "fcwd",
+            f"n{runtime}",  # working directory — must NOT bind
+            "ftxt",
+            f"n{runtime}/venv/bin/python3",  # executable — binds
+            "fmem",
+            f"n{runtime}/venv/lib/libhermes.dylib",  # loaded library — binds
+            "f3",
+            f"n{runtime}/logs/app.log",  # ordinary open file — must NOT bind
+            "ftxt",
+            "n/usr/lib/dyld",  # system text outside release — must NOT bind
+        ]
+    )
+
+    def fake_run(argv, cwd=None, **_kwargs):
+        program = argv[0]
+        if program == "launchctl":
+            return _Result(0, "\tpid = 100\n")
+        if program == "ps":
+            return _Result(0, command + "\n")
+        if program == "lsof":
+            return _Result(0, lsof + "\n")
+        return _Result(0, "")
+
+    monkeypatch.setattr(module, "_run", fake_run)
+    service = module._collect_service(
+        "gateway", module.SERVICE_CONTRACTS["gateway"], runtime, hermes_home
+    )
+    assert service["alive"] is True
+    assert service["command_ok"] is True
+    assert service["runtime_code_file_count"] == 2
+    assert service["executable_in_release"] is True
+
+    only_cwd = "\n".join(["p100", "fcwd", f"n{runtime}", "f3", f"n{runtime}/logs/app.log"])
+
+    def cwd_only_run(argv, cwd=None, **_kwargs):
+        if argv[0] == "lsof":
+            return _Result(0, only_cwd + "\n")
+        return fake_run(argv, cwd=cwd)
+
+    monkeypatch.setattr(module, "_run", cwd_only_run)
+    unbound = module._collect_service(
+        "gateway", module.SERVICE_CONTRACTS["gateway"], runtime, hermes_home
+    )
+    assert unbound["runtime_code_file_count"] == 0
+    assert unbound["executable_in_release"] is False
+
+
+def test_collect_release_falls_back_on_missing_or_corrupt_receipt(tmp_path: Path) -> None:
+    releases = tmp_path / "releases"
+    releases.mkdir()
+    runtime = releases / "v1.2.3-abcdef1"
+    runtime.mkdir()
+    empty = module._collect_release(releases, runtime, "a" * 40)
+    assert empty["latest_hash_valid"] is False
+    assert empty["last_good"] == {"valid": False}
+
+    (releases / ".mini-release-last-receipt.json").write_text("{not-json")
+    corrupt = module._collect_release(releases, runtime, "a" * 40)
+    assert corrupt["latest_hash_valid"] is False
+    assert corrupt["last_good"] == {"valid": False}
+
+
+def test_safe_probe_captures_success_and_failure() -> None:
+    assert module._safe_probe(lambda: "verified") == {"ok": True, "detail": "verified"}
+
+    def boom() -> None:
+        raise RuntimeError("mismatch")
+
+    probe = module._safe_probe(boom)
+    assert probe["ok"] is False
+    assert probe["detail"] == "RuntimeError: mismatch"

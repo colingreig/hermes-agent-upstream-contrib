@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timezone
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -26,6 +27,13 @@ from urllib.request import urlopen
 SCHEMA = "hermes-mini-health-attestation/v1"
 CONFIG_RECEIPT_SCHEMA = "hermes-mini-config-migration/v1"
 SUCCESSFUL_RELEASE_EVENTS = frozenset(("advanced", "cut", "noop"))
+# Hermes core modules whose behaviour this attestation reads. Every one must
+# resolve inside the active release so the checks exercise the deployed code,
+# not a stale checkout that merely looks similar.
+ATTESTED_MODULES = ("hermes_cli.config", "cron.jobs", "cron.executions")
+GOVERNED_CONTRACTS = ("launchd-environment", "marketplace-skills", "pr-pipeline")
+# releases/vX.Y.Z-<sha> — the trailing fragment binds the directory to a commit.
+RELEASE_DIR_RE = re.compile(r"v\d+\.\d+\.\d+-([0-9a-f]{7,40})\Z")
 RESEARCH_SUCCESS_STATUSES = frozenset(
     ("disabled-or-smoke-only", "healthy", "insufficient-data")
 )
@@ -122,8 +130,31 @@ def evaluate_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
     )
     dirty_paths = list(runtime.get("dirty_paths") or [])
     _check(checks, "runtime.clean", not dirty_paths, {"dirty_paths": dirty_paths})
+    source = runtime.get("source_binding") or {}
+    _check(
+        checks,
+        "runtime.source-binding",
+        bool(source.get("bound")),
+        {
+            "release_dir": source.get("release_dir"),
+            "release_name_binds_sha": source.get("release_name_binds_sha"),
+            "unbound_sources": sorted(
+                name
+                for name, item in (source.get("sources") or {}).items()
+                if not item.get("under_runtime")
+            ),
+        },
+    )
 
-    for name, service in sorted((snapshot.get("services") or {}).items()):
+    services = snapshot.get("services") or {}
+    missing_services = [name for name in SERVICE_CONTRACTS if name not in services]
+    _check(
+        checks,
+        "inventory.services",
+        bool(services) and not missing_services,
+        {"present": sorted(services), "missing": missing_services},
+    )
+    for name, service in sorted(services.items()):
         base = f"service.{name}"
         _check(checks, f"{base}.registered", bool(service.get("registered")), service.get("label"))
         _check(checks, f"{base}.alive", bool(service.get("alive")), {"pid": service.get("pid")})
@@ -131,8 +162,12 @@ def evaluate_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
         _check(
             checks,
             f"{base}.runtime",
-            int(service.get("runtime_file_count") or 0) > 0,
-            {"runtime_file_count": service.get("runtime_file_count")},
+            int(service.get("runtime_code_file_count") or 0) > 0
+            or bool(service.get("executable_in_release")),
+            {
+                "runtime_code_file_count": service.get("runtime_code_file_count"),
+                "executable_in_release": service.get("executable_in_release"),
+            },
         )
         if service.get("http_required"):
             _check(
@@ -198,7 +233,15 @@ def evaluate_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
             {"event": release.get("latest_event")},
         )
 
-    for name, governed in sorted((snapshot.get("governed") or {}).items()):
+    governed_assets = snapshot.get("governed") or {}
+    missing_governed = [name for name in GOVERNED_CONTRACTS if name not in governed_assets]
+    _check(
+        checks,
+        "inventory.governed",
+        bool(governed_assets) and not missing_governed,
+        {"present": sorted(governed_assets), "missing": missing_governed},
+    )
+    for name, governed in sorted(governed_assets.items()):
         _check(checks, f"governed.{name}", bool(governed.get("ok")), governed.get("detail"))
 
     execution = snapshot.get("execution") or {}
@@ -233,14 +276,18 @@ def evaluate_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
             },
         )
 
-    for skill in snapshot.get("skills") or []:
+    skills = snapshot.get("skills") or []
+    _check(checks, "inventory.skills", len(skills) > 0, {"count": len(skills)})
+    for skill in skills:
         _check(
             checks,
             f"skill.{skill.get('name')}",
             bool(skill.get("available")),
             {"name": skill.get("name"), "available": bool(skill.get("available"))},
         )
-    for credential in snapshot.get("credentials") or []:
+    credentials = snapshot.get("credentials") or []
+    _check(checks, "inventory.credentials", len(credentials) > 0, {"count": len(credentials)})
+    for credential in credentials:
         _check(
             checks,
             f"credential.{credential.get('job')}.{credential.get('name')}",
@@ -252,7 +299,15 @@ def evaluate_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
             },
         )
 
-    for job in snapshot.get("cron") or []:
+    cron_jobs = snapshot.get("cron") or []
+    enabled_jobs = [job for job in cron_jobs if job.get("enabled")]
+    _check(
+        checks,
+        "inventory.cron",
+        len(cron_jobs) > 0 and len(enabled_jobs) > 0,
+        {"jobs": len(cron_jobs), "enabled": len(enabled_jobs)},
+    )
+    for job in cron_jobs:
         if not job.get("enabled"):
             continue
         name = str(job.get("name") or job.get("id") or "unknown")
@@ -300,6 +355,49 @@ def _git_output(runtime: Path, *args: str) -> str:
     if result.returncode != 0:
         raise RuntimeError(f"git {' '.join(args)} failed")
     return result.stdout.strip()
+
+
+def _source_binding(runtime: Path, actual_sha: str) -> dict[str, Any]:
+    """Prove the attestor and the Hermes code it reads are the active release.
+
+    The attestor's own file, every ``ATTESTED_MODULES`` import, and the release
+    directory naming must all resolve inside ``runtime`` (the resolved
+    ``runtime-current`` → ``releases/vX.Y.Z-<sha>``) at the exact deployed commit
+    — not a tree that merely looks similar.
+    """
+    runtime_resolved = runtime.resolve()
+    prefix = str(runtime_resolved) + os.sep
+
+    def _under(path: str | None) -> bool:
+        return bool(path and (path == str(runtime_resolved) or path.startswith(prefix)))
+
+    def _resolved_origin(module_name: str) -> str | None:
+        loaded = sys.modules.get(module_name)
+        origin = getattr(loaded, "__file__", None)
+        if origin is None:
+            try:
+                spec = importlib.util.find_spec(module_name)
+            except Exception:
+                spec = None
+            origin = spec.origin if spec else None
+        return str(Path(origin).resolve()) if origin else None
+
+    sources: dict[str, dict[str, Any]] = {}
+    attestor = str(Path(__file__).resolve())
+    sources["attestor"] = {"path": attestor, "under_runtime": _under(attestor)}
+    for module_name in ATTESTED_MODULES:
+        origin = _resolved_origin(module_name)
+        sources[module_name] = {"path": origin, "under_runtime": _under(origin)}
+
+    name_match = RELEASE_DIR_RE.fullmatch(runtime_resolved.name)
+    release_name_binds_sha = bool(name_match and actual_sha.startswith(name_match.group(1)))
+    bound = release_name_binds_sha and all(item["under_runtime"] for item in sources.values())
+    return {
+        "release_dir": runtime_resolved.name,
+        "release_name_binds_sha": release_name_binds_sha,
+        "sources": sources,
+        "bound": bound,
+    }
 
 
 def _collect_release(releases_dir: Path, runtime: Path, runtime_sha: str) -> dict[str, Any]:
@@ -512,18 +610,31 @@ def _collect_service(
     pid = int(pid_match.group(1)) if pid_match else None
     command = ""
     alive = False
-    runtime_file_count = 0
+    runtime_code_file_count = 0
+    executable_in_release = False
     if pid:
         process = _run(["ps", "-p", str(pid), "-o", "command="])
         command = process.stdout.strip()
         alive = process.returncode == 0 and bool(command)
-        opened = _run(["lsof", "-a", "-p", str(pid), "-Fn"])
-        runtime_prefix = str(runtime.resolve()) + os.sep
-        runtime_file_count = sum(
-            line[1:].startswith(runtime_prefix)
-            for line in opened.stdout.splitlines()
-            if line.startswith("n")
-        )
+        # -Ff (file descriptor) + -Fn (name): only ``txt`` (program text /
+        # executable) and ``mem`` (mapped shared library) entries prove loaded
+        # code. A ``cwd`` entry or an ordinary open file inside the release does
+        # NOT bind the service to it, so those descriptors are ignored.
+        opened = _run(["lsof", "-a", "-p", str(pid), "-Ffn"])
+        runtime_resolved = str(runtime.resolve())
+        runtime_prefix = runtime_resolved + os.sep
+        fd = ""
+        for line in opened.stdout.splitlines():
+            if not line:
+                continue
+            tag, value = line[0], line[1:]
+            if tag == "f":
+                fd = value
+            elif tag == "n" and fd in ("txt", "mem"):
+                if value == runtime_resolved or value.startswith(runtime_prefix):
+                    runtime_code_file_count += 1
+                    if fd == "txt":
+                        executable_in_release = True
     markers = tuple(str(marker) for marker in contract["argv_markers"])
     command_ok = bool(command) and str(hermes_home / "runtime-current") in command
     command_ok = command_ok and all(marker in command for marker in markers)
@@ -542,7 +653,8 @@ def _collect_service(
         "alive": alive,
         "command_ok": command_ok,
         "command_shape": {"runtime_current": "present" if command_ok else "invalid", "markers": list(markers)},
-        "runtime_file_count": runtime_file_count,
+        "runtime_code_file_count": runtime_code_file_count,
+        "executable_in_release": executable_in_release,
         "http_required": bool(http_url),
         "http_url": http_url,
         "http_status": http_status,
@@ -714,6 +826,7 @@ def collect_live(home: Path, hermes_home: Path) -> dict[str, Any]:
             "actual_sha": actual_sha,
             "expected_sha": expected_sha,
             "dirty_paths": dirty_paths,
+            "source_binding": _source_binding(runtime, actual_sha),
         },
         "services": {
             name: _collect_service(name, contract, runtime, hermes_home)
