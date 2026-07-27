@@ -228,19 +228,21 @@ under `pr_pipeline/`. Do not compare or copy those files one at a time.
   key, query text, fetched content, or generated brief.
 - `research_stage_monitor.py` — independent served-ledger liveness check. It
   reports recent enabled attempts, successful serves, degraded attempts, and
-  served rate. Exit codes: `0` healthy or disabled-or-smoke-only, `2`
-  degraded (provider genuinely failing on real traffic), `3` not-observed
-  (stage never ran / ledger missing or stale), `4` insufficient-data (fewer
-  than `--min-attempts` real, non-smoke attempts in the lookback window), and
-  `5` fetch-degraded (`fetch_success_rate < 0.50`) — the JSON `status` field
-  is authoritative, and the exit code exists for consumers that only check
-  process exit status. The JSON also exposes
+  served rate. Exit codes: `0` healthy, disabled-or-smoke-only, or advisory
+  `insufficient-data` (fewer than `--min-attempts` real, non-smoke attempts
+  before the persistent-inconclusive threshold), `2` degraded (provider
+  genuinely failing on real traffic), `3` not-observed (stage never ran /
+  ledger missing or stale), and `5` fetch-degraded
+  (`fetch_success_rate < 0.50`) — the JSON `status` field is authoritative,
+  and the exit code exists for consumers that only check process exit status.
+  The JSON also exposes
   `fetch_success_band` as `alarm`, `warn`, `healthy`, or `null`; the warning
   band is `0.50 <= fetch_success_rate < 0.70`. `--quiet-when-healthy`
   suppresses stdout (still exits 0) when status is `healthy` or
   `disabled-or-smoke-only`, except that a `warn` fetch band remains visible
   so the Mini cron/Slack delivery is actionable without changing status or
-  exit codes. Every non-success status still prints the full JSON. Cross-run
+  exit codes. Every status other than quiet healthy/disabled still prints the
+  full JSON, including advisory `insufficient-data`. Cross-run
   state is written atomically to
   `~/.hermes/state/research-stage-monitor.json`; one continuous
   `not-observed` / `insufficient-data` window escalates after more than 72

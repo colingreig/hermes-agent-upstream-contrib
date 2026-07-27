@@ -25,7 +25,9 @@ never hardcode an absolute path here), runs it with `--quiet-when-healthy`,
 and propagates its stdout, stderr, and exit code verbatim. All actual
 monitor logic (ledger evaluation, state tracking, exit-code mapping) lives in
 `research_stage_monitor.py`; see that file's docstring for the full
-0/2/3/4/5/6 exit-code contract.
+0/2/3/5/6 exit-code contract. Exit 0 includes advisory pre-threshold
+`insufficient-data`; the same continuous inconclusive state becomes
+`persistently-inconclusive` with exit 6 only after more than 72 hours.
 """
 from __future__ import annotations
 
