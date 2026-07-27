@@ -7,6 +7,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 
@@ -26,11 +27,11 @@ def test_execution_transitions_are_durable(monkeypatch, tmp_path):
     assert claimed["started_at"] is None
     assert claimed["finished_at"] is None
 
-    running = executions.mark_execution_running(claimed["id"])
+    running = executions.mark_execution_running(claimed["id"], owner_token=claimed["owner_token"])
     assert running["status"] == "running"
     assert running["started_at"]
 
-    completed = executions.finish_execution(claimed["id"], success=True)
+    completed = executions.finish_execution(claimed["id"], owner_token=claimed["owner_token"], success=True)
     assert completed["status"] == "completed"
     assert completed["finished_at"]
     assert completed["error"] is None
@@ -42,12 +43,14 @@ def test_execution_transitions_are_durable(monkeypatch, tmp_path):
 def test_terminal_execution_cannot_be_rewritten(monkeypatch, tmp_path):
     executions = _point_ledger(monkeypatch, tmp_path)
     record = executions.create_execution("immutable", source="builtin")
-    executions.mark_execution_running(record["id"])
-    executions.finish_execution(record["id"], success=True)
+    executions.mark_execution_running(record["id"], owner_token=record["owner_token"])
+    executions.finish_execution(record["id"], owner_token=record["owner_token"], success=True)
 
-    assert executions.finish_execution(
-        record["id"], success=False, error="late writer"
-    ) is None
+    retry = executions.finish_execution(
+        record["id"], owner_token=record["owner_token"], success=False, error="late writer"
+    )
+    assert retry["status"] == "completed"
+    assert retry["error"] is None
     assert executions.latest_execution("immutable")["status"] == "completed"
 
 
@@ -55,10 +58,10 @@ def test_retention_bounds_terminal_history_but_preserves_inflight(monkeypatch, t
     executions = _point_ledger(monkeypatch, tmp_path)
     monkeypatch.setattr(executions, "MAX_TERMINAL_EXECUTIONS", 3)
     inflight = executions.create_execution("live", source="builtin")
-    executions.mark_execution_running(inflight["id"])
+    executions.mark_execution_running(inflight["id"], owner_token=inflight["owner_token"])
     for index in range(8):
         row = executions.create_execution(f"done-{index}", source="builtin")
-        executions.finish_execution(row["id"], success=True)
+        executions.finish_execution(row["id"], owner_token=row["owner_token"], success=True)
 
     records = executions.list_executions(limit=100)
     assert len([row for row in records if row["status"] == "completed"]) == 3
@@ -80,7 +83,7 @@ def test_execution_history_is_paginated(monkeypatch, tmp_path):
     ids = []
     for _index in range(5):
         row = executions.create_execution("paged", source="builtin")
-        executions.finish_execution(row["id"], success=True)
+        executions.finish_execution(row["id"], owner_token=row["owner_token"], success=True)
         ids.append(row["id"])
 
     first = executions.list_executions(job_id="paged", limit=2)
@@ -94,7 +97,7 @@ def test_execution_history_is_paginated(monkeypatch, tmp_path):
 def test_cron_runs_cli_prints_execution_history(monkeypatch, tmp_path, capsys):
     executions = _point_ledger(monkeypatch, tmp_path)
     row = executions.create_execution("cli-job", source="builtin")
-    executions.finish_execution(row["id"], success=False, error="boom")
+    executions.finish_execution(row["id"], owner_token=row["owner_token"], success=False, error="boom")
     from hermes_cli.cron import cron_runs
 
     cron_runs("cli-job", limit=10)
@@ -115,7 +118,7 @@ def test_failed_execution_keeps_error(monkeypatch, tmp_path):
     executions = _point_ledger(monkeypatch, tmp_path)
 
     record = executions.create_execution("job-2", source="external")
-    failed = executions.finish_execution(record["id"], success=False, error="provider exploded")
+    failed = executions.finish_execution(record["id"], owner_token=record["owner_token"], success=False, error="provider exploded")
 
     assert failed["status"] == "failed"
     assert failed["error"] == "provider exploded"
@@ -124,7 +127,7 @@ def test_failed_execution_keeps_error(monkeypatch, tmp_path):
 def test_recovery_does_not_mark_live_process_execution_unknown(monkeypatch, tmp_path):
     executions = _point_ledger(monkeypatch, tmp_path)
     record = executions.create_execution("still-live", source="builtin")
-    executions.mark_execution_running(record["id"])
+    executions.mark_execution_running(record["id"], owner_token=record["owner_token"])
 
     assert executions.recover_interrupted_executions() == 0
     assert executions.latest_execution("still-live")["status"] == "running"
@@ -153,11 +156,11 @@ def test_recovery_rejects_recycled_pid(monkeypatch, tmp_path):
         )
 
     assert executions.recover_interrupted_executions() == 1
-    assert executions.latest_execution("recycled")["status"] == "unknown"
+    assert executions.latest_execution("recycled")["status"] == "interrupted"
 
 
-def test_restart_marks_interrupted_execution_unknown_without_requeue(tmp_path):
-    """Real temp-HERMES_HOME subprocess restart: in-flight is audit-only unknown."""
+def test_restart_marks_interrupted_execution_without_requeue(tmp_path):
+    """A restarted process finalizes its provably dead leased execution."""
     home = tmp_path / "home"
     repo = Path(__file__).resolve().parents[2]
     env = os.environ.copy()
@@ -170,7 +173,7 @@ def test_restart_marks_interrupted_execution_unknown_without_requeue(tmp_path):
             "-c",
             "from cron.executions import create_execution, mark_execution_running; "
             "r=create_execution('restart-job', source='builtin'); "
-            "mark_execution_running(r['id']); print(r['id'])",
+            "mark_execution_running(r['id'], owner_token=r['owner_token']); print(r['id'])",
         ],
         cwd=repo,
         env=env,
@@ -199,12 +202,12 @@ def test_restart_marks_interrupted_execution_unknown_without_requeue(tmp_path):
     records = json.loads(lines[1])
     assert len(records) == 1
     assert records[0]["id"] == execution_id
-    assert records[0]["status"] == "unknown"
+    assert records[0]["status"] == "interrupted"
     assert records[0]["finished_at"]
-    assert "restart" in records[0]["error"].lower()
+    assert "owner died" in records[0]["error"].lower()
     # Recovery only classifies the old attempt. It must not manufacture a new
     # claimed record (which would imply an automatic retry).
-    assert [r["status"] for r in records] == ["unknown"]
+    assert [r["status"] for r in records] == ["interrupted"]
 
 
 def test_generic_submit_failure_finishes_attempt_and_releases_guard(monkeypatch):
@@ -217,7 +220,7 @@ def test_generic_submit_failure_finishes_attempt_and_releases_guard(monkeypatch)
     finished = []
     monkeypatch.setattr(
         scheduler, "create_execution",
-        lambda *_args, **_kwargs: {"id": "exec-submit-fail"},
+        lambda *_args, **_kwargs: {"id": "exec-submit-fail", "owner_token": "owner-submit-fail"},
     )
     monkeypatch.setattr(
         scheduler, "finish_execution",
@@ -230,8 +233,10 @@ def test_generic_submit_failure_finishes_attempt_and_releases_guard(monkeypatch)
     assert scheduler.tick(verbose=False, sync=False) == 0
     assert finished == [
         ("exec-submit-fail", {
+            "owner_token": "owner-submit-fail",
             "success": False,
             "error": "Executor dispatch failed: executor rejected",
+            "reason": "dispatch_failed",
         })
     ]
     assert "submit-fail" not in scheduler.get_running_job_ids()
@@ -244,7 +249,7 @@ def test_run_one_job_records_running_then_terminal(monkeypatch):
     monkeypatch.setattr(
         scheduler,
         "mark_execution_running",
-        lambda execution_id: events.append(("running", execution_id)),
+        lambda execution_id, **kwargs: events.append(("running", execution_id, kwargs)) or {"id": execution_id},
         raising=False,
     )
     monkeypatch.setattr(
@@ -263,10 +268,12 @@ def test_run_one_job_records_running_then_terminal(monkeypatch):
     monkeypatch.setattr(scheduler, "_deliver_result", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(scheduler, "mark_job_run", lambda *_args, **_kwargs: None)
 
-    assert scheduler.run_one_job({"id": "job-3", "execution_id": "exec-3"}) is True
-    assert events[0] == ("running", "exec-3")
+    assert scheduler.run_one_job({"id": "job-3", "execution_id": "exec-3", "execution_owner_token": "owner-3"}) is True
+    assert events[0] == ("running", "exec-3", {"owner_token": "owner-3"})
     assert events[-1][0:2] == ("finish", "exec-3")
     assert events[-1][2]["success"] is True
+    assert events[-1][2]["owner_token"] == "owner-3"
+    assert events[-1][2]["reason"] == "completed"
 
 
 def test_provider_start_recovers_interrupted_records_before_tick(monkeypatch):
@@ -314,8 +321,166 @@ def test_job_listing_exposes_latest_execution(monkeypatch, tmp_path):
 
     job = jobs.create_job(prompt="audit me", schedule="every 1h", name="audit")
     record = executions.create_execution(job["id"], source="builtin")
-    executions.mark_execution_running(record["id"])
+    executions.mark_execution_running(record["id"], owner_token=record["owner_token"])
 
     listed = jobs.list_jobs(include_disabled=True)
     assert listed[0]["latest_execution"]["id"] == record["id"]
     assert listed[0]["latest_execution"]["status"] == "running"
+
+
+def test_migration_preserves_legacy_rows_and_adds_fenced_lease_columns(monkeypatch, tmp_path):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    executions.EXECUTIONS_FILE.parent.mkdir(parents=True)
+    with sqlite3.connect(executions.EXECUTIONS_FILE) as conn:
+        conn.execute(
+            """CREATE TABLE executions (
+                id TEXT PRIMARY KEY, job_id TEXT NOT NULL, source TEXT NOT NULL,
+                process_id TEXT NOT NULL, pid INTEGER NOT NULL, process_started_at INTEGER,
+                status TEXT NOT NULL CHECK(status IN ('claimed','running','completed','failed','unknown')),
+                claimed_at TEXT NOT NULL, started_at TEXT, finished_at TEXT, error TEXT
+            )"""
+        )
+        conn.execute(
+            "INSERT INTO executions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("legacy", "job", "builtin", "old", 1, 1, "completed", "t0", "t0", "t1", None),
+        )
+
+    created = executions.create_execution("new", source="builtin")
+    assert created["owner_token"]
+    assert created["heartbeat_at"]
+    assert created["lease_expires_at"]
+    with sqlite3.connect(executions.EXECUTIONS_FILE) as conn:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(executions)")}
+        legacy = conn.execute("SELECT terminal_at, terminal_reason FROM executions WHERE id='legacy'").fetchone()
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+    assert {"owner_token", "heartbeat_at", "lease_expires_at", "terminal_at", "terminal_reason"} <= columns
+    assert legacy == ("t1", "legacy_completed")
+    assert version == executions.SCHEMA_VERSION
+
+
+def test_heartbeat_and_finalization_are_fenced_and_idempotent(monkeypatch, tmp_path):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    record = executions.create_execution("fenced", source="builtin")
+    owner = record["owner_token"]
+    assert executions.mark_execution_running(record["id"], owner_token=owner)
+    assert not executions.heartbeat_execution(record["id"], owner_token="stale-owner")
+    assert executions.heartbeat_execution(record["id"], owner_token=owner)
+
+    assert executions.finish_execution(
+        record["id"], owner_token="stale-owner", success=False, error="late", reason="late_writer"
+    ) is None
+    terminal = executions.finish_execution(
+        record["id"], owner_token=owner, success=False, error="timeout", reason="timeout"
+    )
+    retried = executions.finish_execution(
+        record["id"], owner_token=owner, success=True, reason="completed"
+    )
+    assert terminal["status"] == "failed"
+    assert terminal["terminal_reason"] == "timeout"
+    assert retried == terminal
+
+
+def test_classifier_is_non_mutating_and_requires_durable_owner_evidence(monkeypatch, tmp_path):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    modern = executions.create_execution("dead", source="builtin")
+    legacy = executions.create_execution("legacy", source="builtin")
+    with sqlite3.connect(executions.EXECUTIONS_FILE) as conn:
+        conn.execute(
+            "UPDATE executions SET process_id=?, process_started_at=? WHERE id=?",
+            ("dead-process", -1, modern["id"]),
+        )
+        conn.execute(
+            "UPDATE executions SET owner_token=NULL, lease_expires_at=NULL, process_id=?, process_started_at=? WHERE id=?",
+            ("old-process", -1, legacy["id"]),
+        )
+
+    manifest = executions.classify_stale_executions()
+    by_id = {entry["execution_id"]: entry for entry in manifest["entries"]}
+    assert manifest["mutated"] is False
+    assert by_id[modern["id"]]["disposition"] == "stale"
+    assert by_id[modern["id"]]["proposed_terminal_status"] == "interrupted"
+    assert by_id[legacy["id"]]["disposition"] == "legacy_unfenced"
+    assert executions.latest_execution("dead")["status"] == "claimed"
+    assert executions.latest_execution("legacy")["status"] == "claimed"
+
+
+def test_recovery_finalizes_only_modern_proven_dead_records(monkeypatch, tmp_path):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    modern = executions.create_execution("dead", source="builtin")
+    legacy = executions.create_execution("legacy", source="builtin")
+    with sqlite3.connect(executions.EXECUTIONS_FILE) as conn:
+        conn.execute(
+            "UPDATE executions SET process_id=?, process_started_at=? WHERE id=?",
+            ("dead-process", -1, modern["id"]),
+        )
+        conn.execute(
+            "UPDATE executions SET owner_token=NULL, lease_expires_at=NULL, process_id=?, process_started_at=? WHERE id=?",
+            ("old-process", -1, legacy["id"]),
+        )
+    assert executions.recover_interrupted_executions() == 1
+    assert executions.latest_execution("dead")["terminal_reason"] == "owner_dead"
+    assert executions.latest_execution("legacy")["status"] == "claimed"
+
+
+def test_concurrent_finalizers_keep_one_terminal_fact(monkeypatch, tmp_path):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    record = executions.create_execution("race", source="builtin")
+    assert executions.mark_execution_running(record["id"], owner_token=record["owner_token"])
+
+    def finalize(reason):
+        return executions.finish_execution(
+            record["id"], owner_token=record["owner_token"], success=False,
+            error=reason, reason=reason,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(finalize, ("timeout", "gateway_child_died")))
+    terminal = executions.latest_execution("race")
+    assert terminal["terminal_reason"] in {"timeout", "gateway_child_died"}
+    assert all(result == terminal for result in results)
+
+
+def test_runner_terminal_reasons_cover_timeout_signal_and_gateway_child_death(monkeypatch, tmp_path):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    import cron.scheduler as scheduler
+
+    monkeypatch.setattr(scheduler, "claim_dispatch", lambda _job_id: True)
+    monkeypatch.setattr(scheduler, "save_job_output", lambda *_args: None)
+    monkeypatch.setattr(scheduler, "_deliver_result", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(scheduler, "mark_job_run", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(scheduler, "_summarize_cron_failure_for_delivery", lambda *_args: "failed")
+    monkeypatch.setattr(scheduler, "_ExecutionLeaseHeartbeat", type("Lease", (), {
+        "__init__": lambda self, *_args: None,
+        "start": lambda self: None,
+        "stop": lambda self: None,
+    }))
+
+    def run_with(result, *, interrupted=False):
+        record = executions.create_execution("reason", source="direct")
+        monkeypatch.setattr(scheduler, "run_job", lambda _job: result)
+        monkeypatch.setattr(scheduler, "_is_interrupted", lambda _job_id: interrupted)
+        monkeypatch.setattr(scheduler, "_consume_interrupted_flag", lambda _job_id: interrupted)
+        job = {
+            "id": "reason", "execution_id": record["id"],
+            "execution_owner_token": record["owner_token"],
+        }
+        return scheduler.run_one_job(job), executions.latest_execution("reason")
+
+    ok, timeout = run_with((False, "", "", "hard timeout while running"))
+    assert ok is True
+    assert timeout["terminal_reason"] == "timeout"
+
+    ok, child_died = run_with((True, "output", "response", None), interrupted=True)
+    assert ok is True
+    assert child_died["terminal_reason"] == "gateway_child_died"
+
+    record = executions.create_execution("signal", source="direct")
+    monkeypatch.setattr(scheduler, "run_job", lambda _job: (_ for _ in ()).throw(KeyboardInterrupt()))
+    monkeypatch.setattr(scheduler, "_is_interrupted", lambda _job_id: False)
+    monkeypatch.setattr(scheduler, "_consume_interrupted_flag", lambda _job_id: False)
+    with __import__("pytest").raises(KeyboardInterrupt):
+        scheduler.run_one_job({
+            "id": "signal", "execution_id": record["id"],
+            "execution_owner_token": record["owner_token"],
+        })
+    assert executions.latest_execution("signal")["terminal_reason"] == "signal"
