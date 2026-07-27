@@ -111,10 +111,13 @@ under `pr_pipeline/`. Do not compare or copy those files one at a time.
 ## Files
 
 - `reconcile_launchd_environment.py` — governed installer for
-  `gateway_secrets_wrap.sh`, `dashboard_secrets_wrap.sh`,
+  itself, `gateway_secrets_wrap.sh`, `dashboard_secrets_wrap.sh`,
   `gateway_launch_inner.sh`, `github_app_token.py`, `op_sdk_resolve.py`, the
-  reference-only `launchd-secrets.op-env.template`, and both generated
-  LaunchAgent plists. It atomically replaces regular files, records exact
+  source-controlled keys in `launchd-secrets.op-env.template`, and both
+  generated LaunchAgent plists. It validates and retains the complete
+  reference-only `op-secrets.env` inventory while overlaying those required
+  keys into the governed `launchd-secrets.op-env`. It atomically replaces
+  regular files, records exact
   content-addressed rollback snapshots and hash receipts, and rejects a
   `config.yaml` whose `gateway.launchd_secrets_wrapper` is not the canonical
   installed gateway wrapper. Plists point only to wrappers and use
