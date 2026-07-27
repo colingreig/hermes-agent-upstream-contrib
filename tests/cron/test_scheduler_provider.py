@@ -371,6 +371,19 @@ def test_fire_due_default_claims_then_runs(monkeypatch):
     assert ran == ["j1"]
 
 
+def test_fire_due_returns_normalized_execution_failure(monkeypatch):
+    """External providers expose the same red outcome as the shared runner."""
+    import cron.jobs as jobs
+    import cron.scheduler as sched
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    monkeypatch.setattr(jobs, "claim_job_for_fire", lambda _jid: True, raising=False)
+    monkeypatch.setattr(jobs, "get_job", lambda jid: {"id": jid, "name": "t"})
+    monkeypatch.setattr(sched, "run_one_job", lambda *_args, **_kw: False)
+
+    assert InProcessCronScheduler().fire_due("failed") is False
+
+
 def test_fire_due_lost_claim_does_not_run(monkeypatch):
     """If the CAS claim is lost (another machine/retry won), fire_due returns
     False and never runs the job."""

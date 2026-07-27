@@ -33,7 +33,7 @@ except ImportError:
     except ImportError:
         msvcrt = None
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, List, NamedTuple, Optional
 
 # Add parent directory to path for imports BEFORE repo-level imports.
 # Without this, standalone invocations (e.g. after `hermes update` reloads
@@ -113,6 +113,15 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     job_name = job.get("name") or job.get("id") or "cron job"
     text = (error or "unknown error").strip()
     lower = text.lower()
+
+    # This diagnostic intentionally lists possible causes including the word
+    # "timeout". It is not evidence of a provider timeout, so classify it
+    # before the generic timeout heuristic below.
+    if lower.startswith("agent completed but produced empty response"):
+        return (
+            f"⚠️ Cron '{job_name}' failed: agent produced no usable final response. "
+            "Full details saved in cron output."
+        )
 
     # Provider/API failures are the common noisy path. Keep these short.
     if "429" in text or "rate limit" in lower or "usage limit" in lower:
@@ -411,6 +420,196 @@ def _is_cron_silence_response(text: str) -> bool:
     if upper.startswith("[SILENT]"):
         return True
     return False
+
+
+class _CronExecutionOutcome(NamedTuple):
+    """The one authoritative execution result shared by every cron sink.
+
+    Delivery is intentionally separate from execution success: a completed job
+    does not become failed merely because its notification transport is down.
+    """
+
+    success: bool
+    error: Optional[str]
+    reason: str
+    delivery_error: Optional[str] = None
+
+
+def _configured_workdir_error(job: dict) -> Optional[str]:
+    """Return a preflight error for a configured but unusable workdir."""
+    configured = job.get("workdir")
+    if configured in (None, "", False):
+        return None
+    if not isinstance(configured, (str, os.PathLike)):
+        return f"Configured cron workdir is invalid: {configured!r}"
+    path_text = os.fspath(configured).strip()
+    if not path_text:
+        return None
+    try:
+        path = Path(path_text).expanduser()
+        if not path.is_dir() or not os.access(path, os.R_OK | os.X_OK):
+            return f"Configured cron workdir is unavailable: {path_text!r}"
+    except OSError as exc:
+        return f"Configured cron workdir is unavailable: {path_text!r} ({exc})"
+    return None
+
+
+def _cron_failure_reason(error: Optional[str], *, interrupted: bool = False) -> str:
+    """Classify a failure without changing execution-ledger ownership rules."""
+    if interrupted:
+        return "gateway_child_died"
+    text = (error or "").lower()
+    if "malformed cron runner result" in text:
+        return "malformed_result"
+    if "timeout" in text or "timed out" in text:
+        return "timeout"
+    if any(token in text for token in (
+        "configured cron workdir", "script", "skill", "credential",
+        "required environment", "no model configured",
+    )):
+        return "preflight_failed"
+    return "run_failed"
+
+
+def _normalize_cron_outcome(
+    runner_success: Any,
+    final_response: Any,
+    error: Any,
+    *,
+    pool_available: Optional[bool] = None,
+    interrupted: bool = False,
+) -> _CronExecutionOutcome:
+    """Apply machine-result precedence before any delivery or persistence."""
+    if runner_success is not True:
+        detail = error if isinstance(error, str) and error.strip() else (
+            "Cron runner reported failure without an error message"
+        )
+        if pool_available is False and "route chain exhausted" not in detail.lower():
+            detail = (
+                f"{detail} (route chain exhausted — no usable provider credential available)"
+            )
+        return _CronExecutionOutcome(
+            False, detail, _cron_failure_reason(detail, interrupted=interrupted)
+        )
+    if isinstance(error, str) and error.strip():
+        detail = f"Malformed cron runner result: success=True with error: {error}"
+        return _CronExecutionOutcome(False, detail, "malformed_result")
+    if not isinstance(final_response, str):
+        detail = "Malformed cron runner result: final_response must be a string"
+        return _CronExecutionOutcome(False, detail, "malformed_result")
+    if interrupted:
+        detail = "Interrupted by gateway shutdown before the run finished (tool subprocess was killed mid-flight)."
+        return _CronExecutionOutcome(False, detail, "gateway_child_died")
+    if not final_response.strip() and not _is_cron_silence_response(final_response):
+        detail = (
+            "route chain exhausted — no usable provider credential available; no objective work produced"
+            if _is_route_chain_exhausted_no_work(pool_available, final_response)
+            else "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
+        )
+        return _CronExecutionOutcome(False, detail, "run_failed")
+    return _CronExecutionOutcome(True, None, "completed")
+
+
+def _normalize_runner_result(
+    result: Any, *, pool_available: Optional[bool], interrupted: bool
+) -> tuple[_CronExecutionOutcome, str, str]:
+    """Validate the positional run_job contract before consuming it."""
+    if not isinstance(result, tuple) or len(result) != 4:
+        detail = "Malformed cron runner result: expected (success, output, final_response, error)"
+        return _CronExecutionOutcome(False, detail, "malformed_result"), "", ""
+    runner_success, output, final_response, error = result
+    if (
+        not isinstance(runner_success, bool)
+        or not isinstance(output, str)
+        or (error is not None and not isinstance(error, str))
+    ):
+        detail = (
+            "Malformed cron runner result: success must be bool, output must be a string, "
+            "and error must be a string or None"
+        )
+        return _CronExecutionOutcome(False, detail, "malformed_result"), "", ""
+    outcome = _normalize_cron_outcome(
+        runner_success,
+        final_response,
+        error,
+        pool_available=pool_available,
+        interrupted=interrupted,
+    )
+    return outcome, output, final_response if isinstance(final_response, str) else ""
+
+
+def _record_cron_outcome(
+    job: dict,
+    execution_id: str,
+    owner_token: str,
+    outcome: _CronExecutionOutcome,
+    *,
+    skip_job_status: bool = False,
+) -> bool:
+    """Persist the normalized result without re-entering execution delivery.
+
+    A status/ledger write can fail after the user has already received the
+    result.  That is an observability failure, not a new runner failure: do
+    not send a second alert or mutate the q7 terminal fact to a different
+    outcome.  Return False so callers fail closed when durability is uncertain.
+    """
+    persisted = True
+    if not skip_job_status:
+        try:
+            mark_job_run(
+                job["id"], outcome.success, outcome.error,
+                delivery_error=outcome.delivery_error,
+            )
+        except Exception:
+            persisted = False
+            logger.exception(
+                "Job '%s': could not persist scheduled-job outcome; execution was %s",
+                job["id"], "successful" if outcome.success else "failed",
+            )
+    try:
+        finish_execution(
+            execution_id,
+            owner_token=owner_token,
+            success=outcome.success,
+            error=outcome.error,
+            reason=outcome.reason,
+        )
+    except Exception:
+        persisted = False
+        logger.exception(
+            "Job '%s': execution ledger finalization failed; "
+            "leaving the normalized outcome unchanged",
+            job["id"],
+        )
+    return outcome.success and persisted
+
+
+def _deliver_cron_outcome(
+    job: dict,
+    outcome: _CronExecutionOutcome,
+    final_response: str,
+    *,
+    adapters=None,
+    loop=None,
+) -> _CronExecutionOutcome:
+    """Deliver an outcome without letting delivery rewrite execution status."""
+    content = (
+        final_response if outcome.success
+        else _summarize_cron_failure_for_delivery(job, outcome.error)
+    )
+    if not content.strip():
+        return outcome
+    if outcome.success and _is_cron_silence_response(content):
+        logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
+        return outcome
+    try:
+        delivery_error = _deliver_result(job, content, adapters=adapters, loop=loop)
+    except Exception as exc:
+        delivery_error = str(exc)
+        logger.error("Delivery failed for job %s: %s", job["id"], exc)
+    return outcome._replace(
+        delivery_error=delivery_error if isinstance(delivery_error, str) else None
+    )
 
 # ---------------------------------------------------------------------------
 # Persistent thread pool for parallel cron jobs.
@@ -3050,6 +3249,22 @@ def run_job(
     job_id = job["id"]
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
 
+    # Revalidate persisted workdirs immediately before either runner path. A
+    # project can disappear after create/update validation; silently using the
+    # scheduler cwd would execute unrelated commands (including no_agent jobs).
+    workdir_error = _configured_workdir_error(job)
+    if workdir_error:
+        logger.error("Job '%s': %s", job_id, workdir_error)
+        now_iso = _hermes_now().strftime("%Y-%m-%d %H:%M:%S")
+        doc = (
+            f"# Cron Job: {job_name}\n\n"
+            f"**Job ID:** {job_id}\n"
+            f"**Run Time:** {now_iso}\n"
+            "**Status:** preflight failed\n\n"
+            f"{workdir_error}\n"
+        )
+        return False, doc, "", workdir_error
+
     # ---------------------------------------------------------------
     # no_agent short-circuit — the script IS the job, no LLM involvement.
     # ---------------------------------------------------------------
@@ -3249,6 +3464,19 @@ def run_job(
             ),
         )
         _ran_ok, _script_output = prerun_script
+        if not _ran_ok:
+            # A required data-collection/tool script is a machine preflight,
+            # not advisory context for an LLM to explain away.  Do not build
+            # a prompt or construct AIAgent after a non-zero exit/timeout.
+            script_error_doc = (
+                f"# Cron Job: {job_name}\n\n"
+                f"**Job ID:** {job_id}\n"
+                f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                "**Status:** pre-run script failed\n\n"
+                f"{_script_output}\n"
+            )
+            logger.error("Job '%s': pre-run script failed: %s", job_id, _script_output)
+            return False, script_error_doc, "", _script_output
         if _ran_ok and not _parse_wake_gate(_script_output):
             logger.info(
                 "Job '%s' (ID: %s): wakeAgent=false, skipping agent run",
@@ -4329,8 +4557,8 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
     under the file lock before dispatch; an external provider claims via the
     store CAS). This function only fires the given job once.
 
-    Returns True if the job was processed (even if the job itself failed —
-    failure is recorded via ``mark_job_run``), False only if processing raised.
+    Returns the normalized execution success.  Delivery failures remain
+    separately recorded and do not turn an otherwise-completed execution red.
     """
     execution_id = job.get("execution_id")
     owner_token = job.get("execution_owner_token")
@@ -4355,14 +4583,12 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
                 "Job '%s': one-shot dispatch limit reached — skipping",
                 job.get("name", job["id"]),
             )
-            finish_execution(
-                execution_id,
-                owner_token=owner_token,
-                success=False,
-                error="Dispatch claim rejected; execution was not started.",
-                reason="dispatch_rejected",
+            outcome = _normalize_cron_outcome(
+                False, "", "Dispatch claim rejected; execution was not started."
+            )._replace(reason="dispatch_rejected")
+            return _record_cron_outcome(
+                job, execution_id, owner_token, outcome, skip_job_status=True
             )
-            return True  # not an error — already handled/removed
 
         # The attempt is claimed durably before executor/provider dispatch and
         # becomes running only immediately before the actual run.
@@ -4414,9 +4640,7 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
                 )
             ):
                 try:
-                    success, output, final_response, error = run_job(
-                        job, defer_agent_teardown=_deferred_agents
-                    )
+                    result = run_job(job, defer_agent_teardown=_deferred_agents)
                 except TypeError as exc:
                     # unittest.mock and some legacy custom runners expose a
                     # permissive **kwargs signature while forwarding to a
@@ -4427,11 +4651,11 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
                         not in str(exc)
                     ):
                         raise
-                    success, output, final_response, error = run_job(job)
+                    result = run_job(job)
             else:
                 # Backward compatibility for custom/test replacements that
                 # implement the pre-deferred-teardown run_job contract.
-                success, output, final_response, error = run_job(job)
+                result = run_job(job)
         except BaseException:
             # run_job's finally still hands back the agent when it raises; tear
             # it down here so a failed run never leaks its async resources
@@ -4451,51 +4675,24 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         # / empty-response computation, or _deliver_result itself — raises, the
         # deferred agent is still torn down. Otherwise the outer `except` would
         # swallow the error and leak the agent's subprocesses/clients (#10200).
-        delivery_error = None
+        outcome, output, final_response = _normalize_runner_result(
+            result,
+            pool_available=_pool_available,
+            interrupted=_is_interrupted(job["id"]),
+        )
         try:
-            output_file = save_job_output(job["id"], output)
-            if verbose:
-                logger.info("Output saved to: %s", output_file)
-
-            # If the gateway shutdown killed this job's tool subprocess
-            # mid-flight (#60432), the agent may still have produced a
-            # plausible-looking final_response from the truncated output --
-            # force the failure path so the delivered message is an honest
-            # "this run was interrupted" summary instead of that response.
-            # Peek-only: the flag stays set for the authoritative check
-            # right before mark_job_run below.
-            if success and _is_interrupted(job["id"]):
-                interrupted_by_gateway = True
-                success = False
-                error = (
-                    "Interrupted by gateway shutdown before the run finished "
-                    "(tool subprocess was killed mid-flight)."
+            try:
+                output_file = save_job_output(job["id"], output)
+                if verbose:
+                    logger.info("Output saved to: %s", output_file)
+            except Exception as exc:
+                outcome = _normalize_cron_outcome(
+                    False, "", f"Cron output save failed: {exc}",
+                    interrupted=_is_interrupted(job["id"]),
                 )
-
-            # Deliver the final response to the origin/target chat.
-            # If the agent responded with [SILENT], skip delivery (but
-            # output is already saved above).  Failed jobs always deliver.
-            deliver_content = final_response if success else _summarize_cron_failure_for_delivery(job, error)
-            # Treat whitespace-only final responses the same as empty
-            # responses: do not deliver a blank message, and let the
-            # empty-response guard below mark the run as a soft failure.
-            should_deliver = bool(deliver_content.strip())
-            # Cron silence suppression — see _is_cron_silence_response.  Replaces the
-            # old `SILENT_MARKER in ...upper()` substring check, which both leaked
-            # bracketless near-markers ("SILENT" / "NO_REPLY") and wrongly swallowed
-            # a real report that merely quoted "[SILENT]" mid-sentence (#51438,
-            # #46917).  Keeps the intentional bracketed-prefix / trailing-line
-            # tolerance the cron contract relies on.
-            if should_deliver and success and _is_cron_silence_response(deliver_content):
-                logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
-                should_deliver = False
-
-            if should_deliver:
-                try:
-                    delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
-                except Exception as de:
-                    delivery_error = str(de)
-                    logger.error("Delivery failed for job %s: %s", job["id"], de)
+            outcome = _deliver_cron_outcome(
+                job, outcome, final_response, adapters=adapters, loop=loop
+            )
         finally:
             # Tear down the deferred agent(s) now that save + delivery have run
             # (or raised). Must happen on every path so cron agents never leak
@@ -4503,75 +4700,40 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             for _deferred_agent in _deferred_agents:
                 _teardown_cron_agent(_deferred_agent, job["id"])
 
-        # Treat empty final_response as a soft failure so last_status
-        # is not "ok" — the agent ran but produced nothing useful.
-        # (issue #8585) Extended for the HERMES audit finding "last_status
-        # can still be 'ok' when the agent reports that zero work occurred":
-        # when the run_job()-resolved provider's credential pool was
-        # DEFINITELY fully exhausted (not merely indeterminate — see
-        # _is_route_chain_exhausted_no_work above) at the same time no
-        # objective work was produced, attribute the forced failure
-        # deterministically to chain exhaustion instead of the generic
-        # empty-response message, so operators get an actionable signal
-        # rather than a guess at model error/timeout/misconfiguration.
-        _chain_exhausted_no_work = _is_route_chain_exhausted_no_work(_pool_available, final_response)
-        if success and not final_response.strip():
-            success = False
-            error = (
-                "route chain exhausted — no usable provider credential available; "
-                "no objective work produced"
-                if _chain_exhausted_no_work
-                else "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
-            )
-        elif not success and _pool_available is False:
-            # Failure path: last_status is already non-ok (unchanged here).
-            # Attribute the recorded error clearly to chain exhaustion so
-            # operators get a deterministic signal instead of a generic
-            # upstream error string.
-            error = (
-                f"{error} (route chain exhausted — no usable provider credential available)"
-                if error
-                else "route chain exhausted — no usable provider credential available"
-            )
-
-        consumed_interrupt = _consume_interrupted_flag(job["id"])
-        if not consumed_interrupt:
-            mark_job_run(job["id"], success, error, delivery_error=delivery_error)
-        terminal_reason = "completed" if success else "run_failed"
-        if not success and (interrupted_by_gateway or consumed_interrupt):
-            terminal_reason = "gateway_child_died"
-        elif not success and error and "timeout" in error.lower():
-            terminal_reason = "timeout"
-        finish_execution(
+        return _record_cron_outcome(
+            job,
             execution_id,
-            owner_token=owner_token,
-            success=success,
-            error=error,
-            reason=terminal_reason,
+            owner_token,
+            outcome,
+            skip_job_status=_consume_interrupted_flag(job["id"]),
         )
-        return True
 
     except Exception as e:
         logger.error("Error processing job %s: %s", job['id'], e)
-        if not _consume_interrupted_flag(job["id"]):
-            mark_job_run(job["id"], False, str(e))
-        finish_execution(
-            execution_id,
-            owner_token=owner_token,
-            success=False,
-            error=str(e),
-            reason="runner_exception",
+        outcome = _normalize_cron_outcome(
+            False, "", str(e), interrupted=_is_interrupted(job["id"])
         )
-        return False
-    except BaseException as e:
-        # Signals and interpreter-level exits are not normal job failures, but
-        # they must still leave an auditable terminal fact before propagating.
-        finish_execution(
+        outcome = _deliver_cron_outcome(
+            job, outcome, "", adapters=adapters, loop=loop
+        )
+        return _record_cron_outcome(
+            job,
             execution_id,
-            owner_token=owner_token,
-            success=False,
-            error=f"{type(e).__name__}: {e}",
-            reason="signal",
+            owner_token,
+            outcome,
+            skip_job_status=_consume_interrupted_flag(job["id"]),
+        )
+    except BaseException as e:
+        # Preserve q7's durable terminal fact even for signals/interpreter exits.
+        outcome = _normalize_cron_outcome(
+            False, "", f"{type(e).__name__}: {e}", interrupted=_is_interrupted(job["id"])
+        )._replace(reason="signal")
+        _record_cron_outcome(
+            job,
+            execution_id,
+            owner_token,
+            outcome,
+            skip_job_status=_consume_interrupted_flag(job["id"]),
         )
         raise
     finally:

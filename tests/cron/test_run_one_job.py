@@ -100,6 +100,96 @@ def test_run_one_job_failed_job_delivers_error(monkeypatch):
     assert mark == ("mark", "j5", False)
 
 
+def test_machine_failure_wins_over_false_green_assistant_prose(monkeypatch):
+    """One failed child result drives delivery, job status, ledger, and return.
+
+    The model's final text is explanatory only: it cannot turn a failed
+    required pre-run/tool result into a green scheduled execution.
+    """
+    marks = []
+    finished = []
+    delivered = []
+    monkeypatch.setattr(
+        s, "run_job",
+        lambda job, **_kw: (False, "script output", "Everything succeeded!", "script exited 1"),
+    )
+    monkeypatch.setattr(s, "save_job_output", lambda *_args: "/tmp/out.md")
+    monkeypatch.setattr(
+        s, "_deliver_result",
+        lambda _job, content, **_kw: delivered.append(content),
+    )
+    monkeypatch.setattr(
+        s, "mark_job_run",
+        lambda job_id, success, error, **_kw: marks.append((job_id, success, error)),
+    )
+    monkeypatch.setattr(
+        s, "finish_execution",
+        lambda execution_id, **kwargs: finished.append((execution_id, kwargs)),
+    )
+
+    assert s.run_one_job({"id": "false-green", "name": "false green"}) is False
+    assert marks == [("false-green", False, "script exited 1")]
+    assert finished[-1][1]["success"] is False
+    assert finished[-1][1]["error"] == "script exited 1"
+    assert finished[-1][1]["reason"] == "preflight_failed"
+    assert "Everything succeeded!" not in delivered[0]
+    assert "script exited 1" in delivered[0]
+
+
+def test_malformed_runner_result_is_red_in_every_persisted_sink(monkeypatch):
+    """A runner that violates its tuple contract cannot be mistaken for success."""
+    marks = []
+    finished = []
+    monkeypatch.setattr(s, "run_job", lambda *_args, **_kw: {"success": True})
+    monkeypatch.setattr(s, "save_job_output", lambda *_args: "/tmp/out.md")
+    monkeypatch.setattr(s, "_deliver_result", lambda *_args, **_kw: None)
+    monkeypatch.setattr(
+        s, "mark_job_run",
+        lambda job_id, success, error, **_kw: marks.append((job_id, success, error)),
+    )
+    monkeypatch.setattr(
+        s, "finish_execution",
+        lambda execution_id, **kwargs: finished.append((execution_id, kwargs)),
+    )
+
+    assert s.run_one_job({"id": "malformed", "name": "bad runner"}) is False
+    assert marks[0][1] is False
+    assert "Malformed cron runner result" in marks[0][2]
+    assert finished[-1][1]["success"] is False
+    assert finished[-1][1]["error"] == marks[0][2]
+    assert finished[-1][1]["reason"] == "malformed_result"
+
+
+def test_mark_persistence_failure_does_not_redeliver_or_relabel_success(monkeypatch):
+    """A post-delivery status write failure is observable but not a new run."""
+    delivered = []
+    terminal = []
+    monkeypatch.setattr(
+        s, "run_job", lambda *_args, **_kw: (True, "out", "completed report", None)
+    )
+    monkeypatch.setattr(s, "save_job_output", lambda *_args: "/tmp/out.md")
+    monkeypatch.setattr(
+        s, "_deliver_result", lambda _job, content, **_kw: delivered.append(content)
+    )
+
+    def mark_boom(*_args, **_kwargs):
+        raise OSError("jobs store unavailable")
+
+    monkeypatch.setattr(s, "mark_job_run", mark_boom)
+    monkeypatch.setattr(
+        s, "finish_execution",
+        lambda execution_id, **kwargs: terminal.append((execution_id, kwargs)) or {"id": execution_id},
+    )
+
+    # Durability is uncertain, so the controller fails closed, but the user
+    # still receives exactly the original successful result and the ledger is
+    # never rewritten as runner_exception.
+    assert s.run_one_job({"id": "mark-fails", "name": "mark fails"}) is False
+    assert delivered == ["completed report"]
+    assert terminal[-1][1]["success"] is True
+    assert terminal[-1][1]["reason"] == "completed"
+
+
 def test_run_one_job_exception_marks_failure(monkeypatch):
     """If run_job raises, the helper marks the run failed and returns False
     rather than propagating."""
@@ -314,8 +404,7 @@ def test_run_one_job_tears_down_deferred_agent_when_save_raises(monkeypatch):
 
     ok = s.run_one_job({"id": "j10", "name": "t"})
 
-    # save raised → outer handler marks failure and returns False, but the
-    # deferred agent was still torn down (no delivery, no leak).
+    # Save failure becomes the normalized red outcome and is still delivered
+    # as an alert before teardown (no leak).
     assert ok is False
-    assert "deliver" not in order
-    assert order == ["save-raise", "agent.close", "cleanup_stale"], order
+    assert order == ["save-raise", "deliver", "agent.close", "cleanup_stale"], order
