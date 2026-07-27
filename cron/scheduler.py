@@ -33,7 +33,7 @@ except ImportError:
     except ImportError:
         msvcrt = None
 from pathlib import Path
-from typing import Any, List, NamedTuple, Optional
+from typing import Any, Iterable, List, NamedTuple, Optional
 
 # Add parent directory to path for imports BEFORE repo-level imports.
 # Without this, standalone invocations (e.g. after `hermes update` reloads
@@ -195,6 +195,16 @@ class CronSkillUnresolvable(Exception):
     distinct from a job that legitimately declares no skill (``skill:
     None`` / ``skills: []``), which is normal and continues to run
     unchanged.
+    """
+
+
+class CronSkillRootConflict(CronSkillUnresolvable):
+    """A cron job resolved skills from incompatible plugin roots.
+
+    A single ``CLAUDE_PLUGIN_ROOT`` must describe every loaded skill before the
+    first model-driven subprocess runs.  Guessing when multiple roots are
+    present can silently execute a sibling plugin's scripts, so this is a
+    fail-closed job configuration error.
     """
 
 
@@ -2401,6 +2411,78 @@ def _normalize_required_environment_variables(value: Any) -> tuple[str, ...]:
     return tuple(names)
 
 
+def _plugin_root_from_skill_dir(skill_dir: Any) -> Optional[Path]:
+    """Derive ``CLAUDE_PLUGIN_ROOT`` from a successful skill-view directory.
+
+    Plugin skills are rooted at ``<plugin-root>/skills/<skill>``.  Find the
+    nearest ``skills`` path component after resolving symlinks; legacy
+    single-file skills have no ``skill_dir`` and intentionally return ``None``.
+    """
+    if not isinstance(skill_dir, str) or not skill_dir.strip():
+        return None
+    try:
+        resolved = Path(skill_dir).expanduser().resolve()
+    except (OSError, RuntimeError):
+        return None
+    for candidate in (resolved, *resolved.parents):
+        if candidate.name == "skills":
+            return candidate.parent
+    return None
+
+
+def _install_cron_child_env(
+    required_names: Any,
+    *,
+    plugin_roots: Optional[Iterable[Path]] = None,
+) -> None:
+    """Install declared scoped values into this cron context's child overlay.
+
+    Only names explicitly declared by the job or a successfully loaded skill
+    are considered, and only values present in the *current* profile secret
+    scope are injected.  No value is copied into ``os.environ``.
+    """
+    from tools.env_passthrough import (
+        get_child_env_overlay,
+        register_child_env_overlay,
+    )
+
+    roots = {str(Path(root).resolve()) for root in (plugin_roots or ())}
+    existing_root = get_child_env_overlay().get("CLAUDE_PLUGIN_ROOT")
+    if existing_root:
+        roots.add(str(Path(existing_root).expanduser().resolve()))
+    if len(roots) > 1:
+        rendered = ", ".join(sorted(roots))
+        raise CronSkillRootConflict(
+            "Cron job resolved skills from conflicting plugin roots: "
+            f"{rendered}. Refusing to choose a CLAUDE_PLUGIN_ROOT."
+        )
+    if roots:
+        register_child_env_overlay(
+            {"CLAUDE_PLUGIN_ROOT": next(iter(roots))},
+            redact_values=False,
+        )
+
+    names = _normalize_required_environment_variables(required_names)
+    if not names:
+        return
+    try:
+        from agent.secret_scope import current_secret_scope
+
+        scope = current_secret_scope()
+    except Exception:
+        scope = None
+    if scope is None:
+        return
+
+    scoped_values = {
+        name: value
+        for name in names
+        if isinstance((value := scope.get(name)), str) and value
+    }
+    if scoped_values:
+        register_child_env_overlay(scoped_values, redact_values=True)
+
+
 def _read_windows_pyvenv_cfg(venv_dir: Path) -> dict[str, str]:
     cfg_path = venv_dir / "pyvenv.cfg"
     try:
@@ -2800,6 +2882,17 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
     user_prompt = str(job.get("prompt") or "")
     prompt = user_prompt
 
+    # A prompt build is one independent cron execution environment. Direct
+    # callers (tests, extensions, immediate-run integrations) may invoke this
+    # function sequentially without run_one_job's outer scope, so replace the
+    # current context's prior skill/root state here before resolving anything
+    # for this job. ContextVar snapshots are immutable, preserving isolation
+    # for concurrently-built jobs; roots discovered within THIS build are
+    # still accumulated and conflict-checked below.
+    from tools.env_passthrough import reset_env_passthrough_context
+
+    reset_env_passthrough_context()
+
     # Register the job's own declared required_environment_variables as
     # sandbox passthrough BEFORE the agent session starts, so an agent-run
     # job's terminal-tool subprocesses (e.g. `op-run`, `node clickup.mjs`)
@@ -2814,6 +2907,7 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
     if job_required_env:
         from tools.env_passthrough import register_env_passthrough
         register_env_passthrough(job_required_env)
+        _install_cron_child_env(job_required_env)
 
     skills = job.get("skills")
     # True when runtime-collected DATA (script stdout, upstream-job output)
@@ -2946,6 +3040,8 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
     # is safe to run at all. `entries` replays the resolved content in the
     # original order once we've confirmed nothing is missing.
     entries: list[tuple[str, str, str]] = []  # (kind, skill_name, payload)
+    skill_required_env: list[str] = []
+    plugin_roots: set[Path] = set()
     skipped: list[str] = []
     skipped_reasons: dict[str, str] = {}
     for skill_name in skill_names:
@@ -2988,6 +3084,14 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
             continue
 
         content = str(loaded.get("content") or "").strip()
+        for env_name in _normalize_required_environment_variables(
+            loaded.get("required_environment_variables")
+        ):
+            if env_name not in skill_required_env:
+                skill_required_env.append(env_name)
+        plugin_root = _plugin_root_from_skill_dir(loaded.get("skill_dir"))
+        if plugin_root is not None:
+            plugin_roots.add(plugin_root)
         entries.append(("skill", skill_name, content))
 
     if skipped:
@@ -3034,6 +3138,11 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
             f"Searched: {searched}. Refusing to run the model — fix the skill "
             f"reference (typo, moved/deleted/renamed skill) or remove it from this job's config."
         )
+
+    # All skills resolved successfully.  Install one unambiguous plugin root
+    # and only the explicitly declared values available in this profile's
+    # current secret scope before the model can launch its first subprocess.
+    _install_cron_child_env(skill_required_env, plugin_roots=plugin_roots)
 
     # Second pass: nothing was missing — replay in original order, now with
     # the bump_use side effect (identical to prior behavior).
@@ -4570,6 +4679,12 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         raise ValueError("execution owner token is required for cron finalization")
     lease_heartbeat = None
     interrupted_by_gateway = False
+    from tools.env_passthrough import (
+        begin_env_passthrough_scope,
+        reset_env_passthrough_scope,
+    )
+
+    _env_scope_tokens = begin_env_passthrough_scope()
     try:
         # Pre-run dispatch claim (issue #38758): atomically commit a finite
         # one-shot's dispatch BEFORE its side effect runs, so a tick that dies
@@ -4739,6 +4854,7 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
     finally:
         if lease_heartbeat is not None:
             lease_heartbeat.stop()
+        reset_env_passthrough_scope(_env_scope_tokens)
 
 
 def _notify_provider_jobs_changed() -> None:

@@ -3,11 +3,12 @@
 degraded_secrets_monitor.py — DEGRADED-SECRETS DETECTION (2026-07-04)
 
 The gateway's secrets wrappers (gateway_secrets_wrap.sh, dashboard_secrets_wrap.sh,
-mcp_secrets_wrap.sh) self-recover from a TRANSIENT 1Password outage: 12s-timeout +
-5x retry, and on total failure they log `>>> FATAL: 1Password unreachable ...` and
-exit 1 so launchd relaunches them. That's autonomous RECOVERY. This script is the
-matching autonomous DETECTION: it alerts a human when recovery ISN'T actually
-happening, i.e. either of:
+mcp_secrets_wrap.sh) self-recover from a TRANSIENT 1Password outage with bounded
+retry. On terminal failure they log either the legacy
+`>>> FATAL: 1Password unreachable ...` line or the classified
+`FATAL classification=...` form. This script is the matching autonomous
+DETECTION: it alerts a human when recovery ISN'T actually happening, i.e.
+either of:
 
   (a) FATAL-relaunch loop — the FATAL line appears >= FATAL_THRESHOLD times within
       the trailing FATAL_WINDOW_MIN minutes of gateway.error.log. That means 1Password
@@ -54,7 +55,15 @@ ESCALATION_TASK_ID = os.environ.get("DEGRADED_SECRETS_ALERT_TASK_ID", "86e2610g8
 SLACK_TARGET = os.environ.get("DEGRADED_SECRETS_ALERT_SLACK", "slack:D0BA2PM9CFM")
 SLACK_MENTION = "<@UN4CQ1EGG>"
 
-FATAL_RE = re.compile(r'^(?P<ts>\S+) gateway_secrets_wrap: >>> FATAL: 1Password unreachable')
+# Match the legacy wrapper line plus the source-controlled resolver/launcher
+# classifications.  Deliberately stop at the classification token: callers
+# retain only the parsed timestamp, never the rest of the log line where an
+# SDK exception might contain sensitive material.
+FATAL_RE = re.compile(
+    r"^(?P<ts>\S+) gateway_secrets_wrap: "
+    r"(?:>>> FATAL: 1Password unreachable"
+    r"|FATAL classification=(?:auth|permanent[-_]auth|transient[-_]exhausted))\b"
+)
 PLACEHOLDER_RE = re.compile(
     r"MCP server '(?P<server>[^']+)': header '(?P<header>[^']+)' still contains "
     r"the unresolved placeholder '\$\{(?P<var>[^}]+)\}'"
