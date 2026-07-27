@@ -112,6 +112,39 @@ classify_fixture() {
 [ "$(classify_fixture active target behind)" = behind ] || fail "behind ref was not rejected distinctly"
 [ "$(classify_fixture active target diverged)" = diverged ] || fail "diverged ref was not rejected distinctly"
 
+# A dry cut has no release directory to inspect. Governed source validation
+# must therefore use only the target commit's ls-tree metadata, accept either
+# regular-file mode, and fail closed for every other tree entry shape.
+tree_metadata_fixture() {
+  local fixture_entry="$1" path="$2"
+  (
+    SHA=cccccccccccccccccccccccccccccccccccccccc
+    # shellcheck disable=SC2034 # consumed by dry_run_target_regular_file_metadata.
+    DRY_RUN=1
+    # shellcheck disable=SC2329 # invoked indirectly by metadata helper.
+    git_current() {
+      [ "${1:-}" = ls-tree ] && [ "${2:-}" = "$SHA" ] \
+        && [ "${3:-}" = -- ] && [ "${4:-}" = "$path" ] || return 2
+      printf '%s\n' "$fixture_entry"
+    }
+    dry_run_target_regular_file_metadata "$path"
+  )
+}
+TREE_BLOB=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+TREE_PATH="$VENDORED_REFRESH_REL"
+tree_metadata_fixture "100644 blob $TREE_BLOB	$TREE_PATH" "$TREE_PATH" \
+  || fail "100644 target-tree source was rejected"
+tree_metadata_fixture "100755 blob $TREE_BLOB	$TREE_PATH" "$TREE_PATH" \
+  || fail "100755 target-tree source was rejected"
+expect_failure tree_metadata_fixture '' "$TREE_PATH"
+expect_failure tree_metadata_fixture "120000 blob $TREE_BLOB	$TREE_PATH" "$TREE_PATH"
+expect_failure tree_metadata_fixture "040000 tree $TREE_BLOB	$TREE_PATH" "$TREE_PATH"
+expect_failure tree_metadata_fixture "100644 blob malformed"$'\t'"$TREE_PATH" "$TREE_PATH"
+expect_failure tree_metadata_fixture \
+  "100644 blob $TREE_BLOB"$'\t'"$TREE_PATH"$'\n'"100644 blob $TREE_BLOB"$'\t'"$TREE_PATH" \
+  "$TREE_PATH"
+expect_failure tree_metadata_fixture "100644 blob $TREE_BLOB"$'\t'"$TREE_PATH.unexpected" "$TREE_PATH"
+
 # Receipts are deterministic and content-addressed: repeating the same no-op
 # state reuses one immutable payload and updates the stable last pointer.
 # shellcheck disable=SC2034 # consumed by write_release_receipt from sourced script.
@@ -152,6 +185,20 @@ restore_governed_refresh_for_release "$EMPTY_OLD_RELEASE" >/dev/null
 [ "$(sha256_file "$DEPLOYED_REFRESH")" = "$old_refresh_hash" ] \
   || fail "governed refresh rollback did not restore staged pre-vendor bytes"
 
+# Real cuts retain filesystem validation: tree metadata is a dry-run-only
+# substitute and must never make missing or symlinked sources executable.
+MISSING_GOVERNED_RELEASE="$RELEASES_DIR/v1.0.1-missing-governed"
+mkdir "$MISSING_GOVERNED_RELEASE"
+if install_governed_refresh "$MISSING_GOVERNED_RELEASE"; then
+  fail "real cut accepted missing governed refresh source"
+fi
+SYMLINK_GOVERNED_RELEASE="$RELEASES_DIR/v1.0.2-symlink-governed"
+mkdir -p "$SYMLINK_GOVERNED_RELEASE/$(dirname "$VENDORED_REFRESH_REL")"
+ln -s "$DEPLOYED_REFRESH" "$SYMLINK_GOVERNED_RELEASE/$VENDORED_REFRESH_REL"
+if install_governed_refresh "$SYMLINK_GOVERNED_RELEASE"; then
+  fail "real cut accepted symlinked governed refresh source"
+fi
+
 # The release path invokes the release-owned launchd reconciler with the exact
 # source root and records that rollback is now required. Rollback uses the
 # deployed reconciler through runtime-current and asks it to reload both jobs.
@@ -191,6 +238,26 @@ grep -Fq "install --source-root $(dirname "$LAUNCHD_RECONCILER")" \
 cmp -s "$LAUNCHD_RECONCILER" \
   "$HERMES_HOME/scripts/reconcile_launchd_environment.py" \
   || fail "launchd install did not deploy its rollback reconciler"
+MISSING_RECONCILER_RELEASE="$RELEASES_DIR/v1.1.1-missing-reconciler"
+mkdir "$MISSING_RECONCILER_RELEASE"
+if install_governed_launchd_environment "$MISSING_RECONCILER_RELEASE"; then
+  fail "real cut accepted missing launchd reconciler"
+fi
+if install_governed_marketplace_skills "$MISSING_RECONCILER_RELEASE"; then
+  fail "real cut accepted missing marketplace reconciler"
+fi
+SYMLINK_RECONCILER_RELEASE="$RELEASES_DIR/v1.1.2-symlink-reconciler"
+mkdir -p "$SYMLINK_RECONCILER_RELEASE/$(dirname "$VENDORED_LAUNCHD_RECONCILER_REL")"
+ln -s "$LAUNCHD_RECONCILER" \
+  "$SYMLINK_RECONCILER_RELEASE/$VENDORED_LAUNCHD_RECONCILER_REL"
+ln -s "$LAUNCHD_RECONCILER" \
+  "$SYMLINK_RECONCILER_RELEASE/$VENDORED_SKILLS_RECONCILER_REL"
+if install_governed_launchd_environment "$SYMLINK_RECONCILER_RELEASE"; then
+  fail "real cut accepted symlinked launchd reconciler"
+fi
+if install_governed_marketplace_skills "$SYMLINK_RECONCILER_RELEASE"; then
+  fail "real cut accepted symlinked marketplace reconciler"
+fi
 
 # A later cut starts with an unarmed in-process marker. If reconciliation fails
 # during validation/before snapshot creation, it must not consume the previous
@@ -337,6 +404,115 @@ fi
 [ "$(cat "$RECEIPT_OUTSIDE")" = "must remain untouched" ] \
   || fail "receipt symlink failure modified the symlink target"
 rm "$LAST_RECEIPT_FILE"
+
+# End-to-end dry cuts validate governed sources from the immutable target tree,
+# never create the planned release directory, and leave the active runtime,
+# deployed refresh, receipts, reloads, and reconcilers untouched. The target
+# refresh bytes are deliberately different from the deployed bytes: dry-run
+# must plan post-install verification, not compare against undeployed state.
+DRY_ROOT="$(cd -P "$TEST_ROOT" && pwd -P)/dry-run"
+DRY_HOME="$DRY_ROOT/home"
+DRY_HERMES="$DRY_HOME/.hermes"
+DRY_RELEASES="$DRY_HERMES/releases"
+DRY_ACTIVE="$DRY_RELEASES/v1.9.0-active"
+DRY_BIN="$DRY_ROOT/bin"
+DRY_GIT_LOG="$DRY_ROOT/git.log"
+DRY_RELOAD_LOG="$DRY_ROOT/reloads.log"
+DRY_TARGET_SHA=cccccccccccccccccccccccccccccccccccccccc
+DRY_TARGET_BLOB=dddddddddddddddddddddddddddddddddddddddd
+mkdir -p "$DRY_ACTIVE" "$DRY_HERMES/scripts" "$DRY_BIN"
+ln -s "$DRY_ACTIVE" "$DRY_HERMES/runtime-current"
+printf '#!/usr/bin/env python3\nprint("deployed refresh")\n' > "$DRY_HERMES/scripts/clickup_workspace_refresh.py"
+chmod 0755 "$DRY_HERMES/scripts/clickup_workspace_refresh.py"
+dry_refresh_before="$(sha256_file "$DRY_HERMES/scripts/clickup_workspace_refresh.py")"
+dry_target_refresh_hash="$(printf '#!/usr/bin/env python3\nprint("target refresh")\n' | shasum -a 256 | awk '{print $1}')"
+[ "$dry_refresh_before" != "$dry_target_refresh_hash" ] \
+  || fail "dry-run fixture did not use divergent deployed and target refresh content"
+cat > "$DRY_BIN/git" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "$DRY_GIT_LOG"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -C|-c) shift 2 ;;
+    *) break ;;
+  esac
+done
+case "${1:-}" in
+  remote)
+    printf 'ssh://example.invalid/hermes-agent.git\n'
+    ;;
+  rev-parse)
+    target="${!#}"
+    case "$target" in
+      origin/*) printf '%s\n' "$DRY_TARGET_SHA" ;;
+      HEAD*) printf '%s\n' aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ;;
+      *) exit 1 ;;
+    esac
+    ;;
+  show|cat-file)
+    printf 'unexpected target blob read during dry run\n' >&2
+    exit 97
+    ;;
+  ls-tree)
+    [ "${2:-}" = "$DRY_TARGET_SHA" ] && [ "${3:-}" = -- ] || exit 2
+    target_path="${4:-}"
+    case "$target_path" in
+      machine-setup/mini-scripts/clickup_workspace_refresh.py|\
+      machine-setup/mini-scripts/reconcile_launchd_environment.py|\
+      machine-setup/mini-scripts/reconcile_marketplace_skills.py)
+        printf '100755 blob %s\t%s\n' "$DRY_TARGET_BLOB" "$target_path"
+        ;;
+      *) exit 3 ;;
+    esac
+    ;;
+  *) exit 2 ;;
+esac
+SH
+cat > "$DRY_BIN/launchctl" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$DRY_RELOAD_LOG"
+SH
+cat > "$DRY_BIN/npm" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+cat > "$DRY_BIN/uv" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+chmod 0755 "$DRY_BIN/git" "$DRY_BIN/launchctl" "$DRY_BIN/npm" "$DRY_BIN/uv"
+if ! HOME="$DRY_HOME" HERMES_HOME="$DRY_HERMES" PATH="$DRY_BIN:$PATH" \
+  DRY_GIT_LOG="$DRY_GIT_LOG" DRY_RELOAD_LOG="$DRY_RELOAD_LOG" \
+  DRY_TARGET_SHA="$DRY_TARGET_SHA" DRY_TARGET_BLOB="$DRY_TARGET_BLOB" \
+  "$SCRIPT" --dry-run --ref dry-target > "$DRY_ROOT/output" 2>&1; then
+  fail "end-to-end dry cut failed despite valid immutable target metadata"
+fi
+DRY_PLANNED="$DRY_RELEASES/v0.0.0-dry-run-${DRY_TARGET_SHA:0:12}"
+[ ! -e "$DRY_PLANNED" ] && [ ! -L "$DRY_PLANNED" ] \
+  || fail "dry cut created the planned release directory"
+[ "$(readlink "$DRY_HERMES/runtime-current")" = "$DRY_ACTIVE" ] \
+  || fail "dry cut changed runtime-current"
+[ "$(sha256_file "$DRY_HERMES/scripts/clickup_workspace_refresh.py")" = "$dry_refresh_before" ] \
+  || fail "dry cut changed the deployed refresh script"
+[ ! -e "$DRY_RELEASES/.previous" ] \
+  || fail "dry cut wrote the previous-release record"
+[ -z "$(find "$DRY_RELEASES" -maxdepth 1 -type f -name '.mini-release-*' -print)" ] \
+  || fail "dry cut wrote a release receipt or refresh backup"
+[ ! -e "$DRY_RELOAD_LOG" ] || fail "dry cut triggered a launchd reload"
+[ ! -e "$DRY_HERMES/launchd-reconciler-calls" ] \
+  || fail "dry cut executed a governed reconciler"
+grep -Fq "ls-tree $DRY_TARGET_SHA -- $VENDORED_REFRESH_REL" "$DRY_GIT_LOG" \
+  || fail "dry cut did not validate refresh metadata from the target tree"
+grep -Fq "ls-tree $DRY_TARGET_SHA -- $VENDORED_LAUNCHD_RECONCILER_REL" "$DRY_GIT_LOG" \
+  || fail "dry cut did not validate launchd reconciler metadata from the target tree"
+grep -Fq "ls-tree $DRY_TARGET_SHA -- $VENDORED_SKILLS_RECONCILER_REL" "$DRY_GIT_LOG" \
+  || fail "dry cut did not validate marketplace reconciler metadata from the target tree"
+if grep -Eq ' (show|cat-file) ' "$DRY_GIT_LOG"; then
+  fail "dry cut materialized a target blob"
+fi
+grep -Fq 'verify governed refresh post-install SHA-256 equality (deferred to real cut)' "$DRY_ROOT/output" \
+  || fail "dry cut did not print deferred refresh verification"
 
 # Polling artifacts are source-controlled, point only at the conditional
 # release mode, and the plist is parseable without requiring launchd.
