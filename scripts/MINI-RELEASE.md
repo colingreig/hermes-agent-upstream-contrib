@@ -36,9 +36,11 @@ Tracked in ClickUp `86e2ddah5`.
   both SHA-256 values in a content-addressed receipt.
 - The canonical launchd environment lives in
   `machine-setup/mini-scripts/` and is installed by
-  `reconcile_launchd_environment.py`: source-identical wrappers/minter/resolver,
-  a reference-only secret file, and generated gateway/dashboard plists. Its
-  content-addressed snapshot restores exact prior bytes on rollback.
+  `reconcile_launchd_environment.py`: the reconciler itself,
+  source-identical wrappers/minter/resolver, a governed reference-only secret
+  file merged from the complete validated `op-secrets.env` inventory plus
+  required source-controlled keys, and generated gateway/dashboard plists.
+  Its content-addressed snapshot restores exact prior bytes on rollback.
 - `.mini-release-last-receipt.json` is the stable latest receipt; immutable
   `.mini-release-receipt-<sha256>.json` siblings are addressed by their exact
   payload bytes.

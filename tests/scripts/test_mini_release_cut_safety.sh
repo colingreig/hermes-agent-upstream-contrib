@@ -163,7 +163,22 @@ cat > "$LAUNCHD_RELEASE/venv/bin/python" <<'SH'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$HERMES_HOME/launchd-reconciler-calls"
 case " $* " in
-  *" install "*) [ "${FAKE_RECONCILER_FAIL_INSTALL:-0}" -eq 0 ] || exit 42 ;;
+  *" install "*)
+    [ "${FAKE_RECONCILER_FAIL_INSTALL:-0}" -eq 0 ] || exit 42
+    source_root=
+    while [ "$#" -gt 0 ]; do
+      if [ "$1" = "--source-root" ]; then
+        source_root="$2"
+        break
+      fi
+      shift
+    done
+    [ -n "$source_root" ] || exit 43
+    mkdir -p "$HERMES_HOME/scripts"
+    cp "$source_root/reconcile_launchd_environment.py" \
+      "$HERMES_HOME/scripts/reconcile_launchd_environment.py"
+    chmod 0755 "$HERMES_HOME/scripts/reconcile_launchd_environment.py"
+    ;;
 esac
 SH
 chmod 0755 "$LAUNCHD_RELEASE/venv/bin/python"
@@ -173,6 +188,9 @@ install_governed_launchd_environment "$LAUNCHD_RELEASE"
 grep -Fq "install --source-root $(dirname "$LAUNCHD_RECONCILER")" \
   "$HERMES_HOME/launchd-reconciler-calls" \
   || fail "release did not invoke launchd install from its canonical source root"
+cmp -s "$LAUNCHD_RECONCILER" \
+  "$HERMES_HOME/scripts/reconcile_launchd_environment.py" \
+  || fail "launchd install did not deploy its rollback reconciler"
 
 # A later cut starts with an unarmed in-process marker. If reconciliation fails
 # during validation/before snapshot creation, it must not consume the previous
@@ -193,7 +211,6 @@ calls_after_failed_rollback="$(wc -l < "$HERMES_HOME/launchd-reconciler-calls" |
 
 # The first successful generation remains independently rollback-capable.
 LAUNCHD_ENV_CHANGED=1
-cp "$LAUNCHD_RECONCILER" "$HERMES_HOME/scripts/reconcile_launchd_environment.py"
 ln -s "$LAUNCHD_RELEASE" "$CURRENT_LINK"
 rollback_governed_launchd_environment "test rollback"
 [ "$LAUNCHD_ENV_CHANGED" -eq 0 ] \

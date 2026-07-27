@@ -13,9 +13,11 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 from typing import Any
 
 SCRIPT_ASSETS = (
+    "reconcile_launchd_environment.py",
     "gateway_secrets_wrap.sh",
     "dashboard_secrets_wrap.sh",
     "gateway_launch_inner.sh",
@@ -24,6 +26,7 @@ SCRIPT_ASSETS = (
 )
 REFERENCE_SOURCE = "launchd-secrets.op-env.template"
 REFERENCE_TARGET = "launchd-secrets.op-env"
+COMPREHENSIVE_REFERENCE_SOURCE = "op-secrets.env"
 GATEWAY_LABEL = "ai.hermes.gateway"
 DASHBOARD_LABEL = "com.colingreig.hermes-dashboard"
 EXPECTED_REFERENCE_KEYS = {
@@ -33,8 +36,15 @@ EXPECTED_REFERENCE_KEYS = {
     "OPENAI_API_KEY_HERMES",
 }
 LAUNCHCTL_BOOTSTRAP_EIO = 5
+LAUNCHCTL_BOOTSTRAP_IN_PROGRESS = 37
+LAUNCHCTL_TRANSIENT_BOOTSTRAP_CODES = {
+    LAUNCHCTL_BOOTSTRAP_EIO,
+    LAUNCHCTL_BOOTSTRAP_IN_PROGRESS,
+}
 LAUNCHCTL_BOOTSTRAP_ATTEMPTS = 3
 LAUNCHCTL_TIMEOUT_SECONDS = 30
+LAUNCHCTL_STATE_POLL_ATTEMPTS = 60
+LAUNCHCTL_STATE_POLL_INTERVAL_SECONDS = 0.1
 
 
 def _sha256(data: bytes) -> str:
@@ -91,6 +101,10 @@ class Reconciler:
         )
         self.gateway_wrapper = self.scripts_dir / "gateway_secrets_wrap.sh"
         self.dashboard_wrapper = self.scripts_dir / "dashboard_secrets_wrap.sh"
+        self.reference_target = self.scripts_dir / REFERENCE_TARGET
+        self.comprehensive_reference_source = (
+            self.scripts_dir / COMPREHENSIVE_REFERENCE_SOURCE
+        )
         self.gateway_plist = self.launch_agents_dir / f"{GATEWAY_LABEL}.plist"
         self.dashboard_plist = self.launch_agents_dir / f"{DASHBOARD_LABEL}.plist"
 
@@ -102,7 +116,7 @@ class Reconciler:
             self.scripts_dir / name: (self.source_path(name), 0o755)
             for name in SCRIPT_ASSETS
         }
-        result[self.scripts_dir / REFERENCE_TARGET] = (
+        result[self.reference_target] = (
             self.source_path(REFERENCE_SOURCE),
             0o600,
         )
@@ -110,26 +124,62 @@ class Reconciler:
         result[self.dashboard_plist] = (None, 0o644)
         return result
 
+    @staticmethod
+    def _parse_references(path: Path) -> dict[str, str]:
+        if path.is_symlink() or not path.is_file():
+            raise RuntimeError(f"secret reference file missing or symlinked: {path}")
+        refs: dict[str, str] = {}
+        for raw in path.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" not in line:
+                raise RuntimeError(f"secret reference file contains malformed line: {path}")
+            key, value = (part.strip() for part in line.split("=", 1))
+            if (
+                not key
+                or not (key[0].isalpha() or key[0] == "_")
+                or not all(char.isalnum() or char == "_" for char in key)
+            ):
+                raise RuntimeError(f"secret reference file contains invalid key: {path}")
+            if key in refs:
+                raise RuntimeError(
+                    f"secret reference file contains duplicate key {key}: {path}"
+                )
+            if not value.startswith("op://"):
+                raise RuntimeError(f"secret reference file contains a value for {key}")
+            refs[key] = value
+        return refs
+
+    def _reference_inventory(self) -> bytes:
+        required = self._parse_references(self.source_path(REFERENCE_SOURCE))
+        refs: dict[str, str] = {}
+        if (
+            self.comprehensive_reference_source.exists()
+            or self.comprehensive_reference_source.is_symlink()
+        ):
+            refs.update(self._parse_references(self.comprehensive_reference_source))
+        # Source-controlled launch requirements always win over an older
+        # comprehensive manifest while every other validated reference is
+        # retained for configured gateway platforms and integrations.
+        refs.update(required)
+        return "".join(f"{key}={refs[key]}\n" for key in sorted(refs)).encode()
+
     def validate_sources(self) -> None:
         for name in (*SCRIPT_ASSETS, REFERENCE_SOURCE):
             source = self.source_path(name)
             if not source.is_file() or source.is_symlink():
                 raise RuntimeError(f"canonical source missing or symlinked: {source}")
-        refs: dict[str, str] = {}
-        for raw in self.source_path(REFERENCE_SOURCE).read_text(encoding="utf-8").splitlines():
-            line = raw.strip()
-            if not line or line.startswith("#"):
-                continue
-            if "=" not in line:
-                raise RuntimeError("secret reference template contains malformed line")
-            key, value = (part.strip() for part in line.split("=", 1))
-            if not value.startswith("op://"):
-                raise RuntimeError(f"secret reference template contains a value for {key}")
-            refs[key] = value
+        refs = self._parse_references(self.source_path(REFERENCE_SOURCE))
         if set(refs) != EXPECTED_REFERENCE_KEYS:
             raise RuntimeError(
                 "secret reference template keys differ from canonical contract"
             )
+        if (
+            self.comprehensive_reference_source.exists()
+            or self.comprehensive_reference_source.is_symlink()
+        ):
+            self._parse_references(self.comprehensive_reference_source)
 
     def validate_gateway_config(self) -> None:
         config_path = self.hermes_home / "config.yaml"
@@ -189,6 +239,7 @@ class Reconciler:
             self._plist(label=DASHBOARD_LABEL, wrapper=self.dashboard_wrapper),
             0o644,
         )
+        desired[self.reference_target] = (self._reference_inventory(), 0o600)
         return desired
 
     def _snapshot(self) -> str:
@@ -348,6 +399,40 @@ class Reconciler:
         except (subprocess.TimeoutExpired, OSError):
             return False
 
+    def _wait_for_registration_state(
+        self,
+        domain: str,
+        label: str,
+        *,
+        registered: bool,
+        attempts: int = LAUNCHCTL_STATE_POLL_ATTEMPTS,
+    ) -> bool:
+        if attempts < 1:
+            raise ValueError("launchctl state poll attempts must be positive")
+        for attempt in range(1, attempts + 1):
+            if self._registered(domain, label) is registered:
+                return True
+            if attempt < attempts:
+                time.sleep(LAUNCHCTL_STATE_POLL_INTERVAL_SECONDS)
+        return False
+
+    def _wait_until_unregistered(self, domain: str, label: str) -> None:
+        if not self._wait_for_registration_state(
+            domain,
+            label,
+            registered=False,
+        ):
+            raise RuntimeError(
+                f"launchctl did not unregister {domain}/{label} after bounded wait"
+            )
+
+    def _wait_until_registered(self, domain: str, label: str) -> bool:
+        return self._wait_for_registration_state(
+            domain,
+            label,
+            registered=True,
+        )
+
     def _bootstrap_until_registered(
         self,
         domain: str,
@@ -356,7 +441,7 @@ class Reconciler:
         *,
         attempts: int = LAUNCHCTL_BOOTSTRAP_ATTEMPTS,
     ) -> None:
-        """Bound bootstrap retries, recover stale EIO, and prove registration."""
+        """Bound bootstrap retries and prove this generation registered."""
         if attempts < 1:
             raise ValueError("launchctl bootstrap attempts must be positive")
         last_error: BaseException | None = None
@@ -371,30 +456,26 @@ class Reconciler:
                 )
             except subprocess.CalledProcessError as exc:
                 last_error = exc
-                if exc.returncode == LAUNCHCTL_BOOTSTRAP_EIO:
-                    # EIO commonly means the prior registration survived the
-                    # first bootout. Drop it once and retry this attempt.
-                    self._bootout(domain, label)
-                    try:
-                        subprocess.run(
-                            ["launchctl", "bootstrap", domain, str(plist)],
-                            check=True,
-                            timeout=LAUNCHCTL_TIMEOUT_SECONDS,
-                            stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL,
-                        )
-                        last_error = None
-                    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as retry_exc:
-                        last_error = retry_exc
+                if exc.returncode not in LAUNCHCTL_TRANSIENT_BOOTSTRAP_CODES:
+                    break
+                # EIO and EINPROGRESS both occur while launchd is still
+                # tearing down the prior generation. The bounded cleanup
+                # below prepares the next attempt.
             except (subprocess.TimeoutExpired, OSError) as exc:
                 last_error = exc
-
-            if self._registered(domain, label):
-                return
+            else:
+                # Only a zero-exit bootstrap can establish provenance for the
+                # registration observed here. A stale pre-bootstrap label can
+                # never satisfy this branch.
+                if self._wait_until_registered(domain, label):
+                    return
+                last_error = RuntimeError(
+                    f"launchctl bootstrap succeeded but {domain}/{label} "
+                    "did not register after bounded wait"
+                )
             if attempt < attempts:
-                # Ensure a zero-exit-but-unregistered or partial registration
-                # cannot turn the next bootstrap into an unrecovered EIO.
                 self._bootout(domain, label)
+                self._wait_until_unregistered(domain, label)
 
         message = (
             f"launchctl failed to register {domain}/{label} after "
@@ -411,6 +492,7 @@ class Reconciler:
             (DASHBOARD_LABEL, self.dashboard_plist),
         ):
             self._bootout(domain, label)
+            self._wait_until_unregistered(domain, label)
             if not plist.is_file():
                 continue
             self._bootstrap_until_registered(domain, label, plist)
