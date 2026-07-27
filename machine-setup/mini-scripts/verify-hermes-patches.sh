@@ -1092,8 +1092,8 @@ PY
 then grn "config     pre_tool_call hooks wired (terminal + MCP merge)"
 else red "config     pre_tool_call merge-guard hooks MISSING in config.yaml — re-add both matchers, then: launchctl kickstart -k gui/$UID_NUM/ai.hermes.gateway"; FAIL=1; fi
 # 10c. BEHAVIORAL: guard BLOCKS a merge and ALLOWS a merge-themed pr create (shadow)
-mg_block=$(printf '%s' '{"tool_name":"terminal","tool_input":{"command":"gh pr merge 35 --squash"}}' | VALIDATE_SHADOW=true HERMES_AUTONOMOUS_MERGE= "$HOOK_PY" "$MG" 2>/dev/null)
-mg_allow=$(printf '%s' '{"tool_name":"terminal","tool_input":{"command":"gh pr create --title \"fix merge conflict\""}}' | VALIDATE_SHADOW=true HERMES_AUTONOMOUS_MERGE= "$HOOK_PY" "$MG" 2>/dev/null)
+mg_block=$(printf '%s' '{"tool_name":"terminal","tool_input":{"command":"gh pr merge 35 --squash"}}' | HERMES_MERGE_SHADOW=1 HERMES_AUTONOMOUS_MERGE= "$HOOK_PY" "$MG" 2>/dev/null)
+mg_allow=$(printf '%s' '{"tool_name":"terminal","tool_input":{"command":"gh pr create --title \"fix merge conflict\""}}' | HERMES_MERGE_SHADOW=1 HERMES_AUTONOMOUS_MERGE= "$HOOK_PY" "$MG" 2>/dev/null)
 if echo "$mg_block" | grep -q '"decision": *"block"' && ! echo "$mg_allow" | grep -q block; then
   grn "behavior   guard BLOCKS gh pr merge, ALLOWS gh pr create (no false-positive)"
 else
@@ -1106,13 +1106,13 @@ fi
 # specific gate fires. cmd_merge_pr is defense-in-depth: the verdict gate runs
 # FIRST (refuses "no validator verdict on record, fail-closed" when PR #35 has
 # no verdict), and only a PR that passes the verdict gate reaches the
-# VALIDATE_SHADOW shadow-refusal branch. PR #35's verdict-store state is
+# HERMES_MERGE_SHADOW shadow-refusal branch. PR #35's verdict-store state is
 # incidental and time-varying, so asserting ONLY the shadow substring made 10d
 # intermittently false-RED whenever #35 had no verdict (the common case) — a
 # stale test, not a real hole (task 86e1yjkzf). Accept refusal via EITHER gate;
 # go red ONLY if the merge is genuinely NOT refused.
-val_out=$(VALIDATE_SHADOW=true "$HOOK_PY" "$VAL_OPS" merge-pr colingreig/ignite-digital-engine 35 --squash 2>&1 || true)
-if echo "$val_out" | grep -qiE 'VALIDATE_SHADOW|verdict gate refuses|refuses merge|fail-closed'; then
+val_out=$(HERMES_MERGE_SHADOW=1 "$HOOK_PY" "$VAL_OPS" merge-pr colingreig/ignite-digital-engine 35 --squash 2>&1 || true)
+if echo "$val_out" | grep -qiE 'HERMES_MERGE_SHADOW|verdict gate refuses|refuses merge|fail-closed'; then
   grn "validator  cmd_merge_pr refuses live merge in shadow (verdict-gate or shadow branch)"
 else
   red "validator  cmd_merge_pr did NOT refuse live merge — live merge possible while writeback muzzled"; FAIL=1
