@@ -22,8 +22,12 @@ POLICY: block a merge attempt when the pipeline is in shadow mode
 
 FAIL CLOSED: any internal error while handling a *matched merge* still blocks.
 The only fail-open is the runtime's own hook timeout/crash handling
-(shell_hooks.py:439-444), so this guard is tiny, stdlib-only, no network/
-subprocess (finishes far under the 10s timeout).
+(shell_hooks.py:439-444). The bulk of this guard (command matching) is tiny
+and stdlib-only; the verdict gate for a MATCHED merge does one bounded `gh`
+round-trip (via autonomous_merge._pr_state) to resolve the PR's exact current
+head before checking the verdict store, and fails closed on any fetch error
+or exception — same "no exact head, no merge" contract as everything else in
+this pipeline (is_pass_fresh() requires an exact head_sha).
 
 COVERAGE (matched against the command STRING, argv-independent — catches bare
 `gh`, absolute `/opt/homebrew/bin/gh`, the `/tmp/gh_with_token.sh` wrapper, the
@@ -47,8 +51,10 @@ import sys
 # deployed guard has this canonical sibling, and an import failure must be
 # visible as a fail-closed guard error rather than silently changing modules.
 if __package__:
+    from . import autonomous_merge
     from . import validator_verdict
 else:
+    import autonomous_merge
     import validator_verdict
 
 BLOCK_REASON = (
@@ -144,14 +150,27 @@ def _extract_repo_pr(tool_name, tool_input, cmd):
 
 def _verdict_gate(tool_name, tool_input, cmd):
     """Return (allowed, reason). A merge needs a fresh PASS verdict for the exact
-    PR. Unknown PR / no verdict / BLOCK / stale = fail closed."""
+    PR. Unknown PR / no verdict / BLOCK / stale = fail closed.
+
+    is_pass_fresh() requires an exact head_sha (its own fail-closed contract —
+    "exact current PR head is required"), so this resolves the PR's CURRENT
+    head via autonomous_merge._pr_state — the same live-head source
+    autonomous_merge.evaluate()/_merge_readiness() and the merge sweep use —
+    before checking the verdict store. Without this the gate always failed
+    closed (dead code below this point), silently making the allow path and
+    the tier-specific refusal messages unreachable.
+    """
     if validator_verdict is None:
         return False, "verdict store module unavailable (fail-closed)"
     repo, pr = _extract_repo_pr(tool_name, tool_input, cmd)
     if not repo or not pr:
         return False, "could not determine which PR is being merged (fail-closed)"
     try:
-        ok, why = validator_verdict.is_pass_fresh(repo, pr)
+        info, err = autonomous_merge._pr_state(repo, pr)
+        if err or not info or not info.get("head"):
+            return False, (f"could not resolve the PR's current head (fail-closed): "
+                           f"{err or 'no head returned'}")
+        ok, why = validator_verdict.is_pass_fresh(repo, pr, info["head"])
         if not ok:
             return False, why
         tier = (validator_verdict.verdict_for(repo, pr) or {}).get("tier", "high")

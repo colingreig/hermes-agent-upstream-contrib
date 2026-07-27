@@ -398,12 +398,26 @@ def validate(
         # (--no-panel) run must ALWAYS produce a shadow verdict — a zero-LLM
         # smoke test can never mint a merge-eligible PASS, regardless of tier
         # or env.
+        # Panel-degraded verdicts must never be merge-eligible (re-review fix,
+        # 2026-07-27): validator_panel.run() defers to a PASS-with-warning
+        # when its own infra failed — no model chain resolved
+        # (panel_ran=False, infra_failure=True), every lens erroring
+        # (panel_ran=False, infra_failure=True), AND the milder case where
+        # only SOME lenses errored and the verdict rests on the rest
+        # (panel_ran=True, infra_failure=True — see validator_panel.py's
+        # "partial-lens-error" branch). In every one of those, "infra_failure"
+        # is set whenever the panel didn't genuinely/fully review the diff, so
+        # a single check on that key (not conditioned on panel_ran) covers all
+        # three shapes. A verdict from a degraded panel is still recorded —
+        # just never merge-eligible.
+        panel_degraded = bool(panel) and bool(panel.get("infra_failure"))
         kept, immutable = validator_verdict.finalize_shadow_review(session, {
             "verdict": verdict, "tier": tier, "task_id": task,
             "head_sha": identity.head_sha, "expected_repo": identity.canonical_repo,
             "model_used": model_used, "findings": findings, "shadow": shadow,
             "ts": validator_verdict._now_iso(),
-        }, validator_review=True, force_shadow=bool(shadow) or not allow_panel)
+        }, validator_review=True,
+           force_shadow=bool(shadow) or not allow_panel or panel_degraded)
         result["shadow"] = kept.get("shadow", True)
         if immutable:
             _log(f"[validate_pr] {repo}#{pr} immutable terminal verdict held for "

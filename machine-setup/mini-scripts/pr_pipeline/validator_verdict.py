@@ -332,6 +332,22 @@ def finalize_shadow_review(
     if session.lease is None:
         raise VerdictStoreError("shadow review session has no live fencing lease")
     stamped = dict(record)
+    # VALIDATOR-ONLY SECRET CHECK (in-process forgery residual close-out): an
+    # executor holding a lease can call this function directly with
+    # validator_review=True from inline Python — the lease alone doesn't prove
+    # the caller IS the validator daemon. HERMES_VALIDATOR_FINALIZE_TOKEN is a
+    # secret-shaped env var, so Hermes' own executor-subprocess scrubbing (see
+    # skill subprocess secret passthrough) strips it from every executor
+    # process; only the validator's own long-lived process env has it. We
+    # never compare it against a hard-coded value — there is nothing to leak
+    # or replay — its mere PRESENCE in this process's environment is the
+    # signal that this process is the validator, not the executor. A missing
+    # token must degrade to shadow, never raise (fail-safe: an
+    # under-provisioned validator loses merge eligibility, not availability).
+    if validator_review and not force_shadow and not (
+        os.environ.get("HERMES_VALIDATOR_FINALIZE_TOKEN", "") or ""
+    ).strip():
+        validator_review = False
     if not validator_review or force_shadow:
         # Not the validator's fenced review flow (or the validator explicitly
         # requested shadow): the verdict is recorded but NEVER merge-eligible.

@@ -298,7 +298,13 @@ class VerdictForgeryTests(unittest.TestCase):
             session = validator_verdict.begin_shadow_review(trusted, path=ledger)
             # Simulate the lease dying (expiry/supersession) before finalize.
             session.store.release(session.lease)
-            with mock.patch.dict(os.environ, _merge_env(HERMES_MERGE_ACTIVE="1")):
+            # HERMES_VALIDATOR_FINALIZE_TOKEN present: this exercises the real
+            # validator-identity path (2026-07-27 anti-forgery hardening) so
+            # the assertion below still proves the lease-liveness check itself
+            # fails closed, rather than exercising the token-missing fallback.
+            with mock.patch.dict(os.environ, _merge_env(
+                HERMES_MERGE_ACTIVE="1", HERMES_VALIDATOR_FINALIZE_TOKEN="test-token",
+            )):
                 with self.assertRaises(validator_verdict.VerdictStoreError) as caught:
                     validator_verdict.finalize_shadow_review(
                         session,
@@ -322,7 +328,14 @@ class VerdictForgeryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             ledger = Path(directory) / "verdicts.sqlite3"
             with (
-                mock.patch.dict(os.environ, _merge_env(HERMES_MERGE_ACTIVE="1")),
+                # HERMES_VALIDATOR_FINALIZE_TOKEN present: this test asserts
+                # what a REAL validator process (2026-07-27 anti-forgery
+                # hardening: the token models "this process is the validator")
+                # finalizes when active — not the missing-token fallback,
+                # which is covered by test_pr_pipeline_reereview_fixes.py.
+                mock.patch.dict(os.environ, _merge_env(
+                    HERMES_MERGE_ACTIVE="1", HERMES_VALIDATOR_FINALIZE_TOKEN="test-token",
+                )),
                 mock.patch.object(validate_pr.vc, "fetch_pr_diff", return_value="diff --git a/a.py b/a.py\n"),
                 mock.patch.object(validate_pr.vc, "pr_head_sha", return_value=trusted.head_sha),
                 mock.patch.object(validate_pr.vt, "run", return_value={"tier": "low", "findings": []}),
