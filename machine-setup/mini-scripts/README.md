@@ -1,12 +1,9 @@
 # Mini-local scripts (canonical copies)
 
 These scripts run on the Mac mini at `~/.hermes/scripts/` but live **outside**
-the mini's git-tracked release/runtime-current deploy path (see
-`hermes_cli/gateway.py` / `hermes update`) — nothing in this repo's deploy
-pipeline provisions, copies, or regenerates `~/.hermes/scripts/*`. That
-independence is normally fine, but it also means these files have no backup
-story beyond the mini's own `.bak-*` files and whatever restic snapshot
-happens to be current.
+the immutable release directory. Most remain manual-copy assets; governed
+exceptions below are installed transactionally by `scripts/mini-release-cut.sh`
+with source/deployed identity checks and rollback snapshots.
 
 The 2026-07-19 mini home-directory data-loss incident (see ClickUp 86e2ddcpb)
 proved that gap real: the `op_sdk_resolve.py` resilience patch (300s cache +
@@ -113,6 +110,41 @@ under `pr_pipeline/`. Do not compare or copy those files one at a time.
 
 ## Files
 
+- `reconcile_launchd_environment.py` — governed installer for
+  `gateway_secrets_wrap.sh`, `dashboard_secrets_wrap.sh`,
+  `gateway_launch_inner.sh`, `github_app_token.py`, `op_sdk_resolve.py`, the
+  reference-only `launchd-secrets.op-env.template`, and both generated
+  LaunchAgent plists. It atomically replaces regular files, records exact
+  content-addressed rollback snapshots and hash receipts, and rejects a
+  `config.yaml` whose `gateway.launchd_secrets_wrapper` is not the canonical
+  installed gateway wrapper. Plists point only to wrappers and use
+  `KeepAlive.SuccessfulExit=false`: permanent authentication errors exit
+  cleanly and park, while transient exhaustion remains nonzero/retryable.
+- `reconcile_marketplace_skills.py` — governed installer for the canonical
+  external-skill roots, `skills.index_floor`, the ignite/Anthropic pull
+  wrappers, and their LaunchAgent plists. It retires only the exact legacy
+  `com.ignite.skills-sync` plist/job, rejects missing or symlink-escaped roots,
+  records source/deployed SHA-256 receipts, and snapshots config plus all owned
+  paths for exact release rollback. Successful pulls write parseable UTC JSON
+  evidence under `~/.hermes/state/skill-pulls/`; the verifier checks both jobs
+  are loaded and each source remains within three scheduled cadences. Pulls
+  fail before fetch/evidence when tracked or untracked prompt-visible content
+  is dirty. Their directory locks carry PID + process-start ownership, reject
+  live contention, and reclaim dead/reboot-stale owners without a permanent
+  mkdir wedge. Changed pulls publish a catalog generation observed by the
+  running gateway/dashboard; those processes clear only future-session and
+  catalog caches, never an existing conversation's byte-stable system prompt.
+- `github_app_token.py` — mints a short-lived GitHub App installation token.
+  Both service wrappers invoke it with the absolute runtime Python, require a
+  non-empty token, and never log the token or credentials. The gateway inner
+  wrapper alone maps `OPENAI_API_KEY_HERMES` to `OPENAI_API_KEY` and exports
+  the canonical LOW/MEDIUM/HIGH validator chain.
+- `clickup_workspace_refresh.py` — canonical source for the Mini's protected
+  `~/.hermes/scripts/clickup_workspace_refresh.py`. Unlike legacy manual-copy
+  entries, this file is installed by `scripts/mini-release-cut.sh`: source and
+  deployed SHA-256 values are recorded in a content-addressed release receipt,
+  and rollback atomically restores the prior release's source or the staged
+  pre-vendor bytes.
 - `op_sdk_resolve.py` — resolves `op://` secret references for
   `gateway_secrets_wrap.sh` and cron/sentinel scripts. **Connect-first since
   2026-07-24**: prefers a locally-run 1Password Connect server (see

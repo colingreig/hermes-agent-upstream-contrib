@@ -33,6 +33,7 @@ from agent.prompt_builder import (
     SESSION_SEARCH_GUIDANCE,
     PLATFORM_HINTS,
     WSL_ENVIRONMENT_HINT,
+    _resolve_skill_dir_scope,
 )
 from hermes_cli.nous_subscription import NousFeatureState, NousSubscriptionFeatures
 
@@ -53,6 +54,28 @@ class TestGuidanceConstants:
     def test_session_search_guidance_is_simple_cross_session_recall(self):
         assert "relevant cross-session context exists" in SESSION_SEARCH_GUIDANCE
         assert "recent turns of the current session" not in SESSION_SEARCH_GUIDANCE
+
+
+class TestCanonicalSkillRoleScope:
+    def test_dev_scope_has_only_canonical_ops_and_anthropic_roots(self):
+        scope = _resolve_skill_dir_scope("dev-executor")
+
+        assert scope == frozenset(
+            {
+                "/Users/colingreig/dev/ignite-skills-live/skills",
+                "/Users/colingreig/.claude/plugins/marketplaces/anthropic-agent-skills/skills",
+            }
+        )
+
+    def test_content_and_seo_scopes_use_canonical_marketplace_checkout(self):
+        content = _resolve_skill_dir_scope("content-executor")
+        seo = _resolve_skill_dir_scope("seo-ppc-executor")
+
+        assert "/Users/colingreig/dev/ignite-marketplace/plugins/claude-blog" in content
+        assert "/Users/colingreig/dev/ignite-marketplace/plugins/claude-ads" in seo
+        assert "/Users/colingreig/dev/ignite-marketplace/plugins/claude-seo" in seo
+        assert all("/.claude/plugins/marketplaces/ignite-marketplace/" not in path for path in content | seo)
+        assert all("/ignite-code/" not in path for path in content | seo)
 
 
 # =========================================================================
@@ -1699,5 +1722,4 @@ class TestParallelToolCallGuidance:
 # =========================================================================
 # Budget warning history stripping
 # =========================================================================
-
 

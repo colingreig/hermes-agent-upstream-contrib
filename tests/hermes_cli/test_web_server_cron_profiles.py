@@ -267,6 +267,7 @@ async def test_create_cron_job_normalizes_representative_core_fields(
             base_url="https://example.invalid/v1/",
             script=str(scripts_dir / "collect-status.py"),
             no_agent=True,
+            skill_scope="validator",
         ),
         profile="worker_alpha",
     )
@@ -275,6 +276,7 @@ async def test_create_cron_job_normalizes_representative_core_fields(
     assert job["base_url"] == "https://example.invalid/v1"
     assert job["script"] == "collect-status.py"
     assert job["no_agent"] is True
+    assert job["skill_scope"] == "validator"
 
 
 @pytest.mark.asyncio

@@ -10,6 +10,9 @@ LIVE="${OP_SDK_RESOLVE_LIVE_SOURCE:-$SOURCE}"
 SENTINEL="${SENTINEL_RUN_SOURCE:-$MINI_SCRIPTS_DIR/sentinel_run.sh}"
 DEGRADED="${DEGRADED_SECRETS_MONITOR_SOURCE:-$MINI_SCRIPTS_DIR/degraded_secrets_monitor.py}"
 MARKETPLACE="${IGNITE_MARKETPLACE_SYNC_SOURCE:-$MINI_SCRIPTS_DIR/ignite-marketplace-sync.sh}"
+GATEWAY_WRAPPER="${GATEWAY_WRAPPER_SOURCE:-$MINI_SCRIPTS_DIR/gateway_secrets_wrap.sh}"
+DASHBOARD_WRAPPER="${DASHBOARD_WRAPPER_SOURCE:-$MINI_SCRIPTS_DIR/dashboard_secrets_wrap.sh}"
+GATEWAY_INNER="${GATEWAY_INNER_SOURCE:-$MINI_SCRIPTS_DIR/gateway_launch_inner.sh}"
 PYTHON="${OP_SDK_RESOLVE_PYTHON:-$REPO_ROOT/.venv/bin/python}"
 if [ ! -x "$PYTHON" ]; then
   PYTHON=python3
@@ -17,6 +20,9 @@ fi
 
 cmp -s "$SOURCE" "$LIVE"
 bash -n "$SENTINEL"
+bash -n "$GATEWAY_WRAPPER"
+bash -n "$DASHBOARD_WRAPPER"
+bash -n "$GATEWAY_INNER"
 "$PYTHON" - "$SOURCE" "$DEGRADED" <<'PY'
 from pathlib import Path
 import sys
@@ -30,6 +36,9 @@ grep -Fq \
   'RESOLVER_PYTHON = os.path.expanduser("~/.hermes/runtime-current/venv/bin/python")' \
   "$DEGRADED"
 grep -Fq 'SENTINEL_SMOKE_ONLY' "$SENTINEL"
+grep -Fq 'RUNTIME_PYTHON="$HERMES_HOME/runtime-current/venv/bin/python"' "$GATEWAY_WRAPPER"
+grep -Fq 'RUNTIME_PYTHON="$HERMES_HOME/runtime-current/venv/bin/python"' "$DASHBOARD_WRAPPER"
+grep -Fq 'exec /bin/bash "$INNER"' "$GATEWAY_WRAPPER"
 
 marketplace_result="marketplace=not-bundled"
 if [ -f "$MARKETPLACE" ]; then

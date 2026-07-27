@@ -1,15 +1,20 @@
 """Tests for tools.env_passthrough — skill and config env var passthrough."""
 
 import os
+import contextvars
 import pytest
 import yaml
 
 import tools.env_passthrough as _ep_mod
 from tools.env_passthrough import (
     clear_env_passthrough,
+    begin_env_passthrough_scope,
+    get_child_env_overlay,
     get_all_passthrough,
     is_env_passthrough,
+    register_child_env_overlay,
     register_env_passthrough,
+    reset_env_passthrough_scope,
 )
 
 
@@ -55,6 +60,40 @@ class TestSkillScopedPassthrough:
         register_env_passthrough(["", "  ", "VALID_KEY"])
         assert is_env_passthrough("VALID_KEY")
         assert not is_env_passthrough("")
+
+    def test_child_overlay_is_context_local_and_does_not_mutate_os_environ(self):
+        """A copied cron/session context must not write back into its parent."""
+        name = "THERMAL_TEST_DATABASE_URL"
+        os.environ.pop(name, None)
+
+        child = contextvars.copy_context()
+        child.run(
+            register_child_env_overlay,
+            {name: "postgresql://user:opaque-password@db/test"},
+        )
+
+        assert child.run(get_child_env_overlay)[name].endswith("/test")
+        assert name not in get_child_env_overlay()
+        assert name not in os.environ
+
+    def test_child_overlay_scope_restores_prior_context(self):
+        register_child_env_overlay({"OUTER_TOKEN": "outer-secret"})
+        tokens = begin_env_passthrough_scope()
+        try:
+            assert get_child_env_overlay() == {}
+            register_child_env_overlay({"INNER_TOKEN": "inner-secret"})
+            assert get_child_env_overlay() == {"INNER_TOKEN": "inner-secret"}
+        finally:
+            reset_env_passthrough_scope(tokens)
+
+        assert get_child_env_overlay() == {"OUTER_TOKEN": "outer-secret"}
+
+    def test_provider_credential_cannot_enter_child_overlay(self):
+        from tools.environments.local import _HERMES_PROVIDER_ENV_BLOCKLIST
+
+        blocked = next(iter(_HERMES_PROVIDER_ENV_BLOCKLIST))
+        register_child_env_overlay({blocked: "must-not-pass"})
+        assert blocked not in get_child_env_overlay()
 
 
 class TestConfigPassthrough:
@@ -262,6 +301,34 @@ class TestTerminalIntegration:
         # Arbitrary skill-specific var
         register_env_passthrough(["MY_SKILL_CUSTOM_CONFIG"])
         assert is_env_passthrough("MY_SKILL_CUSTOM_CONFIG")
+
+    def test_child_overlay_reaches_foreground_and_background_sanitizers(self):
+        from tools.environments.local import _make_run_env, _sanitize_subprocess_env
+
+        name = "THERMAL_TEST_DATABASE_URL"
+        scoped = "postgresql://user:opaque-child-value@db/test"
+        inherited = "postgresql://wrong:stale@db/test"
+        register_child_env_overlay({name: scoped})
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setenv(name, inherited)
+            assert _make_run_env({})[name] == scoped
+            assert _sanitize_subprocess_env(dict(os.environ))[name] == scoped
+            assert os.environ[name] == inherited
+
+    def test_child_overlay_value_is_redacted_from_opaque_process_output(self):
+        from agent.redact import redact_terminal_output
+
+        secret = "opaque-value-with-no-known-vendor-prefix"
+        register_child_env_overlay({"THERMAL_TEST_TOKEN": secret})
+
+        redacted = redact_terminal_output(
+            f"resolver returned {secret}",
+            command="custom-resolver --diagnose",
+        )
+
+        assert secret not in redacted
+        assert "«redacted-secret»" in redacted
 
     def test_provider_blocklist_import_failure_fails_closed(self, monkeypatch):
         """If the dynamic provider blocklist can't be imported, provider

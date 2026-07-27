@@ -32,7 +32,12 @@ from difflib import unified_diff
 from pathlib import Path
 from typing import Any
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+_SOURCE_PATH = Path(__file__).resolve()
+if _SOURCE_PATH.parent.name == "mini-scripts" and _SOURCE_PATH.parent.parent.name == "machine-setup":
+    REPO_ROOT = _SOURCE_PATH.parents[2]
+else:
+    # Deployed Mini path: ~/.hermes/scripts/clickup_workspace_refresh.py.
+    REPO_ROOT = _SOURCE_PATH.parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 

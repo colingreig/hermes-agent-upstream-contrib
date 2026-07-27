@@ -186,6 +186,12 @@ async def _lifespan(app: "FastAPI"):
     # On app.state (not a module global) so the Lock binds to the running
     # event loop during lifespan startup — see _get_event_state's docstring.
     app.state.chat_argv_lock = asyncio.Lock()
+    # Observe governed external-skill generations in this long-lived process.
+    # This clears only caches used by future sessions/catalog requests; live
+    # AIAgent instances keep their byte-stable system prompts.
+    from agent.prompt_builder import start_external_skills_generation_observer
+
+    start_external_skills_generation_observer()
 
     # Fire hermes_cli.gateway import into a background thread so the event
     # loop is not blocked and HERMES_DASHBOARD_READY fires without delay.
@@ -10439,6 +10445,7 @@ class CronJobCreate(BaseModel):
     enabled_toolsets: Optional[List[str]] = None
     workdir: Optional[str] = None
     no_agent: bool = False
+    skill_scope: Optional[str] = None
 
 
 class CronJobUpdate(BaseModel):
@@ -10761,6 +10768,7 @@ def _create_cron_job_sync(body: CronJobCreate, profile: str = "default"):
             enabled_toolsets=_cron_string_list(body.enabled_toolsets),
             workdir=_cron_optional_text(body.workdir),
             no_agent=no_agent,
+            skill_scope=body.skill_scope,
         )
     except HTTPException:
         raise

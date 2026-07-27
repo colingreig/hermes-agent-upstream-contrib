@@ -1,13 +1,25 @@
-"""Tests for scripts/clickup_workspace_refresh.py."""
+"""Tests for the governed Mini clickup_workspace_refresh.py source."""
 
 from __future__ import annotations
 
+import importlib.util
 import json
 from pathlib import Path
+import sys
 
 import pytest
 
-import scripts.clickup_workspace_refresh as refresh_mod
+_SOURCE = (
+    Path(__file__).resolve().parents[2]
+    / "machine-setup"
+    / "mini-scripts"
+    / "clickup_workspace_refresh.py"
+)
+_SPEC = importlib.util.spec_from_file_location("clickup_workspace_refresh", _SOURCE)
+assert _SPEC is not None and _SPEC.loader is not None
+refresh_mod = importlib.util.module_from_spec(_SPEC)
+sys.modules[_SPEC.name] = refresh_mod
+_SPEC.loader.exec_module(refresh_mod)
 
 
 def test_build_workspace_map_captures_schema_and_aliases(monkeypatch):

@@ -553,9 +553,13 @@ def _sanitize_subprocess_env(
     model-driven-terminal hardening from PR #24 for every other caller.
     """
     try:
-        from tools.env_passthrough import is_env_passthrough as _is_passthrough
+        from tools.env_passthrough import (
+            get_child_env_overlay as _get_child_env_overlay,
+            is_env_passthrough as _is_passthrough,
+        )
     except Exception:
         _is_passthrough = lambda _: False  # noqa: E731
+        _get_child_env_overlay = lambda: {}  # noqa: E731
 
     sanitized: dict[str, str] = {}
 
@@ -602,6 +606,19 @@ def _sanitize_subprocess_env(
         if key in _HERMES_PROVIDER_ENV_BLOCKLIST:
             continue
         if apply_secret_shape_gate and _is_secret_shaped_and_not_exempt(key):
+            continue
+        sanitized[key] = value
+
+    # Context-local values are merged last so an active profile's scoped value
+    # beats a stale inherited default-profile value.  Re-apply the
+    # non-overridable blocks defensively even though registration already
+    # rejects these names.
+    for key, value in _get_child_env_overlay().items():
+        if _is_hermes_internal_secret(key):
+            continue
+        if key in _HERMES_PROVIDER_ENV_BLOCKLIST:
+            continue
+        if not _is_passthrough(key):
             continue
         sanitized[key] = value
 
@@ -1257,9 +1274,13 @@ def _path_env_key(run_env: dict) -> str | None:
 def _make_run_env(env: dict) -> dict:
     """Build a run environment with a sane PATH and provider-var stripping."""
     try:
-        from tools.env_passthrough import is_env_passthrough as _is_passthrough
+        from tools.env_passthrough import (
+            get_child_env_overlay as _get_child_env_overlay,
+            is_env_passthrough as _is_passthrough,
+        )
     except Exception:
         _is_passthrough = lambda _: False  # noqa: E731
+        _get_child_env_overlay = lambda: {}  # noqa: E731
 
     merged = dict(os.environ | env)
     run_env = {}
@@ -1290,6 +1311,19 @@ def _make_run_env(env: dict) -> dict:
         if k in _HERMES_PROVIDER_ENV_BLOCKLIST:
             continue
         if _is_secret_shaped_and_not_exempt(k):
+            continue
+        run_env[k] = v
+
+    # Merge only explicitly registered, context-local child values.  Provider
+    # and Hermes-internal credentials remain unconditionally blocked, and the
+    # active scope wins over any stale process-global value without mutating
+    # ``os.environ``.
+    for k, v in _get_child_env_overlay().items():
+        if _is_hermes_internal_secret(k):
+            continue
+        if k in _HERMES_PROVIDER_ENV_BLOCKLIST:
+            continue
+        if not _is_passthrough(k):
             continue
         run_env[k] = v
     path_key = _path_env_key(run_env)
