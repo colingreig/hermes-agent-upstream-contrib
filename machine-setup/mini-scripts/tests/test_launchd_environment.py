@@ -112,6 +112,12 @@ class LaunchdEnvironmentTests(unittest.TestCase):
             deployed = self.hermes / "scripts" / name
             self.assertEqual(source.read_bytes(), deployed.read_bytes())
             self.assertTrue(deployed.stat().st_mode & 0o111)
+        self.assertEqual(
+            RECONCILER_SOURCE.read_bytes(),
+            (
+                self.hermes / "scripts" / "reconcile_launchd_environment.py"
+            ).read_bytes(),
+        )
 
         for label, wrapper_name in (
             (module.GATEWAY_LABEL, "gateway_secrets_wrap.sh"),
@@ -222,7 +228,13 @@ class LaunchdEnvironmentTests(unittest.TestCase):
         self.reconciler.install()
         template = (SOURCE_ROOT / module.REFERENCE_SOURCE).read_text()
         deployed = (self.hermes / "scripts" / module.REFERENCE_TARGET).read_text()
-        self.assertEqual(template, deployed)
+        template_refs = self.reconciler._parse_references(
+            SOURCE_ROOT / module.REFERENCE_SOURCE
+        )
+        deployed_refs = self.reconciler._parse_references(
+            self.hermes / "scripts" / module.REFERENCE_TARGET
+        )
+        self.assertEqual(template_refs, deployed_refs)
         for line in template.splitlines():
             if line and not line.startswith("#"):
                 self.assertTrue(line.split("=", 1)[1].startswith("op://"))
@@ -230,6 +242,53 @@ class LaunchdEnvironmentTests(unittest.TestCase):
             self.assertNotIn(fake_secret, template)
             for plist in self.launch_agents.glob("*.plist"):
                 self.assertNotIn(fake_secret, plist.read_text())
+
+    def test_complete_reference_inventory_is_preserved_with_required_overlay(self):
+        comprehensive = (
+            self.hermes / "scripts" / module.COMPREHENSIVE_REFERENCE_SOURCE
+        )
+        comprehensive.parent.mkdir(parents=True, exist_ok=True)
+        comprehensive.write_text(
+            "SLACK_APP_TOKEN=op://Gateway/slack/app-token\n"
+            "SLACK_BOT_TOKEN=op://Gateway/slack/bot-token\n"
+            "OPENAI_API_KEY_HERMES=op://Legacy/openai/key\n",
+            encoding="utf-8",
+        )
+
+        self.reconciler.install()
+
+        deployed = self.reconciler._parse_references(
+            self.hermes / "scripts" / module.REFERENCE_TARGET
+        )
+        required = self.reconciler._parse_references(
+            SOURCE_ROOT / module.REFERENCE_SOURCE
+        )
+        self.assertEqual(deployed["SLACK_APP_TOKEN"], "op://Gateway/slack/app-token")
+        self.assertEqual(deployed["SLACK_BOT_TOKEN"], "op://Gateway/slack/bot-token")
+        self.assertEqual(
+            deployed["OPENAI_API_KEY_HERMES"],
+            required["OPENAI_API_KEY_HERMES"],
+        )
+        self.assertEqual(set(deployed), set(required) | {
+            "SLACK_APP_TOKEN",
+            "SLACK_BOT_TOKEN",
+        })
+
+    def test_complete_reference_inventory_rejects_non_op_values(self):
+        comprehensive = (
+            self.hermes / "scripts" / module.COMPREHENSIVE_REFERENCE_SOURCE
+        )
+        comprehensive.parent.mkdir(parents=True, exist_ok=True)
+        comprehensive.write_text(
+            "SLACK_APP_TOKEN=not-a-reference\n",
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "contains a value"):
+            self.reconciler.install()
+        self.assertFalse(
+            (self.hermes / "scripts" / module.REFERENCE_TARGET).exists()
+        )
 
     def test_failed_install_restores_exact_previous_files(self):
         target = self.hermes / "scripts" / "gateway_secrets_wrap.sh"
@@ -268,6 +327,11 @@ class LaunchdEnvironmentTests(unittest.TestCase):
             (self.hermes / "scripts" / "dashboard_secrets_wrap.sh").exists()
         )
         self.assertFalse(
+            (
+                self.hermes / "scripts" / "reconcile_launchd_environment.py"
+            ).exists()
+        )
+        self.assertFalse(
             (self.launch_agents / f"{module.GATEWAY_LABEL}.plist").exists()
         )
 
@@ -290,43 +354,75 @@ class LaunchdEnvironmentTests(unittest.TestCase):
             (self.launch_agents / f"{module.GATEWAY_LABEL}.plist").exists()
         )
 
-    def test_bootstrap_recovers_eio_and_verifies_registration(self):
-        calls = []
-        bootstrap_count = 0
+    def test_bootstrap_recovers_transient_codes_and_verifies_registration(self):
+        for transient_code in (
+            module.LAUNCHCTL_BOOTSTRAP_EIO,
+            module.LAUNCHCTL_BOOTSTRAP_IN_PROGRESS,
+        ):
+            with self.subTest(transient_code=transient_code):
+                calls = []
+                bootstrap_count = 0
 
-        def fake_run(args, **kwargs):
-            nonlocal bootstrap_count
-            calls.append(tuple(args))
-            if args[1] == "bootstrap":
-                bootstrap_count += 1
-                if bootstrap_count == 1:
-                    raise subprocess.CalledProcessError(5, args)
-            return subprocess.CompletedProcess(args, 0)
+                def fake_run(args, **kwargs):
+                    nonlocal bootstrap_count
+                    calls.append(tuple(args))
+                    if args[1] == "bootstrap":
+                        bootstrap_count += 1
+                        if bootstrap_count == 1:
+                            raise subprocess.CalledProcessError(transient_code, args)
+                    return subprocess.CompletedProcess(args, 0)
 
-        with mock.patch.object(module.subprocess, "run", side_effect=fake_run):
-            self.reconciler._bootstrap_until_registered(
-                "gui/501",
-                module.GATEWAY_LABEL,
-                self.reconciler.gateway_plist,
-            )
+                with (
+                    mock.patch.object(
+                        module.subprocess,
+                        "run",
+                        side_effect=fake_run,
+                    ),
+                    mock.patch.object(
+                        self.reconciler,
+                        "_wait_until_unregistered",
+                    ) as wait_absent,
+                    mock.patch.object(
+                        self.reconciler,
+                        "_wait_until_registered",
+                        return_value=True,
+                    ) as wait_present,
+                ):
+                    self.reconciler._bootstrap_until_registered(
+                        "gui/501",
+                        module.GATEWAY_LABEL,
+                        self.reconciler.gateway_plist,
+                    )
 
-        self.assertEqual(
-            [call[1] for call in calls],
-            ["bootstrap", "bootout", "bootstrap", "print"],
-        )
-        self.assertEqual(calls[-1][-1], f"gui/501/{module.GATEWAY_LABEL}")
+                self.assertEqual(
+                    [call[1] for call in calls],
+                    ["bootstrap", "bootout", "bootstrap"],
+                )
+                wait_absent.assert_called_once_with(
+                    "gui/501",
+                    module.GATEWAY_LABEL,
+                )
+                wait_present.assert_called_once_with(
+                    "gui/501",
+                    module.GATEWAY_LABEL,
+                )
 
     def test_bootstrap_registration_failure_is_bounded(self):
         calls = []
 
         def fake_run(args, **kwargs):
             calls.append(tuple(args))
-            return subprocess.CompletedProcess(
-                args,
-                1 if args[1] == "print" else 0,
-            )
+            return subprocess.CompletedProcess(args, 0)
 
-        with mock.patch.object(module.subprocess, "run", side_effect=fake_run):
+        with (
+            mock.patch.object(module.subprocess, "run", side_effect=fake_run),
+            mock.patch.object(
+                self.reconciler,
+                "_wait_until_registered",
+                return_value=False,
+            ),
+            mock.patch.object(self.reconciler, "_wait_until_unregistered"),
+        ):
             with self.assertRaisesRegex(RuntimeError, "after 3 bounded"):
                 self.reconciler._bootstrap_until_registered(
                     "gui/501",
@@ -334,27 +430,96 @@ class LaunchdEnvironmentTests(unittest.TestCase):
                     self.reconciler.gateway_plist,
                 )
         self.assertEqual(sum(call[1] == "bootstrap" for call in calls), 3)
-        self.assertEqual(sum(call[1] == "print" for call in calls), 3)
         self.assertEqual(sum(call[1] == "bootout" for call in calls), 2)
 
-    def test_reload_verifies_gateway_and_dashboard_registration(self):
-        self.reconciler.install()
+    def test_failed_bootstrap_does_not_accept_stale_registration(self):
         calls = []
 
         def fake_run(args, **kwargs):
             calls.append(tuple(args))
+            if args[1] == "bootstrap":
+                raise subprocess.CalledProcessError(
+                    module.LAUNCHCTL_BOOTSTRAP_IN_PROGRESS,
+                    args,
+                )
             return subprocess.CompletedProcess(args, 0)
 
-        with mock.patch.object(module.subprocess, "run", side_effect=fake_run):
-            self.reconciler.reload()
-        print_targets = [call[-1] for call in calls if call[1] == "print"]
+        with (
+            mock.patch.object(module.subprocess, "run", side_effect=fake_run),
+            mock.patch.object(self.reconciler, "_wait_until_unregistered"),
+            mock.patch.object(
+                self.reconciler,
+                "_wait_until_registered",
+            ) as wait_present,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "after 3 bounded"):
+                self.reconciler._bootstrap_until_registered(
+                    "gui/501",
+                    module.GATEWAY_LABEL,
+                    self.reconciler.gateway_plist,
+                )
+        self.assertEqual(sum(call[1] == "bootstrap" for call in calls), 3)
+        self.assertEqual(sum(call[1] == "bootout" for call in calls), 2)
+        wait_present.assert_not_called()
+
+    def test_wait_for_job_absence_is_bounded(self):
+        with (
+            mock.patch.object(
+                self.reconciler,
+                "_registered",
+                side_effect=(True, True, False),
+            ) as registered,
+            mock.patch.object(module.time, "sleep") as sleep,
+        ):
+            self.reconciler._wait_until_unregistered(
+                "gui/501",
+                module.GATEWAY_LABEL,
+            )
+        self.assertEqual(registered.call_count, 3)
+        self.assertEqual(sleep.call_count, 2)
+
+        with (
+            mock.patch.object(
+                self.reconciler,
+                "_registered",
+                return_value=True,
+            ) as registered,
+            mock.patch.object(module.time, "sleep") as sleep,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "bounded wait"):
+                self.reconciler._wait_until_unregistered(
+                    "gui/501",
+                    module.GATEWAY_LABEL,
+                )
+        self.assertEqual(registered.call_count, module.LAUNCHCTL_STATE_POLL_ATTEMPTS)
         self.assertEqual(
-            print_targets,
+            sleep.call_count,
+            module.LAUNCHCTL_STATE_POLL_ATTEMPTS - 1,
+        )
+
+    def test_reload_verifies_gateway_and_dashboard_registration(self):
+        self.reconciler.install()
+        with (
+            mock.patch.object(self.reconciler, "_bootout") as bootout,
+            mock.patch.object(
+                self.reconciler,
+                "_wait_until_unregistered",
+            ) as wait_absent,
+            mock.patch.object(
+                self.reconciler,
+                "_bootstrap_until_registered",
+            ) as bootstrap,
+        ):
+            self.reconciler.reload()
+        self.assertEqual(
+            [call.args[:2] for call in wait_absent.call_args_list],
             [
-                f"gui/{os.getuid()}/{module.GATEWAY_LABEL}",
-                f"gui/{os.getuid()}/{module.DASHBOARD_LABEL}",
+                (f"gui/{os.getuid()}", module.GATEWAY_LABEL),
+                (f"gui/{os.getuid()}", module.DASHBOARD_LABEL),
             ],
         )
+        self.assertEqual(bootout.call_count, 2)
+        self.assertEqual(bootstrap.call_count, 2)
 
     def test_registration_failure_restores_snapshot_before_returning_error(self):
         target = self.hermes / "scripts" / "gateway_secrets_wrap.sh"
