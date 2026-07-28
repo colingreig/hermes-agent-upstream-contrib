@@ -10,6 +10,8 @@ Mini deployment reconciler can prove the canonical assets are present.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fcntl
 import json
 import os
 import subprocess
@@ -108,6 +110,18 @@ def _append_jsonl(path: Path, record: dict[str, Any]) -> None:
         os.fsync(handle.fileno())
 
 
+@contextlib.contextmanager
+def _state_lock(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    with lock_path.open("w", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 def _load_state(path: Path = STATE_PATH) -> dict[str, Any]:
     if not path.exists():
         return {}
@@ -141,6 +155,9 @@ def _load_topology(path: Path = TOPOLOGY_PATH) -> dict[str, Any]:
     for runner in runners:
         if not isinstance(runner, dict) or not isinstance(runner.get("repo"), str) or not isinstance(runner.get("name"), str):
             raise MonitorError("each expected runner must declare repo and name")
+        listener = runner.get("listener_command")
+        if not isinstance(listener, list) or not listener or not all(isinstance(part, str) and part for part in listener):
+            raise MonitorError("each expected runner must declare an exact listener_command string array")
     expected_runner_set = {
         ("colingreig/jdmbuysell-v4", "hermes-jdmbuysell-v4"),
         ("colingreig/topdynamicspartners", "hermes-topdynamicspartners"),
@@ -261,6 +278,36 @@ def _runner_statuses(topology: dict[str, Any], runner: CommandRunner = subproces
         status = str(match.get("status")) if match else "missing"
         statuses[f"{repo}::{name}"] = RunnerStatus(repo=repo, name=name, status=status, busy=match.get("busy") if match else None)
     return statuses
+
+
+def _local_runner_statuses(topology: dict[str, Any], runner: CommandRunner = subprocess.run) -> dict[str, RunnerStatus] | None:
+    vm_name = topology["vm"]["name"]
+    result = _run(["orb", "exec", "-m", vm_name, "ps", "-eo", "args="], runner=runner, timeout=20)
+    if result.returncode != 0:
+        print(f"[ci-health] local runner fallback ps rc={result.returncode} {result.stderr.strip()[:120]}", file=sys.stderr)
+        return None
+    process_lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    statuses: dict[str, RunnerStatus] = {}
+    for expected in topology["expected_runners"]:
+        repo = expected["repo"]
+        name = expected["name"]
+        listener = expected.get("listener_command")
+        if not isinstance(listener, list) or not all(isinstance(part, str) and part for part in listener):
+            return None
+        exact = " ".join(listener)
+        matches = [line for line in process_lines if line == exact]
+        if len(matches) > 1:
+            print(f"[ci-health] local runner fallback {repo}: listener {name} is ambiguous", file=sys.stderr)
+            return None
+        statuses[f"{repo}::{name}"] = RunnerStatus(repo=repo, name=name, status="online" if matches else "missing", busy=None)
+    return statuses
+
+
+def _runner_statuses_with_fallback(topology: dict[str, Any], runner: CommandRunner = subprocess.run) -> dict[str, RunnerStatus] | None:
+    statuses = _runner_statuses(topology, runner=runner)
+    if statuses is not None:
+        return statuses
+    return _local_runner_statuses(topology, runner=runner)
 
 
 def _probe_vm(topology: dict[str, Any], runner: CommandRunner = subprocess.run) -> VmStatus:
@@ -388,15 +435,13 @@ def _record_transition(previous: dict[str, Any], vm: VmStatus, state: dict[str, 
     elif vm.available is True:
         state.pop("vm_outage", None)
 
-    # A boot-ID change proves a reboot, but not when this poll observed it.
-    # The guest uptime is the only bounded interruption point available here.
-    # Without it, recovery fails closed rather than treating an arbitrary
-    # interval around the observation as restart-related.
     boot_changed = bool(prior_boot and vm.boot_id and prior_boot != vm.boot_id)
-    if boot_changed and isinstance(vm.uptime_seconds, int) and vm.uptime_seconds >= 0:
-        restarted_at = (observed_at - timedelta(seconds=vm.uptime_seconds)).isoformat()
-        interruption_started_at = restarted_at
-        interruption_ended_at = restarted_at
+    managed_restart = intent is not None and intent.get("action") == "restart" and boot_changed
+    if managed_restart:
+        managed_started = _parse_time(intent.get("timestamp"))
+        if managed_started is not None and managed_started <= observed_at:
+            interruption_started_at = managed_started.isoformat()
+            interruption_ended_at = timestamp
     recovery_eligible = interruption_started_at is not None and interruption_ended_at is not None
     record = {
         "timestamp": timestamp,
@@ -420,6 +465,9 @@ def _record_transition(previous: dict[str, Any], vm: VmStatus, state: dict[str, 
         record["managed_action"] = intent.get("action")
         record["reason"] = intent.get("reason") or "unknown"
         record["managed_intent_timestamp"] = intent.get("timestamp")
+    if managed_restart:
+        record["restart_notification_eligible"] = True
+        record["recovery_notification_eligible"] = vm.available is True
     _append_jsonl(EVIDENCE_LOG_PATH, record)
     return record
 
@@ -467,22 +515,36 @@ def _maybe_alert_vm_transition(state: dict[str, Any], record: dict[str, Any] | N
         return False
     key = _vm_alert_key(record)
     vm_alerts = state.setdefault("vm_alerts", {})
-    if vm_alerts.get("last_alert_key") == key:
-        return False
     initiator = record.get("initiator") or "unknown"
     reason = record.get("reason") or "unknown"
-    headline = "🟢 *hermes-ci VM recovered*" if record.get("current_available") is True and record.get("prior_available") is False else "🔴 *hermes-ci VM lifecycle transition observed*"
-    msg = (
-        f"{headline}\n"
-        f"boot `{record.get('prior_boot_id')}` -> `{record.get('current_boot_id')}`, "
-        f"available `{record.get('prior_available')}` -> `{record.get('current_available')}`; "
-        f"initiator=`{initiator}`, reason=`{reason}`."
-    )
-    if send(msg):
-        vm_alerts["last_alert_key"] = key
-        vm_alerts["last_alerted_at"] = _now_iso()
-        return True
-    return False
+    alerted = False
+    sent = vm_alerts.setdefault("sent", {})
+
+    def send_once(kind: str, headline: str) -> None:
+        nonlocal alerted
+        sent_key = f"{key}:{kind}"
+        if sent.get(sent_key):
+            return
+        msg = (
+            f"{headline}\n"
+            f"boot `{record.get('prior_boot_id')}` -> `{record.get('current_boot_id')}`, "
+            f"available `{record.get('prior_available')}` -> `{record.get('current_available')}`; "
+            f"initiator=`{initiator}`, reason=`{reason}`."
+        )
+        if send(msg):
+            sent[sent_key] = _now_iso()
+            vm_alerts["last_alert_key"] = key
+            vm_alerts["last_alerted_at"] = sent[sent_key]
+            alerted = True
+
+    if record.get("restart_notification_eligible") is True:
+        send_once("restart", "🔴 *hermes-ci VM restart/outage observed*")
+        if record.get("recovery_notification_eligible") is True:
+            send_once("recovery", "🟢 *hermes-ci VM recovered*")
+    else:
+        headline = "🟢 *hermes-ci VM recovered*" if record.get("current_available") is True and record.get("prior_available") is False else "🔴 *hermes-ci VM lifecycle transition observed*"
+        send_once("transition", headline)
+    return alerted
 
 
 def _run_overlaps_restart(run: dict[str, Any], transition: dict[str, Any]) -> bool:
@@ -497,7 +559,7 @@ def _run_overlaps_restart(run: dict[str, Any], transition: dict[str, Any]) -> bo
     return started <= interruption_ended and ended >= interruption_started
 
 
-def _allowlisted_recovery(topology: dict[str, Any], run: dict[str, Any]) -> bool:
+def _recovery_allowlist_match(topology: dict[str, Any], run: dict[str, Any]) -> dict[str, Any] | None:
     for item in topology.get("recovery_allowlist", []):
         if (
             run.get("repo") == item.get("repo")
@@ -505,8 +567,22 @@ def _allowlisted_recovery(topology: dict[str, Any], run: dict[str, Any]) -> bool
             and run.get("event") == item.get("event")
             and item.get("max_reruns") == 1
         ):
-            return True
-    return False
+            return item
+    return None
+
+
+def _allowlisted_recovery(topology: dict[str, Any], run: dict[str, Any]) -> bool:
+    return _recovery_allowlist_match(topology, run) is not None
+
+
+def _allowlisted_rerun_count(recovery_state: dict[str, Any], *, repo: object, workflow: object) -> int:
+    count = 0
+    for entry in recovery_state.values():
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("repo") == repo and entry.get("workflow") == workflow and entry.get("attempt"):
+            count += 1
+    return count
 
 
 def _expected_runner_for_repo(topology: dict[str, Any], repo: str) -> dict[str, Any] | None:
@@ -558,7 +634,8 @@ def _maybe_recover(
         key = str(run_id or "")
         if not key or key in recovery_state:
             continue
-        if not _allowlisted_recovery(topology, run):
+        allowlist = _recovery_allowlist_match(topology, run)
+        if allowlist is None:
             send(f"⚠️ *CI recovery refused*\n`{run.get('repo')}` / {run.get('workflowName')} run {run_id} is not allowlisted for automatic rerun.")
             recovery_state[key] = {"refused_at": _now_iso(), "reason": "not-allowlisted", "original_run_id": run_id}
             continue
@@ -567,6 +644,8 @@ def _maybe_recover(
         if latest_transition.get("recovery_eligible") is not True:
             continue
         if not _runner_recovered_for_run(topology, statuses, run):
+            continue
+        if _allowlisted_rerun_count(recovery_state, repo=run.get("repo"), workflow=run.get("workflowName")) >= int(allowlist.get("max_reruns") or 0):
             continue
         recovery_state[key] = {
             "original_run_id": run_id,
@@ -620,41 +699,42 @@ def _ci_red_alerts(state: dict[str, Any], current: dict[str, dict[str, Any]], *,
 
 def poll_once(*, runner: CommandRunner = subprocess.run, topology_path: Path = TOPOLOGY_PATH, state_path: Path = STATE_PATH) -> dict[str, Any]:
     topology = _load_topology(topology_path)
-    state = _load_state(state_path)
-    previous = dict(state)
-    send = lambda msg: _send_slack(msg, runner=runner)
+    with _state_lock(state_path):
+        state = _load_state(state_path)
+        previous = dict(state)
+        send = lambda msg: _send_slack(msg, runner=runner)
 
-    vm = _probe_vm(topology, runner=runner)
-    statuses = _runner_statuses(topology, runner=runner)
-    runner_summary = "unknown" if statuses is None else ",".join(f"{key}={value.status}" for key, value in sorted(statuses.items()))
-    transition = _record_transition(previous, vm, state, runner_summary)
-    vm_alerted = _maybe_alert_vm_transition(state, transition, send=send)
-    runner_alerted, runner_recovered = _update_runner_alerts(state, statuses, send=send)
-    saved_transition = state.get("last_transition") if isinstance(state.get("last_transition"), dict) else None
-    correlation_transition = transition or saved_transition
-    rerun_ids = _maybe_recover(topology, state, statuses, correlation_transition, runner=runner, send=send)
+        vm = _probe_vm(topology, runner=runner)
+        statuses = _runner_statuses_with_fallback(topology, runner=runner)
+        runner_summary = "unknown" if statuses is None else ",".join(f"{key}={value.status}" for key, value in sorted(statuses.items()))
+        transition = _record_transition(previous, vm, state, runner_summary)
+        vm_alerted = _maybe_alert_vm_transition(state, transition, send=send)
+        runner_alerted, runner_recovered = _update_runner_alerts(state, statuses, send=send)
+        saved_transition = state.get("last_transition") if isinstance(state.get("last_transition"), dict) else None
+        correlation_transition = transition or saved_transition
+        rerun_ids = _maybe_recover(topology, state, statuses, correlation_transition, runner=runner, send=send)
 
-    repos = _repos()
-    current = _current_red(repos) if repos else {}
-    if current is None:
-        newly_red = ci_recovered = 0
-    else:
-        newly_red, ci_recovered = _ci_red_alerts(state, current, send=send)
-    state["generated_at"] = _now_iso()
-    state["vm"] = {"available": vm.available, "boot_id": vm.boot_id, "uptime_seconds": vm.uptime_seconds}
-    if transition is not None:
-        state["last_transition"] = transition
-    _save_state(state, state_path)
-    return {
-        "checked": len(repos),
+        repos = _repos()
+        current = _current_red(repos) if repos else {}
+        if current is None:
+            newly_red = ci_recovered = 0
+        else:
+            newly_red, ci_recovered = _ci_red_alerts(state, current, send=send)
+        state["generated_at"] = _now_iso()
+        state["vm"] = {"available": vm.available, "boot_id": vm.boot_id, "uptime_seconds": vm.uptime_seconds}
+        if transition is not None:
+            state["last_transition"] = transition
+        _save_state(state, state_path)
+        return {
+            "checked": len(repos),
             "red": len(current) if current is not None else None,
-        "newly_red": newly_red,
-        "recovered": ci_recovered,
-        "vm_alerted": vm_alerted,
-        "runner_alerted": len(runner_alerted),
-        "runner_recovered": len(runner_recovered),
-        "rerun_ids": rerun_ids,
-    }
+            "newly_red": newly_red,
+            "recovered": ci_recovered,
+            "vm_alerted": vm_alerted,
+            "runner_alerted": len(runner_alerted),
+            "runner_recovered": len(runner_recovered),
+            "rerun_ids": rerun_ids,
+        }
 
 
 def record_managed_lifecycle(
@@ -678,10 +758,11 @@ def record_managed_lifecycle(
     if not isinstance(command, list) or not all(isinstance(part, str) for part in command):
         raise MonitorError("managed command must be a string array")
     record = {"timestamp": _now_iso(), "actor": actor, "action": action, "reason": reason, "vm": topology["vm"]["name"]}
-    _append_jsonl(INTENT_LOG_PATH, record)
-    state = _load_state(state_path)
-    state["last_managed_intent"] = record
-    _save_state(state, state_path)
+    with _state_lock(state_path):
+        _append_jsonl(INTENT_LOG_PATH, record)
+        state = _load_state(state_path)
+        state["last_managed_intent"] = record
+        _save_state(state, state_path)
     result = runner(command, capture_output=True, text=True, timeout=120)
     return result.returncode
 

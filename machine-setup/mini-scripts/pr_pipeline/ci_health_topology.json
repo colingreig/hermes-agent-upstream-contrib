@@ -16,15 +16,18 @@
   "expected_runners": [
     {
       "repo": "colingreig/jdmbuysell-v4",
-      "name": "hermes-jdmbuysell-v4"
+      "name": "hermes-jdmbuysell-v4",
+      "listener_command": ["/home/colingreig/actions-runner/jdmbuysell-v4/bin/Runner.Listener", "run"]
     },
     {
       "repo": "colingreig/topdynamicspartners",
-      "name": "hermes-topdynamicspartners"
+      "name": "hermes-topdynamicspartners",
+      "listener_command": ["/home/colingreig/actions-runner/topdynamicspartners/bin/Runner.Listener", "run"]
     },
     {
       "repo": "colingreig/elevatoruptime.com",
-      "name": "hermes-elevatoruptime.com"
+      "name": "hermes-elevatoruptime.com",
+      "listener_command": ["/home/colingreig/actions-runner/elevatoruptime.com/bin/Runner.Listener", "run"]
     }
   ],
   "recovery_allowlist": [
