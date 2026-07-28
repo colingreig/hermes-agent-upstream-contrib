@@ -37,6 +37,48 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 
+def _is_purge_target(mod_name: str) -> bool:
+    return (
+        mod_name == "run_agent"
+        or mod_name.startswith("agent.")
+        or mod_name.startswith("tools.")
+        or mod_name.startswith("hermes_")
+    )
+
+
+def _restore_purged_modules(saved_modules: dict) -> None:
+    """Undo the sys.modules purge/reimport from agent_env, restoring identity.
+
+    Deletes whatever run_agent/agent.*/tools.*/hermes_* entries this test's
+    fresh reimport left behind and puts the pre-purge module objects back —
+    otherwise later tests in the same worker that imported these modules
+    before this fixture ran keep stale references to modules no longer in
+    sys.modules.
+
+    Also re-binds each restored dotted submodule as an attribute on its
+    parent package object (e.g. ``agent.model_metadata`` on the ``agent``
+    package). The purge only ever removes dotted submodule entries, never
+    the parent package itself, so a fresh reimport rebinds the parent's
+    attribute to the NEW submodule object. Restoring just the sys.modules
+    dict entry leaves that attribute pointing at the new object — any test
+    that captured the module via attribute access (``agent.model_metadata``)
+    and later calls ``importlib.reload()`` on it then fails with
+    "module ... not in sys.modules" because the reloaded object no longer
+    matches sys.modules[name].
+    """
+    for mod_name in list(sys.modules):
+        if _is_purge_target(mod_name):
+            del sys.modules[mod_name]
+    sys.modules.update(saved_modules)
+    for name, mod in saved_modules.items():
+        if "." not in name:
+            continue
+        parent_name, leaf = name.rsplit(".", 1)
+        parent = sys.modules.get(parent_name)
+        if parent is not None:
+            setattr(parent, leaf, mod)
+
+
 class _MockHandler(BaseHTTPRequestHandler):
     # Set by the fixture before each request cycle.
     captured_requests: list = []
@@ -136,8 +178,9 @@ def agent_env():
 
     # Import fresh so the patched conversation_loop is exercised even when the
     # module was imported earlier in the same worker.
+    saved_modules = {k: v for k, v in sys.modules.items() if _is_purge_target(k)}
     for mod in list(sys.modules):
-        if mod == "run_agent" or mod.startswith("agent.") or mod.startswith("tools.") or mod.startswith("hermes_"):
+        if _is_purge_target(mod):
             del sys.modules[mod]
     from run_agent import AIAgent
 
@@ -159,6 +202,11 @@ def agent_env():
             os.environ.pop("HERMES_HOME", None)
         else:
             os.environ["HERMES_HOME"] = prev_home
+        # Restore sys.modules to pre-purge state so other test modules that
+        # imported run_agent/agent.*/tools.*/hermes_* earlier keep referring
+        # to the same module objects instead of picking up this test's
+        # freshly-reimported (and possibly monkeypatched) copies.
+        _restore_purged_modules(saved_modules)
 
 
 def _tool_results(handler) -> list[str]:
