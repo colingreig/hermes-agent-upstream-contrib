@@ -17,8 +17,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: docker-lint-${{ github.ref }}
-  cancel-in-progress: true
+  group: docker-lint-${{ github.event_name == 'push' && github.sha || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   hadolint:

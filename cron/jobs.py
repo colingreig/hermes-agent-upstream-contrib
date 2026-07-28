@@ -33,7 +33,7 @@ except ImportError:  # pragma: no cover - non-Windows
     msvcrt = None
 from datetime import datetime, timedelta
 from pathlib import Path
-from hermes_constants import get_hermes_home
+from hermes_constants import get_default_hermes_root, get_hermes_home
 from typing import Optional, Dict, List, Any, Set, Tuple, Union
 
 logger = logging.getLogger(__name__)
@@ -106,6 +106,9 @@ VALID_SKILL_SCOPES = (
     "seo-ppc-executor",
     "validator",
     "messaging-ops",
+)
+_LEGACY_RUNTIME_WORKDIR_ALIASES = (
+    "/Users/colingreig/dev/hermes-agent",
 )
 
 
@@ -1037,12 +1040,43 @@ def _normalize_workdir(workdir: Optional[str]) -> Optional[str]:
             f"Cron workdir must be an absolute path (got {raw!r}). "
             f"Cron jobs run detached from any shell cwd, so relative paths are ambiguous."
         )
+    expanded = _resolve_runtime_current_workdir_alias(expanded)
     resolved = expanded.resolve()
     if not resolved.exists():
         raise ValueError(f"Cron workdir does not exist: {resolved}")
     if not resolved.is_dir():
         raise ValueError(f"Cron workdir is not a directory: {resolved}")
     return str(resolved)
+
+
+def _resolve_runtime_current_workdir_alias(workdir: Union[str, Path]) -> Path:
+    """Map known stale Mini checkout workdirs to the active runtime release.
+
+    The Hermes Mini release topology keeps the deployable checkout at
+    ``~/.hermes/runtime-current``. Older cron jobs may still persist the
+    long-lived development checkout as their ``workdir``; when that happens,
+    context-file loading can keep picking up a stale, oversized AGENTS.md even
+    after a runtime release ships a trimmed one. Keep this alias narrow and
+    activation-based: only the exact known legacy path is remapped, and only
+    when ``runtime-current`` exists.
+    """
+    path = Path(workdir).expanduser()
+    try:
+        comparable = path.resolve(strict=False)
+    except OSError:
+        comparable = path
+
+    for alias in _LEGACY_RUNTIME_WORKDIR_ALIASES:
+        try:
+            alias_path = Path(alias).expanduser().resolve(strict=False)
+        except OSError:
+            alias_path = Path(alias).expanduser()
+        if comparable != alias_path:
+            continue
+        runtime_current = get_default_hermes_root() / "runtime-current"
+        if runtime_current.is_dir():
+            return runtime_current.resolve()
+    return path
 
 
 def _resolve_default_model_snapshot() -> Optional[str]:

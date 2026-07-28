@@ -50,8 +50,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: uv-lockfile-check-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: uv-lockfile-check-${{ github.event_name == 'push' && github.sha || (github.event.pull_request.number || github.ref) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   check:

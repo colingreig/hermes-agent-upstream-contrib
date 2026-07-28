@@ -37,4 +37,12 @@ case ":$PATH:" in
     ;;
 esac
 export PATH
+
+# Make the GitHub App credential helper available to default non-interactive
+# Git commands on the mini. Callers can still override or disable global Git
+# config explicitly before starting the shell.
+if [ -z "${GIT_CONFIG_GLOBAL+x}" ] && [ -z "${GIT_CONFIG_NOGLOBAL+x}" ] && [ -f "$HOME/.hermes/gitconfig" ]; then
+  export GIT_CONFIG_GLOBAL="$HOME/.hermes/gitconfig"
+fi
+
 unset _hermes_bin _hermes_newpath _hermes_oldifs _hermes_p

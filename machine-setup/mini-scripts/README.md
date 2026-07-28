@@ -330,6 +330,10 @@ under `pr_pipeline/`. Do not compare or copy those files one at a time.
 - `dot-profile` — **deploys to `~/.profile`.** Sourced by every `bash -l` the
   terminal tool spawns for its session-env snapshot; hoists `~/.hermes/bin`
   back to the front of `PATH` after `/etc/profile`'s `path_helper` demotes it.
+  It also exports `GIT_CONFIG_GLOBAL=~/.hermes/gitconfig` when that file
+  exists and the caller has not explicitly set `GIT_CONFIG_GLOBAL` or
+  `GIT_CONFIG_NOGLOBAL`, so default non-interactive mini Git commands can use
+  the GitHub App credential helper.
 - `spend_guard.py` — hard $50/day spend cap gating every `opencode_exec.py`
   delegation. Vendored 2026-07-26 as the canonical git home for what had been
   a mini-only, untracked file; the live file already carried its fix, so
@@ -396,16 +400,30 @@ under `pr_pipeline/`. Do not compare or copy those files one at a time.
   default ref from `refs/remotes/origin/HEAD` when present, falling back to
   the mirror's own `HEAD` symbolic ref (typically `refs/heads/main` on a true
   `--mirror` clone), and failing clearly (`--base` hint) when neither
-  resolves.
+  resolves. Its Git subprocess environment now defaults
+  `GIT_TERMINAL_PROMPT=0` and, when the caller has not supplied an explicit
+  Git config mode, injects `GIT_CONFIG_GLOBAL=~/.hermes/gitconfig` if that
+  file exists. That makes the GitHub App credential helper available to the
+  default `git remote update` path used by `wt-new` and callers such as
+  repo-baseline tooling without every caller remembering to export the config.
   Was previously live-only at `~/.hermes/scripts/wt-new` with no repo history;
   vendored here verbatim (byte-for-byte, sha256-matched) so future changes are
   reviewable and revertible through source control like every other
-  manual-copy script. Deploy by scp-by-name:
-  `scp machine-setup/mini-scripts/wt-new mini:~/.hermes/scripts/wt-new`.
+  manual-copy script. Deploy by scp-by-name, together with the profile hook
+  that makes the default login-shell Git config available:
+  `scp machine-setup/mini-scripts/wt-new mini:~/.hermes/scripts/wt-new && scp machine-setup/mini-scripts/dot-profile mini:~/.profile`.
+  Live post-copy smoke:
+  `ssh mini 'chmod 755 ~/.hermes/scripts/wt-new && chmod 644 ~/.profile && bash -lc '"'"'test "${GIT_CONFIG_GLOBAL:-}" = "$HOME/.hermes/gitconfig" && GIT_TERMINAL_PROMPT=0 git ls-remote https://github.com/colingreig/ignite-skills.git HEAD >/dev/null'"'"''`.
 - `tests/test_wt_new_default_ref.py` — covers `default_ref()`'s three cases:
   true mirror falling back to `refs/heads/main`, an ordinary clone with
   `origin/HEAD` set, and a bare repo with neither ref resolving cleanly to a
-  `SystemExit` with the `--base` hint.
+  `SystemExit` with the `--base` hint. It also covers the mini Git credential
+  environment contract and verifies `try_fetch()` passes that environment to
+  its subprocess Git invocation.
+- `tests/test_dot_profile_env.py` — covers the mini login-shell profile hook:
+  `~/.hermes/bin` is re-hoisted, `~/.hermes/gitconfig` becomes the default
+  global Git config when present, and explicit caller Git config overrides are
+  preserved.
 
 ## Cron-context GitHub auth (2026-07-26)
 
@@ -628,3 +646,66 @@ receipt `~/.hermes/logs/hermes-self-report-last-send.json` and exits `0`
 — no LLM, no send. The postmark sender's fallback target `slack:D0BA2PM9CFM` is
 a Slack DM channel id (not a secret); `hermes send --list` on the mini is the
 source of truth if it rotates.
+
+## hermes-spend-guard bundle (ClickUp 86e2hdxcb)
+
+Before this bundle existed, `spend_opencode.py`, `opencode_exec.py`,
+`spend_guard.py`, and `spend_meter.py` had no manifest and no governed
+installer at all — a release could change any of them and
+`scripts/mini-release-cut.sh` would still print "governed script deployment
+verified," because that check only ever covered
+`clickup_workspace_refresh.py`. The merged 86e2hap1g billing-route fix shipped
+as v0.18.2 and never reached the live `~/.hermes/scripts/` copy the mini cron
+actually executes (see `hermes-cron-executes-from-scripts-dir-not-release`).
+This bundle closes that gap the same way `self_report_manifest.json` +
+`install_self_report.py` already closed it for the status-email chain.
+
+**The bundle** (`spend_manifest.json`) records `src_rel`, `src_base`,
+`dest_abs`, `sha256`, `role`, and `deploy_mode` for each file:
+
+| File | dest | role |
+|---|---|---|
+| `spend_opencode.py` | `~/.hermes/scripts/` | shared billing-route helpers imported by the other three |
+| `opencode_exec.py` | `~/.hermes/scripts/` | executor's code-writing delegate (STEP 4 of clickup-queue-poller/SKILL.md) |
+| `spend_guard.py` | `~/.hermes/scripts/` | hard $50/day spend cap gating every delegation |
+| `spend_meter.py` | `~/.hermes/scripts/` | per-provider ($/provider/day) companion meter, no blocking power |
+
+**The installer** (`install_spend.py`, stdlib only, `no_agent`-safe) is the
+**sole writer** of these four files. It mirrors `install_self_report.py`
+exactly: sha-pinned, fails closed on any source hash drift, snapshots each
+existing destination into `~/.hermes/logs/spend-guard-installs/<UTC-ts>/`
+(plus a `<dest>.bak-spend-install-<ts>` sibling) before writing, installs
+atomically and re-verifies the deployed bytes (restoring the snapshot on any
+mismatch), writes a durable `install-receipt.json`, and refuses any
+destination outside `~/.hermes/` or named `claim_store.py` /
+`hermes_report_build.py`. It **warns (never installs)** if those two required
+co-exist files are absent: `opencode_exec.py` dynamically loads
+`claim_store.py` from its own directory to record the per-task outcome, and
+`hermes_report_build.py` (owned by the hermes-self-report bundle) imports
+`spend_opencode.served_row_cost` to strip phantom Codex-OAuth spend from
+legacy rows.
+
+```bash
+# preview: verify all source hashes, print the plan, write nothing
+python3 machine-setup/mini-scripts/install_spend.py --dry-run
+
+# scripts (default home = ~)
+python3 machine-setup/mini-scripts/install_spend.py
+```
+
+**Never** rsync `~/.hermes/scripts/`: this installer copies only the four
+declared files by name and touches nothing else. Because release/reconcile
+passes are known to clobber hand edits, this manifest + installer must be the
+ONLY writer of these four files going forward.
+
+`scripts/mini-release-cut.sh`'s post-cut receipt now scans every file that
+changed in the cut release under `machine-setup/mini-scripts/` and warns by
+name if any changed file is not covered by `self_report_manifest.json`,
+`spend_manifest.json`, `pr_pipeline/manifest.json`, or the three files it
+vendors directly (`clickup_workspace_refresh.py`,
+`reconcile_launchd_environment.py`, `reconcile_marketplace_skills.py`) —
+so an uncovered change is flagged instead of silently rolling up into
+"governed script deployment verified." Neither `install_self_report.py` nor
+`install_spend.py` is invoked automatically by the cut itself (they require an
+explicit, deliberate run — see each installer's usage above); the drift check
+only makes the receipt honest about what did and did not deploy.

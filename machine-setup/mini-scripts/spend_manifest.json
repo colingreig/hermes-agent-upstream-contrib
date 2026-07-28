@@ -1,0 +1,50 @@
+{
+  "bundle": "hermes-spend-guard",
+  "source_task": "86e2hdxcb",
+  "generated": "2026-07-28",
+  "description": "Declared deploy bundle for the Hermes mini spend-control chain: spend_opencode.py (shared billing-route helpers), opencode_exec.py (executor writer delegate), spend_guard.py (hard daily cap), and spend_meter.py (per-provider meter). These four files previously had no manifest and no governed installer, so mini-release-cut.sh's release receipt claimed \"governed script deployment verified\" even on releases that changed them without ever deploying the change to ~/.hermes/scripts/ (see the v0.18.2/86e2hap1g inert-fix incident in hermes-cron-executes-from-scripts-dir-not-release). This file IS the bundle the installer copies; nothing outside its 'files' list is written. Canon bytes are the live mini copies (all four were vendored verbatim from already-fixed live files, see README.md).",
+  "coexist_required": [
+    {
+      "dest_abs": "~/.hermes/scripts/claim_store.py",
+      "reason": "opencode_exec.py dynamically loads claim_store.py from its own directory (importlib.util.spec_from_file_location, not a package import) to record the per-task outcome at session end; a missing copy degrades that outcome bookkeeping. Installer warns, never installs or removes it."
+    },
+    {
+      "dest_abs": "~/.hermes/scripts/hermes_report_build.py",
+      "reason": "hermes_report_build._row_cost() imports spend_opencode.served_row_cost to strip subscription-covered (Codex OAuth) phantom spend from legacy writer-served rows (86e2hap1g). Owned by the hermes-self-report bundle, not this one; installer warns, never installs or removes it."
+    }
+  ],
+  "files": [
+    {
+      "src_rel": "spend_opencode.py",
+      "src_base": "mirror",
+      "dest_abs": "~/.hermes/scripts/spend_opencode.py",
+      "sha256": "467bcf0b482f52a7ecb33b34d6c4d34969866fe6bb64cc8f985f5d6eab911bbd",
+      "role": "shared billing-route helpers imported by opencode_exec.py, spend_guard.py, and spend_meter.py; classifies Codex-OAuth/subscription-covered rows as $0 marginal cost so the daily cap and meter don't alarm on phantom spend",
+      "deploy_mode": "script"
+    },
+    {
+      "src_rel": "opencode_exec.py",
+      "src_base": "mirror",
+      "dest_abs": "~/.hermes/scripts/opencode_exec.py",
+      "sha256": "fb5b81cffb1f51b3cebf1a54a8e2d2bd500ec01f5aaf888d378f38a51d71fa16",
+      "role": "executor's code-writing delegate (STEP 4 of clickup-queue-poller/SKILL.md); invokes OpenCode, streams the JSON event log, and reports success/failure to the orchestrator; imports spend_opencode for billing-route classification and dynamically loads claim_store.py for the outcome record",
+      "deploy_mode": "script"
+    },
+    {
+      "src_rel": "spend_guard.py",
+      "src_base": "mirror",
+      "dest_abs": "~/.hermes/scripts/spend_guard.py",
+      "sha256": "cd74070cfdd5afa9727c8dc59cfad59beb903501fa64cbd57c42139f4d4b8a22",
+      "role": "hard $50/day spend cap gating every opencode_exec.py delegation; three-tier policy (clean read / stale-cache alarm / no-cache fail-closed) so a state.db or log read hiccup can never silently masquerade as a $0 day; imports spend_opencode for billing-route resolution",
+      "deploy_mode": "script"
+    },
+    {
+      "src_rel": "spend_meter.py",
+      "src_base": "mirror",
+      "dest_abs": "~/.hermes/scripts/spend_meter.py",
+      "sha256": "1ba5592f4858bce4b07a8b4abb8a025f80cfc09cb25dd88ebe09ec835e67df47",
+      "role": "per-provider ($/provider/day) companion to spend_guard.py's global cap; a read failure raises SpendDataUnavailable (nonzero exit) instead of returning [] so the spend-meter cron's failure-delivery path fires; no blocking power, informational only; imports spend_opencode for billing-route resolution",
+      "deploy_mode": "script"
+    }
+  ]
+}
