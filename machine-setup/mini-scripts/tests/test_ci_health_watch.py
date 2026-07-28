@@ -50,9 +50,9 @@ class FakeRunner:
             if self.orb_list_stdout is not None:
                 return subprocess.CompletedProcess(cmd, 0, self.orb_list_stdout, "")
             return subprocess.CompletedProcess(cmd, 0, json.dumps({"vms": [{"name": "hermes-ci", "state": self.vm_state}]}), "")
-        if Path(cmd[0]).name == "orb" and cmd[1:4] == ["exec", "hermes-ci", "cat"]:
+        if Path(cmd[0]).name == "orb" and cmd[1:5] == ["exec", "-m", "hermes-ci", "cat"]:
             return subprocess.CompletedProcess(cmd, self.boot_rc, self.boot_id + "\n" if self.boot_rc == 0 else "", "boot failed")
-        if Path(cmd[0]).name == "orb" and cmd[1:4] == ["exec", "hermes-ci", "cut"]:
+        if Path(cmd[0]).name == "orb" and cmd[1:5] == ["exec", "-m", "hermes-ci", "cut"]:
             return subprocess.CompletedProcess(cmd, 0, "120\n", "")
         if cmd[:3] == ["gh", "api", "repos/colingreig/jdmbuysell-v4/actions/runners"]:
             payload = {"runners": [{"name": "hermes-jdmbuysell-v4", "status": self.runner_statuses["colingreig/jdmbuysell-v4"], "busy": False}]}
