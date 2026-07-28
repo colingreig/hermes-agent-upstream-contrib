@@ -3740,16 +3740,13 @@ class TestRouteChainExhaustedNoWork:
             # Fetch the ContextVar from whatever module object is *currently*
             # live in sys.modules — NOT the name bound at file-import/collection
             # time (see module docstring note below `TestRouteChainExhaustedNoWork`).
-            # Other test files (e.g. test_cron_no_agent.py's `hermes_env`
-            # fixture) call ``importlib.reload(cron.scheduler)`` to pick up a
-            # fresh HERMES_HOME, which replaces ``cron.scheduler``'s module
-            # namespace — including creating a BRAND NEW
-            # ``_JOB_CREDENTIAL_POOL_AVAILABLE`` ContextVar object. A name bound
-            # via ``from cron.scheduler import _JOB_CREDENTIAL_POOL_AVAILABLE``
-            # at collection time keeps pointing at the stale pre-reload object,
-            # so setting it here would silently diverge from the ContextVar
-            # ``tick()``/``run_one_job()`` actually read from (both freshly
-            # imported below, so always the live module). Always re-import here
+            # If another test reloads ``cron.scheduler``, the module namespace
+            # also gets a brand new ``_JOB_CREDENTIAL_POOL_AVAILABLE``
+            # ContextVar object. A name bound via
+            # ``from cron.scheduler import _JOB_CREDENTIAL_POOL_AVAILABLE`` at
+            # collection time would keep pointing at the stale pre-reload
+            # object, so setting it here could silently diverge from what
+            # ``tick()``/``run_one_job()`` actually read. Always re-import here
             # to stay pinned to the live module, whatever test order produced it.
             import cron.scheduler as _live_scheduler
             _live_scheduler._JOB_CREDENTIAL_POOL_AVAILABLE.set(False)

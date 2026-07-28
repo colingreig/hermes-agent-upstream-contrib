@@ -103,7 +103,7 @@ diverged, so bootstrap is intentionally blocked until the branch is reconciled.
    `origin` URL (the default; it avoids inheriting missing blobs from the
    blobless `runtime-current` clone), detached-checkout the sha, build the venv
    (`uv sync --extra all --locked`, falling back to `uv venv` + editable pip),
-   build the web dist (`npm install && npm run build --workspace web` →
+   build the web dist (`npm ci --include=dev && npm run build --workspace web` →
    `hermes_cli/web_dist/`). `--offline` is the explicit, best-effort local
    clone fallback; its integrity check must pass before it can be activated.
 5. **Verify the build before any switch**: `venv/bin/python -c "import
