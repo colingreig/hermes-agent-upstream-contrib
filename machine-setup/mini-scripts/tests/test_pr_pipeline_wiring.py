@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import contextlib
+import inspect
 import io
 import json
 import os
@@ -21,6 +22,7 @@ for path in (SCRIPTS, PIPELINE):
         sys.path.insert(0, str(path))
 
 import validate_pr  # noqa: E402
+import validator_visual_preview  # noqa: E402
 import validator_verdict  # noqa: E402
 import autonomous_merge  # noqa: E402
 import merge_guard  # noqa: E402
@@ -70,6 +72,58 @@ class RuntimeWiringTests(unittest.TestCase):
             self.assertFalse((SCRIPTS / name).exists(), name)
             self.assertTrue((PIPELINE / name).is_file(), name)
         self.assertFalse(retired.intersection(manifest["legacy_flat_entrypoints"]))
+
+    def test_visual_preview_module_is_deployed_and_runs_before_verdict_logic(self) -> None:
+        manifest = json.loads((PIPELINE / "manifest.json").read_text())
+        self.assertIn(
+            "validator_visual_preview.py",
+            manifest["legacy_flat_entrypoints"],
+        )
+        self.assertEqual(validator_visual_preview.PILOT_REPO, "colingreig/jdmbuysell-v4")
+
+        source = inspect.getsource(validate_pr.validate)
+        self.assertLess(source.index("head = vc.pr_head_sha"), source.index("visual = vvp.run"))
+        self.assertLess(source.index("visual = vvp.run"), source.index("tw = vt.run"))
+
+    def test_visual_high_finding_forces_final_block_even_when_other_lenses_pass(self) -> None:
+        trusted = identity()
+        visual = validator_visual_preview.operational_failure(
+            "navigation-failure",
+            "browser navigation failed",
+            preview_url="https://preview.example.test",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = Path(directory) / "verdicts.sqlite3"
+            with (
+                mock.patch.object(validate_pr.vc, "fetch_pr_diff", return_value="diff --git a/a.py b/a.py\n"),
+                mock.patch.object(validate_pr.vc, "pr_head_sha", return_value=trusted.head_sha),
+                mock.patch.object(validate_pr.vvp, "run", return_value=visual),
+                mock.patch.object(validate_pr.vt, "run", return_value={"tier": "low", "findings": []}),
+                mock.patch.object(validate_pr.via, "run", return_value={"findings": []}),
+                mock.patch.object(
+                    validate_pr,
+                    "_run_content_lens",
+                    return_value={"verdict": "PASS", "prose_pct": 0.0, "reason": "not prose-dominant"},
+                ),
+            ):
+                code, result = validate_pr.validate(
+                    "acme/widget",
+                    7,
+                    task="86e2gh04e",
+                    trusted_identity=trusted,
+                    trust_store_path=ledger,
+                )
+
+        self.assertEqual(code, 1)
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertEqual(result["visual_preview"]["failure_class"], "navigation-failure")
+        self.assertTrue(
+            any(
+                finding.get("check") == "visual-preview"
+                and finding.get("severity") == "high"
+                for finding in result["findings"]
+            )
+        )
 
     def test_finalization_count_is_read_only_and_distinguishes_unreadable_from_zero(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
