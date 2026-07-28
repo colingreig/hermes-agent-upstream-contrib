@@ -1693,10 +1693,61 @@ fi
 # recipe (mkdir/prompt-file/&-backgrounding/json-parse) every tick → 0 ships. SKILL must call
 # it; the script must exist + be executable + parse.
 DB_PUB="$HOME/.hermes/scripts/db_publish_task.py"
+DB_PUB_CANON="$REPO/machine-setup/mini-scripts/db_publish_task.py"
 if [ -x "$DB_PUB" ] && python3 -c "import ast; ast.parse(open('$DB_PUB').read())" 2>/dev/null; then
   grn "helper     db_publish_task.py present + executable + parse-ok (one-call DB-publish lane)"
 else
   red "helper     db_publish_task.py MISSING/not-executable/unparseable — DB-publish lane reverts to fumbled multi-step; re-apply Agent A3 script"; FAIL=1
+fi
+# 18b4a. Content-publish route must stay Sonnet-only / fail-closed. The old operator
+# text claimed a Sonnet > GLM-5.2 > Gemini cascade even though content fallback is
+# intentionally forbidden. Guard both the real resolver and the DB-publish helper text.
+if [ -f "$OC_EXEC" ] && [ -f "$DB_PUB_CANON" ]; then
+  content_report=$("$HOOK_PY" - "$OC_EXEC" "$DB_PUB_CANON" <<'PY' 2>/dev/null
+import ast
+import sys
+
+oc_path, db_pub_path = sys.argv[1:3]
+oc_source = open(oc_path, encoding="utf-8").read()
+db_source = open(db_pub_path, encoding="utf-8").read()
+tree = ast.parse(oc_source)
+miss = []
+content_cascade = None
+fail_closed_branch = False
+
+for node in ast.walk(tree):
+    if isinstance(node, ast.Assign):
+        for target in node.targets:
+            if isinstance(target, ast.Name) and target.id == "CONTENT_CASCADE":
+                try:
+                    content_cascade = ast.literal_eval(node.value)
+                except Exception:
+                    content_cascade = None
+    if isinstance(node, ast.If):
+        if any(isinstance(child, ast.Constant) and child.value == "content:<no enabled Sonnet tier>" for child in ast.walk(node)):
+            fail_closed_branch = True
+
+if content_cascade != [("anthropic/claude-sonnet-5", "content-anthropic")]:
+    miss.append("CONTENT_CASCADE-not-single-Sonnet")
+if not fail_closed_branch:
+    miss.append("content-empty-cascade-not-fail-closed")
+if "--content" not in db_source:
+    miss.append("db_publish_task-missing---content")
+if "CONTENT cascade: Sonnet > GLM-5.2 > Gemini" in db_source:
+    miss.append("stale-db-publish-GLM-Gemini-help")
+if "NO --model" in db_source and "writer cascade" in db_source:
+    miss.append("stale-db-publish-writer-cascade-help")
+if "Sonnet-only" not in db_source or "fail-closed" not in db_source:
+    miss.append("db_publish_task-missing-Sonnet-only-fail-closed-text")
+
+print("OK" if not miss else "MISS " + " ".join(miss))
+PY
+)
+  if [ "$content_report" = "OK" ]; then
+    grn "content    opencode_exec.py --content resolves Sonnet-only/fail-closed; canonical db_publish_task.py operator text matches"
+  else
+    red "content    DB-publish content route drift:${content_report#MISS } — keep --content Sonnet-only/fail-closed; remove stale GLM/Gemini canonical helper text"; FAIL=1
+  fi
 fi
 # 18b4b. 2026-06-27 site-config hardening: per-site values (live_url_base/table/whitelist/
 # slug-pattern/db-env) live in db_site_config.py (the SITE_CONFIG registry + fail-safe-LOUD
