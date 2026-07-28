@@ -19,17 +19,63 @@ from unittest.mock import MagicMock
 import pytest
 
 
-def _fresh_run_agent(hermes_home):
+def _is_purge_target(mod_name: str) -> bool:
+    return (
+        mod_name == "run_agent"
+        or mod_name.startswith("agent.")
+        or mod_name.startswith("tools.")
+        or mod_name.startswith("hermes_")
+    )
+
+
+def _restore_purged_modules(saved_modules: dict) -> None:
+    """Undo a sys.modules purge/reimport, restoring pre-purge identity.
+
+    Also re-binds each restored dotted submodule as an attribute on its
+    parent package object (e.g. ``agent.model_metadata`` on the ``agent``
+    package). The purge only ever removes dotted submodule entries, never
+    the parent package itself, so a fresh reimport rebinds the parent's
+    attribute to the NEW submodule object. Restoring just the sys.modules
+    dict entry leaves that attribute pointing at the new object — any test
+    that captured the module via attribute access (``agent.model_metadata``)
+    and later calls ``importlib.reload()`` on it then fails with
+    "module ... not in sys.modules" because the reloaded object no longer
+    matches sys.modules[name].
+    """
+    for mod_name in list(sys.modules):
+        if _is_purge_target(mod_name):
+            del sys.modules[mod_name]
+    sys.modules.update(saved_modules)
+    for name, mod in saved_modules.items():
+        if "." not in name:
+            continue
+        parent_name, leaf = name.rsplit(".", 1)
+        parent = sys.modules.get(parent_name)
+        if parent is not None:
+            setattr(parent, leaf, mod)
+
+
+def _fresh_run_agent(request):
+    """Reimport run_agent (and its agent./tools./hermes_* deps) from scratch.
+
+    Snapshots the pre-purge module objects and restores them once the
+    requesting test finishes, so this helper's forced reimport doesn't leak a
+    fresh (and possibly differently-patched) copy of these modules into tests
+    that run later in the same worker.
+    """
+    saved_modules = {k: v for k, v in sys.modules.items() if _is_purge_target(k)}
+    request.addfinalizer(lambda: _restore_purged_modules(saved_modules))
+
     for mod in list(sys.modules):
-        if mod == "run_agent" or mod.startswith("agent.") or mod.startswith("tools.") or mod.startswith("hermes_"):
+        if _is_purge_target(mod):
             del sys.modules[mod]
     import run_agent  # noqa: F401
     return sys.modules["run_agent"]
 
 
-def test_verification_flags_registered_as_ephemeral(tmp_path, monkeypatch):
+def test_verification_flags_registered_as_ephemeral(tmp_path, monkeypatch, request):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
-    ra = _fresh_run_agent(tmp_path)
+    ra = _fresh_run_agent(request)
 
     assert "_verification_stop_synthetic" in ra._EPHEMERAL_SCAFFOLDING_FLAGS
     assert "_pre_verify_synthetic" in ra._EPHEMERAL_SCAFFOLDING_FLAGS
@@ -64,9 +110,9 @@ def _make_agent(ra, session_id, tmp_path):
     return agent
 
 
-def test_db_flush_drops_verification_scaffolding(tmp_path, monkeypatch):
+def test_db_flush_drops_verification_scaffolding(tmp_path, monkeypatch, request):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
-    ra = _fresh_run_agent(tmp_path)
+    ra = _fresh_run_agent(request)
     agent = _make_agent(ra, "sess_db", tmp_path)
 
     messages = [
@@ -88,9 +134,9 @@ def test_db_flush_drops_verification_scaffolding(tmp_path, monkeypatch):
     assert "[System: run tests]" not in persisted
 
 
-def test_json_log_drops_verification_scaffolding(tmp_path, monkeypatch):
+def test_json_log_drops_verification_scaffolding(tmp_path, monkeypatch, request):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
-    ra = _fresh_run_agent(tmp_path)
+    ra = _fresh_run_agent(request)
     agent = _make_agent(ra, "sess_json", tmp_path)
 
     messages = [

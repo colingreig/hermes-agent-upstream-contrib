@@ -1,6 +1,9 @@
 """Tests for agent.models_dev — models.dev registry integration."""
 from unittest.mock import patch, MagicMock
 
+import pytest
+
+import agent.models_dev as _models_dev_module
 from agent.models_dev import (
     PROVIDER_TO_MODELS_DEV,
     _extract_context,
@@ -8,6 +11,23 @@ from agent.models_dev import (
     get_model_capabilities,
     lookup_models_dev_context,
 )
+
+
+@pytest.fixture(autouse=True)
+def _restore_models_dev_cache():
+    """Several tests below assign directly to the module-level in-memory
+    cache (``_models_dev_cache`` / ``_models_dev_cache_time``) to exercise
+    ``fetch_models_dev``'s cache hierarchy. Left unrestored, a fake/stale
+    registry (e.g. ``SAMPLE_REGISTRY``) sticks around for the rest of the
+    test process and silently changes ``get_model_capabilities`` /
+    ``decide_image_input_mode`` results in unrelated test modules that run
+    later in the same session (see tests/agent/test_vision_routing_31179.py).
+    """
+    original_cache = _models_dev_module._models_dev_cache
+    original_cache_time = _models_dev_module._models_dev_cache_time
+    yield
+    _models_dev_module._models_dev_cache = original_cache
+    _models_dev_module._models_dev_cache_time = original_cache_time
 
 
 SAMPLE_REGISTRY = {

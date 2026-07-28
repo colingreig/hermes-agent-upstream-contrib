@@ -850,6 +850,82 @@ prune_releases() {
   done
 }
 
+# ---------------------------------------------------------------------------
+# Ungoverned mini-scripts drift check.
+#
+# Two bundles (self_report_manifest.json + install_self_report.py,
+# spend_manifest.json + install_spend.py) declare which
+# machine-setup/mini-scripts/ files are sha-pinned and governed; a third
+# (pr_pipeline/manifest.json) owns its whole subtree the same way. Every
+# other file under machine-setup/mini-scripts/ is a manual-copy asset (see
+# the README). None of these installers runs automatically as part of this
+# cut — they require an explicit, deliberate invocation — so a file inside a
+# declared bundle can still go undeployed if nobody re-ran its installer.
+# What THIS check guards against is different and narrower: the receipt
+# claiming "governed script deployment verified" while a
+# machine-setup/mini-scripts/ file changed in the cut release that isn't
+# even DECLARED in any bundle — the exact gap that let the 86e2hap1g spend
+# fix ship as v0.18.2 and never reach the live mini (see
+# hermes-cron-executes-from-scripts-dir-not-release). This reads target-tree
+# blobs only (git show / diff --name-only), so it is dry-run safe and needs
+# no clone/checkout.
+# ---------------------------------------------------------------------------
+
+# Print the mirror-sourced dest paths (repo-relative, under $root) declared
+# by a self_report_manifest.json / spend_manifest.json -shaped bundle at the
+# resolved target commit. Prints nothing (not an error) if the manifest is
+# absent at that commit or fails to parse — an absent/malformed manifest is
+# itself surfaced as an uncovered change by the caller, not swallowed here.
+covered_mini_scripts_paths() {
+  local manifest_rel="${1:-}" root="${2:-}"
+  git_current show "${SHA}:${manifest_rel}" 2>/dev/null | python3 -c "
+import json, sys
+
+root = sys.argv[1]
+try:
+    manifest = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for entry in manifest.get('files', []):
+    if entry.get('src_base') == 'mirror':
+        print(root + '/' + entry['src_rel'])
+" "$root"
+}
+
+# List (repo-relative paths, one per line) every machine-setup/mini-scripts/
+# file that changed between $ACTIVE_SHA and $SHA but is not accounted for by
+# self_report_manifest.json, spend_manifest.json, the whole pr_pipeline/
+# subtree (owned wholesale by pr_pipeline/manifest.json), or the three files
+# this script vendors directly. tests/ and README.md are excluded — neither
+# is ever deployed to the mini.
+find_uncovered_mini_scripts_changes() {
+  local root="machine-setup/mini-scripts"
+  local changed covered f
+  changed="$(git_current diff --name-only "$ACTIVE_SHA" "$SHA" -- "$root" 2>/dev/null || true)"
+  [ -n "$changed" ] || return 0
+
+  covered="$(
+    {
+      covered_mini_scripts_paths "$root/self_report_manifest.json" "$root"
+      covered_mini_scripts_paths "$root/spend_manifest.json" "$root"
+      printf '%s\n' \
+        "$VENDORED_REFRESH_REL" \
+        "$VENDORED_LAUNCHD_RECONCILER_REL" \
+        "$VENDORED_SKILLS_RECONCILER_REL"
+    } 2>/dev/null
+  )"
+
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    case "$f" in
+      "$root"/tests/*|"$root"/README.md|"$root"/pr_pipeline/*) continue ;;
+    esac
+    if ! grep -Fxq -- "$f" <<<"$covered"; then
+      printf '%s\n' "$f"
+    fi
+  done <<<"$changed"
+}
+
 # The focused shell harness sources only the helpers above. This is deliberately
 # an opt-in no-op for a production invocation: it cannot cause a release cut.
 if [ "${MINI_RELEASE_CUT_TEST_LIB:-0}" = "1" ]; then
@@ -1283,13 +1359,32 @@ else
     die "cut aborted and rolled back to previous release"
   fi
 fi
+# Honest receipt: don't claim "governed script deployment verified" while a
+# machine-setup/mini-scripts/ file changed in this release outside every
+# declared deploy manifest (self_report_manifest.json, spend_manifest.json,
+# pr_pipeline/manifest.json, or the three files vendored above). This is a
+# report-only check — it never blocks or rolls back the cut.
+UNCOVERED_MINI_SCRIPTS="$(find_uncovered_mini_scripts_changes)"
+RECEIPT_DETAIL="release cut and governed script deployment verified"
+if [ -n "$UNCOVERED_MINI_SCRIPTS" ]; then
+  UNCOVERED_COUNT="$(printf '%s\n' "$UNCOVERED_MINI_SCRIPTS" | grep -c .)"
+  warn "release changed machine-setup/mini-scripts/ file(s) outside every deploy manifest — NOT deployed to the mini by this cut:"
+  while IFS= read -r UNCOVERED_FILE; do
+    [ -n "$UNCOVERED_FILE" ] && warn "  ungoverned change: $UNCOVERED_FILE"
+  done <<<"$UNCOVERED_MINI_SCRIPTS"
+  RECEIPT_DETAIL="release cut complete; WARNING: ${UNCOVERED_COUNT} machine-setup/mini-scripts/ file(s) changed outside every deploy manifest (see cut log for names)"
+fi
+
 RECEIPT_EVENT="cut"
 [ "$IF_ADVANCED" -eq 1 ] && RECEIPT_EVENT="advanced"
 record_cut_receipt_or_rollback "$RECEIPT_EVENT" "$ACTIVE_SHA" "$SHA" "$NEW_DIR" \
   "$REFRESH_SOURCE_HASH" "$REFRESH_DEPLOYED_HASH" \
-  "release cut and governed script deployment verified"
+  "$RECEIPT_DETAIL"
 
 ok "release cut complete: runtime-current → $NEW_DIR (v${VERSION}-${SHORT_SHA})"
+if [ -n "$UNCOVERED_MINI_SCRIPTS" ]; then
+  warn "release cut complete WITH WARNINGS: ${UNCOVERED_COUNT} ungoverned mini-scripts change(s) — see above"
+fi
 
 # --- Optional prune (explicit only) ----------------------------------------
 if [ "$DO_PRUNE" -eq 1 ]; then
