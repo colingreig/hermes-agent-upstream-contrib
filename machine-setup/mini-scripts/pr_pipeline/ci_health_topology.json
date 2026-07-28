@@ -5,8 +5,8 @@
   "vm": {
     "name": "hermes-ci",
     "status_command": ["/usr/local/bin/orb", "list", "--format", "json"],
-    "boot_id_command": ["/usr/local/bin/orb", "exec", "hermes-ci", "cat", "/proc/sys/kernel/random/boot_id"],
-    "uptime_command": ["/usr/local/bin/orb", "exec", "hermes-ci", "cut", "-d.", "-f1", "/proc/uptime"],
+    "boot_id_command": ["/usr/local/bin/orb", "exec", "-m", "hermes-ci", "cat", "/proc/sys/kernel/random/boot_id"],
+    "uptime_command": ["/usr/local/bin/orb", "exec", "-m", "hermes-ci", "cut", "-d.", "-f1", "/proc/uptime"],
     "managed_commands": {
       "start": ["/usr/local/bin/orb", "start", "hermes-ci"],
       "stop": ["/usr/local/bin/orb", "stop", "hermes-ci"],
