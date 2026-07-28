@@ -46,6 +46,8 @@ import time
 import urllib.request
 from pathlib import Path
 
+from spend_opencode import configured_codex_oauth_proxy_metadata, opencode_route_metadata_event
+
 
 # GLM/reasoning models leak <think>...</think> tags into OpenCode's --format json
 # text events (OpenCode issue #16903, open as of 2026-06). Strip them from any
@@ -223,6 +225,42 @@ def _variant_for(model, explicit_variant):
     return ""
 
 
+def _billing_route_for_model(model):
+    for cascade_model, provider in WRITER_CASCADE + CONTENT_CASCADE + KANBAN_DECOMPOSER_CASCADE:
+        if cascade_model == model:
+            if provider == "openai-codex":
+                metadata = configured_codex_oauth_proxy_metadata()
+                if metadata is not None:
+                    return metadata["provider"], metadata["base_url"]
+                return "openai", ""
+            if provider in ("anthropic", "content-anthropic"):
+                return "anthropic", ""
+            if provider in ("google", "google-flash", "google-decomposer"):
+                return "gemini", ""
+            if provider == "minimax":
+                return "minimax", ""
+            if provider == "zai":
+                return "zai", ""
+            if provider == "openai":
+                return "openai", ""
+            return provider, ""
+    if model.startswith("openai/"):
+        if model in {"openai/gpt-5.5", "openai/gpt-5.4", "openai/gpt-5.4-mini"}:
+            metadata = configured_codex_oauth_proxy_metadata()
+            if metadata is not None:
+                return metadata["provider"], metadata["base_url"]
+        return "openai", ""
+    if model.startswith("anthropic/"):
+        return "anthropic", ""
+    if model.startswith("google/"):
+        return "gemini", ""
+    if model.startswith("minimax/"):
+        return "minimax", ""
+    if model.startswith("zai-coding/"):
+        return "zai", ""
+    return "unknown", ""
+
+
 def _run_once(model, variant, child_env, workdir, opencode_bin, timeout, log_path, task_id, cascade_label):
     """Run ONE OpenCode delegation and capture results. Returns a dict with
     rc/texts/final/saw_error/timed_out/stderr_tail/elapsed, or {"launch_error": ...}."""
@@ -267,6 +305,15 @@ def _run_once(model, variant, child_env, workdir, opencode_bin, timeout, log_pat
     watchdog_thread.start()
 
     with open(log_path, "w", encoding="utf-8") as logf:
+        billing_provider, base_url = _billing_route_for_model(model)
+        logf.write(json.dumps(opencode_route_metadata_event(
+            model=model,
+            provider=billing_provider,
+            base_url=base_url,
+            task_id=task_id,
+            cascade_label=cascade_label,
+        )) + "\n")
+        logf.flush()
         try:
             for line in proc.stdout:
                 logf.write(line)
