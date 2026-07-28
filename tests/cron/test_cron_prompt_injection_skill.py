@@ -28,11 +28,8 @@ def cron_env(tmp_path, monkeypatch):
     setting `HERMES_HOME` alone doesn't reach it. We also patch the
     module-level constant so `skill_view()` finds the skills we plant.
 
-    Note: `test_cron_no_agent.py` (and potentially others) do
-    ``importlib.reload(cron.scheduler)`` in their fixtures. A plain
-    top-level import of ``CronPromptInjectionBlocked`` would become stale
-    after that reload and defeat ``pytest.raises(...)`` checks. Each test
-    re-imports via this fixture's return value instead.
+    Keep scheduler exception lookup module-local to avoid stale class
+    bindings if another cron fixture ever reloads ``cron.scheduler``.
     """
     hermes_home = tmp_path / ".hermes"
     hermes_home.mkdir()
