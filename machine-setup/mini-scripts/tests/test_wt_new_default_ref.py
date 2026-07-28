@@ -1,9 +1,11 @@
 import importlib.util
 import importlib.machinery
+import os
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "wt-new"
@@ -69,6 +71,56 @@ class DefaultRefTests(unittest.TestCase):
         message = str(raised.exception)
         self.assertIn("could not resolve mirror default branch", message)
         self.assertIn("Pass --base", message)
+
+    def test_git_env_uses_hermes_gitconfig_when_present(self):
+        gitconfig = self.root / ".hermes" / "gitconfig"
+        gitconfig.parent.mkdir()
+        gitconfig.write_text("[credential]\n\thelper = /fake/helper\n", encoding="utf-8")
+        self.wt_new.GIT_CONFIG_PATH = gitconfig
+
+        with mock.patch.dict(os.environ, {}, clear=True):
+            env = self.wt_new._git_env()
+
+        self.assertEqual(env["GIT_TERMINAL_PROMPT"], "0")
+        self.assertEqual(env["GIT_CONFIG_GLOBAL"], str(gitconfig))
+
+    def test_git_env_preserves_explicit_git_config_override(self):
+        gitconfig = self.root / ".hermes" / "gitconfig"
+        gitconfig.parent.mkdir()
+        gitconfig.write_text("[credential]\n\thelper = /fake/helper\n", encoding="utf-8")
+        self.wt_new.GIT_CONFIG_PATH = gitconfig
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "GIT_CONFIG_GLOBAL": "/tmp/custom-gitconfig",
+                "GIT_TERMINAL_PROMPT": "1",
+            },
+            clear=True,
+        ):
+            env = self.wt_new._git_env()
+
+        self.assertEqual(env["GIT_CONFIG_GLOBAL"], "/tmp/custom-gitconfig")
+        self.assertEqual(env["GIT_TERMINAL_PROMPT"], "1")
+
+    def test_try_fetch_passes_git_auth_env(self):
+        gitconfig = self.root / ".hermes" / "gitconfig"
+        gitconfig.parent.mkdir()
+        gitconfig.write_text("[credential]\n\thelper = /fake/helper\n", encoding="utf-8")
+        self.wt_new.GIT_CONFIG_PATH = gitconfig
+        mirror = self.root / "mirror.git"
+        mirror.mkdir()
+
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+            self.wt_new.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 0, "", ""),
+        ) as run_mock:
+            self.wt_new.try_fetch(mirror)
+
+        env = run_mock.call_args.kwargs["env"]
+        self.assertEqual(env["GIT_TERMINAL_PROMPT"], "0")
+        self.assertEqual(env["GIT_CONFIG_GLOBAL"], str(gitconfig))
 
 
 if __name__ == "__main__":

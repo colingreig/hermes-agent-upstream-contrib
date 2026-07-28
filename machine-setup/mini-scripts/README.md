@@ -330,6 +330,10 @@ under `pr_pipeline/`. Do not compare or copy those files one at a time.
 - `dot-profile` — **deploys to `~/.profile`.** Sourced by every `bash -l` the
   terminal tool spawns for its session-env snapshot; hoists `~/.hermes/bin`
   back to the front of `PATH` after `/etc/profile`'s `path_helper` demotes it.
+  It also exports `GIT_CONFIG_GLOBAL=~/.hermes/gitconfig` when that file
+  exists and the caller has not explicitly set `GIT_CONFIG_GLOBAL` or
+  `GIT_CONFIG_NOGLOBAL`, so default non-interactive mini Git commands can use
+  the GitHub App credential helper.
 - `spend_guard.py` — hard $50/day spend cap gating every `opencode_exec.py`
   delegation. Vendored 2026-07-26 as the canonical git home for what had been
   a mini-only, untracked file; the live file already carried its fix, so
@@ -396,16 +400,30 @@ under `pr_pipeline/`. Do not compare or copy those files one at a time.
   default ref from `refs/remotes/origin/HEAD` when present, falling back to
   the mirror's own `HEAD` symbolic ref (typically `refs/heads/main` on a true
   `--mirror` clone), and failing clearly (`--base` hint) when neither
-  resolves.
+  resolves. Its Git subprocess environment now defaults
+  `GIT_TERMINAL_PROMPT=0` and, when the caller has not supplied an explicit
+  Git config mode, injects `GIT_CONFIG_GLOBAL=~/.hermes/gitconfig` if that
+  file exists. That makes the GitHub App credential helper available to the
+  default `git remote update` path used by `wt-new` and callers such as
+  repo-baseline tooling without every caller remembering to export the config.
   Was previously live-only at `~/.hermes/scripts/wt-new` with no repo history;
   vendored here verbatim (byte-for-byte, sha256-matched) so future changes are
   reviewable and revertible through source control like every other
-  manual-copy script. Deploy by scp-by-name:
-  `scp machine-setup/mini-scripts/wt-new mini:~/.hermes/scripts/wt-new`.
+  manual-copy script. Deploy by scp-by-name, together with the profile hook
+  that makes the default login-shell Git config available:
+  `scp machine-setup/mini-scripts/wt-new mini:~/.hermes/scripts/wt-new && scp machine-setup/mini-scripts/dot-profile mini:~/.profile`.
+  Live post-copy smoke:
+  `ssh mini 'chmod 755 ~/.hermes/scripts/wt-new && chmod 644 ~/.profile && bash -lc '"'"'test "${GIT_CONFIG_GLOBAL:-}" = "$HOME/.hermes/gitconfig" && GIT_TERMINAL_PROMPT=0 git ls-remote https://github.com/colingreig/ignite-skills.git HEAD >/dev/null'"'"''`.
 - `tests/test_wt_new_default_ref.py` — covers `default_ref()`'s three cases:
   true mirror falling back to `refs/heads/main`, an ordinary clone with
   `origin/HEAD` set, and a bare repo with neither ref resolving cleanly to a
-  `SystemExit` with the `--base` hint.
+  `SystemExit` with the `--base` hint. It also covers the mini Git credential
+  environment contract and verifies `try_fetch()` passes that environment to
+  its subprocess Git invocation.
+- `tests/test_dot_profile_env.py` — covers the mini login-shell profile hook:
+  `~/.hermes/bin` is re-hoisted, `~/.hermes/gitconfig` becomes the default
+  global Git config when present, and explicit caller Git config overrides are
+  preserved.
 
 ## Cron-context GitHub auth (2026-07-26)
 

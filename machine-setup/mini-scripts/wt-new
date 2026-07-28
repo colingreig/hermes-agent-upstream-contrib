@@ -42,6 +42,7 @@ HERMES_HOME = Path(os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")
 BARE_ROOT = HERMES_HOME / "bare"
 WORKTREE_ROOT = HERMES_HOME / "worktrees"
 REPO_MAP_PATH = HERMES_HOME.parent / ".hermes" / "bare-repo-map.tsv"
+GIT_CONFIG_PATH = HERMES_HOME / "gitconfig"
 
 TASK_ID_RE = re.compile(r"^[A-Za-z0-9]{6,}$")
 FETCH_TIMEOUT = int(os.environ.get("WT_NEW_FETCH_TIMEOUT", "20"))
@@ -49,6 +50,18 @@ FETCH_TIMEOUT = int(os.environ.get("WT_NEW_FETCH_TIMEOUT", "20"))
 
 def _log(msg: str) -> None:
     print(f"[wt-new] {msg}", file=sys.stderr)
+
+
+def _git_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env.setdefault("GIT_TERMINAL_PROMPT", "0")
+    if (
+        "GIT_CONFIG_GLOBAL" not in env
+        and "GIT_CONFIG_NOGLOBAL" not in env
+        and GIT_CONFIG_PATH.is_file()
+    ):
+        env["GIT_CONFIG_GLOBAL"] = str(GIT_CONFIG_PATH)
+    return env
 
 
 def _load_repo_map() -> dict:
@@ -107,6 +120,7 @@ def default_ref(bare_dir: Path) -> str:
             out = subprocess.run(
                 ["git", "-C", str(bare_dir), "symbolic-ref", symbolic_ref],
                 capture_output=True, text=True, timeout=10, check=True,
+                env=_git_env(),
             ).stdout.strip()
         except Exception:
             checked.append(symbolic_ref)
@@ -115,7 +129,7 @@ def default_ref(bare_dir: Path) -> str:
         checked.append(out)
         proc = subprocess.run(
             ["git", "-C", str(bare_dir), "rev-parse", "--verify", "--quiet", f"{out}^{{commit}}"],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True, text=True, timeout=10, env=_git_env(),
         )
         if proc.returncode == 0:
             if out.startswith("refs/remotes/"):
@@ -135,7 +149,7 @@ def try_fetch(bare_dir: Path) -> None:
     try:
         proc = subprocess.run(
             ["git", "-C", str(bare_dir), "remote", "update", "--prune"],
-            capture_output=True, text=True, timeout=FETCH_TIMEOUT,
+            capture_output=True, text=True, timeout=FETCH_TIMEOUT, env=_git_env(),
         )
         if proc.returncode != 0:
             _log(f"WARN: fetch failed (non-fatal, using cached history): {proc.stderr.strip()[:300]}")
@@ -180,7 +194,7 @@ def main(argv=None) -> int:
 
     cmd = ["git", "-C", str(bare_dir), "worktree", "add", "-b", branch, str(target), base]
     _log(f"running: {' '.join(cmd)}")
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    proc = subprocess.run(cmd, capture_output=True, text=True, env=_git_env())
     if proc.returncode != 0:
         _log(proc.stdout)
         _log(proc.stderr)

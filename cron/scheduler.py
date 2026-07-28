@@ -346,6 +346,7 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
 
 from cron.jobs import (
     _coerce_job_bool,
+    _resolve_runtime_current_workdir_alias,
     advance_next_run,
     claim_dispatch,
     get_due_jobs,
@@ -3524,6 +3525,13 @@ def run_job(
     """
     job_id = job["id"]
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
+    _configured_workdir = (job.get("workdir") or "").strip() or None
+    if _configured_workdir:
+        _effective_workdir = str(
+            _resolve_runtime_current_workdir_alias(_configured_workdir)
+        )
+        if _effective_workdir != _configured_workdir:
+            job = {**job, "workdir": _effective_workdir}
 
     # Revalidate persisted workdirs immediately before either runner path. A
     # project can disappear after create/update validation; silently using the
@@ -3898,6 +3906,8 @@ def run_job(
     # we leave TERMINAL_CWD untouched — preserves the original behaviour
     # (skip_context_files=True, tools use whatever cwd the scheduler has).
     _job_workdir = (job.get("workdir") or "").strip() or None
+    if _job_workdir:
+        _job_workdir = str(_resolve_runtime_current_workdir_alias(_job_workdir))
     if _job_workdir and not Path(_job_workdir).is_dir():
         # Directory was removed between create-time validation and now.  Log
         # and drop back to old behaviour rather than crashing the job.
