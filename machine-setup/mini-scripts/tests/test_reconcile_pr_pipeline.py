@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import os
 import sys
 import tempfile
@@ -14,6 +15,7 @@ from unittest import mock
 SCRIPTS = Path(__file__).resolve().parent.parent
 RECONCILER = SCRIPTS / "reconcile_pr_pipeline.py"
 PIPELINE = SCRIPTS / "pr_pipeline"
+PATCH_VERIFIER = SCRIPTS / "verify-hermes-patches.sh"
 _COUNTER = 0
 
 # Autonomous-merge activation made shadow/tier gates env-derived instead of
@@ -56,12 +58,67 @@ class PipelineDeploymentTests(unittest.TestCase):
 
     def setUp(self):
         self.mod = _load(RECONCILER, "reconcile_pr_pipeline_test")
+        self.real_resolve_manifest = self.mod.resolve_manifest
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.destination = Path(self.tmp.name) / "scripts"
+        self.local_patch_bytes = b"test-local verify-hermes-patches.sh\n"
+        self.fixture_manifest = self._fixture_manifest_for_local_patch(self.local_patch_bytes)
+        self.mod.resolve_manifest = lambda path=self.mod.DEFAULT_MANIFEST: self.fixture_manifest
+        self.addCleanup(lambda: setattr(self.mod, "resolve_manifest", self.real_resolve_manifest))
 
     def _install(self):
+        self.destination.mkdir(parents=True, exist_ok=True)
+        (self.destination / "verify-hermes-patches.sh").write_bytes(self.local_patch_bytes)
         return self.mod.install(self.destination, source_commit=self.source_commit)
+
+    def _fixture_manifest_for_local_patch(self, payload: bytes):
+        manifest = self.real_resolve_manifest()
+        expected = hashlib.sha256(payload).hexdigest()
+        files = []
+        for item in manifest.files:
+            if item.destination.as_posix() == "verify-hermes-patches.sh":
+                files.append(
+                    self.mod.ResolvedFile(
+                        source=item.source,
+                        destination=item.destination,
+                        sha256=expected,
+                        mode=item.mode,
+                        install=False,
+                        source_sha256=item.source_sha256,
+                        local_patch_reason="test local patch",
+                    )
+                )
+            else:
+                files.append(item)
+        return self.mod.ResolvedManifest(
+            path=manifest.path,
+            sha256=manifest.sha256,
+            files=tuple(files),
+            root_patterns=manifest.root_patterns,
+            unmanaged_root_exclusions=manifest.unmanaged_root_exclusions,
+            package_destination=manifest.package_destination,
+        )
+
+    def test_default_manifest_declares_verify_patches_as_expected_local_patch(self):
+        manifest = self.real_resolve_manifest()
+        local_patch = {
+            item.destination.as_posix(): item
+            for item in manifest.files
+            if not item.install
+        }
+
+        self.assertEqual(set(local_patch), {"verify-hermes-patches.sh"})
+        item = local_patch["verify-hermes-patches.sh"]
+        self.assertEqual(
+            item.source_sha256,
+            hashlib.sha256(PATCH_VERIFIER.read_bytes()).hexdigest(),
+        )
+        self.assertEqual(
+            item.sha256,
+            "ce51ca818e1d127a83b61694545c0fb673e749688a72dd7b0ae909522431aff5",
+        )
+        self.assertIn("Slack patch-05 MPIM/DM", item.local_patch_reason)
 
     def test_install_has_hash_parity_and_records_source_commit(self):
         report = self._install()
@@ -74,9 +131,25 @@ class PipelineDeploymentTests(unittest.TestCase):
         for relative in report["expected_files"]:
             self.assertTrue((self.destination / relative).is_file(), relative)
         self.assertTrue((self.destination / "verify-hermes-patches.sh").is_file())
+        self.assertEqual(
+            (self.destination / "verify-hermes-patches.sh").read_bytes(),
+            self.local_patch_bytes,
+        )
+        self.assertIn("verify-hermes-patches.sh", report["expected_local_patches"])
         self.assertTrue((self.destination / "validator_repo_guard.py").is_file())
         self.assertTrue((self.destination / "pr_pipeline" / "validator_repo_guard.py").is_file())
         self.assertTrue((self.destination / ".pr_pipeline_deployment.json").is_file())
+
+    def test_install_reports_wrong_local_patch_without_resyncing_it(self):
+        self.destination.mkdir(parents=True, exist_ok=True)
+        wrong = b"wrong local patch\n"
+        (self.destination / "verify-hermes-patches.sh").write_bytes(wrong)
+
+        report = self.mod.install(self.destination, source_commit=self.source_commit)
+
+        self.assertFalse(report["ok"])
+        self.assertIn("verify-hermes-patches.sh", report["hash_mismatches"])
+        self.assertEqual((self.destination / "verify-hermes-patches.sh").read_bytes(), wrong)
 
     def test_manifest_includes_validator_repo_guard_in_flat_and_package_surfaces(self):
         manifest = self.mod.resolve_manifest()

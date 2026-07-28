@@ -21,7 +21,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -30,6 +30,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_MANIFEST = SCRIPT_DIR / "pr_pipeline" / "manifest.json"
 MARKER_NAME = ".pr_pipeline_deployment.json"
 SOURCE_COMMIT_RE = re.compile(r"[0-9a-f]{7,64}\Z")
+SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 REMOTE_HOST_RE = re.compile(r"[A-Za-z0-9_.@:-]+\Z")
 
 
@@ -43,6 +44,9 @@ class ResolvedFile:
     destination: Path
     sha256: str
     mode: int
+    install: bool = True
+    source_sha256: str | None = None
+    local_patch_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -85,6 +89,55 @@ def _safe_directory(value: object, *, field: str) -> str:
     return value
 
 
+def _safe_destination(value: object, *, field: str) -> str:
+    if not isinstance(value, str) or not value or value.startswith("/"):
+        raise ManifestError(f"{field} must be a safe relative path")
+    path = Path(value)
+    if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+        raise ManifestError(f"{field} must be a safe relative path")
+    return path.as_posix()
+
+
+def _safe_sha256(value: object, *, field: str) -> str:
+    if not isinstance(value, str) or not SHA256_RE.fullmatch(value):
+        raise ManifestError(f"{field} must be a lowercase SHA-256 digest")
+    return value
+
+
+def _expected_local_patch_specs(data: dict[str, Any]) -> dict[str, dict[str, str]]:
+    raw = data.get("expected_local_patches", {})
+    if not isinstance(raw, dict):
+        raise ManifestError("expected_local_patches must be an object")
+    if list(raw) != sorted(raw):
+        raise ManifestError("expected_local_patches must be sorted by destination")
+    specs: dict[str, dict[str, str]] = {}
+    for raw_destination, raw_spec in raw.items():
+        destination = _safe_destination(raw_destination, field="expected_local_patches key")
+        if not isinstance(raw_spec, dict):
+            raise ManifestError(f"expected_local_patches[{destination}] must be an object")
+        if raw_spec.get("sync") is not False:
+            raise ManifestError(f"expected_local_patches[{destination}].sync must be false")
+        reason = raw_spec.get("reason")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ManifestError(f"expected_local_patches[{destination}].reason must be non-empty")
+        source_sha256 = _safe_sha256(
+            raw_spec.get("source_sha256"),
+            field=f"expected_local_patches[{destination}].source_sha256",
+        )
+        deployed_sha256 = _safe_sha256(
+            raw_spec.get("deployed_sha256"),
+            field=f"expected_local_patches[{destination}].deployed_sha256",
+        )
+        if deployed_sha256 == source_sha256:
+            raise ManifestError(f"expected_local_patches[{destination}] must differ from the source hash")
+        specs[destination] = {
+            "deployed_sha256": deployed_sha256,
+            "reason": reason,
+            "source_sha256": source_sha256,
+        }
+    return specs
+
+
 def resolve_manifest(path: Path = DEFAULT_MANIFEST) -> ResolvedManifest:
     """Resolve the stable manifest shape into sorted files and runtime hashes."""
     path = path.resolve()
@@ -125,6 +178,7 @@ def resolve_manifest(path: Path = DEFAULT_MANIFEST) -> ResolvedManifest:
         raise ManifestError("unmanaged_root_exclusions must be unique and sorted")
     if any(not any(fnmatch.fnmatchcase(name, pattern) for pattern in root_patterns) for name in unmanaged_root_exclusions):
         raise ManifestError("unmanaged_root_exclusions must match managed_root_patterns")
+    expected_local_patches = _expected_local_patch_specs(data)
 
     resolved: list[ResolvedFile] = []
     destination_names: set[Path] = set()
@@ -156,6 +210,28 @@ def resolve_manifest(path: Path = DEFAULT_MANIFEST) -> ResolvedManifest:
     for source in package_sources:
         add(source, Path(package_destination) / source.name)
 
+    indexes = {item.destination.as_posix(): index for index, item in enumerate(resolved)}
+    unmanaged_patches = sorted(set(expected_local_patches).difference(indexes))
+    if unmanaged_patches:
+        raise ManifestError(
+            "expected_local_patches must reference manifest destinations: "
+            + ", ".join(unmanaged_patches)
+        )
+    for relative, spec in expected_local_patches.items():
+        index = indexes[relative]
+        item = resolved[index]
+        if item.sha256 != spec["source_sha256"]:
+            raise ManifestError(
+                f"expected_local_patches[{relative}].source_sha256 does not match the source file"
+            )
+        resolved[index] = replace(
+            item,
+            install=False,
+            local_patch_reason=spec["reason"],
+            sha256=spec["deployed_sha256"],
+            source_sha256=item.sha256,
+        )
+
     return ResolvedManifest(
         path=path,
         sha256=_sha256_path(path),
@@ -168,6 +244,19 @@ def resolve_manifest(path: Path = DEFAULT_MANIFEST) -> ResolvedManifest:
 
 def _expected_hashes(manifest: ResolvedManifest) -> dict[str, str]:
     return {item.destination.as_posix(): item.sha256 for item in manifest.files}
+
+
+def _expected_local_patches(manifest: ResolvedManifest) -> dict[str, dict[str, str | bool]]:
+    return {
+        item.destination.as_posix(): {
+            "deployed_sha256": item.sha256,
+            "reason": item.local_patch_reason or "",
+            "source_sha256": item.source_sha256 or "",
+            "sync": False,
+        }
+        for item in manifest.files
+        if not item.install
+    }
 
 
 def _atomic_copy(source: Path, destination: Path, mode: int) -> None:
@@ -218,7 +307,8 @@ def install(destination: Path, *, source_commit: str, manifest_path: Path = DEFA
         raise ManifestError(f"destination is not a directory: {destination}")
 
     for item in manifest.files:
-        _atomic_copy(item.source, destination / item.destination, item.mode)
+        if item.install:
+            _atomic_copy(item.source, destination / item.destination, item.mode)
 
     marker = {
         "schema_version": 1,
@@ -226,6 +316,7 @@ def install(destination: Path, *, source_commit: str, manifest_path: Path = DEFA
         "source_commit": source_commit,
         "manifest_sha256": manifest.sha256,
         "files": _expected_hashes(manifest),
+        "expected_local_patches": _expected_local_patches(manifest),
     }
     _atomic_json(destination / MARKER_NAME, marker)
     return verify(destination, manifest_path=manifest_path, expected_source_commit=source_commit)
@@ -313,6 +404,7 @@ def verify(
         "manifest": str(manifest.path),
         "manifest_sha256": manifest.sha256,
         "expected_files": expected_hashes,
+        "expected_local_patches": _expected_local_patches(manifest),
         "missing": missing,
         "hash_mismatches": mismatches,
         "extra": extras,

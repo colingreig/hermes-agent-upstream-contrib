@@ -213,72 +213,57 @@ pytest tests/ -v
 
 ## Project Structure
 
+File counts shift constantly — don't treat the tree below as exhaustive. The
+canonical source is the filesystem; the notes call out the load-bearing entry
+points you'll actually edit.
+
 ```
 hermes-agent/
-├── run_agent.py              # AIAgent class — core conversation loop, tool dispatch, session persistence
-├── cli.py                    # HermesCLI class — interactive TUI, prompt_toolkit integration
-├── model_tools.py            # Tool orchestration (thin layer over tools/registry.py)
-├── toolsets.py               # Tool groupings and presets (hermes-cli, hermes-telegram, etc.)
-├── hermes_state.py           # SQLite session database with FTS5 full-text search, session titles
-├── batch_runner.py           # Parallel batch processing for trajectory generation
-│
-├── agent/                    # Agent internals (extracted modules)
-│   ├── prompt_builder.py         # System prompt assembly (identity, skills, context files, memory)
-│   ├── context_compressor.py     # Auto-summarization when approaching context limits
-│   ├── auxiliary_client.py       # Resolves auxiliary OpenAI clients (summarization, vision)
-│   ├── display.py                # KawaiiSpinner, tool progress formatting
-│   ├── model_metadata.py         # Model context lengths, token estimation
-│   └── trajectory.py             # Trajectory saving helpers
-│
-├── hermes_cli/               # CLI command implementations
-│   ├── main.py                   # Entry point, argument parsing, command dispatch
-│   ├── config.py                 # Config management, migration, env var definitions
-│   ├── setup.py                  # Interactive setup wizard
-│   ├── auth.py                   # Provider resolution, OAuth, Nous Portal
-│   ├── models.py                 # OpenRouter model selection lists
-│   ├── banner.py                 # Welcome banner, ASCII art
-│   ├── commands.py               # Central slash command registry (CommandDef), autocomplete, gateway helpers
-│   ├── callbacks.py              # Interactive callbacks (clarify, sudo, approval)
-│   ├── doctor.py                 # Diagnostics
-│   ├── skills_hub.py             # Skills Hub CLI + /skills slash command
-│   └── skin_engine.py            # Skin/theme engine — data-driven CLI visual customization
-│
-├── tools/                    # Tool implementations (self-registering)
-│   ├── registry.py               # Central tool registry (schemas, handlers, dispatch)
-│   ├── approval.py               # Dangerous command detection + per-session approval
-│   ├── terminal_tool.py          # Terminal orchestration (sudo, env lifecycle, backends)
-│   ├── file_operations.py        # read_file, write_file, search, patch, etc.
-│   ├── web_tools.py              # web_search, web_extract (Parallel/Firecrawl + Gemini summarization)
-│   ├── vision_tools.py           # Image analysis via multimodal models
-│   ├── delegate_tool.py          # Subagent spawning and parallel task execution
-│   ├── code_execution_tool.py    # Sandboxed Python with RPC tool access
-│   ├── session_search_tool.py    # Search past conversations with FTS5 + anchored windows
-│   ├── cronjob_tools.py          # Scheduled task management
-│   ├── skill_tools.py            # Skill search, load, manage
-│   └── environments/             # Terminal execution backends
-│       ├── base.py                   # BaseEnvironment ABC
-│       ├── local.py, docker.py, ssh.py, singularity.py, modal.py, daytona.py
-│
-├── gateway/                  # Messaging gateway
-│   ├── run.py                    # GatewayRunner — platform lifecycle, message routing, cron
-│   ├── config.py                 # Platform configuration resolution
-│   ├── session.py                # Session store, context prompts, reset policies
-│   └── platforms/                # Platform adapters
-│       ├── telegram.py, discord_adapter.py, slack.py, whatsapp.py
-│
-├── scripts/                  # Installer and bridge scripts
-│   ├── install.sh                # Linux/macOS installer
-│   ├── install.ps1               # Windows PowerShell installer
-│   └── whatsapp-bridge/          # Node.js WhatsApp bridge (Baileys)
-│
-├── skills/                   # Bundled skills (copied to ~/.hermes/skills/ on install)
-├── optional-skills/          # Official optional skills (discoverable via hub, not activated by default)
-├── tests/                    # Test suite
-├── website/                  # Documentation site (hermes-agent.nousresearch.com)
-│
-├── cli-config.yaml.example   # Example configuration (copied to ~/.hermes/config.yaml)
-└── AGENTS.md                 # Development guide for AI coding assistants
+├── run_agent.py          # AIAgent class — core conversation loop (~12k LOC)
+├── model_tools.py        # Tool orchestration, discover_builtin_tools(), handle_function_call()
+├── toolsets.py           # Toolset definitions, _HERMES_CORE_TOOLS list
+├── cli.py                # HermesCLI class — interactive CLI orchestrator (~11k LOC)
+├── hermes_state.py       # SessionDB — SQLite session store (FTS5 search)
+├── hermes_constants.py   # get_hermes_home(), display_hermes_home() — profile-aware paths
+├── hermes_logging.py     # setup_logging() — agent.log / errors.log / gateway.log (profile-aware)
+├── batch_runner.py       # Parallel batch processing
+├── agent/                # Agent internals (provider adapters, memory, caching, compression, etc.)
+├── hermes_cli/           # CLI subcommands, setup wizard, plugins loader, skin engine
+├── tools/                # Tool implementations — auto-discovered via tools/registry.py
+│   └── environments/     # Terminal backends (local, docker, ssh, modal, daytona, singularity)
+├── gateway/              # Messaging gateway — run.py + session.py + platforms/
+│   ├── platforms/        # Adapter per platform (telegram, discord, slack, whatsapp,
+│   │                     #   homeassistant, signal, matrix, mattermost, email, sms,
+│   │                     #   dingtalk, wecom, weixin, feishu, qqbot, bluebubbles,
+│   │                     #   yuanbao, webhook, api_server, ...). See ADDING_A_PLATFORM.md.
+│   └── builtin_hooks/    # Extension point for always-registered gateway hooks (none shipped)
+├── plugins/              # Plugin system (see AGENTS.md's "Plugins" section)
+│   ├── memory/           # Memory-provider plugins (honcho, mem0, supermemory, ...)
+│   ├── context_engine/   # Context-engine plugins
+│   ├── model-providers/  # Inference backend plugins (openrouter, anthropic, gmi, ...)
+│   ├── kanban/           # Multi-agent board dispatcher + worker plugin
+│   ├── hermes-achievements/  # Gamified achievement tracking
+│   ├── observability/    # Metrics / traces / logs plugin
+│   ├── image_gen/        # Image-generation providers
+│   └── <others>/         # disk-cleanup, google_meet, platforms, spotify,
+│                         #   strike-freedom-cockpit, ...
+├── optional-skills/      # Heavier/niche skills shipped but NOT active by default
+├── skills/               # Built-in skills bundled with the repo
+├── ui-tui/               # Ink (React) terminal UI — `hermes --tui`
+│   └── src/              # entry.tsx, app.tsx, gatewayClient.ts + app/components/hooks/lib
+├── tui_gateway/          # Python JSON-RPC backend for the TUI
+├── apps/desktop/         # Electron desktop chat app (separate from the TUI)
+├── acp_adapter/          # ACP server (VS Code / Zed / JetBrains integration)
+├── cron/                 # Scheduler — jobs.py, scheduler.py
+├── scripts/              # run_tests.sh, release.py, install.sh/.ps1, auxiliary scripts
+├── website/              # Docusaurus docs site (hermes-agent.nousresearch.com)
+└── tests/                # Pytest suite
 ```
+
+**User config:** `~/.hermes/config.yaml` (settings), `~/.hermes/.env` (API keys only).
+**Logs:** `~/.hermes/logs/` — `agent.log` (INFO+), `errors.log` (WARNING+),
+`gateway.log` when running the gateway. Profile-aware via `get_hermes_home()`.
+Browse with `hermes logs [--follow] [--level ...] [--session ...]`.
 
 ### User configuration (stored in `~/.hermes/`)
 

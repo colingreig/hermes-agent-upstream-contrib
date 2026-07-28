@@ -513,6 +513,11 @@ if grep -Eq ' (show|cat-file) ' "$DRY_GIT_LOG"; then
 fi
 grep -Fq 'verify governed refresh post-install SHA-256 equality (deferred to real cut)' "$DRY_ROOT/output" \
   || fail "dry cut did not print deferred refresh verification"
+grep -Fq 'npm ci --include=dev && npm run build --workspace web' "$DRY_ROOT/output" \
+  || fail "dry cut did not advertise lockfile-respecting npm ci web build"
+if grep -Fq 'npm install && npm run build --workspace web' "$DRY_ROOT/output"; then
+  fail "dry cut advertised lockfile-mutating npm install web build"
+fi
 
 # Polling artifacts are source-controlled, point only at the conditional
 # release mode, and the plist is parseable without requiring launchd.
