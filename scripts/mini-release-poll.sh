@@ -11,4 +11,4 @@ if [ ! -x "$CUT" ]; then
   exit 1
 fi
 
-exec "$CUT" --ref prod-live-patches --if-advanced
+exec "$CUT" --ref prod-live-patches --if-advanced --prune

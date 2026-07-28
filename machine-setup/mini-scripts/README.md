@@ -375,6 +375,22 @@ under `pr_pipeline/`. Do not compare or copy those files one at a time.
   `spend['error']` field threaded through the subject line, headline, HTML
   render, text render, and JSON summary so an unreadable ledger renders as
   "spend UNKNOWN (ledger unreadable)" and never as a silent zero.
+- `mcp_serve_reaper.py` (task 86e2hap4g) — standalone, redundant, age-based
+  safety net (same philosophy as `worktree_backstop_sweep.py`) that reaps
+  orphaned per-session `hermes mcp serve` stdio subprocesses left behind by a
+  dropped SSH/MCP client. Liveness-based, NOT release-path-based: a
+  release-cut-tied reaper would kill healthy in-progress Claude Code/Codex
+  sessions, since "release path != current" mostly selects processes started
+  before the last deploy. Reaps only when a process is both genuinely
+  orphaned (`ppid == 1`, or the parent chain never reaches a live
+  `sshd-session:` ancestor before PID 1) AND older than `--min-age-minutes`
+  (default 45, avoids flip-timing races) — TERM, grace period, then KILL.
+  LaunchAgent `com.colingreig.hermes.mcp-serve-reaper` runs it every 20 min
+  (`launchd/com.colingreig.hermes.mcp-serve-reaper.plist`). Sibling fix folded
+  into the same task: `scripts/mini-release-poll.sh` now passes `--prune` to
+  `mini-release-cut.sh` (previously never pruned, so old release dirs
+  accumulated unbounded — `mini-release-cut.sh` already had `--prune` wired
+  and tested, it just wasn't being invoked).
 
 ## Cron-context GitHub auth (2026-07-26)
 
