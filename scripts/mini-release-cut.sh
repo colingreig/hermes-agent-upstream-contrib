@@ -1156,11 +1156,11 @@ fi
 
 # --- Build the web dashboard bundle into hermes_cli/web_dist ---------------
 # vite is configured with outDir ../hermes_cli/web_dist (web/vite.config.ts).
-log "building web dist (npm install && npm run build --workspace web)"
+log "building web dist (npm ci --include=dev && npm run build --workspace web)"
 if [ "$DRY_RUN" -eq 1 ]; then
-  printf '\033[35m[DRY-RUN]\033[0m (cd %s && npm install && npm run build --workspace web)\n' "$NEW_DIR"
+  printf '\033[35m[DRY-RUN]\033[0m (cd %s && npm ci --include=dev && npm run build --workspace web)\n' "$NEW_DIR"
 else
-  ( cd "$NEW_DIR" && npm install && npm run build --workspace web ) || die "web build failed"
+  ( cd "$NEW_DIR" && npm ci --include=dev && npm run build --workspace web ) || die "web build failed"
 fi
 
 # --- Verify the build BEFORE any switch ------------------------------------

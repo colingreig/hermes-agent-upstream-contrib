@@ -28,14 +28,17 @@ def hermes_env(tmp_path, monkeypatch):
 
     monkeypatch.setenv("HERMES_HOME", str(home))
 
-    # Reload modules that cache get_hermes_home() at import time.
+    # Reload jobs, which snapshots its store paths at import time. Do not
+    # reload cron.scheduler here: pytest has already collected modules that
+    # imported scheduler exception classes by value, and an in-place reload
+    # replaces those class identities for the rest of the worker.
     import importlib
     import hermes_constants
     importlib.reload(hermes_constants)
     import cron.jobs
     importlib.reload(cron.jobs)
     import cron.scheduler
-    importlib.reload(cron.scheduler)
+    monkeypatch.setattr(cron.scheduler, "_hermes_home", home)
 
     return home
 

@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 SCRIPTS = Path(__file__).resolve().parent.parent
@@ -33,7 +35,43 @@ class PipelineVerifierTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.destination = Path(self.temporary.name) / "scripts"
-        self.reconciler.install(self.destination, source_commit="a" * 40)
+        self.local_patch_bytes = b"pipeline-verifier local patch fixture\n"
+        self.destination.mkdir(parents=True, exist_ok=True)
+        self._install_fixture()
+
+    def _fixture_manifest_for_local_patch(self, payload: bytes):
+        manifest = self.reconciler.resolve_manifest()
+        expected = hashlib.sha256(payload).hexdigest()
+        files = []
+        for item in manifest.files:
+            if item.destination.as_posix() == "verify-hermes-patches.sh":
+                files.append(
+                    self.reconciler.ResolvedFile(
+                        source=item.source,
+                        destination=item.destination,
+                        sha256=expected,
+                        mode=item.mode,
+                        install=False,
+                        source_sha256=item.source_sha256,
+                        local_patch_reason="test local patch",
+                    )
+                )
+            else:
+                files.append(item)
+        return self.reconciler.ResolvedManifest(
+            path=manifest.path,
+            sha256=manifest.sha256,
+            files=tuple(files),
+            root_patterns=manifest.root_patterns,
+            unmanaged_root_exclusions=manifest.unmanaged_root_exclusions,
+            package_destination=manifest.package_destination,
+        )
+
+    def _install_fixture(self):
+        (self.destination / "verify-hermes-patches.sh").write_bytes(self.local_patch_bytes)
+        manifest = self._fixture_manifest_for_local_patch(self.local_patch_bytes)
+        with mock.patch.object(self.reconciler, "resolve_manifest", return_value=manifest):
+            return self.reconciler.install(self.destination, source_commit="a" * 40)
 
     def test_deployed_pipeline_verifier_proves_the_shadow_boundary(self):
         report = self.verifier.verify(self.destination)
@@ -55,7 +93,7 @@ class PipelineVerifierTests(unittest.TestCase):
         with self.assertRaises(self.verifier.VerificationError):
             self.verifier.verify(self.destination)
 
-        self.reconciler.install(self.destination, source_commit="a" * 40)
+        self._install_fixture()
         (self.destination / "pr_pipeline_improvements.py.bak-pre-boundary").write_text("legacy backup\n", encoding="utf-8")
         self.assertTrue(self.verifier.verify(self.destination)["ok"])
 
@@ -63,7 +101,7 @@ class PipelineVerifierTests(unittest.TestCase):
         with self.assertRaises(self.verifier.VerificationError):
             self.verifier.verify(self.destination)
 
-        self.reconciler.install(self.destination, source_commit="a" * 40)
+        self._install_fixture()
         (self.destination / "pr_pipeline" / "unmanaged.py").write_text("# unsafe\n", encoding="utf-8")
         with self.assertRaises(self.verifier.VerificationError):
             self.verifier.verify(self.destination)
