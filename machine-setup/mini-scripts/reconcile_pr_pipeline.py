@@ -22,6 +22,7 @@ import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass, replace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -29,6 +30,10 @@ from typing import Any, Iterable
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_MANIFEST = SCRIPT_DIR / "pr_pipeline" / "manifest.json"
 MARKER_NAME = ".pr_pipeline_deployment.json"
+CI_HEALTH_CRON_NAME = "ci-health-watch"
+CI_HEALTH_CRON_SCHEDULE = {"kind": "cron", "expr": "*/5 * * * *", "display": "*/5 * * * *"}
+CI_HEALTH_CRON_SCHEDULE_DISPLAY = "*/5 * * * *"
+CI_HEALTH_CRON_MAX_SECONDS = 300
 SOURCE_COMMIT_RE = re.compile(r"[0-9a-f]{7,64}\Z")
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 REMOTE_HOST_RE = re.compile(r"[A-Za-z0-9_.@:-]+\Z")
@@ -275,20 +280,128 @@ def _atomic_copy(source: Path, destination: Path, mode: int) -> None:
         raise
 
 
-def _atomic_json(destination: Path, value: dict[str, Any]) -> None:
+def _atomic_json(destination: Path, value: Any) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(value, indent=2, sort_keys=True) + "\n"
     fd, temporary = tempfile.mkstemp(prefix=f".{destination.name}.", dir=destination.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as output:
             output.write(payload)
+            output.flush()
+            os.fsync(output.fileno())
         os.chmod(temporary, 0o600)
         os.replace(temporary, destination)
+        directory_fd = os.open(destination.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
     except BaseException:
         try:
             os.unlink(temporary)
         except FileNotFoundError:
             pass
         raise
+
+
+def _cron_jobs_path(destination: Path) -> Path:
+    return destination.parent / "cron" / "jobs.json"
+
+
+def _managed_ci_health_script(destination: Path) -> str:
+    return "ci_health_watch.py"
+
+
+def _load_cron_jobs_document(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        raise ManifestError(f"cron jobs {path} is missing")
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ManifestError(f"cannot read cron jobs {path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ManifestError(f"cron jobs {path} must be a JSON object")
+    jobs = data.get("jobs")
+    if not isinstance(jobs, list) or not all(isinstance(item, dict) for item in jobs):
+        raise ManifestError(f"cron jobs {path}.jobs must be a JSON list of objects")
+    return data
+
+
+def _load_cron_jobs(path: Path) -> list[dict[str, Any]]:
+    return _load_cron_jobs_document(path)["jobs"]
+
+
+def _schedule_seconds(schedule: object) -> int | None:
+    if isinstance(schedule, dict):
+        if schedule.get("kind") != "cron":
+            return None
+        schedule = schedule.get("expr")
+    if not isinstance(schedule, str):
+        return None
+    value = schedule.strip().lower()
+    match = re.fullmatch(r"every\s+(\d+)\s*([mh])", value)
+    if match:
+        count = int(match.group(1))
+        return count * (60 if match.group(2) == "m" else 3600)
+    match = re.fullmatch(r"\*/(\d+)\s+\*\s+\*\s+\*\s+\*", value)
+    if match:
+        return int(match.group(1)) * 60
+    return None
+
+
+def _ci_health_schedule_errors(destination: Path, jobs: list[dict[str, Any]]) -> list[str]:
+    matches = [job for job in jobs if job.get("name") == CI_HEALTH_CRON_NAME]
+    if len(matches) != 1:
+        return ["ci-health-cron-missing" if not matches else "ci-health-cron-ambiguous"]
+    job = matches[0]
+    errors: list[str] = []
+    if job.get("script") != _managed_ci_health_script(destination):
+        errors.append("ci-health-cron-script-drift")
+    if job.get("no_agent") is not True:
+        errors.append("ci-health-cron-no-agent-drift")
+    seconds = _schedule_seconds(job.get("schedule"))
+    if seconds is None or seconds > CI_HEALTH_CRON_MAX_SECONDS:
+        errors.append("ci-health-cron-schedule-drift")
+    elif job.get("schedule") != CI_HEALTH_CRON_SCHEDULE or job.get("schedule_display") != CI_HEALTH_CRON_SCHEDULE_DISPLAY:
+        errors.append("ci-health-cron-schedule-contract-drift")
+    if job.get("enabled") is not True:
+        errors.append("ci-health-cron-disabled")
+    if job.get("enabled") is True and job.get("state") != "scheduled":
+        errors.append("ci-health-cron-state-drift")
+    return errors
+
+
+def _ci_health_job_index(jobs: list[dict[str, Any]]) -> int:
+    matches = [index for index, job in enumerate(jobs) if job.get("name") == CI_HEALTH_CRON_NAME]
+    if len(matches) != 1:
+        detail = "missing" if not matches else "ambiguous"
+        raise ManifestError(f"cron job name is {detail}: {CI_HEALTH_CRON_NAME}")
+    return matches[0]
+
+
+def _next_ci_health_run_at() -> str:
+    return (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
+
+
+def _repair_ci_health_schedule(destination: Path) -> None:
+    jobs_path = _cron_jobs_path(destination)
+    document = _load_cron_jobs_document(jobs_path)
+    jobs = document["jobs"]
+    index = _ci_health_job_index(jobs)
+    repaired = dict(jobs[index])
+    repaired.update({
+        "name": CI_HEALTH_CRON_NAME,
+        "schedule": CI_HEALTH_CRON_SCHEDULE,
+        "script": _managed_ci_health_script(destination),
+        "schedule_display": CI_HEALTH_CRON_SCHEDULE_DISPLAY,
+        "enabled": True,
+        "no_agent": True,
+        "state": "scheduled",
+        "next_run_at": _next_ci_health_run_at(),
+    })
+    jobs[index] = repaired
+    document["jobs"] = jobs
+    _atomic_json(jobs_path, document)
 
 
 def _validate_source_commit(value: str | None) -> str:
@@ -306,9 +419,11 @@ def install(destination: Path, *, source_commit: str, manifest_path: Path = DEFA
     if not destination.is_dir():
         raise ManifestError(f"destination is not a directory: {destination}")
 
+    _ci_health_job_index(_load_cron_jobs(_cron_jobs_path(destination)))
     for item in manifest.files:
         if item.install:
             _atomic_copy(item.source, destination / item.destination, item.mode)
+    _repair_ci_health_schedule(destination)
 
     marker = {
         "schema_version": 1,
@@ -398,8 +513,13 @@ def verify(
             marker_errors.append("deployment-marker-source-commit-mismatch")
 
     extras = _extra_root_files(destination, manifest, set(expected_hashes))
+    cron_errors: list[str]
+    try:
+        cron_errors = _ci_health_schedule_errors(destination, _load_cron_jobs(_cron_jobs_path(destination)))
+    except ManifestError as exc:
+        cron_errors = [f"ci-health-cron-invalid:{exc}"]
     report = {
-        "ok": not missing and not mismatches and not extras and not marker_errors,
+        "ok": not missing and not mismatches and not extras and not marker_errors and not cron_errors,
         "deployment": str(destination),
         "manifest": str(manifest.path),
         "manifest_sha256": manifest.sha256,
@@ -409,6 +529,12 @@ def verify(
         "hash_mismatches": mismatches,
         "extra": extras,
         "marker_errors": marker_errors,
+        "cron_errors": cron_errors,
+        "managed_cron": {
+            "name": CI_HEALTH_CRON_NAME,
+            "max_interval_seconds": CI_HEALTH_CRON_MAX_SECONDS,
+            "script": _managed_ci_health_script(destination),
+        },
         "recorded_source_commit": recorded_commit,
         "expected_source_commit": expected_source_commit,
     }
