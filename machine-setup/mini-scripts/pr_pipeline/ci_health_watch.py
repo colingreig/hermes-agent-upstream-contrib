@@ -375,18 +375,29 @@ def _record_transition(previous: dict[str, Any], vm: VmStatus, state: dict[str, 
         current_available=vm.available,
     )
     outage = state.get("vm_outage") if isinstance(state.get("vm_outage"), dict) else None
-    recovery_eligible = bool(prior_boot and vm.boot_id and prior_boot != vm.boot_id)
-    outage_started_at = None
+    observed_at = _now()
+    timestamp = observed_at.isoformat()
+    interruption_started_at = None
+    interruption_ended_at = None
     if prior_available is True and vm.available is False:
-        outage_started_at = _now_iso()
-        state["vm_outage"] = {"started_at": outage_started_at, "prior_boot_id": prior_boot}
+        state["vm_outage"] = {"started_at": timestamp, "prior_boot_id": prior_boot}
     elif prior_available is False and vm.available is True and vm.boot_id and outage is not None:
-        outage_started_at = outage.get("started_at") if isinstance(outage.get("started_at"), str) else None
-        recovery_eligible = outage_started_at is not None
+        interruption_started_at = outage.get("started_at") if isinstance(outage.get("started_at"), str) else None
+        interruption_ended_at = timestamp if interruption_started_at is not None else None
         state.pop("vm_outage", None)
     elif vm.available is True:
         state.pop("vm_outage", None)
-    timestamp = _now_iso()
+
+    # A boot-ID change proves a reboot, but not when this poll observed it.
+    # The guest uptime is the only bounded interruption point available here.
+    # Without it, recovery fails closed rather than treating an arbitrary
+    # interval around the observation as restart-related.
+    boot_changed = bool(prior_boot and vm.boot_id and prior_boot != vm.boot_id)
+    if boot_changed and isinstance(vm.uptime_seconds, int) and vm.uptime_seconds >= 0:
+        restarted_at = (observed_at - timedelta(seconds=vm.uptime_seconds)).isoformat()
+        interruption_started_at = restarted_at
+        interruption_ended_at = restarted_at
+    recovery_eligible = interruption_started_at is not None and interruption_ended_at is not None
     record = {
         "timestamp": timestamp,
         "event": "hermes-ci-lifecycle-transition",
@@ -401,10 +412,9 @@ def _record_transition(previous: dict[str, Any], vm: VmStatus, state: dict[str, 
         "reason": "unknown",
         "recovery_eligible": recovery_eligible,
     }
-    if outage_started_at is not None:
-        record["outage_started_at"] = outage_started_at
-    if prior_available is False and vm.available is True and recovery_eligible:
-        record["outage_recovered_at"] = timestamp
+    if interruption_started_at is not None and interruption_ended_at is not None:
+        record["interruption_started_at"] = interruption_started_at
+        record["interruption_ended_at"] = interruption_ended_at
     if intent is not None:
         record["initiator"] = intent.get("actor") or "unknown"
         record["managed_action"] = intent.get("action")
@@ -478,18 +488,13 @@ def _maybe_alert_vm_transition(state: dict[str, Any], record: dict[str, Any] | N
 def _run_overlaps_restart(run: dict[str, Any], transition: dict[str, Any]) -> bool:
     started = _parse_time(run.get("createdAt"))
     ended = _parse_time(run.get("updatedAt")) or _parse_time(run.get("createdAt"))
-    outage_started = _parse_time(transition.get("outage_started_at"))
-    outage_recovered = _parse_time(transition.get("outage_recovered_at"))
+    interruption_started = _parse_time(transition.get("interruption_started_at"))
+    interruption_ended = _parse_time(transition.get("interruption_ended_at"))
     if started is None or ended is None:
         return False
-    if outage_started is not None and outage_recovered is not None:
-        return started <= outage_recovered and ended >= outage_started
-    detected = _parse_time(transition.get("timestamp"))
-    if detected is None:
+    if interruption_started is None or interruption_ended is None:
         return False
-    window_start = detected - timedelta(minutes=10)
-    window_end = detected + timedelta(minutes=10)
-    return started <= window_end and ended >= window_start
+    return started <= interruption_ended and ended >= interruption_started
 
 
 def _allowlisted_recovery(topology: dict[str, Any], run: dict[str, Any]) -> bool:

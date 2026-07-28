@@ -6,7 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
@@ -295,24 +295,23 @@ class CiHealthWatchTests(unittest.TestCase):
             self._poll()
         self.assertEqual(self.runner.reruns, [])
 
-    def test_restart_window_correlation_dispatches_one_allowlisted_rerun_and_survives_reload(self):
+    def test_restart_interruption_correlation_dispatches_one_allowlisted_rerun_and_survives_reload(self):
         self._poll()
-        self.runner.boot_id = "boot-b"
-        self._poll()
+        now = self.mod._now()
         self.runner.runs = [
             {
                 "databaseId": 101,
                 "workflowName": "Dead-image monitor",
                 "conclusion": "failure",
                 "status": "completed",
-                "createdAt": self.mod._now_iso(),
-                "updatedAt": self.mod._now_iso(),
+                "createdAt": (now - timedelta(minutes=5)).isoformat(),
+                "updatedAt": now.isoformat(),
                 "event": "schedule",
                 "headBranch": "main",
                 "url": "https://example/run/101",
             }
         ]
-
+        self.runner.boot_id = "boot-b"
         first = self._poll()
         second = self._poll()
 
@@ -324,14 +323,13 @@ class CiHealthWatchTests(unittest.TestCase):
         self.assertEqual(state["recovery"]["101"]["attempt"], 1)
         self.assertIn("persisted_before_dispatch_at", state["recovery"]["101"])
 
-    def test_recovery_readiness_is_runner_specific(self):
+    def test_post_restart_allowlisted_failure_is_not_recovered(self):
         self._poll()
         self.runner.boot_id = "boot-b"
         self._poll()
-        self.runner.runner_statuses["colingreig/topdynamicspartners"] = "offline"
         self.runner.runs = [
             {
-                "databaseId": 111,
+                "databaseId": 102,
                 "workflowName": "Dead-image monitor",
                 "conclusion": "failure",
                 "status": "completed",
@@ -339,9 +337,33 @@ class CiHealthWatchTests(unittest.TestCase):
                 "updatedAt": self.mod._now_iso(),
                 "event": "schedule",
                 "headBranch": "main",
+                "url": "https://example/run/102",
+            }
+        ]
+
+        report = self._poll()
+
+        self.assertEqual(report["rerun_ids"], [])
+        self.assertEqual(self.runner.reruns, [])
+
+    def test_recovery_readiness_is_runner_specific(self):
+        self._poll()
+        now = self.mod._now()
+        self.runner.runs = [
+            {
+                "databaseId": 111,
+                "workflowName": "Dead-image monitor",
+                "conclusion": "failure",
+                "status": "completed",
+                "createdAt": (now - timedelta(minutes=5)).isoformat(),
+                "updatedAt": now.isoformat(),
+                "event": "schedule",
+                "headBranch": "main",
                 "url": "https://example/run/111",
             }
         ]
+        self.runner.boot_id = "boot-b"
+        self.runner.runner_statuses["colingreig/topdynamicspartners"] = "offline"
 
         report = self._poll()
 
