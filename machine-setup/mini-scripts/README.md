@@ -646,3 +646,66 @@ receipt `~/.hermes/logs/hermes-self-report-last-send.json` and exits `0`
 — no LLM, no send. The postmark sender's fallback target `slack:D0BA2PM9CFM` is
 a Slack DM channel id (not a secret); `hermes send --list` on the mini is the
 source of truth if it rotates.
+
+## hermes-spend-guard bundle (ClickUp 86e2hdxcb)
+
+Before this bundle existed, `spend_opencode.py`, `opencode_exec.py`,
+`spend_guard.py`, and `spend_meter.py` had no manifest and no governed
+installer at all — a release could change any of them and
+`scripts/mini-release-cut.sh` would still print "governed script deployment
+verified," because that check only ever covered
+`clickup_workspace_refresh.py`. The merged 86e2hap1g billing-route fix shipped
+as v0.18.2 and never reached the live `~/.hermes/scripts/` copy the mini cron
+actually executes (see `hermes-cron-executes-from-scripts-dir-not-release`).
+This bundle closes that gap the same way `self_report_manifest.json` +
+`install_self_report.py` already closed it for the status-email chain.
+
+**The bundle** (`spend_manifest.json`) records `src_rel`, `src_base`,
+`dest_abs`, `sha256`, `role`, and `deploy_mode` for each file:
+
+| File | dest | role |
+|---|---|---|
+| `spend_opencode.py` | `~/.hermes/scripts/` | shared billing-route helpers imported by the other three |
+| `opencode_exec.py` | `~/.hermes/scripts/` | executor's code-writing delegate (STEP 4 of clickup-queue-poller/SKILL.md) |
+| `spend_guard.py` | `~/.hermes/scripts/` | hard $50/day spend cap gating every delegation |
+| `spend_meter.py` | `~/.hermes/scripts/` | per-provider ($/provider/day) companion meter, no blocking power |
+
+**The installer** (`install_spend.py`, stdlib only, `no_agent`-safe) is the
+**sole writer** of these four files. It mirrors `install_self_report.py`
+exactly: sha-pinned, fails closed on any source hash drift, snapshots each
+existing destination into `~/.hermes/logs/spend-guard-installs/<UTC-ts>/`
+(plus a `<dest>.bak-spend-install-<ts>` sibling) before writing, installs
+atomically and re-verifies the deployed bytes (restoring the snapshot on any
+mismatch), writes a durable `install-receipt.json`, and refuses any
+destination outside `~/.hermes/` or named `claim_store.py` /
+`hermes_report_build.py`. It **warns (never installs)** if those two required
+co-exist files are absent: `opencode_exec.py` dynamically loads
+`claim_store.py` from its own directory to record the per-task outcome, and
+`hermes_report_build.py` (owned by the hermes-self-report bundle) imports
+`spend_opencode.served_row_cost` to strip phantom Codex-OAuth spend from
+legacy rows.
+
+```bash
+# preview: verify all source hashes, print the plan, write nothing
+python3 machine-setup/mini-scripts/install_spend.py --dry-run
+
+# scripts (default home = ~)
+python3 machine-setup/mini-scripts/install_spend.py
+```
+
+**Never** rsync `~/.hermes/scripts/`: this installer copies only the four
+declared files by name and touches nothing else. Because release/reconcile
+passes are known to clobber hand edits, this manifest + installer must be the
+ONLY writer of these four files going forward.
+
+`scripts/mini-release-cut.sh`'s post-cut receipt now scans every file that
+changed in the cut release under `machine-setup/mini-scripts/` and warns by
+name if any changed file is not covered by `self_report_manifest.json`,
+`spend_manifest.json`, `pr_pipeline/manifest.json`, or the three files it
+vendors directly (`clickup_workspace_refresh.py`,
+`reconcile_launchd_environment.py`, `reconcile_marketplace_skills.py`) —
+so an uncovered change is flagged instead of silently rolling up into
+"governed script deployment verified." Neither `install_self_report.py` nor
+`install_spend.py` is invoked automatically by the cut itself (they require an
+explicit, deliberate run — see each installer's usage above); the drift check
+only makes the receipt honest about what did and did not deploy.
