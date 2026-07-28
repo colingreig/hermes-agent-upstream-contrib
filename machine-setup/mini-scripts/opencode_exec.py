@@ -75,6 +75,7 @@ def _strip_think(s):
 # Both are config-PRIORITY cascades (first enabled tier), matching the prior writer
 # design — flip a tier off via its flag to fall back. An explicit `--model X`
 # (X != "auto") bypasses both cascades (escape hatch / per-call override).
+# gpt-5.6-sol is intentionally absent: ClickUp executor cron pins it as its orchestration model, not an OpenCode writer/content-cascade tier.
 WRITER_CASCADE = [
     ("openai/gpt-5.5",              "openai-codex"),  # PRIMARY when HERMES_WRITER_CODEX=1 (subscription-flat) — Colin's pick; documented hang risk → runner timeout+failover covers it
     ("openai/gpt-5.4-mini",         "openai-codex"),  # tier-2 Codex OAuth fallback (subscription-flat)
