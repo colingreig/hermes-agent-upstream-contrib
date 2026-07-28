@@ -16,6 +16,11 @@ We value contributions in this order:
 6. **New tools** — rarely needed. Most capabilities should be skills. See below.
 7. **Documentation** — fixes, clarifications, new examples.
 
+The durable project-intent layer lives in the
+[Contribution Rubric](website/docs/developer-guide/contribution-rubric.md).
+Read it before opening or reviewing changes that affect core agent behavior,
+tool surface, plugins, configuration, tests, or automated PR triage.
+
 ---
 
 ## Before You Start: Search First
