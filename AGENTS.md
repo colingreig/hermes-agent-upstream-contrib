@@ -4,6 +4,8 @@ Instructions for AI coding assistants and developers working on the hermes-agent
 
 **Never give up on the right solution.**
 
+- **Deployment:** Hermes can be deployed to the Hermes Mac mini; invoke `ignite-ship` and never treat its manual-platform routing as a no-deploy exemption.
+
 ## What Hermes Is
 
 Hermes is a personal AI agent that runs the same agent core across a CLI, a
