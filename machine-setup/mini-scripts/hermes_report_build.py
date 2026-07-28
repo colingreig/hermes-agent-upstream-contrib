@@ -110,16 +110,35 @@ def load_served_ledger(path, window_min):
     return window_rows, today_rows, yesterday_rows, None
 
 
+def _row_cost(row):
+    """Billable USD for one served-ledger row (86e2hap1g).
+
+    Rows written after the fix already carry a subscription-routed ``cost_usd``;
+    LEGACY rows carry OpenCode's raw API-rate-card cost, which is phantom spend
+    for a Codex-OAuth-proxied run. Normalize at READ time through the SAME
+    shared resolver the spend meters use, so the digest stops reporting phantom
+    spend for rows already on disk without rewriting the append-only ledger. If
+    the helper isn't importable, fall back to the recorded cost — an unroutable
+    row must never be under-reported.
+    """
+    try:
+        from spend_opencode import served_row_cost
+
+        return float(served_row_cost(row) or 0)
+    except Exception:
+        return float(row.get("cost_usd") or 0)
+
+
 def summarize_spend(window_rows, today_rows, yesterday_rows):
-    total_cost = sum(float(r.get("cost_usd") or 0) for r in window_rows)
-    today_cost = sum(float(r.get("cost_usd") or 0) for r in today_rows)
-    yesterday_cost = sum(float(r.get("cost_usd") or 0) for r in yesterday_rows)
+    total_cost = sum(_row_cost(r) for r in window_rows)
+    today_cost = sum(_row_cost(r) for r in today_rows)
+    yesterday_cost = sum(_row_cost(r) for r in yesterday_rows)
 
     by_provider = collections.defaultdict(lambda: {"n": 0, "cost": 0.0, "degraded": 0})
     for r in window_rows:
         prov = r.get("served_provider") or r.get("served_model") or "unknown"
         by_provider[prov]["n"] += 1
-        by_provider[prov]["cost"] += float(r.get("cost_usd") or 0)
+        by_provider[prov]["cost"] += _row_cost(r)
         if r.get("degraded"):
             by_provider[prov]["degraded"] += 1
     provider_rows = sorted(

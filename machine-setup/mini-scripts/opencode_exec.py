@@ -46,6 +46,12 @@ import time
 import urllib.request
 from pathlib import Path
 
+from spend_opencode import (
+    configured_codex_oauth_proxy_metadata,
+    opencode_route_metadata_event,
+    route_marginal_cost,
+)
+
 
 # GLM/reasoning models leak <think>...</think> tags into OpenCode's --format json
 # text events (OpenCode issue #16903, open as of 2026-06). Strip them from any
@@ -223,6 +229,42 @@ def _variant_for(model, explicit_variant):
     return ""
 
 
+def _billing_route_for_model(model):
+    for cascade_model, provider in WRITER_CASCADE + CONTENT_CASCADE + KANBAN_DECOMPOSER_CASCADE:
+        if cascade_model == model:
+            if provider == "openai-codex":
+                metadata = configured_codex_oauth_proxy_metadata()
+                if metadata is not None:
+                    return metadata["provider"], metadata["base_url"]
+                return "openai", ""
+            if provider in ("anthropic", "content-anthropic"):
+                return "anthropic", ""
+            if provider in ("google", "google-flash", "google-decomposer"):
+                return "gemini", ""
+            if provider == "minimax":
+                return "minimax", ""
+            if provider == "zai":
+                return "zai", ""
+            if provider == "openai":
+                return "openai", ""
+            return provider, ""
+    if model.startswith("openai/"):
+        if model in {"openai/gpt-5.5", "openai/gpt-5.4", "openai/gpt-5.4-mini"}:
+            metadata = configured_codex_oauth_proxy_metadata()
+            if metadata is not None:
+                return metadata["provider"], metadata["base_url"]
+        return "openai", ""
+    if model.startswith("anthropic/"):
+        return "anthropic", ""
+    if model.startswith("google/"):
+        return "gemini", ""
+    if model.startswith("minimax/"):
+        return "minimax", ""
+    if model.startswith("zai-coding/"):
+        return "zai", ""
+    return "unknown", ""
+
+
 def _run_once(model, variant, child_env, workdir, opencode_bin, timeout, log_path, task_id, cascade_label):
     """Run ONE OpenCode delegation and capture results. Returns a dict with
     rc/texts/final/saw_error/timed_out/stderr_tail/elapsed, or {"launch_error": ...}."""
@@ -267,6 +309,15 @@ def _run_once(model, variant, child_env, workdir, opencode_bin, timeout, log_pat
     watchdog_thread.start()
 
     with open(log_path, "w", encoding="utf-8") as logf:
+        billing_provider, base_url = _billing_route_for_model(model)
+        logf.write(json.dumps(opencode_route_metadata_event(
+            model=model,
+            provider=billing_provider,
+            base_url=base_url,
+            task_id=task_id,
+            cascade_label=cascade_label,
+        )) + "\n")
+        logf.flush()
         try:
             for line in proc.stdout:
                 logf.write(line)
@@ -385,12 +436,41 @@ def _record_served(result, armed):
     that "model" secretly means "the model that actually served, post-
     failover" — see 86e260vnn: pinned-vs-actual drift went unnoticed for
     days because nothing surfaced which tier really served.
+
+    Cost is SUBSCRIPTION-ROUTED before it is written (86e2hap1g). OpenCode
+    reports its own API-rate-card ``part.cost`` even when the tier was served by
+    a Codex-OAuth token through the local proxy, where the marginal cost is $0.
+    The status email (hermes_report_build*.py) sums this ledger's ``cost_usd``
+    for its spend total and per-provider breakdown, so writing the RAW number
+    here put phantom spend in the daily digest. Routing happens at the WRITE
+    site through the same shared resolver the spend cap/alert meters use; the
+    raw figure is preserved alongside as ``raw_cost_usd`` so nothing is lost.
     """
     try:
         served_model  = result.get("model", "unknown")
         served_provider = next((p for (m, p) in CONTENT_CASCADE + WRITER_CASCADE + KANBAN_DECOMPOSER_CASCADE if m == served_model), None)
         result["served_by"] = served_model
         degraded      = bool(armed and served_model != _EXPECTED_PRIMARY)
+        # Idempotent across the 5 exit-path call sites: once stamped, re-route
+        # from the preserved RAW figure rather than from the already-routed one.
+        raw_cost = result.get("raw_cost_usd", result.get("cost_usd"))
+        billing_provider, billing_base_url, billing_mode = "", "", "unknown"
+        cost_usd = raw_cost
+        try:
+            billing_provider, billing_base_url = _billing_route_for_model(served_model)
+            cost_usd, _route = route_marginal_cost(
+                raw_cost, served_model,
+                provider=billing_provider or None,
+                base_url=billing_base_url or None,
+            )
+            billing_mode = _route.billing_mode
+        except Exception as _br_err:
+            # Fail-open toward BILLING it: an unresolvable route must never
+            # silently zero real spend. Keep the raw cost and say why.
+            eprint("[opencode_exec] WRITER-LIVENESS: billing route failed, "
+                   f"recording raw cost (fail-open): {_br_err!r}")
+        result["raw_cost_usd"] = raw_cost
+        result["cost_usd"] = cost_usd
         record = {
             "ts":                   time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "task_id":              result.get("task_id", "unknown"),
@@ -401,7 +481,11 @@ def _record_served(result, armed):
             "degraded":             degraded,
             "writer_cascade":       result.get("writer_cascade"),
             "failover_tried":       result.get("failover_tried", []),
-            "cost_usd":             result.get("cost_usd"),
+            "cost_usd":             cost_usd,
+            "raw_cost_usd":         raw_cost,
+            "billing_mode":         billing_mode,
+            "billing_provider":     billing_provider,
+            "billing_base_url":     billing_base_url,
             "ok":                   result.get("ok", False),
         }
         os.makedirs(os.path.dirname(_LIVENESS_LEDGER), exist_ok=True)
@@ -412,7 +496,7 @@ def _record_served(result, armed):
         # pinned-vs-actual drift should be impossible to miss in the log,
         # the executor brief, and the ClickUp closeout comment that quotes it.
         eprint(f"[opencode_exec] served-by: {served_model} (task={result.get('task_id', 'unknown')}, "
-               f"cost_usd={result.get('cost_usd')})")
+               f"cost_usd={cost_usd} raw_cost_usd={raw_cost} billing={billing_mode})")
         if degraded:
             eprint(f"[opencode_exec] WRITER-LIVENESS: DEGRADED — armed={armed} "
                    f"expected={_EXPECTED_PRIMARY} served={served_model}")
