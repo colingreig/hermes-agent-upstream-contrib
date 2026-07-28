@@ -11,10 +11,11 @@ on:
 permissions:
   contents: read
 
-# Cancel in-progress runs for the same ref
+# Cancel in-progress runs for the same PR; give each push-to-main run its own
+# group (keyed on sha) so post-merge runs never cancel each other.
 concurrency:
-  group: tests-${{ github.ref }}
-  cancel-in-progress: true
+  group: tests-${{ github.event_name == 'push' && github.sha || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   generate:
