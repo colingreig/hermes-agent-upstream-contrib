@@ -12,13 +12,22 @@ WIRE PROTOCOL (shell_hooks.py):
   stdin  : {"hook_event_name","tool_name","tool_input":{...},"session_id","cwd","extra"}
   stdout : {"decision":"block","reason":"..."}  to block, or empty == allow.
 
-POLICY: block a merge attempt when VALIDATE_SHADOW is truthy OR
-  HERMES_AUTONOMOUS_MERGE is NOT in {1,true,yes,on} (default-deny). Else allow.
+POLICY: block a merge attempt when the pipeline is in shadow mode
+  (HERMES_MERGE_ACTIVE not truthy, or the emergency HERMES_MERGE_SHADOW
+  override set — absence of env = shadow, default-deny), when there is no
+  fresh non-shadow PASS verdict for the exact PR, or when the PR's risk tier
+  is not autonomy-enabled (tier 'high' is NEVER autonomously mergeable).
+  Verdict-store writes (`validator_verdict.py write` and the Python writer
+  functions) are blocked unconditionally on the terminal tool.
 
 FAIL CLOSED: any internal error while handling a *matched merge* still blocks.
 The only fail-open is the runtime's own hook timeout/crash handling
-(shell_hooks.py:439-444), so this guard is tiny, stdlib-only, no network/
-subprocess (finishes far under the 10s timeout).
+(shell_hooks.py:439-444). The bulk of this guard (command matching) is tiny
+and stdlib-only; the verdict gate for a MATCHED merge does one bounded `gh`
+round-trip (via autonomous_merge._pr_state) to resolve the PR's exact current
+head before checking the verdict store, and fails closed on any fetch error
+or exception — same "no exact head, no merge" contract as everything else in
+this pipeline (is_pass_fresh() requires an exact head_sha).
 
 COVERAGE (matched against the command STRING, argv-independent — catches bare
 `gh`, absolute `/opt/homebrew/bin/gh`, the `/tmp/gh_with_token.sh` wrapper, the
@@ -42,20 +51,33 @@ import sys
 # deployed guard has this canonical sibling, and an import failure must be
 # visible as a fail-closed guard error rather than silently changing modules.
 if __package__:
+    from . import autonomous_merge
     from . import validator_verdict
 else:
+    import autonomous_merge
     import validator_verdict
 
 BLOCK_REASON = (
     "MERGE BLOCKED by merge_guard (mechanical pre_tool_call gate). "
-    "Autonomous PR merge is DISABLED: VALIDATE_SHADOW is truthy or "
-    "HERMES_AUTONOMOUS_MERGE is not enabled. This is intentional, NOT a "
-    "transient error — do NOT retry, do NOT switch tools, do NOT call the "
-    "absolute-path gh or self-mint a token and curl the merge API; those are "
-    "gated too. Leave the PR OPEN for the human/validator to merge. If the PR "
-    "is ALREADY merged, treat that as SUCCESS and advance the ClickUp task (do "
-    "not loop). To enable real merges, set HERMES_AUTONOMOUS_MERGE=1 and "
-    "VALIDATE_SHADOW=false in Doppler claude-code/dev."
+    "Autonomous PR merge is DISABLED: the pipeline is in shadow mode "
+    "(HERMES_MERGE_ACTIVE is not enabled, or the emergency HERMES_MERGE_SHADOW "
+    "override is set). This is intentional, NOT a transient error — do NOT "
+    "retry, do NOT switch tools, do NOT call the absolute-path gh or self-mint "
+    "a token and curl the merge API; those are gated too. Leave the PR OPEN "
+    "for the human/validator to merge. If the PR is ALREADY merged, treat that "
+    "as SUCCESS and advance the ClickUp task (do not loop). High-risk-tier PRs "
+    "are NEVER autonomously mergeable by any switch — they always require a "
+    "human merge, full stop."
+)
+
+VERDICT_WRITE_BLOCK_REASON = (
+    "VERDICT WRITE BLOCKED by merge_guard (mechanical pre_tool_call gate). "
+    "Writing or finalizing validator verdicts (validator_verdict.py write, "
+    "record_verdict, finalize_shadow_review) is reserved for the validator's "
+    "own fenced review flow and is NEVER available to the executor through "
+    "the terminal tool. This is unconditional — no env switch enables it. Do "
+    "NOT retry, do NOT switch tools, do NOT re-implement the write in Python. "
+    "Leave the PR for the validator daemon to review."
 )
 
 _TRUTHY = {"1", "true", "yes", "on"}
@@ -73,6 +95,14 @@ _RE_CURL_MERGE = re.compile(r"\bcurl\b[^\n]*?pulls/\d+/merge\b")
 _RE_ANY_REST_MERGE = re.compile(r"pulls/\d+/merge\b")
 # subprocess list form: ['gh','pr','merge', ...] / ("gh","pr","merge")
 _RE_PYLIST_MERGE = re.compile(r"""['"]gh['"]\s*,\s*['"]pr['"]\s*,\s*['"]merge['"]""")
+# validator_verdict.py write / python -m pr_pipeline.validator_verdict write —
+# the executor must never mint or touch verdicts through the terminal. Matches
+# the module spelled with or without .py, followed anywhere later on the line
+# by the `write` subcommand.
+_RE_VERDICT_WRITE_CLI = re.compile(r"validator_verdict(?:\.py)?\b[^\n]*?\bwrite\b")
+# Inline-python verdict writers (import validator_verdict; record_verdict(...)/
+# finalize_shadow_review(...)) — same forgery surface, different spelling.
+_RE_VERDICT_WRITE_API = re.compile(r"\b(?:record_verdict|finalize_shadow_review)\s*\(")
 
 _MERGE_TOOL_NAMES = {
     "mcp__plugin_github_github__merge_pull_request",
@@ -120,18 +150,35 @@ def _extract_repo_pr(tool_name, tool_input, cmd):
 
 def _verdict_gate(tool_name, tool_input, cmd):
     """Return (allowed, reason). A merge needs a fresh PASS verdict for the exact
-    PR. Unknown PR / no verdict / BLOCK / stale = fail closed."""
+    PR. Unknown PR / no verdict / BLOCK / stale = fail closed.
+
+    is_pass_fresh() requires an exact head_sha (its own fail-closed contract —
+    "exact current PR head is required"), so this resolves the PR's CURRENT
+    head via autonomous_merge._pr_state — the same live-head source
+    autonomous_merge.evaluate()/_merge_readiness() and the merge sweep use —
+    before checking the verdict store. Without this the gate always failed
+    closed (dead code below this point), silently making the allow path and
+    the tier-specific refusal messages unreachable.
+    """
     if validator_verdict is None:
         return False, "verdict store module unavailable (fail-closed)"
     repo, pr = _extract_repo_pr(tool_name, tool_input, cmd)
     if not repo or not pr:
         return False, "could not determine which PR is being merged (fail-closed)"
     try:
-        ok, why = validator_verdict.is_pass_fresh(repo, pr)
+        info, err = autonomous_merge._pr_state(repo, pr)
+        if err or not info or not info.get("head"):
+            return False, (f"could not resolve the PR's current head (fail-closed): "
+                           f"{err or 'no head returned'}")
+        ok, why = validator_verdict.is_pass_fresh(repo, pr, info["head"])
         if not ok:
             return False, why
         tier = (validator_verdict.verdict_for(repo, pr) or {}).get("tier", "high")
         if not _tier_autonomy_enabled(tier):
+            normalized = tier.strip().lower() if isinstance(tier, str) else ""
+            if normalized not in ("low", "medium"):
+                return False, (f"PASS verdict exists but risk tier '{tier}' is NEVER "
+                               "autonomously mergeable — a human must merge this PR")
             return False, (f"PASS verdict exists but autonomous merge is not enabled "
                            f"for risk tier '{tier}' "
                            f"(set HERMES_AUTONOMOUS_MERGE_{tier.upper()}=1 once graduated)")
@@ -140,10 +187,22 @@ def _verdict_gate(tool_name, tool_input, cmd):
         return False, f"verdict check error: {e!r} (fail-closed)"
 
 
-def _is_merge_command(cmd):
-    """True iff the command string is an attempt to merge a PR.
+def _is_verdict_write_command(cmd):
+    """True iff the command string attempts to write/finalize a validator
+    verdict (CLI `validator_verdict.py ... write` or the inline-python writer
+    functions). Blocked UNCONDITIONALLY — no env switch, verdict state, or
+    shadow mode makes this allowed for the executor."""
+    if not cmd:
+        return False
+    return bool(_RE_VERDICT_WRITE_CLI.search(cmd) or _RE_VERDICT_WRITE_API.search(cmd))
 
-    Anchored on the pr+merge subcommand pair / REST merge path / py-list form.
+
+def _is_merge_command(cmd):
+    """True iff the command string is an attempt to merge a PR (or to forge
+    the verdict that would authorize one).
+
+    Anchored on the pr+merge subcommand pair / REST merge path / py-list form,
+    PLUS the verdict-write matchers (a forged verdict is a merge by proxy).
     Does NOT match a bare 'merge' word, so `git merge`, `gh pr create
     --title '...merge...'`, `gh pr comment --body '...merge'`, and
     `gh pr view --json mergeable` are NOT flagged.
@@ -157,25 +216,38 @@ def _is_merge_command(cmd):
         or _RE_CURL_MERGE.search(cmd)
         or _RE_ANY_REST_MERGE.search(cmd)
         or _RE_PYLIST_MERGE.search(cmd)
+        or _is_verdict_write_command(cmd)
     )
 
 
 def _shadow():
-    # The vendored trust-boundary snapshot is shadow-only.  Preserve this
-    # mechanical block even when a caller injects VALIDATE_SHADOW=false or an
-    # autonomous-merge flag.  Live merge activation is deliberately outside
-    # the reconciler's deployment surface.
-    return True
+    # Activation switch (Task: autonomous-merge activation). FAIL-CLOSED
+    # default: shadow unless HERMES_MERGE_ACTIVE is explicitly truthy, and the
+    # emergency HERMES_MERGE_SHADOW override forces shadow back on even then
+    # (shadow wins) — the SAME env-derived helper autonomous_merge._shadow(),
+    # hermes_validate_ops.VALIDATE_SHADOW, and the verdict writer's "shadow"
+    # stamp all call, so none of them can disagree about which mode the
+    # pipeline is in. When this returns False, control falls through to
+    # _verdict_gate() below, which still refuses the merge unless a fresh
+    # non-shadow PASS verdict exists for the exact PR head.
+    return validator_verdict.merge_shadow_active()
 
 
 def _tier_autonomy_enabled(tier):
-    """Per-risk-tier autonomy (graduates independently). The master switch
-    HERMES_AUTONOMOUS_MERGE enables ALL tiers; otherwise the per-tier flag
-    HERMES_AUTONOMOUS_MERGE_<LOW|MEDIUM|HIGH> must be truthy. Unknown tier is
-    treated as HIGH (most conservative)."""
+    """Per-risk-tier autonomy (low/medium graduate independently). Tier 'high'
+    — and any unknown/unparseable tier, which defaults to high — is NEVER
+    autonomously mergeable: neither the master HERMES_AUTONOMOUS_MERGE nor any
+    per-tier flag (the retired HERMES_AUTONOMOUS_MERGE_HIGH included) can
+    enable it. A human must merge high-tier PRs, full stop. For low/medium:
+    the master switch enables both, else the per-tier
+    HERMES_AUTONOMOUS_MERGE_<LOW|MEDIUM> must be truthy. Mirrors
+    autonomous_merge._tier_autonomy_enabled exactly."""
+    normalized = tier.strip().lower() if isinstance(tier, str) else ""
+    if normalized not in ("low", "medium"):
+        return False  # high / unknown: never autonomous, no env can enable it
     if (os.environ.get("HERMES_AUTONOMOUS_MERGE", "") or "").strip().lower() in _TRUTHY:
         return True
-    key = "HERMES_AUTONOMOUS_MERGE_" + (tier or "high").upper()
+    key = "HERMES_AUTONOMOUS_MERGE_" + normalized.upper()
     return (os.environ.get(key, "") or "").strip().lower() in _TRUTHY
 
 
@@ -222,6 +294,11 @@ def main():
         if not isinstance(cmd, str):
             _allow()
         try:
+            # Verdict writes are blocked UNCONDITIONALLY, before every other
+            # gate: no shadow/env/verdict state ever allows the executor to
+            # mint or touch a validator verdict through the terminal.
+            if _is_verdict_write_command(cmd):
+                _block(VERDICT_WRITE_BLOCK_REASON)
             if not _is_merge_command(cmd):
                 _allow()
             if _shadow():

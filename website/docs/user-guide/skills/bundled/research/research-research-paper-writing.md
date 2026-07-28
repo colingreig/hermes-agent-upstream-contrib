@@ -1258,295 +1258,18 @@ Work through systematically: title/authors → abstract → introduction → met
 
 Templates in `templates/` directory. See [templates/README.md](https://github.com/NousResearch/hermes-agent/blob/main/skills/research/research-paper-writing/templates/README.md) for compilation setup (VS Code, CLI, Overleaf, other IDEs).
 
-### Tables and Figures
+### LaTeX Production Details
 
-**Tables** — use `booktabs` for professional formatting:
-
-```latex
-\usepackage{booktabs}
-\begin{tabular}{lcc}
-\toprule
-Method & Accuracy $\uparrow$ & Latency $\downarrow$ \\
-\midrule
-Baseline & 85.2 & 45ms \\
-\textbf{Ours} & \textbf{92.1} & 38ms \\
-\bottomrule
-\end{tabular}
-```
-
-Rules:
-- Bold best value per metric
-- Include direction symbols ($\uparrow$ higher better, $\downarrow$ lower better)
-- Right-align numerical columns
-- Consistent decimal precision
-
-**Figures**:
-- **Vector graphics** (PDF, EPS) for all plots and diagrams — `plt.savefig('fig.pdf')`
-- **Raster** (PNG 600 DPI) only for photographs
-- **Colorblind-safe palettes** (Okabe-Ito or Paul Tol)
-- Verify **grayscale readability** (8% of men have color vision deficiency)
-- **No title inside figure** — the caption serves this function
-- **Self-contained captions** — reader should understand without main text
+Keep the main drafting workflow here concise. When the task needs concrete LaTeX implementation examples, load [references/latex-production.md](https://github.com/NousResearch/hermes-agent/blob/main/skills/research/research-paper-writing/references/latex-production.md) for:
+- `booktabs` and `siunitx` table patterns
+- Figure, subfigure, TikZ, and algorithm examples
+- Professional preamble package guidance
+- `latexdiff` revision tracking
+- SciencePlots setup and standard figure sizes
 
 ### Conference Resubmission
 
 For converting between venues, see Phase 7 (Submission Preparation) — it covers the full conversion workflow, page-change table, and post-rejection guidance.
-
-### Professional LaTeX Preamble
-
-Add these packages to any paper for professional quality. They are compatible with all major conference style files:
-
-```latex
-% --- Professional Packages (add after conference style file) ---
-
-% Typography
-\usepackage{microtype}              % Microtypographic improvements (protrusion, expansion)
-                                     % Makes text noticeably more polished — always include
-
-% Tables
-\usepackage{booktabs}               % Professional table rules (\toprule, \midrule, \bottomrule)
-\usepackage{siunitx}                % Consistent number formatting, decimal alignment
-                                     % Usage: \num{12345} → 12,345; \SI{3.5}{GHz} → 3.5 GHz
-                                     % Table alignment: S column type for decimal-aligned numbers
-
-% Figures
-\usepackage{graphicx}               % Include graphics (\includegraphics)
-\usepackage{subcaption}             % Subfigures with (a), (b), (c) labels
-                                     % Usage: \begin{subfigure}{0.48\textwidth} ... \end{subfigure}
-
-% Diagrams and Algorithms
-\usepackage{tikz}                   % Programmable vector diagrams
-\usetikzlibrary{arrows.meta, positioning, shapes.geometric, calc, fit, backgrounds}
-\usepackage[ruled,vlined]{algorithm2e}  % Professional pseudocode
-                                     % Alternative: \usepackage{algorithmicx} if template bundles it
-
-% Cross-references
-\usepackage{cleveref}               % Smart references: \cref{fig:x} → "Figure 1"
-                                     % MUST be loaded AFTER hyperref
-                                     % Handles: figures, tables, sections, equations, algorithms
-
-% Math (usually included by conference .sty, but verify)
-\usepackage{amsmath,amssymb}        % AMS math environments and symbols
-\usepackage{mathtools}              % Extends amsmath (dcases, coloneqq, etc.)
-
-% Colors (for figures and diagrams)
-\usepackage{xcolor}                 % Color management
-% Okabe-Ito colorblind-safe palette:
-\definecolor{okblue}{HTML}{0072B2}
-\definecolor{okorange}{HTML}{E69F00}
-\definecolor{okgreen}{HTML}{009E73}
-\definecolor{okred}{HTML}{D55E00}
-\definecolor{okpurple}{HTML}{CC79A7}
-\definecolor{okcyan}{HTML}{56B4E9}
-\definecolor{okyellow}{HTML}{F0E442}
-```
-
-**Notes:**
-- `microtype` is the single highest-impact package for visual quality. It adjusts character spacing at a sub-pixel level. Always include it.
-- `siunitx` handles decimal alignment in tables via the `S` column type — eliminates manual spacing.
-- `cleveref` must be loaded **after** `hyperref`. Most conference .sty files load hyperref, so put cleveref last.
-- Check if the conference template already loads any of these (especially `algorithm`, `amsmath`, `graphicx`). Don't double-load.
-
-### siunitx Table Alignment
-
-`siunitx` makes number-heavy tables significantly more readable:
-
-```latex
-\begin{tabular}{l S[table-format=2.1] S[table-format=2.1] S[table-format=2.1]}
-\toprule
-Method & {Accuracy $\uparrow$} & {F1 $\uparrow$} & {Latency (ms) $\downarrow$} \\
-\midrule
-Baseline         & 85.2  & 83.7  & 45.3 \\
-Ablation (no X)  & 87.1  & 85.4  & 42.1 \\
-\textbf{Ours}    & \textbf{92.1} & \textbf{90.8} & \textbf{38.7} \\
-\bottomrule
-\end{tabular}
-```
-
-The `S` column type auto-aligns on the decimal point. Headers in `{}` escape the alignment.
-
-### Subfigures
-
-Standard pattern for side-by-side figures:
-
-```latex
-\begin{figure}[t]
-  \centering
-  \begin{subfigure}[b]{0.48\textwidth}
-    \centering
-    \includegraphics[width=\textwidth]{fig_results_a.pdf}
-    \caption{Results on Dataset A.}
-    \label{fig:results-a}
-  \end{subfigure}
-  \hfill
-  \begin{subfigure}[b]{0.48\textwidth}
-    \centering
-    \includegraphics[width=\textwidth]{fig_results_b.pdf}
-    \caption{Results on Dataset B.}
-    \label{fig:results-b}
-  \end{subfigure}
-  \caption{Comparison of our method across two datasets. (a) shows the scaling
-  behavior and (b) shows the ablation results. Both use 5 random seeds.}
-  \label{fig:results}
-\end{figure}
-```
-
-Use `\cref{fig:results}` → "Figure 1", `\cref{fig:results-a}` → "Figure 1a".
-
-### Pseudocode with algorithm2e
-
-```latex
-\begin{algorithm}[t]
-\caption{Iterative Refinement with Judge Panel}
-\label{alg:method}
-\KwIn{Task $T$, model $M$, judges $J_1 \ldots J_n$, convergence threshold $k$}
-\KwOut{Final output $A^*$}
-$A \gets M(T)$ \tcp*{Initial generation}
-$\text{streak} \gets 0$\;
-\While{$\text{streak} < k$}{
-  $C \gets \text{Critic}(A, T)$ \tcp*{Identify weaknesses}
-  $B \gets M(T, C)$ \tcp*{Revised version addressing critique}
-  $AB \gets \text{Synthesize}(A, B)$ \tcp*{Merge best elements}
-  \ForEach{judge $J_i$}{
-    $\text{rank}_i \gets J_i(\text{shuffle}(A, B, AB))$ \tcp*{Blind ranking}
-  }
-  $\text{winner} \gets \text{BordaCount}(\text{ranks})$\;
-  \eIf{$\text{winner} = A$}{
-    $\text{streak} \gets \text{streak} + 1$\;
-  }{
-    $A \gets \text{winner}$; $\text{streak} \gets 0$\;
-  }
-}
-\Return{$A$}\;
-\end{algorithm}
-```
-
-### TikZ Diagram Patterns
-
-TikZ is the standard for method diagrams in ML papers. Common patterns:
-
-**Pipeline/Flow Diagram** (most common in ML papers):
-
-```latex
-\begin{figure}[t]
-\centering
-\begin{tikzpicture}[
-  node distance=1.8cm,
-  box/.style={rectangle, draw, rounded corners, minimum height=1cm, 
-              minimum width=2cm, align=center, font=\small},
-  arrow/.style={-{Stealth[length=3mm]}, thick},
-]
-  \node[box, fill=okcyan!20] (input) {Input\\$x$};
-  \node[box, fill=okblue!20, right of=input] (encoder) {Encoder\\$f_\theta$};
-  \node[box, fill=okgreen!20, right of=encoder] (latent) {Latent\\$z$};
-  \node[box, fill=okorange!20, right of=latent] (decoder) {Decoder\\$g_\phi$};
-  \node[box, fill=okred!20, right of=decoder] (output) {Output\\$\hat{x}$};
-  
-  \draw[arrow] (input) -- (encoder);
-  \draw[arrow] (encoder) -- (latent);
-  \draw[arrow] (latent) -- (decoder);
-  \draw[arrow] (decoder) -- (output);
-\end{tikzpicture}
-\caption{Architecture overview. The encoder maps input $x$ to latent 
-representation $z$, which the decoder reconstructs.}
-\label{fig:architecture}
-\end{figure}
-```
-
-**Comparison/Matrix Diagram** (for showing method variants):
-
-```latex
-\begin{tikzpicture}[
-  cell/.style={rectangle, draw, minimum width=2.5cm, minimum height=1cm, 
-               align=center, font=\small},
-  header/.style={cell, fill=gray!20, font=\small\bfseries},
-]
-  % Headers
-  \node[header] at (0, 0) {Method};
-  \node[header] at (3, 0) {Converges?};
-  \node[header] at (6, 0) {Quality?};
-  % Rows
-  \node[cell] at (0, -1) {Single Pass};
-  \node[cell, fill=okgreen!15] at (3, -1) {N/A};
-  \node[cell, fill=okorange!15] at (6, -1) {Baseline};
-  \node[cell] at (0, -2) {Critique+Revise};
-  \node[cell, fill=okred!15] at (3, -2) {No};
-  \node[cell, fill=okred!15] at (6, -2) {Degrades};
-  \node[cell] at (0, -3) {Ours};
-  \node[cell, fill=okgreen!15] at (3, -3) {Yes ($k$=2)};
-  \node[cell, fill=okgreen!15] at (6, -3) {Improves};
-\end{tikzpicture}
-```
-
-**Iterative Loop Diagram** (for methods with feedback):
-
-```latex
-\begin{tikzpicture}[
-  node distance=2cm,
-  box/.style={rectangle, draw, rounded corners, minimum height=0.8cm, 
-              minimum width=1.8cm, align=center, font=\small},
-  arrow/.style={-{Stealth[length=3mm]}, thick},
-  label/.style={font=\scriptsize, midway, above},
-]
-  \node[box, fill=okblue!20] (gen) {Generator};
-  \node[box, fill=okred!20, right=2.5cm of gen] (critic) {Critic};
-  \node[box, fill=okgreen!20, below=1.5cm of $(gen)!0.5!(critic)$] (judge) {Judge Panel};
-  
-  \draw[arrow] (gen) -- node[label] {output $A$} (critic);
-  \draw[arrow] (critic) -- node[label, right] {critique $C$} (judge);
-  \draw[arrow] (judge) -| node[label, left, pos=0.3] {winner} (gen);
-\end{tikzpicture}
-```
-
-### latexdiff for Revision Tracking
-
-Essential for rebuttals — generates a marked-up PDF showing changes between versions:
-
-```bash
-# Install
-# macOS: brew install latexdiff (or comes with TeX Live)
-# Linux: sudo apt install latexdiff
-
-# Generate diff
-latexdiff paper_v1.tex paper_v2.tex > paper_diff.tex
-pdflatex paper_diff.tex
-
-# For multi-file projects (with \input{} or \include{})
-latexdiff --flatten paper_v1.tex paper_v2.tex > paper_diff.tex
-```
-
-This produces a PDF with deletions in red strikethrough and additions in blue — standard format for rebuttal supplements.
-
-### SciencePlots for matplotlib
-
-Install and use for publication-quality plots:
-
-```bash
-pip install SciencePlots
-```
-
-```python
-import matplotlib.pyplot as plt
-import scienceplots  # registers styles
-
-# Use science style (IEEE-like, clean)
-with plt.style.context(['science', 'no-latex']):
-    fig, ax = plt.subplots(figsize=(3.5, 2.5))  # Single-column width
-    ax.plot(x, y, label='Ours', color='#0072B2')
-    ax.plot(x, y2, label='Baseline', color='#D55E00', linestyle='--')
-    ax.set_xlabel('Training Steps')
-    ax.set_ylabel('Accuracy')
-    ax.legend()
-    fig.savefig('paper/fig_results.pdf', bbox_inches='tight')
-
-# Available styles: 'science', 'ieee', 'nature', 'science+ieee'
-# Add 'no-latex' if LaTeX is not installed on the machine generating plots
-```
-
-**Standard figure sizes** (two-column format):
-- Single column: `figsize=(3.5, 2.5)` — fits in one column
-- Double column: `figsize=(7.0, 3.0)` — spans both columns
-- Square: `figsize=(3.5, 3.5)` — for heatmaps, confusion matrices
 
 ---
 
@@ -1932,63 +1655,9 @@ for r in results: print(f'  {r.title} ({r.published.year})')
 
 ### Step 7.10: Research Code Packaging
 
-Releasing clean, runnable code significantly increases citations and reviewer trust. Package code alongside the camera-ready submission.
+Releasing clean, runnable code significantly increases citations and reviewer trust. Package code alongside the camera-ready submission, and use anonymous code hosting for double-blind review when needed.
 
-**Repository structure:**
-
-```
-your-method/
-  README.md              # Setup, usage, reproduction instructions
-  requirements.txt       # Or environment.yml for conda
-  setup.py               # For pip-installable packages
-  LICENSE                # MIT or Apache 2.0 recommended for research
-  configs/               # Experiment configurations
-  src/                   # Core method implementation
-  scripts/               # Training, evaluation, analysis scripts
-    train.py
-    evaluate.py
-    reproduce_table1.sh  # One script per main result
-  data/                  # Small data or download scripts
-    download_data.sh
-  results/               # Expected outputs for verification
-```
-
-**README template for research code:**
-
-```markdown
-# [Paper Title]
-
-Official implementation of "[Paper Title]" (Venue Year).
-
-## Setup
-[Exact commands to set up environment]
-
-## Reproduction
-To reproduce Table 1: `bash scripts/reproduce_table1.sh`
-To reproduce Figure 2: `python scripts/make_figure2.py`
-
-## Citation
-[BibTeX entry]
-```
-
-**Pre-release checklist:**
-```
-- [ ] Code runs from a clean clone (test on fresh machine or Docker)
-- [ ] All dependencies pinned to specific versions
-- [ ] No hardcoded absolute paths
-- [ ] No API keys, credentials, or personal data in repo
-- [ ] README covers setup, reproduction, and citation
-- [ ] LICENSE file present (MIT or Apache 2.0 for max reuse)
-- [ ] Results are reproducible within expected variance
-- [ ] .gitignore excludes data files, checkpoints, logs
-```
-
-**Anonymous code for submission** (before acceptance):
-```bash
-# Use Anonymous GitHub for double-blind review
-# https://anonymous.4open.science/
-# Upload your repo → get an anonymous URL → put in paper
-```
+See [references/publication-and-release.md](https://github.com/NousResearch/hermes-agent/blob/main/skills/research/research-paper-writing/references/publication-and-release.md) for repository layout, README template, pre-release checklist, anonymous-code guidance, posters, talks, and blog/project-page deliverables.
 
 ---
 
@@ -1996,48 +1665,7 @@ To reproduce Figure 2: `python scripts/make_figure2.py`
 
 **Goal**: Maximize the impact of your accepted paper through presentation materials and community engagement.
 
-### Step 8.1: Conference Poster
-
-Most conferences require a poster session. Poster design principles:
-
-| Element | Guideline |
-|---------|-----------|
-| **Size** | Check venue requirements (typically 24"x36" or A0 portrait/landscape) |
-| **Content** | Title, authors, 1-sentence contribution, method figure, 2-3 key results, conclusion |
-| **Flow** | Top-left to bottom-right (Z-pattern) or columnar |
-| **Text** | Title readable at 3m, body at 1m. No full paragraphs — bullet points only. |
-| **Figures** | Reuse paper figures at higher resolution. Enlarge key result. |
-
-**Tools**: LaTeX (`beamerposter` package), PowerPoint/Keynote, Figma, Canva.
-
-**Production**: Order 2+ weeks before the conference. Fabric posters are lighter for travel. Many conferences now support virtual/digital posters too.
-
-### Step 8.2: Conference Talk / Spotlight
-
-If awarded an oral or spotlight presentation:
-
-| Talk Type | Duration | Content |
-|-----------|----------|---------|
-| **Spotlight** | 5 min | Problem, approach, one key result. Rehearse to exactly 5 minutes. |
-| **Oral** | 15-20 min | Full story: problem, approach, key results, ablations, limitations. |
-| **Workshop talk** | 10-15 min | Adapt based on workshop audience — may need more background. |
-
-**Slide design rules:**
-- One idea per slide
-- Minimize text — speak the details, don't project them
-- Animate key figures to build understanding step-by-step
-- Include a "takeaway" slide at the end (single sentence contribution)
-- Prepare backup slides for anticipated questions
-
-### Step 8.3: Blog Post / Social Media
-
-An accessible summary significantly increases impact:
-
-- **Twitter/X thread**: 5-8 tweets. Lead with the result, not the method. Include Figure 1 and key result figure.
-- **Blog post**: 800-1500 words. Written for ML practitioners, not reviewers. Skip formalism, emphasize intuition and practical implications.
-- **Project page**: HTML page with abstract, figures, demo, code link, BibTeX. Use GitHub Pages.
-
-**Timing**: Post within 1-2 days of paper appearing on proceedings or arXiv camera-ready.
+After acceptance, prepare the camera-ready PDF, public code/data, poster, talk or spotlight, blog post, social thread, and project page. See [references/publication-and-release.md](https://github.com/NousResearch/hermes-agent/blob/main/skills/research/research-paper-writing/references/publication-and-release.md) for detailed poster/talk/blog guidance and code-release checklists.
 
 ---
 
@@ -2166,7 +1794,7 @@ Compose this skill with other Hermes skills for specific phases:
 | **`memory`** | Persist key decisions across sessions: contribution framing, venue choice, reviewer feedback. |
 | **`cronjob`** | Schedule experiment monitoring, deadline countdowns, automated arXiv checks. |
 | **`clarify`** | Ask the user targeted questions when blocked (venue choice, contribution framing). |
-| **`send_message`** | Notify user when experiments complete or drafts are ready, even if user isn't in chat. |
+| **cron `deliver:`** | Notify the user when experiments complete or drafts are ready even if they're not in chat — schedule the check as a cron job with a messaging `deliver:` target (the agent no longer has a `send_message` tool; outbound delivery is handled by cron/`hermes send`). |
 
 ### Tool Usage Patterns
 
@@ -2177,7 +1805,7 @@ terminal("ps aux | grep <pattern>")
 → terminal("ls results/")
 → execute_code("analyze results JSON, compute metrics")
 → terminal("git add -A && git commit -m '<descriptive message>' && git push")
-→ send_message("Experiment complete: <summary>")
+→ (final response auto-delivers "Experiment complete: <summary>"; for unattended runs, schedule via cron with a deliver: target)
 ```
 
 **Parallel section drafting** (using delegation):
@@ -2277,7 +1905,7 @@ cronjob("create", {
 
 ### Communication Patterns
 
-**When to notify the user** (via `send_message` or direct response):
+**When to notify the user** (via your direct/final response, or a cron `deliver:` target for unattended runs):
 - Experiment batch completed (with results table)
 - Unexpected finding or failure requiring decision
 - Draft section ready for review
@@ -2383,13 +2011,4 @@ See [templates/README.md](https://github.com/NousResearch/hermes-agent/blob/main
 
 ### Key External Sources
 
-**Writing Philosophy:**
-- [Neel Nanda: How to Write ML Papers](https://www.alignmentforum.org/posts/eJGptPbbFPZGLpjsp/highly-opinionated-advice-on-how-to-write-ml-papers)
-- [Sebastian Farquhar: How to Write ML Papers](https://sebastianfarquhar.com/on-research/2024/11/04/how_to_write_ml_papers/)
-- [Gopen & Swan: Science of Scientific Writing](https://cseweb.ucsd.edu/~swanson/papers/science-of-writing.pdf)
-- [Lipton: Heuristics for Scientific Writing](https://www.approximatelycorrect.com/2018/01/29/heuristics-technical-scientific-writing-machine-learning-perspective/)
-- [Perez: Easy Paper Writing Tips](https://ethanperez.net/easy-paper-writing-tips/)
-
-**APIs:** [Semantic Scholar](https://api.semanticscholar.org/api-docs/) | [CrossRef](https://www.crossref.org/documentation/retrieve-metadata/rest-api/) | [arXiv](https://info.arxiv.org/help/api/basics.html)
-
-**Venues:** [NeurIPS](https://neurips.cc/Conferences/2025/PaperInformation/StyleFiles) | [ICML](https://icml.cc/Conferences/2025/AuthorInstructions) | [ICLR](https://iclr.cc/Conferences/2026/AuthorGuide) | [ACL](https://github.com/acl-org/acl-style-files)
+See [references/sources.md](https://github.com/NousResearch/hermes-agent/blob/main/skills/research/research-paper-writing/references/sources.md) for writing philosophy sources, citation APIs, and venue links.

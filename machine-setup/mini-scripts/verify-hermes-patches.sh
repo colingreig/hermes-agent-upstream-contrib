@@ -926,41 +926,17 @@ PY
   fi
 fi
 
-# 7c. The reconciler receipt is the source/deployed manifest authority.
-SKILLS_RECEIPT="$HOME/.hermes/releases/marketplace-skills/last-receipt.json"
-if "$REPO/venv/bin/python" - "$SKILLS_RECEIPT" <<'PY' 2>/dev/null
-import hashlib, json, sys
-from pathlib import Path
-
-receipt = Path(sys.argv[1])
-if not receipt.is_file() or receipt.is_symlink():
-    raise SystemExit(1)
-payload = json.loads(receipt.read_text(encoding="utf-8"))
-files = payload.get("files")
-if payload.get("schema_version") != 1 or not isinstance(files, list) or not files:
-    raise SystemExit(1)
-for item in files:
-    target = Path(item["target"])
-    if not target.is_file() or target.is_symlink():
-        raise SystemExit(1)
-    deployed = hashlib.sha256(target.read_bytes()).hexdigest()
-    if deployed != item.get("deployed_sha256"):
-        raise SystemExit(1)
-    source = item.get("source")
-    if source == "generated-config":
-        source_hash = deployed
-    else:
-        source_path = Path(source)
-        if not source_path.is_file() or source_path.is_symlink():
-            raise SystemExit(1)
-        source_hash = hashlib.sha256(source_path.read_bytes()).hexdigest()
-    if source_hash != item.get("source_sha256"):
-        raise SystemExit(1)
-PY
+# 7c. The reconciler receipt is the source/deployed manifest authority.  Execute
+# only the regular, non-symlinked reconciler in the immutable release source;
+# the mutable deployed copy is one of the targets that trusted code verifies.
+SKILLS_RECONCILER="$REPO/machine-setup/mini-scripts/reconcile_marketplace_skills.py"
+if [ -f "$SKILLS_RECONCILER" ] && [ ! -L "$SKILLS_RECONCILER" ] \
+    && "$REPO/venv/bin/python" "$SKILLS_RECONCILER" verify \
+    --source-root "$REPO/machine-setup/mini-scripts"
 then
   grn "skill deployment manifest source/deployed hashes verified"
 else
-  red "skill deployment manifest missing or source/deployed hash mismatch: $SKILLS_RECEIPT"
+  red "skill deployment manifest or owned generated config verification failed"
   FAIL=1
   SKILLS_BRIDGE_ALERT="${SKILLS_BRIDGE_ALERT}- source/deployed skill manifest mismatch\n"
 fi
@@ -1116,8 +1092,8 @@ PY
 then grn "config     pre_tool_call hooks wired (terminal + MCP merge)"
 else red "config     pre_tool_call merge-guard hooks MISSING in config.yaml — re-add both matchers, then: launchctl kickstart -k gui/$UID_NUM/ai.hermes.gateway"; FAIL=1; fi
 # 10c. BEHAVIORAL: guard BLOCKS a merge and ALLOWS a merge-themed pr create (shadow)
-mg_block=$(printf '%s' '{"tool_name":"terminal","tool_input":{"command":"gh pr merge 35 --squash"}}' | VALIDATE_SHADOW=true HERMES_AUTONOMOUS_MERGE= "$HOOK_PY" "$MG" 2>/dev/null)
-mg_allow=$(printf '%s' '{"tool_name":"terminal","tool_input":{"command":"gh pr create --title \"fix merge conflict\""}}' | VALIDATE_SHADOW=true HERMES_AUTONOMOUS_MERGE= "$HOOK_PY" "$MG" 2>/dev/null)
+mg_block=$(printf '%s' '{"tool_name":"terminal","tool_input":{"command":"gh pr merge 35 --squash"}}' | HERMES_MERGE_SHADOW=1 HERMES_AUTONOMOUS_MERGE= "$HOOK_PY" "$MG" 2>/dev/null)
+mg_allow=$(printf '%s' '{"tool_name":"terminal","tool_input":{"command":"gh pr create --title \"fix merge conflict\""}}' | HERMES_MERGE_SHADOW=1 HERMES_AUTONOMOUS_MERGE= "$HOOK_PY" "$MG" 2>/dev/null)
 if echo "$mg_block" | grep -q '"decision": *"block"' && ! echo "$mg_allow" | grep -q block; then
   grn "behavior   guard BLOCKS gh pr merge, ALLOWS gh pr create (no false-positive)"
 else
@@ -1130,22 +1106,33 @@ fi
 # specific gate fires. cmd_merge_pr is defense-in-depth: the verdict gate runs
 # FIRST (refuses "no validator verdict on record, fail-closed" when PR #35 has
 # no verdict), and only a PR that passes the verdict gate reaches the
-# VALIDATE_SHADOW shadow-refusal branch. PR #35's verdict-store state is
+# HERMES_MERGE_SHADOW shadow-refusal branch. PR #35's verdict-store state is
 # incidental and time-varying, so asserting ONLY the shadow substring made 10d
 # intermittently false-RED whenever #35 had no verdict (the common case) — a
 # stale test, not a real hole (task 86e1yjkzf). Accept refusal via EITHER gate;
 # go red ONLY if the merge is genuinely NOT refused.
-val_out=$(VALIDATE_SHADOW=true "$HOOK_PY" "$VAL_OPS" merge-pr colingreig/ignite-digital-engine 35 --squash 2>&1 || true)
-if echo "$val_out" | grep -qiE 'VALIDATE_SHADOW|verdict gate refuses|refuses merge|fail-closed'; then
+val_out=$(HERMES_MERGE_SHADOW=1 "$HOOK_PY" "$VAL_OPS" merge-pr colingreig/ignite-digital-engine 35 --squash 2>&1 || true)
+if echo "$val_out" | grep -qiE 'HERMES_MERGE_SHADOW|verdict gate refuses|refuses merge|fail-closed'; then
   grn "validator  cmd_merge_pr refuses live merge in shadow (verdict-gate or shadow branch)"
 else
   red "validator  cmd_merge_pr did NOT refuse live merge — live merge possible while writeback muzzled"; FAIL=1
 fi
-# 10e. BEHAVIORAL: gh shim refuses pr merge under shadow (refuses before exec)
-if [ -x "$GH_SHIM" ] && VALIDATE_SHADOW=true HERMES_AUTONOMOUS_MERGE= "$GH_SHIM" pr merge 999999 --squash >/dev/null 2>&1; [ "$?" = "13" ]; then
-  grn "shim       ~/.hermes/bin/gh refuses pr merge (defense-in-depth, exit 13)"
+# 10e. BEHAVIORAL: gh shim refuses pr merge (refuses before exec) under the
+# activation contract: (1) no env at all = SHADOW = refuse (fail-closed
+# default), and (2) the emergency HERMES_MERGE_SHADOW=1 override closes the
+# shim even when HERMES_MERGE_ACTIVE=1 is set (shadow wins). The retired
+# HERMES_AUTONOMOUS_MERGE master switch must NOT be required by the shim.
+shim_default_rc=99; shim_override_rc=99
+if [ -x "$GH_SHIM" ]; then
+  env -u HERMES_MERGE_ACTIVE -u HERMES_MERGE_SHADOW -u VALIDATE_SHADOW \
+    "$GH_SHIM" pr merge 999999 --squash >/dev/null 2>&1 && shim_default_rc=0 || shim_default_rc=$?
+  HERMES_MERGE_ACTIVE=1 HERMES_MERGE_SHADOW=1 \
+    "$GH_SHIM" pr merge 999999 --squash >/dev/null 2>&1 && shim_override_rc=0 || shim_override_rc=$?
+fi
+if [ "$shim_default_rc" = "13" ] && [ "$shim_override_rc" = "13" ]; then
+  grn "shim       ~/.hermes/bin/gh refuses pr merge (default-shadow + HERMES_MERGE_SHADOW override, exit 13)"
 else
-  ylw "shim       ~/.hermes/bin/gh merge refuse not firing (secondary layer; hook is primary)"
+  ylw "shim       ~/.hermes/bin/gh merge refuse not firing (default=$shim_default_rc override=$shim_override_rc; secondary layer; hook is primary)"
 fi
 
 # --- 11. Git commit identity guard (blocks -c user.email=<non-bot>) ----------
@@ -1216,15 +1203,21 @@ hdr "12. Autonomous-merge fail-closed CI gate (require green gating check)"
 AM="$HOME/.hermes/scripts/autonomous_merge.py"
 HOOK_PY="$REPO/venv/bin/python"
 if [ -f "$AM" ] && "$HOOK_PY" -c "import ast; ast.parse(open('$AM').read())" 2>/dev/null; then
-  am_verdict=$(HERMES_AUTONOMOUS_MERGE=1 VALIDATE_SHADOW=false "$HOOK_PY" - "$AM" <<'PY' 2>/dev/null
+  am_verdict=$(HERMES_MERGE_ACTIVE=1 HERMES_MERGE_SHADOW= HERMES_AUTONOMOUS_MERGE=1 "$HOOK_PY" - "$AM" <<'PY' 2>/dev/null
 import sys,importlib.util
 spec=importlib.util.spec_from_file_location("autonomous_merge",sys.argv[1])
 am=importlib.util.module_from_spec(spec); spec.loader.exec_module(am)
 sys.modules["autonomous_merge"]=am  # so cmd_merge_pr's `import autonomous_merge` gets THIS (monkeypatched) instance
-am.validator_verdict.is_pass_fresh=lambda repo,pr:(True,"fresh")
-base=dict(state="OPEN",head="abc123",mergeable="MERGEABLE",merge_state="CLEAN",
-          failing=[],pending=[],ignored=["Vercel"])
-v={"tier":"low","head_sha":"abc123"}; al={"r/r"}
+HEAD="a"*40
+am.validator_verdict.is_pass_fresh=lambda repo,pr,head_sha="",*a,**k:(True,"fresh")
+am._head_trips_tripwire=lambda repo,pr:(False,[],"")
+base=dict(state="OPEN",head=HEAD,mergeable="MERGEABLE",merge_state="CLEAN",
+          draft=False,labels=[],failing=[],pending=[],ignored=["Vercel"])
+v={"tier":"low","head_sha":HEAD,
+   "identity":{"canonical_repo":"r/r","pr_number":1,"trusted_task_id":"pr-1",
+               "base_sha":"b"*40,"head_sha":HEAD,"tested_merge_sha":"c"*40,
+               "ci_policy_id":"policy-v1","ci_run_ids":["ci:unit"]}}
+al={"r/r"}
 # Point 1: the sweep ACTOR (autonomous_merge.evaluate).
 am._pr_state=lambda repo,pr:(dict(base,gating_green=[]),None)
 no_gate=am.evaluate("r/r",1,v,al)[0]
@@ -1236,7 +1229,9 @@ import types
 import hermes_validate_ops as ops
 ops.VALIDATE_SHADOW=False; ops.DRY_RUN=True
 ops.load_allowlist=lambda:{"r/r"}; ops.repo_allowed=lambda r,a:True
-ops.validator_verdict=types.SimpleNamespace(is_pass_fresh=lambda r,p:(True,"fresh"))
+ops.validator_verdict=types.SimpleNamespace(
+    is_pass_fresh=lambda r,p,head_sha="",*a,**k:(True,"fresh"),
+    verdict_for=lambda r,p,path=None,head_sha="",*a,**k:{"tier":"low","head_sha":head_sha})
 arg=types.SimpleNamespace(repo="r/r",pr_number=1,squash=True)
 import io,contextlib
 _sink=io.StringIO()
@@ -1432,7 +1427,8 @@ fi
 #   (b) the helper losing a load-bearing guard (OPENCODE_DISABLE_CLAUDE_CODE=1
 #       prevents the ~/.claude/skills init-hang + 35k-token bloat;
 #       --dangerously-skip-permissions prevents the headless permission-hang;
-#       doppler run is the only auth path), or
+#       scoped 1Password SDK resolution plus child-env allowlisting prevents
+#       broad credential injection into the skip-perms child), or
 #   (c) the executor skill's STEP 4 reverting to self-coding.
 # This section is the structural tripwire. The live model smoke (network + ~$;
 # ~15s) is OPT-IN via HERMES_VERIFY_OPENCODE_SMOKE=1. Refs: brain
@@ -1463,43 +1459,193 @@ if [ -f "$OC_EXEC" ] && "$HOOK_PY" -c "import ast; ast.parse(open('$OC_EXEC').re
   grep -qE 'OPENCODE_DISABLE_CLAUDE_CODE=1' "$OC_EXEC" || miss="$miss OPENCODE_DISABLE_CLAUDE_CODE=1"
   # --dangerously-skip-permissions must appear in the CLI args (executable context)
   grep -qF -- '--dangerously-skip-permissions' "$OC_EXEC" || miss="$miss --dangerously-skip-permissions"
-  # SCOPED secret injection (S1 2026-06-23 hardening): fetch only the needed keys via
-  # `doppler secrets get`, NOT a blanket `doppler run` that injects all ~134 secrets into
-  # the --dangerously-skip-permissions child (prompt-injection exfil path).
-  grep -qE '"doppler", *"secrets", *"get"' "$OC_EXEC" || miss="$miss scoped-secret-fetch"
-  # child_env MUST be an explicit allowlist; a blanket dict(os.environ) is a full-credential
-  # leak into the skip-perms child — fail CLOSED if it ever reverts.
-  if grep -qE 'child_env *= *dict\(os\.environ\)' "$OC_EXEC"; then miss="$miss env-allowlist(FULL-ENV-LEAK)"; fi
-  grep -qE 'child_env *= *\{' "$OC_EXEC" || miss="$miss child_env-allowlist"
+  # SCOPED secret injection (S1 2026-06-23 hardening, migrated 2026-07-05):
+  # resolve only the needed 1Password refs through op_sdk_resolve.py, then pass
+  # an explicit child_env allowlist. Any broad os.environ inheritance into the
+  # --dangerously-skip-permissions child remains a hard failure.
+  env_report=$("$HOOK_PY" - "$OC_EXEC" <<'PY' 2>/dev/null
+import ast
+import re
+import sys
+
+path = sys.argv[1]
+source = open(path, encoding="utf-8").read()
+tree = ast.parse(source)
+miss = []
+
+strings = [n.value for n in ast.walk(tree) if isinstance(n, ast.Constant) and isinstance(n.value, str)]
+if "op_sdk_resolve.py" not in strings:
+    miss.append("op_sdk_resolve.py")
+if not any(isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "resolve_refs" for n in ast.walk(tree)):
+    miss.append("resolve_refs")
+if not any(s.startswith("op://") for s in strings):
+    miss.append("op:// scoped refs")
+
+def is_os_environ(node):
+    return (
+        isinstance(node, ast.Attribute)
+        and node.attr == "environ"
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "os"
+    )
+
+def is_child_env_target(target):
+    return isinstance(target, ast.Name) and target.id == "child_env"
+
+child_env_keys = None
+popen_uses_child_env = False
+broad_env = False
+retired_doppler = False
+for node in ast.walk(tree):
+    if isinstance(node, ast.Assign) and any(is_child_env_target(t) for t in node.targets):
+        if isinstance(node.value, ast.Dict):
+            child_env_keys = {
+                k.value for k in node.value.keys
+                if isinstance(k, ast.Constant) and isinstance(k.value, str)
+            }
+        elif is_os_environ(node.value):
+            broad_env = True
+        elif isinstance(node.value, ast.Call):
+            if isinstance(node.value.func, ast.Name) and node.value.func.id == "dict" and node.value.args and is_os_environ(node.value.args[0]):
+                broad_env = True
+            if isinstance(node.value.func, ast.Attribute) and node.value.func.attr == "copy" and is_os_environ(node.value.func.value):
+                broad_env = True
+    if isinstance(node, ast.Call):
+        if isinstance(node.func, ast.Attribute) and node.func.attr == "update" and isinstance(node.func.value, ast.Name) and node.func.value.id == "child_env":
+            if node.args and is_os_environ(node.args[0]):
+                broad_env = True
+        if isinstance(node.func, ast.Attribute) and node.func.attr == "Popen":
+            for kw in node.keywords:
+                if kw.arg == "env":
+                    popen_uses_child_env = isinstance(kw.value, ast.Name) and kw.value.id == "child_env"
+                    if is_os_environ(kw.value):
+                        broad_env = True
+        if isinstance(node.func, ast.Attribute) and node.func.attr == "run":
+            for kw in node.keywords:
+                if kw.arg == "env" and is_os_environ(kw.value):
+                    broad_env = True
+    if isinstance(node, (ast.List, ast.Tuple)):
+        vals = [e.value for e in node.elts if isinstance(e, ast.Constant) and isinstance(e.value, str)]
+        joined = " ".join(vals)
+        if joined in ("doppler secrets get", "doppler run"):
+            retired_doppler = True
+
+required_child_keys = {
+    "PATH", "HOME", "TMPDIR", "OPENAI_API_KEY", "ANTHROPIC_API_KEY",
+    "GH_TOKEN", "OPENCODE_DISABLE_CLAUDE_CODE", "OC_PROMPT", "HERMES_WRITER_CODEX",
+}
+if child_env_keys is None:
+    miss.append("child_env explicit dict")
+else:
+    missing_keys = sorted(required_child_keys - child_env_keys)
+    if missing_keys:
+        miss.append("child_env keys:" + ",".join(missing_keys))
+if not popen_uses_child_env:
+    miss.append("Popen env=child_env")
+if broad_env:
+    miss.append("FULL-ENV-LEAK")
+if retired_doppler:
+    miss.append("retired-doppler-child-auth")
+
+print("OK" if not miss else "MISS " + " ".join(miss))
+PY
+)
+  if [ "$env_report" = "OK" ]; then
+    :
+  else
+    miss="$miss ${env_report#MISS }"
+  fi
   # real wall-clock watchdog timeout (kills a silent hang that emits no stdout)
   grep -qE '_watchdog|threading\.(Thread|Timer)|signal\.alarm' "$OC_EXEC" || miss="$miss watchdog-timeout"
-  # openai/gpt-5 must appear as the model string in the MODEL_FALLBACK_ORDER / args
-  grep -qE '"openai/gpt-5"' "$OC_EXEC" || miss="$miss \"openai/gpt-5\""
+  # openai/gpt-5.x must be present in the writer cascade; exact minor is checked
+  # below by deriving the active primary tuple from WRITER_CASCADE.
+  grep -qE '"openai/gpt-5(\.|\")' "$OC_EXEC" || miss="$miss \"openai/gpt-5.x\""
   if [ -z "$miss" ]; then
-    grn "helper     opencode_exec.py parse-ok + all guards present (OPENCODE_DISABLE=1, skip-perms, scoped-secret-fetch, env-allowlist, watchdog, gpt-5 literal)"
+    grn "helper     opencode_exec.py parse-ok + all guards present (OPENCODE_DISABLE=1, skip-perms, scoped-1Password-SDK, env-allowlist, watchdog, gpt-5.x cascade)"
   else
     red "helper     opencode_exec.py MISSING guard(s):$miss — delegation will hang/bloat/mis-auth"; FAIL=1
   fi
 else
   red "helper     MISSING/UNPARSEABLE $OC_EXEC — executor has no code-writing delegate"; FAIL=1
 fi
-# 18b-codex (2026-06-25): the opt-in Codex WRITER tier. opencode_exec.py must
-# carry (a) the HERMES_WRITER_CODEX gate (default OFF) in _provider_enabled and
-# the child_env passthrough, and (b) the ("openai/gpt-5.4","openai-codex") cascade
-# tier. This is the writer counterpart to the validator chain's codex tier. The
-# tier is BEHIND glm-5.2 so a missing/disabled flag is safe (falls to glm-5.2),
-# but if the tier string or flag is dropped the opt-in path silently dies.
+# 18b-codex: the opt-in Codex WRITER tier. opencode_exec.py must carry
+# (a) the HERMES_WRITER_CODEX gate (default OFF) in _provider_enabled and the
+# child_env passthrough, and (b) a current openai-codex primary at the head of
+# WRITER_CASCADE. Derive the model/provider tuple instead of freezing another
+# stale gpt-5 minor version into this verifier.
 if [ -f "$OC_EXEC" ]; then
-  cmiss=""
-  grep -qE 'HERMES_WRITER_CODEX' "$OC_EXEC" || cmiss="$cmiss HERMES_WRITER_CODEX-flag"
-  grep -qE '"openai/gpt-5\.4", *"openai-codex"' "$OC_EXEC" || cmiss="$cmiss codex-cascade-tier"
-  # HERMES-PATCH 27: the flag must be re-resolved from Doppler (the subprocess
-  # sanitizer scrubs the bare env var, so without this gpt-5.4 is silently skipped).
-  grep -qE 'HERMES-PATCH 27' "$OC_EXEC" || cmiss="$cmiss patch27-doppler-resolve"
-  if [ -z "$cmiss" ]; then
-    grn "writer     opencode_exec.py carries opt-in Codex writer tier (HERMES_WRITER_CODEX gate + openai/gpt-5.4→openai-codex cascade + patch27 Doppler-resolve)"
+  codex_report=$("$HOOK_PY" - "$OC_EXEC" <<'PY' 2>/dev/null
+import ast
+import re
+import sys
+
+path = sys.argv[1]
+tree = ast.parse(open(path, encoding="utf-8").read())
+miss = []
+primary = None
+provider_gate = False
+expected_primary_derived = False
+
+for node in ast.walk(tree):
+    if isinstance(node, ast.Assign):
+        for target in node.targets:
+            if isinstance(target, ast.Name) and target.id == "WRITER_CASCADE" and isinstance(node.value, (ast.List, ast.Tuple)) and node.value.elts:
+                first = node.value.elts[0]
+                if isinstance(first, (ast.Tuple, ast.List)) and len(first.elts) >= 2:
+                    vals = []
+                    for elt in first.elts[:2]:
+                        vals.append(elt.value if isinstance(elt, ast.Constant) and isinstance(elt.value, str) else None)
+                    primary = tuple(vals)
+            if isinstance(target, ast.Name) and target.id == "_EXPECTED_PRIMARY":
+                value = node.value
+                expected_primary_derived = (
+                    isinstance(value, ast.Subscript)
+                    and isinstance(value.value, ast.Subscript)
+                    and isinstance(value.value.value, ast.Name)
+                    and value.value.value.id == "WRITER_CASCADE"
+                )
+    if isinstance(node, ast.If):
+        test = node.test
+        is_codex_provider_branch = (
+            isinstance(test, ast.Compare)
+            and isinstance(test.left, ast.Name)
+            and test.left.id == "provider"
+            and any(isinstance(op, ast.Eq) for op in test.ops)
+            and any(isinstance(c, ast.Constant) and c.value == "openai-codex" for c in test.comparators)
+        )
+        body_has_codex_flag = any(
+            isinstance(child, ast.Constant) and child.value == "HERMES_WRITER_CODEX"
+            for stmt in node.body
+            for child in ast.walk(stmt)
+        )
+        if is_codex_provider_branch and body_has_codex_flag:
+            provider_gate = True
+
+if primary is None:
+    miss.append("WRITER_CASCADE-primary")
+else:
+    model, provider = primary
+    if provider != "openai-codex":
+        miss.append("primary-provider:" + str(provider))
+    if not isinstance(model, str) or not re.match(r"^openai/gpt-5(\.|$)", model):
+        miss.append("primary-model:" + str(model))
+if not provider_gate:
+    miss.append("HERMES_WRITER_CODEX-provider-gate")
+if not expected_primary_derived:
+    miss.append("EXPECTED_PRIMARY-not-derived")
+
+if miss:
+    print("MISS " + " ".join(miss))
+else:
+    print("OK %s %s" % primary)
+PY
+)
+  if [ "${codex_report%% *}" = "OK" ]; then
+    codex_model=$(printf '%s\n' "$codex_report" | awk '{print $2}')
+    codex_provider=$(printf '%s\n' "$codex_report" | awk '{print $3}')
+    grn "writer     opencode_exec.py derives current Codex primary from WRITER_CASCADE (${codex_model}→${codex_provider}) + HERMES_WRITER_CODEX gate + SDK flag self-heal"
   else
-    red "writer     opencode_exec.py MISSING Codex writer wiring:$cmiss — the HERMES_WRITER_CODEX opt-in path is dead (re-apply patch 26/27 companion)"; FAIL=1
+    red "writer     opencode_exec.py MISSING Codex writer wiring:${codex_report#MISS } — the HERMES_WRITER_CODEX opt-in path is dead"; FAIL=1
   fi
 fi
 # 18b-proxy (2026-06-25): the codex-proxy launchd service. opencode's Codex writer
@@ -1601,7 +1747,7 @@ if [ "${HERMES_VERIFY_OPENCODE_SMOKE:-0}" = "1" ] && [ -x "$OC_BIN" ]; then
   smoke_dir="$(mktemp -d)"; printf 'Create a file ok.txt containing exactly READYCHECK_OK and nothing else.' > "$smoke_dir/p.txt"
   smoke=$(python3 "$OC_EXEC" --workdir "$smoke_dir" --prompt-file "$smoke_dir/p.txt" --task-id verifysmoke 2>/dev/null)
   if echo "$smoke" | grep -q '"ok": *true'; then
-    grn "smoke      live opencode delegation wrote code under doppler (cost: $(echo "$smoke" | sed -n 's/.*"cost_usd": *\([0-9.e-]*\).*/\1/p'))"
+    grn "smoke      live opencode delegation wrote code through scoped OpenCode auth (cost: $(echo "$smoke" | sed -n 's/.*"cost_usd": *\([0-9.e-]*\).*/\1/p'))"
   else
     red "smoke      live opencode delegation FAILED: $(echo "$smoke" | head -c 200)"; FAIL=1
   fi

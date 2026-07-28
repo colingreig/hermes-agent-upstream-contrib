@@ -8,9 +8,12 @@ grew without bound ("build but never ship"). This script is that missing actor: 
 deterministic, zero-LLM sweep that merges every PR the gates already permit.
 
 For each verdict-store entry it merges iff ALL hold (default-deny, fail-closed):
-  - VALIDATE_SHADOW is false           (shadow = validator observes, never merges)
-  - tier autonomy is enabled           (HERMES_AUTONOMOUS_MERGE master, or the
-                                         per-tier HERMES_AUTONOMOUS_MERGE_<TIER>)
+  - pipeline is ACTIVE, not shadow      (HERMES_MERGE_ACTIVE truthy AND the
+                                         emergency HERMES_MERGE_SHADOW override
+                                         not set; absence of env = shadow)
+  - tier autonomy is enabled            (low/medium only: HERMES_AUTONOMOUS_MERGE
+                                         master or per-tier flag; tier 'high' is
+                                         NEVER autonomously mergeable)
   - verdict == PASS and fresh          (< DEFAULT_MAX_AGE_H)
   - the stored head_sha == the PR's CURRENT head (re-fetched live — a PASS for an
                                          older commit must NOT merge a newer one)
@@ -104,20 +107,32 @@ def _env_truthy(name):
 
 
 def _shadow():
-    # Trust-boundary bootstrap: this vendored deployment is intentionally
-    # observation-only.  An environment typo or a cron's inherited environment
-    # must never turn a source-reconciliation deploy into a merge actor.
-    # Graduating out of shadow is a separate, explicitly reviewed change.
-    return True
+    # Activation switch (Task: autonomous-merge activation). FAIL-CLOSED
+    # default: shadow unless HERMES_MERGE_ACTIVE is explicitly truthy, and the
+    # emergency HERMES_MERGE_SHADOW override forces shadow back on even then
+    # (shadow wins) — a single env-derived helper shared with
+    # merge_guard._shadow(), hermes_validate_ops.VALIDATE_SHADOW, and the
+    # verdict writer's "shadow" stamp
+    # (validator_verdict.merge_shadow_active()) so all four can never disagree
+    # about which mode the pipeline is in.
+    return validator_verdict.merge_shadow_active()
 
 
 def _tier_autonomy_enabled(tier):
-    """Master HERMES_AUTONOMOUS_MERGE enables ALL tiers; else the per-tier flag
-    HERMES_AUTONOMOUS_MERGE_<LOW|MEDIUM|HIGH>. Unknown tier => HIGH (strictest).
-    Mirrors merge_guard._tier_autonomy_enabled exactly."""
+    """Per-risk-tier autonomy. Tier 'high' — and any unknown/unparseable tier,
+    which defaults to high — is NEVER autonomously mergeable: neither the
+    master HERMES_AUTONOMOUS_MERGE nor any per-tier flag (the retired
+    HERMES_AUTONOMOUS_MERGE_HIGH included) can enable it. A human must merge
+    high-tier PRs, full stop. For low/medium: the master
+    HERMES_AUTONOMOUS_MERGE enables both, else the per-tier
+    HERMES_AUTONOMOUS_MERGE_<LOW|MEDIUM>. Mirrors
+    merge_guard._tier_autonomy_enabled exactly."""
+    normalized = tier.strip().lower() if isinstance(tier, str) else ""
+    if normalized not in ("low", "medium"):
+        return False  # high / unknown: never autonomous, no env can enable it
     if _env_truthy("HERMES_AUTONOMOUS_MERGE"):
         return True
-    return _env_truthy("HERMES_AUTONOMOUS_MERGE_" + (tier or "high").upper())
+    return _env_truthy("HERMES_AUTONOMOUS_MERGE_" + normalized.upper())
 
 
 def _load_allowlist(path=ALLOWLIST_PATH):
@@ -201,6 +216,33 @@ def _gh_api(path):
         return None, f"gh api error: {e!r}"
 
 
+def _gh_api_paginated_list(path, list_key):
+    """REST GET via `gh api --paginate`, merging `list_key` across ALL pages.
+    Returns (items, err). Without --paginate the check-runs endpoint returns
+    only the first page (30 runs), so a failing gating check beyond run #30
+    was invisible — a merge-safety hole, not a nicety. `--paginate` on an
+    object-shaped endpoint emits one JSON object per page concatenated, so
+    decode the stream with raw_decode rather than a single json.loads."""
+    try:
+        r = subprocess.run(["gh", "api", "--paginate", path], capture_output=True,
+                           text=True, timeout=GH_TIMEOUT, env=_shim_env())
+        if r.returncode != 0:
+            return None, f"gh api --paginate {path} rc={r.returncode}: {r.stderr.strip()[:160]}"
+        items, buf, idx = [], (r.stdout or "").strip(), 0
+        decoder = json.JSONDecoder()
+        while idx < len(buf):
+            page, end = decoder.raw_decode(buf, idx)
+            if not isinstance(page, dict):
+                return None, f"gh api --paginate {path}: non-object page"
+            items.extend(page.get(list_key) or [])
+            idx = end
+            while idx < len(buf) and buf[idx] in " \t\r\n":
+                idx += 1
+        return items, None
+    except Exception as e:
+        return None, f"gh api error: {e!r}"
+
+
 def _pr_state(repo, pr):
     """Return (info, reason). info has state, head, mergeable, merge_state, and
     the GATING failing/pending check names (monitoring smokes excluded). Uses the
@@ -213,10 +255,11 @@ def _pr_state(repo, pr):
     failing, pending, ignored, gating_green = [], [], [], []
     # CheckRun checks (Actions, etc.) via REST — name + status + conclusion.
     if head:
-        runs, rerr = _gh_api(f"repos/{repo}/commits/{head}/check-runs")
+        runs, rerr = _gh_api_paginated_list(
+            f"repos/{repo}/commits/{head}/check-runs?per_page=100", "check_runs")
         if rerr:
             return None, rerr
-        for c in (runs.get("check_runs") or []):
+        for c in (runs or []):
             name = c.get("name") or "?"
             concl = (c.get("conclusion") or "").upper()
             is_fail = (c.get("status") == "completed" and concl in _BAD_CHECK)
@@ -233,18 +276,22 @@ def _pr_state(repo, pr):
                 ignored.append(name)
                 continue
             (failing if is_fail else pending).append(name)
-        # Legacy commit statuses (e.g. Vercel) via REST.
+        # Legacy commit statuses (e.g. Vercel) via REST. FAIL CLOSED on a fetch
+        # error, symmetric with the check-runs fetch above: silently proceeding
+        # on a failed status read could hide a failing gating status and merge
+        # an unverified head.
         stat, serr = _gh_api(f"repos/{repo}/commits/{head}/status")
-        if not serr:
-            for s in (stat.get("statuses") or []):
-                name = s.get("context") or "?"
-                st = (s.get("state") or "").upper()
-                if st == "SUCCESS" and _is_gating_check(name):
-                    gating_green.append(name)
-                elif st in ("FAILURE", "ERROR"):
-                    (ignored if not _is_gating_check(name) else failing).append(name)
-                elif st == "PENDING":
-                    (ignored if not _is_gating_check(name) else pending).append(name)
+        if serr:
+            return None, serr
+        for s in (stat.get("statuses") or []):
+            name = s.get("context") or "?"
+            st = (s.get("state") or "").upper()
+            if st == "SUCCESS" and _is_gating_check(name):
+                gating_green.append(name)
+            elif st in ("FAILURE", "ERROR"):
+                (ignored if not _is_gating_check(name) else failing).append(name)
+            elif st == "PENDING":
+                (ignored if not _is_gating_check(name) else pending).append(name)
     return {
         "state": data.get("state"),
         "head": head,
@@ -267,7 +314,8 @@ def evaluate(repo, pr, verdict, allowlist):
     if shadow_plan_error:
         return "blocked", shadow_plan_error
     if _shadow():
-        return "skip", "VALIDATE_SHADOW is true (fenced MergeActor plan recorded; live ownership disabled)"
+        return "skip", ("merge pipeline is in shadow mode (fenced MergeActor plan "
+                        "recorded; live ownership disabled)")
     if not _tier_autonomy_enabled(tier):
         return "skip", f"tier '{tier}' autonomy not enabled"
     return _merge_readiness(repo, pr, verdict, allowlist)

@@ -118,6 +118,18 @@ class LaunchdEnvironmentTests(unittest.TestCase):
                 self.hermes / "scripts" / "reconcile_launchd_environment.py"
             ).read_bytes(),
         )
+        template_source = SOURCE_ROOT / module.REFERENCE_SOURCE
+        deployed_template = self.hermes / "scripts" / module.REFERENCE_SOURCE
+        self.assertEqual(template_source.read_bytes(), deployed_template.read_bytes())
+        self.assertEqual(deployed_template.stat().st_mode & 0o777, 0o600)
+
+        installed_source_reconciler = module.Reconciler(
+            source_root=self.hermes / "scripts",
+            home=self.home,
+            launch_agents_dir=self.launch_agents,
+            state_dir=self.state,
+        )
+        installed_source_reconciler.verify()
 
         for label, wrapper_name in (
             (module.GATEWAY_LABEL, "gateway_secrets_wrap.sh"),
@@ -251,6 +263,11 @@ class LaunchdEnvironmentTests(unittest.TestCase):
         comprehensive.write_text(
             "SLACK_APP_TOKEN=op://Gateway/slack/app-token\n"
             "SLACK_BOT_TOKEN=op://Gateway/slack/bot-token\n"
+            "DATABASE_URL=op://Dev/database/url\n"
+            "THERMAL_APP_DATABASE_URL=op://Thermal/database/url\n"
+            "HERMES_VALIDATOR_FINALIZE_TOKEN=op://Hermes/flags/finalize\n"
+            "D365GROUP_DATABASE_URL=op://D365/database/url\n"
+            "D365GROUP_DATABASE_URL_UNPOOLED=op://D365/database/unpooled\n"
             "OPENAI_API_KEY_HERMES=op://Legacy/openai/key\n",
             encoding="utf-8",
         )
@@ -269,9 +286,22 @@ class LaunchdEnvironmentTests(unittest.TestCase):
             deployed["OPENAI_API_KEY_HERMES"],
             required["OPENAI_API_KEY_HERMES"],
         )
+        self.assertNotIn("DATABASE_URL", deployed)
+        self.assertNotIn("THERMAL_APP_DATABASE_URL", deployed)
+        self.assertNotIn("HERMES_VALIDATOR_FINALIZE_TOKEN", deployed)
+        self.assertEqual(
+            deployed["D365GROUP_DATABASE_URL"],
+            "op://D365/database/url",
+        )
+        self.assertEqual(
+            deployed["D365GROUP_DATABASE_URL_UNPOOLED"],
+            "op://D365/database/unpooled",
+        )
         self.assertEqual(set(deployed), set(required) | {
             "SLACK_APP_TOKEN",
             "SLACK_BOT_TOKEN",
+            "D365GROUP_DATABASE_URL",
+            "D365GROUP_DATABASE_URL_UNPOOLED",
         })
 
     def test_complete_reference_inventory_rejects_non_op_values(self):

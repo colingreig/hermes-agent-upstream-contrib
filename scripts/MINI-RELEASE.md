@@ -116,7 +116,7 @@ diverged, so bootstrap is intentionally blocked until the branch is reconciled.
 8. Transactionally reconcile both LaunchAgents and their canonical wrappers,
    then reload with `bootout` + `bootstrap`. Plists point only to wrappers;
    permanent auth parks cleanly while transient exhaustion remains retryable.
-9. **Verify (up to 60s)**: gateway process running through the new release,
+9. **Verify (up to 240s)**: gateway process running through the new release,
    `Gateway running with N platform(s)` with N ≥ 2 in `gateway.log`, and
    `:8642` listening; then verify the dashboard (`:9119` → HTTP 200).
 10. Atomically install and hash-verify the governed refresh source at

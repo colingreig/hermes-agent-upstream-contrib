@@ -70,6 +70,41 @@ DEFAULT_MAX_AGE_H = 24
 _LEASE_TTL_S = 15 * 60
 _STATUS_PROVIDER_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:@/-]{0,240}$")
 
+# --- shared merge-shadow activation switch (Task: autonomous-merge activation) -
+#
+# Single source of truth for "is the PR-merge pipeline still in shadow
+# (observe-only) mode, or has it been activated?". Every merge gate
+# (autonomous_merge._shadow(), merge_guard._shadow(),
+# hermes_validate_ops.VALIDATE_SHADOW) AND the verdict writer below
+# (``finalize_shadow_review`` / ``_validate_record``'s ``shadow`` stamp) call
+# this ONE function so they can never disagree about which mode is active.
+#
+# FAIL-CLOSED DEFAULT: absence of env means SHADOW. Activation requires an
+# explicit HERMES_MERGE_ACTIVE truthy value ({1,true,yes,on},
+# case-insensitive). HERMES_MERGE_SHADOW is the emergency override: when
+# truthy it forces shadow back ON even if HERMES_MERGE_ACTIVE is set —
+# shadow always wins.
+_MERGE_SHADOW_ENV = "HERMES_MERGE_SHADOW"
+_MERGE_ACTIVE_ENV = "HERMES_MERGE_ACTIVE"
+_MERGE_SHADOW_TRUTHY = {"1", "true", "yes", "on"}
+
+
+def _env_truthy(source: Mapping[str, str], name: str) -> bool:
+    return (source.get(name, "") or "").strip().lower() in _MERGE_SHADOW_TRUTHY
+
+
+def merge_shadow_active(env: Mapping[str, str] | None = None) -> bool:
+    """Return True iff the PR-merge pipeline must stay in shadow (observe-only)
+    mode. Fail-closed: shadow unless HERMES_MERGE_ACTIVE is explicitly truthy,
+    and HERMES_MERGE_SHADOW (the emergency override) forces shadow ON even
+    when HERMES_MERGE_ACTIVE is set — shadow always wins. Every merge gate and
+    the verdict writer must call this function (not re-implement the env
+    parsing) so they cannot drift apart."""
+    source = env if env is not None else os.environ
+    if _env_truthy(source, _MERGE_SHADOW_ENV):
+        return True
+    return not _env_truthy(source, _MERGE_ACTIVE_ENV)
+
 
 class VerdictStoreError(RuntimeError):
     """The authoritative verdict boundary could not safely complete."""
@@ -155,9 +190,14 @@ def _validate_record(identity: TrustedMergeIdentity, record: Mapping[str, Any]) 
     cleaned["pr"] = identity.pr_number
     cleaned["head_sha"] = identity.head_sha
     cleaned["expected_repo"] = identity.canonical_repo
-    # This deployment performs observation only.  A future activation must be a
-    # reviewed change that supplies a non-shadow trusted executor.
-    cleaned["shadow"] = True
+    # "shadow" is stamped exclusively by finalize_shadow_review() at WRITE time
+    # (from merge_shadow_active()), never inferred here or trusted from an
+    # arbitrary caller. This function also reconstructs ALREADY-FINALIZED
+    # records on READ (see _finalization_record) — an immutable terminal
+    # verdict's historical shadow value must not be recomputed against
+    # today's env, only validated as the explicit boolean it was written with.
+    if not isinstance(cleaned.get("shadow"), bool):
+        raise VerdictStoreError("verdict record must carry an explicit boolean 'shadow' flag")
     return cleaned
 
 
@@ -262,8 +302,26 @@ def begin_shadow_review(
     return ShadowReviewSession(store, identity, lease)
 
 
-def finalize_shadow_review(session: ShadowReviewSession, record: Mapping[str, Any]) -> tuple[dict[str, Any], bool]:
-    """Commit one immutable verdict through the session's active fencing lease."""
+def finalize_shadow_review(
+    session: ShadowReviewSession,
+    record: Mapping[str, Any],
+    *,
+    validator_review: bool = False,
+    force_shadow: bool = False,
+) -> tuple[dict[str, Any], bool]:
+    """Commit one immutable verdict through the session's active fencing lease.
+
+    ANTI-FORGERY CONTRACT (Task: autonomous-merge activation hardening): a
+    NON-SHADOW (merge-eligible) verdict may only be finalized from inside the
+    validator's own review flow (``validate_pr.validate`` passes
+    ``validator_review=True``) while the session's TrustStore lease is provably
+    still live. Every other caller — including the compatibility writer
+    ``record_verdict`` and the ``validator_verdict.py write`` CLI — is stamped
+    ``shadow=True`` unconditionally, so a bare CLI/process write can never mint
+    a merge-eligible PASS regardless of env. ``force_shadow=True`` lets the
+    validator itself demand a shadow verdict (``--shadow`` / panel-suppressed
+    runs) even when the pipeline is activated.
+    """
     if session.existing is not None:
         existing = _finalization_record(session.existing)
         if existing is None:
@@ -273,7 +331,47 @@ def finalize_shadow_review(session: ShadowReviewSession, record: Mapping[str, An
         return existing, True
     if session.lease is None:
         raise VerdictStoreError("shadow review session has no live fencing lease")
-    cleaned = _validate_record(session.identity, record)
+    stamped = dict(record)
+    # VALIDATOR-ONLY SECRET CHECK (in-process forgery residual close-out): an
+    # executor holding a lease can call this function directly with
+    # validator_review=True from inline Python — the lease alone doesn't prove
+    # the caller IS the validator daemon. HERMES_VALIDATOR_FINALIZE_TOKEN is a
+    # secret-shaped env var, so Hermes' own executor-subprocess scrubbing (see
+    # skill subprocess secret passthrough) strips it from every executor
+    # process; only the validator's own long-lived process env has it. We
+    # never compare it against a hard-coded value — there is nothing to leak
+    # or replay — its mere PRESENCE in this process's environment is the
+    # signal that this process is the validator, not the executor. A missing
+    # token must degrade to shadow, never raise (fail-safe: an
+    # under-provisioned validator loses merge eligibility, not availability).
+    if validator_review and not force_shadow and not (
+        os.environ.get("HERMES_VALIDATOR_FINALIZE_TOKEN", "") or ""
+    ).strip():
+        validator_review = False
+    if not validator_review or force_shadow:
+        # Not the validator's fenced review flow (or the validator explicitly
+        # requested shadow): the verdict is recorded but NEVER merge-eligible.
+        stamped["shadow"] = True
+    else:
+        # Validator review flow: prove the fencing lease is live RIGHT NOW via
+        # the store's own lease machinery before stamping a merge-eligible
+        # verdict. A stale/superseded/expired lease fails closed and loudly.
+        try:
+            session.store.heartbeat(session.lease, ttl_s=_LEASE_TTL_S)
+        except (StoreError, ValueError, TypeError) as exc:
+            raise VerdictStoreError(
+                "non-shadow finalization REFUSED: fencing lease is not live "
+                "(fail-closed; only the validator's fenced review flow may "
+                "finalize a merge-eligible verdict)"
+            ) from exc
+        # Single source of truth: stamp "shadow" from the SAME env-derived
+        # switch every merge gate reads. A new terminal verdict's shadow state
+        # must always match the pipeline's CURRENT activation mode at the
+        # moment it is finalized — never a caller's guess, and never
+        # recomputed later (it becomes immutable the instant it is written;
+        # see _validate_record's read-path note above).
+        stamped["shadow"] = merge_shadow_active()
+    cleaned = _validate_record(session.identity, stamped)
     evidence = {
         "record": cleaned,
         "review_runner": {"mode": "shadow", "executed_pr_code": False},
@@ -309,6 +407,11 @@ def record_verdict(
     intentionally incompatible with the old unlocked JSON setter: there is no
     safe way to infer base, tested merge, policy, and exact CI from a verdict
     payload after review has already run.
+
+    SHADOW-ONLY: this writer never passes ``validator_review=True``, so every
+    verdict it records is stamped ``shadow=True`` (never merge-eligible). A
+    merge-eligible verdict can only come from the validator's own fenced
+    review flow (``validate_pr.validate`` -> ``finalize_shadow_review``).
     """
     canonical = _canonical_repo(repo)
     if identity.canonical_repo != canonical or identity.pr_number != int(pr):
@@ -316,7 +419,7 @@ def record_verdict(
     owned = session is None
     active = session or begin_shadow_review(identity, path=path)
     try:
-        return finalize_shadow_review(active, record)
+        return finalize_shadow_review(active, record, validator_review=False)
     except Exception:
         if owned:
             abort_shadow_review(active)
@@ -566,6 +669,18 @@ def resolve_shadow_identity(repo: str, pr: int, task_id: str = "", expected_repo
 
 
 def cmd_write(args: argparse.Namespace) -> int:
+    # SECURITY: the CLI write path is SHADOW-ONLY by construction. The
+    # caller-supplied --identity JSON is only structurally validated, so a CLI
+    # write can never be trusted as the validator itself; record_verdict()
+    # stamps shadow=True unconditionally and no flag on this command can
+    # change that. Merge-eligible (non-shadow) verdicts exist only via the
+    # validator's fenced review flow. Say so loudly, every time.
+    print(
+        "NOTICE: CLI-written verdicts are ALWAYS shadow (never merge-eligible). "
+        "A merge-eligible verdict can only be finalized by the validator's own "
+        "fenced review flow (validate_pr.py).",
+        file=sys.stderr,
+    )
     try:
         identity = TrustedMergeIdentity.from_record(json.loads(Path(args.identity).read_text(encoding="utf-8")))
         record = {
@@ -576,6 +691,8 @@ def cmd_write(args: argparse.Namespace) -> int:
             "expected_repo": args.expected_repo or identity.canonical_repo,
             "model_used": args.model,
             "findings": json.loads(Path(args.findings).read_text(encoding="utf-8")) if args.findings else [],
+            # Overwritten by finalize_shadow_review(): CLI writes are stamped
+            # shadow=True unconditionally (see record_verdict docstring).
             "shadow": True,
             "ts": _now_iso(),
         }

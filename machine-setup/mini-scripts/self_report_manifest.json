@@ -1,0 +1,74 @@
+{
+  "bundle": "hermes-self-report",
+  "source_task": "86e2gnz60",
+  "generated": "2026-07-27",
+  "description": "Declared deploy bundle for the hermes-self-report cron. This file IS the bundle the installer copies; nothing outside its 'files' list is written. Canon bytes are the live mini copies (RC4) except postmark_send_report.py and hermes_self_report_delivery_probe.py, whose canon is the hermes-agent deploy mirror (live behavior + encoding=utf-8 on file opens). SKILL.md is authored in Brain and installed only with --include-skill --brain-path.",
+  "coexist_required": [
+    {
+      "dest_abs": "~/.hermes/scripts/claim_store.py",
+      "reason": "hermes_report_build.compute_work_stoppage() does `import claim_store`; a missing copy degrades every work-stoppage verdict to UNKNOWN. Installer warns, never installs or removes it."
+    },
+    {
+      "dest_abs": "~/.hermes/scripts/queue_snapshot.json",
+      "reason": "Read by the claim/snapshot-freshness logic. Runtime state, outside the bundle. Installer warns, never installs or removes it."
+    }
+  ],
+  "files": [
+    {
+      "src_rel": "hermes_report_build.py",
+      "src_base": "mirror",
+      "dest_abs": "~/.hermes/scripts/hermes_report_build.py",
+      "sha256": "bfc8eb728fb86025fa93c103415089e92c313c5a4d62f0f9f7022299c1273546",
+      "role": "report builder (HTML+text+subject+JSON); imports hermes_report_build_v1lib + claim_store",
+      "deploy_mode": "script"
+    },
+    {
+      "src_rel": "hermes_report_build_v1lib.py",
+      "src_base": "mirror",
+      "dest_abs": "~/.hermes/scripts/hermes_report_build_v1lib.py",
+      "sha256": "b46e002b3a75cbad3c128d39b212892febf2876f3bcfd31e2282a4cdc05f1c2d",
+      "role": "load-bearing data-collection library imported by the builder as hermes_report_build_v1lib; its own table renderer is deprecated but the module is not retirable",
+      "deploy_mode": "script"
+    },
+    {
+      "src_rel": "hermes_report_build_v2.py",
+      "src_base": "mirror",
+      "dest_abs": "~/.hermes/scripts/hermes_report_build_v2.py",
+      "sha256": "b0b5f0467a54105e3bf29e9761cf93638bae622e0138a36a22f2dc8e88e95bf2",
+      "role": "compat-only orphan; no live importer (survey confirmed). Ships until a follow-up PR retires it after a final cross-surface caller check",
+      "deploy_mode": "script"
+    },
+    {
+      "src_rel": "hermes-metrics.py",
+      "src_base": "mirror",
+      "dest_abs": "~/.hermes/scripts/hermes-metrics.py",
+      "sha256": "d3f17e307fc5f3c60f717b083fb245d9cc5a2877ed83f5a8d53ccf90316e596d",
+      "role": "standalone per-list ClickUp metrics CLI; no automated caller; live copy uses runtime-current venv path + lazy_secret_resolver token",
+      "deploy_mode": "script"
+    },
+    {
+      "src_rel": "postmark_send_report.py",
+      "src_base": "mirror",
+      "dest_abs": "~/.hermes/scripts/postmark_send_report.py",
+      "sha256": "388195cd7f4830f5162494aabf10e2976ddccc7df5f481afe9d105a2d7c53924",
+      "role": "RC4 delivery contract: venv re-exec, lazy token resolve, Postmark POST with in-code hermes-send fallback, receipt, nonzero-exit-on-total-failure. Canon = deploy mirror bytes (live behavior + encoding=utf-8)",
+      "deploy_mode": "script"
+    },
+    {
+      "src_rel": "hermes_self_report_delivery_probe.py",
+      "src_base": "mirror",
+      "dest_abs": "~/.hermes/scripts/hermes_self_report_delivery_probe.py",
+      "sha256": "caa52b11adf2939f302b512bf095ed7916c81bcf7e9c8541fc208e32fc76437a",
+      "role": "receipt-reader probe for its own no_agent cron (offset from 0 */6 * * *): 0 fresh+sent, 1 both channels failed, 2 missing/stale/unreadable. Canon = deploy mirror bytes (live behavior + encoding=utf-8)",
+      "deploy_mode": "script"
+    },
+    {
+      "src_rel": "hermes/skills/hermes-self-report/SKILL.md",
+      "src_base": "brain",
+      "dest_abs": "~/.hermes/skills/hermes-self-report/SKILL.md",
+      "sha256": "f251b3c0825704a02eb235b2ba70853b7b31759a5a71d6837d6da9cff4696efc",
+      "role": "authored cron contract (Brain source of truth); installed only with --include-skill --brain-path <brain checkout>",
+      "deploy_mode": "skill"
+    }
+  ]
+}

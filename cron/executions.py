@@ -10,7 +10,10 @@ so reconciliation remains an explicit, reviewable operation.
 from __future__ import annotations
 
 from datetime import timedelta
+import hashlib
+import json
 import os
+import re
 import sqlite3
 import threading
 import uuid
@@ -24,8 +27,19 @@ EXECUTIONS_FILE = get_hermes_home().resolve() / "cron" / "executions.db"
 MAX_TERMINAL_EXECUTIONS = 1000
 DEFAULT_LEASE_SECONDS = 120
 SCHEMA_VERSION = 2
+HISTORICAL_RECONCILIATION_SCHEMA = "hermes-cron-historical-reconciliation/v1"
+HISTORICAL_RECONCILIATION_REASON = "legacy_unfenced_owner_dead_reconciled"
+HISTORICAL_RECONCILIATION_EXECUTION_IDS = (
+    "ffa80d66c55b40e3a85f454a83812ab8",
+    "4cc3598fd5e3400aa6b317791fe51961",
+    "9c5dc41e180a459397a6ff9896d5f6de",
+    "5f140a86aafb499c92fdb073d0c50f63",
+    "c8948bf7beb840eaab5a3224e75fb2d6",
+    "1d0b4a2376a2495bb4f609d39ab7684a",
+)
 _lock = threading.RLock()
 _PROCESS_ID = uuid.uuid4().hex
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 _CREATE_EXECUTIONS_SQL = """CREATE TABLE executions (
     id TEXT PRIMARY KEY,
@@ -165,13 +179,24 @@ def _owner_liveness(pid: int, started_at: Optional[int]) -> str:
 
 def _prune_unlocked(conn: sqlite3.Connection) -> None:
     limit = max(0, int(MAX_TERMINAL_EXECUTIONS))
+    placeholders = ",".join(
+        "?" for _ in HISTORICAL_RECONCILIATION_EXECUTION_IDS
+    )
     conn.execute(
-        """DELETE FROM executions WHERE id IN (
+        f"""DELETE FROM executions WHERE id IN (
              SELECT id FROM executions
              WHERE status IN ('completed','failed','interrupted','unknown')
+               AND NOT (
+                 terminal_reason IS ?
+                 AND id IN ({placeholders})
+               )
              ORDER BY claimed_at DESC, id DESC LIMIT -1 OFFSET ?
            )""",
-        (limit,),
+        (
+            HISTORICAL_RECONCILIATION_REASON,
+            *HISTORICAL_RECONCILIATION_EXECUTION_IDS,
+            limit,
+        ),
     )
 
 
@@ -315,6 +340,514 @@ def classify_stale_executions() -> Dict[str, Any]:
             "insufficient_evidence": sum(entry["disposition"] == "insufficient_evidence" for entry in entries),
         },
     }
+
+
+class HistoricalReconciliationError(ValueError):
+    """The reviewed historical-reconciliation contract no longer holds."""
+
+
+def _historical_manifest_hash(manifest: Dict[str, Any]) -> str:
+    content = dict(manifest)
+    content.pop("content_hash", None)
+    canonical = json.dumps(
+        content, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _historical_pid_evidence(row: sqlite3.Row) -> Dict[str, Any]:
+    """Capture exact PID presence without treating PID reuse as owner death."""
+    pid = int(row["pid"])
+    try:
+        from gateway.status import _pid_exists
+        present = bool(_pid_exists(pid))
+    except Exception:
+        return {
+            "pid": pid,
+            "state": "unknown",
+            "recorded_process_started_at": row["process_started_at"],
+            "observed_process_started_at": None,
+        }
+    if not present:
+        return {
+            "pid": pid,
+            "state": "absent",
+            "recorded_process_started_at": row["process_started_at"],
+            "observed_process_started_at": None,
+        }
+    observed_started_at = _process_start_time(pid)
+    recorded_started_at = row["process_started_at"]
+    if (
+        recorded_started_at is not None
+        and observed_started_at is not None
+        and observed_started_at != recorded_started_at
+    ):
+        state = "pid_reused"
+    elif (
+        recorded_started_at is not None
+        and observed_started_at is not None
+        and observed_started_at == recorded_started_at
+    ):
+        state = "live_owner"
+    else:
+        state = "present_identity_unknown"
+    return {
+        "pid": pid,
+        "state": state,
+        "recorded_process_started_at": recorded_started_at,
+        "observed_process_started_at": observed_started_at,
+    }
+
+
+def _historical_row_eligible(row: sqlite3.Row, evidence: Dict[str, Any]) -> bool:
+    return (
+        row["status"] == "running"
+        and row["finished_at"] is None
+        and row["terminal_at"] is None
+        and row["owner_token"] is None
+        and row["lease_expires_at"] is None
+        and evidence["state"] == "absent"
+    )
+
+
+def build_historical_reconciliation_manifest(
+    *,
+    database_snapshot_sha256: str,
+    runtime_release: str,
+    runtime_commit: str,
+) -> Dict[str, Any]:
+    """Build a non-mutating manifest for the one approved legacy repair.
+
+    The fixed allow-list is intentionally not caller-configurable.  The
+    database snapshot hash and runtime identity make the review artifact
+    attributable to the exact operational state that will later be applied.
+    """
+    snapshot_hash = str(database_snapshot_sha256).strip().lower()
+    if not _SHA256_RE.fullmatch(snapshot_hash):
+        raise HistoricalReconciliationError(
+            "database_snapshot_sha256 must be a lowercase SHA-256 digest"
+        )
+    release = str(runtime_release).strip()
+    commit = str(runtime_commit).strip()
+    if not release or not commit:
+        raise HistoricalReconciliationError(
+            "runtime_release and runtime_commit are required"
+        )
+
+    generated_at = _hermes_now().isoformat()
+    placeholders = ",".join("?" for _ in HISTORICAL_RECONCILIATION_EXECUTION_IDS)
+    with _lock, _connect() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM executions WHERE id IN ({placeholders})",
+            HISTORICAL_RECONCILIATION_EXECUTION_IDS,
+        ).fetchall()
+    by_id = {row["id"]: row for row in rows}
+    entries = []
+    for execution_id in HISTORICAL_RECONCILIATION_EXECUTION_IDS:
+        row = by_id.get(execution_id)
+        if row is None:
+            entries.append({
+                "execution_id": execution_id,
+                "eligible": False,
+                "rejection": "missing",
+                "owner_pid_evidence": None,
+                "original": None,
+            })
+            continue
+        evidence = _historical_pid_evidence(row)
+        eligible = _historical_row_eligible(row, evidence)
+        entries.append({
+            "execution_id": execution_id,
+            "eligible": eligible,
+            "rejection": None if eligible else "historical_preconditions_not_met",
+            "owner_pid_evidence": evidence,
+            "original": dict(row),
+        })
+
+    manifest = {
+        "schema": HISTORICAL_RECONCILIATION_SCHEMA,
+        "generated_at": generated_at,
+        "mutated": False,
+        "database_snapshot": {"sha256": snapshot_hash},
+        "runtime": {"release": release, "commit": commit},
+        "approved_execution_ids": list(HISTORICAL_RECONCILIATION_EXECUTION_IDS),
+        "entries": entries,
+        "summary": {
+            "approved": len(HISTORICAL_RECONCILIATION_EXECUTION_IDS),
+            "eligible": sum(bool(entry["eligible"]) for entry in entries),
+            "rejected": sum(not entry["eligible"] for entry in entries),
+        },
+    }
+    manifest["content_hash"] = _historical_manifest_hash(manifest)
+    return manifest
+
+
+def _validate_historical_manifest(
+    manifest: Dict[str, Any],
+    *,
+    manifest_hash: str,
+    database_snapshot_sha256: str,
+    runtime_release: str,
+    runtime_commit: str,
+) -> None:
+    expected_ids = list(HISTORICAL_RECONCILIATION_EXECUTION_IDS)
+    supplied_hash = str(manifest_hash).strip().lower()
+    if not _SHA256_RE.fullmatch(supplied_hash):
+        raise HistoricalReconciliationError("manifest_hash must be a SHA-256 digest")
+    if manifest.get("content_hash") != supplied_hash:
+        raise HistoricalReconciliationError("manifest_hash does not match the manifest")
+    if _historical_manifest_hash(manifest) != supplied_hash:
+        raise HistoricalReconciliationError("manifest content hash verification failed")
+    if manifest.get("schema") != HISTORICAL_RECONCILIATION_SCHEMA:
+        raise HistoricalReconciliationError("unsupported historical manifest schema")
+    if manifest.get("mutated") is not False:
+        raise HistoricalReconciliationError("only a dry-run manifest may be applied")
+    if manifest.get("approved_execution_ids") != expected_ids:
+        raise HistoricalReconciliationError("manifest allow-list is not the fixed approved set")
+    entries = manifest.get("entries")
+    if not isinstance(entries, list) or [
+        entry.get("execution_id") for entry in entries if isinstance(entry, dict)
+    ] != expected_ids:
+        raise HistoricalReconciliationError("manifest entries do not match the fixed approved set")
+    if not all(entry.get("eligible") is True for entry in entries):
+        raise HistoricalReconciliationError("manifest contains an ineligible approved execution")
+
+    snapshot_hash = str(database_snapshot_sha256).strip().lower()
+    if manifest.get("database_snapshot") != {"sha256": snapshot_hash}:
+        raise HistoricalReconciliationError("database snapshot hash does not match the manifest")
+    if manifest.get("runtime") != {
+        "release": str(runtime_release).strip(),
+        "commit": str(runtime_commit).strip(),
+    }:
+        raise HistoricalReconciliationError("runtime identity does not match the manifest")
+
+
+def apply_historical_execution_reconciliation(
+    manifest: Dict[str, Any],
+    *,
+    manifest_hash: str,
+    database_snapshot_sha256: str,
+    runtime_release: str,
+    runtime_commit: str,
+) -> Dict[str, Any]:
+    """Atomically interrupt the six approved legacy rows, or change nothing.
+
+    This path is deliberately separate from startup recovery.  Apply requires
+    the reviewed dry-run manifest, its content hash, the database snapshot
+    digest, and the same observed runtime identity.  Every row is re-read in
+    one immediate transaction and compared byte-for-byte with the manifest
+    before any update occurs.
+    """
+    canonical_manifest_hash = str(manifest_hash).strip().lower()
+    _validate_historical_manifest(
+        manifest,
+        manifest_hash=canonical_manifest_hash,
+        database_snapshot_sha256=database_snapshot_sha256,
+        runtime_release=runtime_release,
+        runtime_commit=runtime_commit,
+    )
+    entries = manifest["entries"]
+    originals = {entry["execution_id"]: entry["original"] for entry in entries}
+    error = (
+        "Historical legacy-unfenced execution reconciled from reviewed manifest "
+        f"{canonical_manifest_hash}; the recorded owner PID was absent at apply time."
+    )
+
+    with _lock:
+        conn = _connect()
+        try:
+            # _connect() may have performed an idempotent schema migration.
+            # Commit that separately before the explicit repair transaction.
+            conn.commit()
+            conn.execute("BEGIN IMMEDIATE")
+            placeholders = ",".join("?" for _ in HISTORICAL_RECONCILIATION_EXECUTION_IDS)
+            rows = conn.execute(
+                f"SELECT * FROM executions WHERE id IN ({placeholders})",
+                HISTORICAL_RECONCILIATION_EXECUTION_IDS,
+            ).fetchall()
+            by_id = {row["id"]: row for row in rows}
+
+            already_reconciled = []
+            pending = []
+            for execution_id in HISTORICAL_RECONCILIATION_EXECUTION_IDS:
+                row = by_id.get(execution_id)
+                if row is None:
+                    raise HistoricalReconciliationError(
+                        f"approved execution disappeared: {execution_id}"
+                    )
+                if (
+                    row["status"] == "interrupted"
+                    and row["finished_at"] is not None
+                    and row["terminal_at"] is not None
+                    and row["finished_at"] == row["terminal_at"]
+                    and row["terminal_reason"] == HISTORICAL_RECONCILIATION_REASON
+                    and row["error"] == error
+                ):
+                    already_reconciled.append(row)
+                    continue
+                if dict(row) != originals[execution_id]:
+                    raise HistoricalReconciliationError(
+                        f"snapshot preconditions changed: {execution_id}"
+                    )
+                evidence = _historical_pid_evidence(row)
+                if not _historical_row_eligible(row, evidence):
+                    raise HistoricalReconciliationError(
+                        f"historical preconditions no longer hold: {execution_id} "
+                        f"(pid_state={evidence['state']})"
+                    )
+                pending.append(row)
+
+            if already_reconciled and pending:
+                raise HistoricalReconciliationError(
+                    "partial historical reconciliation detected; refusing mixed-state apply"
+                )
+            if already_reconciled:
+                conn.commit()
+                return {
+                    "manifest_hash": canonical_manifest_hash,
+                    "mutated": 0,
+                    "already_reconciled": len(already_reconciled),
+                    "entries": [
+                        {
+                            "execution_id": row["id"],
+                            "status": row["status"],
+                            "finished_at": row["finished_at"],
+                            "terminal_at": row["terminal_at"],
+                            "terminal_reason": row["terminal_reason"],
+                        }
+                        for row in already_reconciled
+                    ],
+                }
+
+            terminal_at = _hermes_now().isoformat()
+            changed = 0
+            for row in pending:
+                cur = conn.execute(
+                    """UPDATE executions
+                       SET status='interrupted', finished_at=?, terminal_at=?,
+                           terminal_reason=?, error=?
+                       WHERE id=? AND status='running' AND finished_at IS NULL
+                         AND terminal_at IS NULL AND owner_token IS NULL
+                         AND lease_expires_at IS NULL AND pid=?
+                         AND process_id IS ? AND process_started_at IS ?""",
+                    (
+                        terminal_at,
+                        terminal_at,
+                        HISTORICAL_RECONCILIATION_REASON,
+                        error,
+                        row["id"],
+                        row["pid"],
+                        row["process_id"],
+                        row["process_started_at"],
+                    ),
+                )
+                if cur.rowcount != 1:
+                    raise HistoricalReconciliationError(
+                        f"compare-and-set rejected execution: {row['id']}"
+                    )
+                changed += 1
+            if changed != len(HISTORICAL_RECONCILIATION_EXECUTION_IDS):
+                raise HistoricalReconciliationError(
+                    "historical reconciliation did not update the complete approved set"
+                )
+            conn.commit()
+            final_rows = conn.execute(
+                f"SELECT * FROM executions WHERE id IN ({placeholders})",
+                HISTORICAL_RECONCILIATION_EXECUTION_IDS,
+            ).fetchall()
+            final_by_id = {row["id"]: row for row in final_rows}
+            return {
+                "manifest_hash": canonical_manifest_hash,
+                "mutated": changed,
+                "already_reconciled": 0,
+                "entries": [
+                    {
+                        "execution_id": execution_id,
+                        "status": final_by_id[execution_id]["status"],
+                        "finished_at": final_by_id[execution_id]["finished_at"],
+                        "terminal_at": final_by_id[execution_id]["terminal_at"],
+                        "terminal_reason": final_by_id[execution_id]["terminal_reason"],
+                    }
+                    for execution_id in HISTORICAL_RECONCILIATION_EXECUTION_IDS
+                ],
+            }
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+
+def restore_historical_reconciliation_rows_from_snapshot(
+    snapshot_path: str | Path,
+    manifest: Dict[str, Any],
+    *,
+    manifest_hash: str,
+    database_snapshot_sha256: str,
+    runtime_release: str,
+    runtime_commit: str,
+) -> Dict[str, Any]:
+    """Atomically restore the six approved originals from their reviewed backup.
+
+    This is a bounded recovery path for an operational interruption between
+    historical reconciliation and durable retention.  It accepts neither a
+    caller-provided allow-list nor arbitrary row contents: the backup digest,
+    reviewed manifest, fixed IDs, schema, and every original value must agree.
+    Existing partial or drifted rows fail closed.  An exact all-six retry is a
+    zero-mutation success so a crash after commit can be resumed safely.
+    """
+    canonical_manifest_hash = str(manifest_hash).strip().lower()
+    snapshot_hash = str(database_snapshot_sha256).strip().lower()
+    _validate_historical_manifest(
+        manifest,
+        manifest_hash=canonical_manifest_hash,
+        database_snapshot_sha256=snapshot_hash,
+        runtime_release=runtime_release,
+        runtime_commit=runtime_commit,
+    )
+
+    snapshot = Path(snapshot_path).expanduser().resolve()
+    if not snapshot.is_file():
+        raise HistoricalReconciliationError("historical database snapshot is missing")
+    digest = hashlib.sha256()
+    try:
+        with snapshot.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError as exc:
+        raise HistoricalReconciliationError(
+            "historical database snapshot could not be read"
+        ) from exc
+    if digest.hexdigest() != snapshot_hash:
+        raise HistoricalReconciliationError(
+            "historical database snapshot hash verification failed"
+        )
+
+    expected_ids = list(HISTORICAL_RECONCILIATION_EXECUTION_IDS)
+    originals = {
+        entry["execution_id"]: entry["original"] for entry in manifest["entries"]
+    }
+    placeholders = ",".join("?" for _ in expected_ids)
+
+    def schema_identity(conn: sqlite3.Connection) -> Dict[str, Any]:
+        table_row = conn.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type='table' AND name='executions'"
+        ).fetchone()
+        table_sql = table_row["sql"] if table_row is not None else None
+        return {
+            "table_info": [
+                tuple(row) for row in conn.execute("PRAGMA table_info(executions)")
+            ],
+            "table_sql": (
+                " ".join(str(table_sql).split()) if table_sql is not None else None
+            ),
+            "user_version": int(conn.execute("PRAGMA user_version").fetchone()[0]),
+        }
+
+    try:
+        snapshot_conn = sqlite3.connect(
+            f"file:{snapshot.as_posix()}?mode=ro", uri=True, timeout=5,
+        )
+        snapshot_conn.row_factory = sqlite3.Row
+        snapshot_schema = schema_identity(snapshot_conn)
+        snapshot_columns = [
+            row[1] for row in snapshot_schema["table_info"]
+        ]
+        snapshot_rows = snapshot_conn.execute(
+            f"SELECT * FROM executions WHERE id IN ({placeholders})",
+            expected_ids,
+        ).fetchall()
+    except sqlite3.Error as exc:
+        raise HistoricalReconciliationError(
+            "historical database snapshot is not a readable execution ledger"
+        ) from exc
+    finally:
+        if "snapshot_conn" in locals():
+            snapshot_conn.close()
+
+    snapshot_by_id = {row["id"]: dict(row) for row in snapshot_rows}
+    if (
+        len(snapshot_by_id) != len(expected_ids)
+        or set(snapshot_by_id) != set(expected_ids)
+    ):
+        raise HistoricalReconciliationError(
+            "historical database snapshot does not contain the fixed approved set"
+        )
+
+    with _lock:
+        conn = _connect()
+        try:
+            conn.commit()
+            conn.execute("BEGIN IMMEDIATE")
+            live_schema = schema_identity(conn)
+            if live_schema != snapshot_schema:
+                raise HistoricalReconciliationError(
+                    "historical snapshot/live execution schemas differ"
+                )
+            for execution_id in expected_ids:
+                if snapshot_by_id[execution_id] != originals[execution_id]:
+                    raise HistoricalReconciliationError(
+                        f"historical database snapshot content changed: {execution_id}"
+                    )
+            live_columns = [
+                row[1] for row in live_schema["table_info"]
+            ]
+            live_rows = conn.execute(
+                f"SELECT * FROM executions WHERE id IN ({placeholders})",
+                expected_ids,
+            ).fetchall()
+            live_by_id = {row["id"]: dict(row) for row in live_rows}
+            if live_by_id:
+                if (
+                    len(live_by_id) == len(expected_ids)
+                    and all(
+                        live_by_id[execution_id] == originals[execution_id]
+                        for execution_id in expected_ids
+                    )
+                ):
+                    conn.commit()
+                    return {
+                        "manifest_hash": canonical_manifest_hash,
+                        "mutated": 0,
+                        "already_restored": len(expected_ids),
+                        "execution_ids": expected_ids,
+                    }
+                raise HistoricalReconciliationError(
+                    "historical restore requires all six approved rows to be absent "
+                    "or already restored exactly"
+                )
+
+            columns_sql = ", ".join(snapshot_columns)
+            values_sql = ", ".join("?" for _ in snapshot_columns)
+            changed = 0
+            for execution_id in expected_ids:
+                row = originals[execution_id]
+                cur = conn.execute(
+                    f"INSERT INTO executions ({columns_sql}) VALUES ({values_sql})",
+                    tuple(row[column] for column in snapshot_columns),
+                )
+                if cur.rowcount != 1:
+                    raise HistoricalReconciliationError(
+                        f"historical restore rejected execution: {execution_id}"
+                    )
+                changed += 1
+            if changed != len(expected_ids):
+                raise HistoricalReconciliationError(
+                    "historical restore did not insert the complete approved set"
+                )
+            conn.commit()
+            return {
+                "manifest_hash": canonical_manifest_hash,
+                "mutated": changed,
+                "already_restored": 0,
+                "execution_ids": expected_ids,
+            }
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
 
 def recover_interrupted_executions() -> int:

@@ -35,6 +35,14 @@ EXPECTED_REFERENCE_KEYS = {
     "GH_APP_INSTALLATION_ID",
     "OPENAI_API_KEY_HERMES",
 }
+# These generic aliases grant broad application-database access and must never
+# become gateway/dashboard boot environment. Site-scoped references such as
+# D365GROUP_DATABASE_URL remain available for explicit per-job resolution.
+FORBIDDEN_BOOT_REFERENCE_KEYS = {
+    "DATABASE_URL",
+    "HERMES_VALIDATOR_FINALIZE_TOKEN",
+    "THERMAL_APP_DATABASE_URL",
+}
 LAUNCHCTL_BOOTSTRAP_EIO = 5
 LAUNCHCTL_BOOTSTRAP_IN_PROGRESS = 37
 LAUNCHCTL_TRANSIENT_BOOTSTRAP_CODES = {
@@ -116,6 +124,14 @@ class Reconciler:
             self.scripts_dir / name: (self.source_path(name), 0o755)
             for name in SCRIPT_ASSETS
         }
+        # Keep the canonical template alongside the rendered launchd reference
+        # file so an installed scripts directory is itself a valid source root
+        # for verification and recovery.  It is deliberately data, not an
+        # executable asset.
+        result[self.scripts_dir / REFERENCE_SOURCE] = (
+            self.source_path(REFERENCE_SOURCE),
+            0o600,
+        )
         result[self.reference_target] = (
             self.source_path(REFERENCE_SOURCE),
             0o600,
@@ -158,7 +174,15 @@ class Reconciler:
             self.comprehensive_reference_source.exists()
             or self.comprehensive_reference_source.is_symlink()
         ):
-            refs.update(self._parse_references(self.comprehensive_reference_source))
+            refs.update(
+                {
+                    key: value
+                    for key, value in self._parse_references(
+                        self.comprehensive_reference_source
+                    ).items()
+                    if key not in FORBIDDEN_BOOT_REFERENCE_KEYS
+                }
+            )
         # Source-controlled launch requirements always win over an older
         # comprehensive manifest while every other validated reference is
         # retained for configured gateway platforms and integrations.
@@ -171,6 +195,12 @@ class Reconciler:
             if not source.is_file() or source.is_symlink():
                 raise RuntimeError(f"canonical source missing or symlinked: {source}")
         refs = self._parse_references(self.source_path(REFERENCE_SOURCE))
+        forbidden_required = set(refs) & FORBIDDEN_BOOT_REFERENCE_KEYS
+        if forbidden_required:
+            raise RuntimeError(
+                "secret reference template contains forbidden boot key(s): "
+                + ", ".join(sorted(forbidden_required))
+            )
         if set(refs) != EXPECTED_REFERENCE_KEYS:
             raise RuntimeError(
                 "secret reference template keys differ from canonical contract"
@@ -365,6 +395,13 @@ class Reconciler:
             )
             if any(item in serialized for item in forbidden):
                 raise RuntimeError(f"plist contains inline secret/mint logic: {plist_path}")
+        deployed_refs = self._parse_references(self.reference_target)
+        forbidden_deployed = set(deployed_refs) & FORBIDDEN_BOOT_REFERENCE_KEYS
+        if forbidden_deployed:
+            raise RuntimeError(
+                "deployed launchd reference inventory contains forbidden boot key(s): "
+                + ", ".join(sorted(forbidden_deployed))
+            )
 
     def rollback(self) -> None:
         pointer = self.state_dir / "previous"

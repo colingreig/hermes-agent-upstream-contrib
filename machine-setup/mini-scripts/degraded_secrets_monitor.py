@@ -8,7 +8,7 @@ retry. On terminal failure they log either the legacy
 `>>> FATAL: 1Password unreachable ...` line or the classified
 `FATAL classification=...` form. This script is the matching autonomous
 DETECTION: it alerts a human when recovery ISN'T actually happening, i.e.
-either of:
+any of:
 
   (a) FATAL-relaunch loop — the FATAL line appears >= FATAL_THRESHOLD times within
       the trailing FATAL_WINDOW_MIN minutes of gateway.error.log. That means 1Password
@@ -18,6 +18,9 @@ either of:
       unresolved placeholder" warning for some MCP server/header, meaning a secret
       never resolved. The known agency-os / MCP_AGENCY_OS_API_KEY case is whitelisted
       (pre-existing until PR #66 deploys — see ClickUp 86e25xwwb lineage).
+  (c) Credential-pool degradation — auth.json credential_pool entries with
+      last_status exhausted, invalid, or error, meaning the runtime has no healthy
+      credential path for that stored pool entry until credentials are repaired.
 
 Alerts via Slack DM to Colin (`hermes send --to slack:D0BA2PM9CFM`, with `@UN4CQ1EGG`
 mention) AND a ClickUp comment (same task-comment escalation convention as
@@ -32,10 +35,11 @@ Usage:
   degraded_secrets_monitor.py --json             # emit JSON result
   degraded_secrets_monitor.py --alert            # same + Slack/ClickUp alert on a NEW degraded signature
   degraded_secrets_monitor.py --log-file PATH    # check a fixture instead of the live log (testing)
+  degraded_secrets_monitor.py --auth-file PATH   # check a fixture auth.json instead of runtime auth.json
   degraded_secrets_monitor.py --now ISO8601      # override "now" for deterministic window tests
   DRY_RUN=1 degraded_secrets_monitor.py --alert  # test alert path without posting anywhere
 
-Exit codes: 0 = healthy, 1 = degraded (either condition).
+Exit codes: 0 = healthy, 1 = degraded (any condition).
 """
 import argparse
 import json
@@ -50,6 +54,7 @@ LOG_PATH = os.path.expanduser("~/.hermes/logs/gateway.error.log")
 STATE_PATH = os.path.expanduser("~/.hermes/state/degraded-secrets-monitor.json")
 HERMES_BIN = os.path.expanduser("~/.local/bin/hermes")
 TOKEN_FILE = os.path.expanduser("~/.config/op-runtime-token")
+DEGRADED_POOL_STATUSES = {"exhausted", "invalid", "error"}
 ESCALATION_TASK_ID = os.environ.get("DEGRADED_SECRETS_ALERT_TASK_ID", "86e2610g8")
 # Default to Colin's Slack DM; override via env if we ever want to revert to a channel target.
 SLACK_TARGET = os.environ.get("DEGRADED_SECRETS_ALERT_SLACK", "slack:D0BA2PM9CFM")
@@ -78,6 +83,15 @@ WHITELIST = {("agency-os", "MCP_AGENCY_OS_API_KEY")}
 FATAL_THRESHOLD = 3
 FATAL_WINDOW_MIN = 5
 TAIL_LINES = 4000  # gateway.error.log isn't rotated hourly; a generous tail is cheap
+
+
+def default_auth_path():
+    try:
+        from hermes_constants import get_hermes_home
+
+        return str(get_hermes_home() / "auth.json")
+    except Exception:
+        return os.path.expanduser(os.path.join(os.environ.get("HERMES_HOME", "~/.hermes"), "auth.json"))
 
 
 def _now():
@@ -148,6 +162,39 @@ def check_unresolved_placeholder(lines, whitelist=None):
     return {"triggered": bool(hits), "hits": hits}
 
 
+def check_credential_pool(auth_file):
+    if not os.path.isfile(auth_file):
+        return {"triggered": False, "status": "missing", "hits": [], "auth_file": auth_file}
+    try:
+        with open(auth_file, encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as exc:
+        return {"triggered": False, "status": "malformed", "hits": [], "auth_file": auth_file,
+                "error": exc.__class__.__name__}
+
+    pool = data.get("credential_pool") if isinstance(data, dict) else None
+    if not isinstance(pool, dict):
+        return {"triggered": False, "status": "absent", "hits": [], "auth_file": auth_file}
+
+    hits = []
+    for provider, entries in pool.items():
+        if not isinstance(entries, list):
+            continue
+        for index, entry in enumerate(entries):
+            if not isinstance(entry, dict):
+                continue
+            status = str(entry.get("last_status") or "").strip().lower()
+            if status not in DEGRADED_POOL_STATUSES:
+                continue
+            hits.append({
+                "provider": str(provider),
+                "id": str(entry.get("id") or f"index:{index}"),
+                "status": status,
+            })
+    hits.sort(key=lambda h: (h["provider"], h["id"], h["status"]))
+    return {"triggered": bool(hits), "status": "ok", "hits": hits, "auth_file": auth_file}
+
+
 def _load_state():
     try:
         with open(STATE_PATH, encoding="utf-8") as f:
@@ -164,13 +211,25 @@ def _save_state(obj):
     os.replace(tmp, STATE_PATH)
 
 
-def _signature(fatal, parked_auth, placeholder):
+def _signature(fatal, parked_auth, placeholder, credential_pool=None):
+    credential_pool = credential_pool or {"hits": []}
     # Lists, not tuples: a tuple survives in-process but round-trips through JSON
     # state as a list, so comparing a freshly-built tuple against a reloaded list
     # would always be unequal (tuple != list in Python) and dedup would never hold.
     return {"fatal": fatal["triggered"],
             "parked_auth": parked_auth["triggered"],
-            "placeholder_keys": sorted([[h["server"], h["var"]] for h in placeholder["hits"]])}
+            "placeholder_keys": sorted([[h["server"], h["var"]] for h in placeholder["hits"]]),
+            "credential_pool": sorted(
+                [[h["provider"], h["id"], h["status"]] for h in credential_pool["hits"]]
+            )}
+
+
+def _normalize_signature(sig):
+    if not isinstance(sig, dict):
+        return sig
+    normalized = dict(sig)
+    normalized.setdefault("credential_pool", [])
+    return normalized
 
 
 def _send_slack(msg):
@@ -221,14 +280,14 @@ def _op_read(ref):
 
 
 def _post_clickup_comment(task_id, text):
+    if os.environ.get("DRY_RUN"):
+        print(f"[degraded-secrets-monitor] DRY_RUN clickup comment on {task_id}:\n{text}")
+        return True
     token = os.environ.get("CLICKUP_API_TOKEN") or _op_read("op://Dev Toolbox/dev/CLICKUP_API_TOKEN")
     if not token:
         print("[degraded-secrets-monitor] no CLICKUP_API_TOKEN available — skipping ClickUp escalation",
               file=sys.stderr)
         return False
-    if os.environ.get("DRY_RUN"):
-        print(f"[degraded-secrets-monitor] DRY_RUN clickup comment on {task_id}:\n{text}")
-        return True
     try:
         body = json.dumps({"comment_text": text, "notify_all": False}).encode()
         req = urllib.request.Request(
@@ -246,6 +305,7 @@ def _post_clickup_comment(task_id, text):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--log-file", default=LOG_PATH, help="path to gateway error log (or a test fixture)")
+    ap.add_argument("--auth-file", default=default_auth_path(), help="path to Hermes auth.json (or a test fixture)")
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--alert", action="store_true", help="send Slack + ClickUp alert on a NEW degraded signature")
     ap.add_argument("--now", help="ISO8601 timestamp to use as 'now' (testing only)")
@@ -256,11 +316,13 @@ def main():
     fatal = check_fatal_loop(lines, now=now)
     parked_auth = check_parked_auth(lines, now=now)
     placeholder = check_unresolved_placeholder(lines)
-    sig = _signature(fatal, parked_auth, placeholder)
-    degraded = fatal["triggered"] or parked_auth["triggered"] or placeholder["triggered"]
+    credential_pool = check_credential_pool(args.auth_file)
+    sig = _signature(fatal, parked_auth, placeholder, credential_pool)
+    degraded = (fatal["triggered"] or parked_auth["triggered"] or placeholder["triggered"]
+                or credential_pool["triggered"])
 
     result = {"degraded": degraded, "fatal_loop": fatal, "parked_auth": parked_auth,
-              "placeholder": placeholder,
+              "placeholder": placeholder, "credential_pool": credential_pool,
               "checked_at": now.isoformat()}
 
     if args.json:
@@ -274,10 +336,15 @@ def main():
             print("[degraded-secrets-monitor] gateway parked after permanent authentication failure")
         for h in placeholder["hits"]:
             print(f"[degraded-secrets-monitor] unresolved placeholder: server={h['server']} var={h['var']}")
+        for h in credential_pool["hits"]:
+            print(
+                f"[degraded-secrets-monitor] credential pool degraded: "
+                f"provider={h['provider']} id={h['id']} status={h['status']}"
+            )
 
     if args.alert:
         state = _load_state()
-        last_sig = state.get("last_alert_signature")
+        last_sig = _normalize_signature(state.get("last_alert_signature"))
         if degraded and sig != last_sig:
             msg_lines = ["\U0001F6A8 Hermes degraded-secrets monitor"]
             if fatal["triggered"]:
@@ -293,6 +360,11 @@ def main():
                     f"- Unresolved secret placeholder: MCP server '{h['server']}' header "
                     f"'{h['header']}' -> ${{{h['var']}}} never resolved. Set {h['var']} in "
                     f"1Password / ~/.hermes/.env and reconnect.")
+            for h in credential_pool["hits"]:
+                msg_lines.append(
+                    f"- Credential pool degraded: provider '{h['provider']}' entry "
+                    f"'{h['id']}' last_status={h['status']}. Repair or refresh the stored credential."
+                )
             msg = "\n".join(msg_lines)
             slack_msg = "\n".join([SLACK_MENTION, *msg_lines])
             slack_ok = _send_slack(slack_msg)

@@ -55,7 +55,7 @@ DASHBOARD_TARGET="${GUI_DOMAIN}/${DASHBOARD_LABEL}"
 GATEWAY_PORT=8642
 DASHBOARD_PORT=9119
 MIN_PLATFORMS=2
-VERIFY_TIMEOUT=60          # seconds
+VERIFY_TIMEOUT="${MINI_RELEASE_VERIFY_TIMEOUT:-240}"          # seconds — observed real cold-boot (Slack connect + channel directory build) taking 150-180s under load; 60s caused spurious rollbacks on healthy releases
 KEEP_RELEASES=3
 
 # node/npm live in Homebrew, and uv lives at ~/.local/bin — neither is on a
@@ -1192,6 +1192,7 @@ PY
   "$NEW_DIR/venv/bin/python" -m py_compile \
     "$LAUNCHD_SOURCE_ROOT/reconcile_launchd_environment.py" \
     "$LAUNCHD_SOURCE_ROOT/reconcile_marketplace_skills.py" \
+    "$LAUNCHD_SOURCE_ROOT/mini_health_attestation.py" \
     "$LAUNCHD_SOURCE_ROOT/record_skill_pull_success.py" \
     "$LAUNCHD_SOURCE_ROOT/skill_pull_guard.py" \
     "$LAUNCHD_SOURCE_ROOT/github_app_token.py" \

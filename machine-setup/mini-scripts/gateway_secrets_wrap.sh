@@ -51,6 +51,18 @@ set -a
 . "$resolved_env"
 set +a
 
+# 1Password's "Hermes Flags" item pre-sets HERMES_AUTONOMOUS_MERGE (master),
+# _MEDIUM, and _HIGH to "1" regardless of which tier has actually graduated.
+# The master flag enables BOTH low and medium tier per
+# merge_guard._tier_autonomy_enabled(), so leaving it resolved would silently
+# turn on medium-tier autonomous merge even though medium hasn't graduated yet
+# (ClickUp 86e2h2q7z, still pending). Neutralize the flags this preset
+# shouldn't govern; HERMES_AUTONOMOUS_MERGE_LOW is deliberately left resolved
+# since low tier is the intentionally-live one.
+unset HERMES_AUTONOMOUS_MERGE
+unset HERMES_AUTONOMOUS_MERGE_MEDIUM
+unset HERMES_AUTONOMOUS_MERGE_HIGH
+
 GH_TOKEN="$("$RUNTIME_PYTHON" "$TOKEN_MINTER" 2>>"$LOG")"
 mint_status=$?
 if [ "$mint_status" -eq "$EXIT_AUTH" ]; then
