@@ -51,6 +51,27 @@ class TestNormalizeWorkdir:
         result = _normalize_workdir("~")
         assert result == str(tmp_path.resolve())
 
+    def test_legacy_mini_workdir_aliases_to_runtime_current(
+        self, tmp_path, monkeypatch
+    ):
+        import cron.jobs as jobs
+
+        legacy = tmp_path / "dev" / "hermes-agent"
+        runtime_current = tmp_path / ".hermes" / "runtime-current"
+        runtime_current.mkdir(parents=True)
+
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        monkeypatch.setattr(
+            jobs,
+            "_LEGACY_RUNTIME_WORKDIR_ALIASES",
+            (str(legacy),),
+        )
+
+        result = jobs._normalize_workdir(str(legacy))
+
+        assert result == str(runtime_current.resolve())
+
     def test_relative_path_rejected(self):
         from cron.jobs import _normalize_workdir
         with pytest.raises(ValueError, match="absolute path"):
@@ -311,6 +332,7 @@ class TestRunJobTerminalCwd:
         monkeypatch.setattr(sched, "_resolve_cron_enabled_toolsets", lambda job, cfg: None)
         # Unlimited inactivity so the poll loop returns immediately.
         monkeypatch.setenv("HERMES_CRON_TIMEOUT", "0")
+        monkeypatch.setenv("HERMES_MODEL", "test-model")
 
         # run_job calls load_dotenv(~/.hermes/.env, override=True), which will
         # happily clobber TERMINAL_CWD out from under us if the real user .env
@@ -350,6 +372,46 @@ class TestRunJobTerminalCwd:
         assert observed["terminal_cwd_during_run"] == str(tmp_path.resolve())
 
         # And it was restored to the original value in finally.
+        assert os.environ["TERMINAL_CWD"] == "/original/cwd"
+
+    def test_legacy_workdir_alias_sets_runtime_current_cwd(
+        self, tmp_path, monkeypatch
+    ):
+        import os
+        import cron.jobs as jobs
+        import cron.scheduler as sched
+
+        legacy = tmp_path / "dev" / "hermes-agent"
+        runtime_current = tmp_path / ".hermes" / "runtime-current"
+        runtime_current.mkdir(parents=True)
+
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        monkeypatch.setenv("TERMINAL_CWD", "/original/cwd")
+        monkeypatch.setattr(
+            jobs,
+            "_LEGACY_RUNTIME_WORKDIR_ALIASES",
+            (str(legacy),),
+        )
+
+        observed: dict = {}
+        self._install_stubs(monkeypatch, observed)
+
+        job = {
+            "id": "legacy",
+            "name": "legacy-wd-job",
+            "workdir": str(legacy),
+            "schedule_display": "manual",
+        }
+
+        success, _output, response, error = sched.run_job(job)
+        assert success is True, f"run_job failed: error={error!r} response={response!r}"
+
+        assert observed["skip_context_files"] is False
+        assert observed["terminal_cwd_during_init"] == str(
+            runtime_current.resolve()
+        )
+        assert observed["terminal_cwd_during_run"] == str(runtime_current.resolve())
         assert os.environ["TERMINAL_CWD"] == "/original/cwd"
 
     def test_no_workdir_leaves_terminal_cwd_untouched(self, monkeypatch):
