@@ -108,6 +108,73 @@ The PR review/merge closure is the exception to the manual-copy convention:
 its canonical sources, deterministic manifest, and deployment reconciler live
 under `pr_pipeline/`. Do not compare or copy those files one at a time.
 
+## Hermes CI VM health and recovery (`pr_pipeline/ci_health_watch.py`)
+
+`ci_health_watch.py` is the canonical Hermes-hosted monitor for the `hermes-ci`
+OrbStack VM and its expected `hermes-*` GitHub runners. It is manifest-managed
+with `ci_health_topology.json`, so install or verify through the PR-pipeline
+reconciler rather than copying individual files:
+
+```bash
+python3 machine-setup/mini-scripts/reconcile_pr_pipeline.py install --host mini --source-commit <sha>
+python3 machine-setup/mini-scripts/reconcile_pr_pipeline.py verify  --host mini --source-commit <sha>
+```
+
+The topology is deliberately declarative and fail-closed. It declares the VM
+probe commands, managed start/stop/restart commands, expected runners, the
+no-agent cadence (`300` seconds, not the older two-hour interval), and the only
+automatic recovery allowlist: `colingreig/jdmbuysell-v4` workflow `Dead-image
+monitor`, event `schedule`, `max_reruns=1`. Any missing or malformed topology,
+ambiguous workflow identity, GitHub/API failure, non-schedule run, mutating or
+non-allowlisted workflow, missing restart correlation, or runner still offline
+prevents automatic rerun. Refused non-allowlisted failures are reported to
+Slack but never dispatched.
+
+Use the managed lifecycle wrapper for any planned VM operation so the monitor
+can distinguish planned maintenance from unknown-cause restarts:
+
+```bash
+python3 ~/.hermes/scripts/ci_health_watch.py lifecycle restart \
+  --actor "colin" \
+  --reason "controlled idle-window verification before next Dead-image monitor schedule"
+```
+
+The wrapper appends intent evidence before it acts. Unmanaged restarts are not
+guessed: lifecycle transition records keep `initiator=unknown` and
+`reason=unknown` unless a recent managed intent exists.
+
+State and evidence locations on the Mini:
+
+- `~/.hermes/scripts/.ci_health_state.json` stores alert dedupe, runner offline
+  debounce, last VM transition, managed intent correlation, and original
+  run-ID recovery attempts. It is written atomically.
+- `~/.hermes/state/ci-health/lifecycle.jsonl` stores every observed VM boot-ID
+  or availability transition with UTC timestamp, prior/current boot ID, host
+  uptime, runner status summary, OrbStack command evidence, and managed or
+  unknown initiator classification.
+- `~/.hermes/state/ci-health/managed-lifecycle.jsonl` stores planned lifecycle
+  actor/action/reason records before the OrbStack command is executed.
+
+Controlled idle-window verification procedure:
+
+1. Confirm the expected runner is online and no protected workflow is active.
+2. Run the lifecycle wrapper with a concrete actor and reason.
+3. Let the no-agent monitor poll on its managed five-minute cadence.
+4. Confirm `lifecycle.jsonl` shows the boot transition with the managed
+   initiator and that Slack received exactly one outage transition and one
+   recovery notification if the runner went offline long enough to debounce.
+
+Natural scheduled-run evidence to collect for the next `Dead-image monitor`
+proof packet:
+
+- GitHub run ID and URL.
+- `event` value, expected `schedule`.
+- `conclusion`.
+- `runner_name` or runner evidence tying the run to `hermes-ci`.
+- Runner recovery state from `.ci_health_state.json`.
+- Matching lifecycle JSONL record proving whether the run overlapped a detected
+  restart and whether the initiator was managed or explicitly unknown.
+
 ## Files
 
 - `mini_health_attestation.py` — authoritative, machine-readable live Mini

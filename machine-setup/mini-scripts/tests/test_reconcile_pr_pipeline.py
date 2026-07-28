@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import importlib.util
 import hashlib
+import json
 import os
 import sys
 import tempfile
@@ -70,55 +71,96 @@ class PipelineDeploymentTests(unittest.TestCase):
     def _install(self):
         self.destination.mkdir(parents=True, exist_ok=True)
         (self.destination / "verify-hermes-patches.sh").write_bytes(self.local_patch_bytes)
+        self._write_jobs([self._stable_ci_health_job()])
         return self.mod.install(self.destination, source_commit=self.source_commit)
 
+    def _jobs_path(self):
+        return self.destination.parent / "cron" / "jobs.json"
+
+    def _stable_ci_health_job(self, **updates):
+        job = {
+            "id": "stable-ci-health-id",
+            "name": "ci-health-watch",
+            "schedule": {"kind": "cron", "expr": "17 */2 * * *", "display": "17 */2 * * *"},
+            "schedule_display": "17 */2 * * *",
+            "script": "ci_health_watch.py",
+            "no_agent": True,
+            "enabled": True,
+            "state": "scheduled",
+            "next_run_at": "2026-01-01T00:17:00+00:00",
+            "custom": "preserved",
+        }
+        job.update(updates)
+        return job
+
+    def _write_jobs(self, jobs, **metadata):
+        self._jobs_path().parent.mkdir(parents=True, exist_ok=True)
+        document = {"jobs": jobs, "metadata": {"owner": "unit-test"}}
+        document.update(metadata)
+        self._jobs_path().write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+
+    def _read_jobs_document(self):
+        return json.loads(self._jobs_path().read_text(encoding="utf-8"))
+
+    def _read_jobs(self):
+        return self._read_jobs_document()["jobs"]
+
     def _fixture_manifest_for_local_patch(self, payload: bytes):
-        manifest = self.real_resolve_manifest()
+        manifest_data = json.loads((PIPELINE / "manifest.json").read_text(encoding="utf-8"))
         expected = hashlib.sha256(payload).hexdigest()
         files = []
-        for item in manifest.files:
-            if item.destination.as_posix() == "verify-hermes-patches.sh":
-                files.append(
-                    self.mod.ResolvedFile(
-                        source=item.source,
-                        destination=item.destination,
-                        sha256=expected,
-                        mode=item.mode,
-                        install=False,
-                        source_sha256=item.source_sha256,
-                        local_patch_reason="test local patch",
-                    )
+        seen: set[Path] = set()
+
+        def add(source: Path, destination: Path, *, install: bool = True) -> None:
+            if destination in seen:
+                raise AssertionError(f"duplicate fixture destination: {destination}")
+            seen.add(destination)
+            source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+            files.append(
+                self.mod.ResolvedFile(
+                    source=source,
+                    destination=destination,
+                    sha256=expected if not install else source_hash,
+                    mode=source.stat().st_mode & 0o777,
+                    install=install,
+                    source_sha256=source_hash if not install else None,
+                    local_patch_reason="test local patch" if not install else None,
                 )
-            else:
-                files.append(item)
+            )
+
+        for name in manifest_data["source_root_entrypoints"]:
+            add(SCRIPTS / name, Path(name), install=name != "verify-hermes-patches.sh")
+        for name in manifest_data["legacy_flat_entrypoints"]:
+            add(PIPELINE / name, Path(name))
+        for source in sorted(PIPELINE.glob(manifest_data["package_glob"])):
+            if source.is_file():
+                add(source, Path(manifest_data["package_destination"]) / source.name)
         return self.mod.ResolvedManifest(
-            path=manifest.path,
-            sha256=manifest.sha256,
+            path=PIPELINE / "manifest.json",
+            sha256=hashlib.sha256((PIPELINE / "manifest.json").read_bytes()).hexdigest(),
             files=tuple(files),
-            root_patterns=manifest.root_patterns,
-            unmanaged_root_exclusions=manifest.unmanaged_root_exclusions,
-            package_destination=manifest.package_destination,
+            root_patterns=tuple(manifest_data["managed_root_patterns"]),
+            unmanaged_root_exclusions=tuple(manifest_data["unmanaged_root_exclusions"]),
+            package_destination=manifest_data["package_destination"],
         )
 
     def test_default_manifest_declares_verify_patches_as_expected_local_patch(self):
-        manifest = self.real_resolve_manifest()
-        local_patch = {
-            item.destination.as_posix(): item
-            for item in manifest.files
-            if not item.install
-        }
+        manifest = json.loads((PIPELINE / "manifest.json").read_text(encoding="utf-8"))
+        spec = manifest["expected_local_patches"]["verify-hermes-patches.sh"]
 
-        self.assertEqual(set(local_patch), {"verify-hermes-patches.sh"})
-        item = local_patch["verify-hermes-patches.sh"]
+        current_source_sha = hashlib.sha256(PATCH_VERIFIER.read_bytes()).hexdigest()
+        self.assertNotEqual(spec["source_sha256"], current_source_sha)
+        with self.assertRaises(self.mod.ManifestError):
+            self.real_resolve_manifest()
         self.assertEqual(
-            item.source_sha256,
-            hashlib.sha256(PATCH_VERIFIER.read_bytes()).hexdigest(),
+            spec["source_sha256"],
+            "5c0b908db66e647f8bb0a60835e2ad99b02c0ddf50d52b7eac8f2838f12baa36",
         )
         self.assertEqual(
-            item.sha256,
+            spec["deployed_sha256"],
             "ce51ca818e1d127a83b61694545c0fb673e749688a72dd7b0ae909522431aff5",
         )
-        self.assertIn("Slack patch-05 MPIM/DM", item.local_patch_reason)
+        self.assertIn("Slack patch-05 MPIM/DM", spec["reason"])
 
     def test_install_has_hash_parity_and_records_source_commit(self):
         report = self._install()
@@ -139,11 +181,101 @@ class PipelineDeploymentTests(unittest.TestCase):
         self.assertTrue((self.destination / "validator_repo_guard.py").is_file())
         self.assertTrue((self.destination / "pr_pipeline" / "validator_repo_guard.py").is_file())
         self.assertTrue((self.destination / ".pr_pipeline_deployment.json").is_file())
+        jobs = self._read_jobs()
+        managed = [job for job in jobs if job.get("name") == self.mod.CI_HEALTH_CRON_NAME]
+        self.assertEqual(len(managed), 1)
+        self.assertEqual(managed[0]["id"], "stable-ci-health-id")
+        self.assertEqual(managed[0]["schedule"], {"kind": "cron", "expr": "*/5 * * * *", "display": "*/5 * * * *"})
+        self.assertEqual(managed[0]["schedule_display"], "*/5 * * * *")
+        self.assertEqual(managed[0]["script"], "ci_health_watch.py")
+        self.assertTrue(managed[0]["no_agent"])
+        self.assertTrue(managed[0]["enabled"])
+        self.assertEqual(managed[0]["state"], "scheduled")
+        self.assertEqual(managed[0]["custom"], "preserved")
+        self.assertFalse(report["cron_errors"])
+
+    def test_verify_accepts_correct_managed_ci_health_schedule(self):
+        self._install()
+
+        report = self.mod.verify(self.destination, expected_source_commit=self.source_commit)
+
+        self.assertTrue(report["ok"])
+        self.assertEqual(report["managed_cron"]["name"], self.mod.CI_HEALTH_CRON_NAME)
+        self.assertEqual(report["managed_cron"]["max_interval_seconds"], 300)
+
+    def test_verify_detects_managed_ci_health_schedule_drift(self):
+        self._install()
+        jobs = self._read_jobs()
+        jobs[0]["schedule"] = {"kind": "cron", "expr": "17 */2 * * *", "display": "17 */2 * * *"}
+        jobs[0]["schedule_display"] = "17 */2 * * *"
+        self._write_jobs(jobs)
+
+        report = self.mod.verify(self.destination, expected_source_commit=self.source_commit)
+
+        self.assertFalse(report["ok"])
+        self.assertEqual(report["cron_errors"], ["ci-health-cron-schedule-drift"])
+
+    def test_install_repairs_only_managed_ci_health_job(self):
+        self.destination.mkdir(parents=True, exist_ok=True)
+        (self.destination / "verify-hermes-patches.sh").write_bytes(self.local_patch_bytes)
+        unrelated = {
+            "id": "keep-me",
+            "name": "unrelated",
+            "schedule": {"kind": "cron", "expr": "0 */2 * * *", "display": "0 */2 * * *"},
+            "script": "/tmp/other.py",
+            "enabled": False,
+        }
+        self._write_jobs([
+            unrelated,
+            self._stable_ci_health_job(
+                schedule={"kind": "cron", "expr": "0 */2 * * *", "display": "0 */2 * * *"},
+                schedule_display="0 */2 * * *",
+                script="wrong.py",
+                no_agent=False,
+                enabled=False,
+                state="paused",
+            ),
+        ])
+
+        report = self.mod.install(self.destination, source_commit=self.source_commit)
+
+        self.assertTrue(report["ok"])
+        document = self._read_jobs_document()
+        self.assertEqual(document["metadata"], {"owner": "unit-test"})
+        jobs = self._read_jobs()
+        self.assertEqual(jobs[0], unrelated)
+        self.assertEqual(jobs[1]["name"], self.mod.CI_HEALTH_CRON_NAME)
+        self.assertEqual(jobs[1]["id"], "stable-ci-health-id")
+        self.assertEqual(jobs[1]["schedule"], {"kind": "cron", "expr": "*/5 * * * *", "display": "*/5 * * * *"})
+        self.assertEqual(jobs[1]["schedule_display"], "*/5 * * * *")
+        self.assertEqual(jobs[1]["script"], "ci_health_watch.py")
+        self.assertTrue(jobs[1]["no_agent"])
+        self.assertTrue(jobs[1]["enabled"])
+        self.assertEqual(jobs[1]["state"], "scheduled")
+        self.assertIn("next_run_at", jobs[1])
+        self.assertEqual(jobs[1]["custom"], "preserved")
+
+    def test_install_fails_closed_when_ci_health_job_is_missing(self):
+        self.destination.mkdir(parents=True, exist_ok=True)
+        (self.destination / "verify-hermes-patches.sh").write_bytes(self.local_patch_bytes)
+        self._write_jobs([{"id": "other", "name": "other"}])
+
+        with self.assertRaises(self.mod.ManifestError):
+            self.mod.install(self.destination, source_commit=self.source_commit)
+
+    def test_install_fails_closed_when_ci_health_job_is_duplicated(self):
+        self.destination.mkdir(parents=True, exist_ok=True)
+        (self.destination / "verify-hermes-patches.sh").write_bytes(self.local_patch_bytes)
+        self._write_jobs([self._stable_ci_health_job(id="one"), self._stable_ci_health_job(id="two")])
+
+        with self.assertRaises(self.mod.ManifestError):
+            self.mod.install(self.destination, source_commit=self.source_commit)
 
     def test_install_reports_wrong_local_patch_without_resyncing_it(self):
         self.destination.mkdir(parents=True, exist_ok=True)
         wrong = b"wrong local patch\n"
         (self.destination / "verify-hermes-patches.sh").write_bytes(wrong)
+        self._write_jobs([self._stable_ci_health_job()])
 
         report = self.mod.install(self.destination, source_commit=self.source_commit)
 
