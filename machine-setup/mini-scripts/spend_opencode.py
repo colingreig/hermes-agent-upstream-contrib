@@ -223,6 +223,26 @@ def opencode_event_route(ev, route_metadata=None):
     return model, provider, base_url
 
 
+def route_marginal_cost(raw_cost, model, provider=None, base_url=None):
+    """Return ``(billable_cost, route)`` for a recorded raw cost on one route.
+
+    THE single implementation of the subscription-vs-billed conditional. Every
+    consumer of an OpenCode cost — the spend cap/alert meters (spend_guard,
+    spend_meter) and the writer-served liveness ledger (opencode_exec) — routes
+    through here so they can never diverge. ``billable_cost`` is 0.0 ONLY for a
+    credential/base-url-PROVEN subscription route (Codex OAuth via the local
+    proxy); an unproven or non-codex route keeps its full recorded cost, so a
+    genuinely billed provider still accrues real spend.
+    """
+    route = resolve_billing_route(model, provider=provider or None, base_url=base_url or None)
+    if raw_cost is None:
+        return None, route
+    cost = float(raw_cost)
+    if route.billing_mode == "subscription_included":
+        return 0.0, route
+    return cost, route
+
+
 def opencode_event_marginal_cost(ev, route_metadata=None):
     """Return marginal USD cost for one OpenCode ``step_finish`` event."""
     if ev.get("type") != "step_finish":
@@ -231,12 +251,9 @@ def opencode_event_marginal_cost(ev, route_metadata=None):
     raw_cost = part.get("cost")
     if raw_cost is None:
         return 0.0
-    cost = float(raw_cost)
     model, provider, base_url = opencode_event_route(ev, route_metadata=route_metadata)
-    route = resolve_billing_route(model, provider=provider or None, base_url=base_url or None)
-    if route.billing_mode == "subscription_included":
-        return 0.0
-    return cost
+    cost, _route = route_marginal_cost(raw_cost, model, provider=provider or None, base_url=base_url or None)
+    return 0.0 if cost is None else cost
 
 
 def opencode_event_provider_cost(ev, route_metadata=None):
@@ -305,3 +322,43 @@ def configured_codex_oauth_proxy_metadata():
             if _codex_proxy_base_url_is_proven(base_url):
                 return {"provider": "openai-codex", "model": "", "base_url": base_url}
     return None
+
+
+def served_row_cost(row):
+    """Billable USD for one ``~/.hermes/logs/writer-served.jsonl`` row.
+
+    Rows written after 86e2hap1g already carry a ROUTED ``cost_usd`` and are
+    stamped with ``billing_mode`` — those are returned as-is. LEGACY rows carry
+    the raw, unrouted OpenCode ``part.cost``, so they are re-routed here at READ
+    time (the append-only ledger is never rewritten). Legacy rows have no
+    base_url, so a codex-tier row is proven the same way the historical-log
+    meter proves one: against the currently configured OpenCode proxy. Any
+    failure falls back to the recorded cost — never silently zero real spend.
+    """
+    if not isinstance(row, dict):
+        return 0.0
+    raw = row.get("cost_usd")
+    if raw is None:
+        return 0.0
+    try:
+        cost = float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+    if row.get("billing_mode"):
+        return cost  # already routed at write time
+    try:
+        provider = (row.get("billing_provider") or row.get("served_provider") or "").strip()
+        base_url = (row.get("billing_base_url") or "").strip()
+        if not base_url and provider.lower() in _CODEX_PROVIDER_ALIASES:
+            metadata = configured_codex_oauth_proxy_metadata()
+            if metadata:
+                base_url = metadata.get("base_url") or ""
+        billable, _route = route_marginal_cost(
+            cost,
+            row.get("served_model") or "",
+            provider=provider or None,
+            base_url=base_url or None,
+        )
+    except Exception:
+        return cost
+    return cost if billable is None else billable

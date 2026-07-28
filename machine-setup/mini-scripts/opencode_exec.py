@@ -46,7 +46,11 @@ import time
 import urllib.request
 from pathlib import Path
 
-from spend_opencode import configured_codex_oauth_proxy_metadata, opencode_route_metadata_event
+from spend_opencode import (
+    configured_codex_oauth_proxy_metadata,
+    opencode_route_metadata_event,
+    route_marginal_cost,
+)
 
 
 # GLM/reasoning models leak <think>...</think> tags into OpenCode's --format json
@@ -432,12 +436,41 @@ def _record_served(result, armed):
     that "model" secretly means "the model that actually served, post-
     failover" — see 86e260vnn: pinned-vs-actual drift went unnoticed for
     days because nothing surfaced which tier really served.
+
+    Cost is SUBSCRIPTION-ROUTED before it is written (86e2hap1g). OpenCode
+    reports its own API-rate-card ``part.cost`` even when the tier was served by
+    a Codex-OAuth token through the local proxy, where the marginal cost is $0.
+    The status email (hermes_report_build*.py) sums this ledger's ``cost_usd``
+    for its spend total and per-provider breakdown, so writing the RAW number
+    here put phantom spend in the daily digest. Routing happens at the WRITE
+    site through the same shared resolver the spend cap/alert meters use; the
+    raw figure is preserved alongside as ``raw_cost_usd`` so nothing is lost.
     """
     try:
         served_model  = result.get("model", "unknown")
         served_provider = next((p for (m, p) in CONTENT_CASCADE + WRITER_CASCADE + KANBAN_DECOMPOSER_CASCADE if m == served_model), None)
         result["served_by"] = served_model
         degraded      = bool(armed and served_model != _EXPECTED_PRIMARY)
+        # Idempotent across the 5 exit-path call sites: once stamped, re-route
+        # from the preserved RAW figure rather than from the already-routed one.
+        raw_cost = result.get("raw_cost_usd", result.get("cost_usd"))
+        billing_provider, billing_base_url, billing_mode = "", "", "unknown"
+        cost_usd = raw_cost
+        try:
+            billing_provider, billing_base_url = _billing_route_for_model(served_model)
+            cost_usd, _route = route_marginal_cost(
+                raw_cost, served_model,
+                provider=billing_provider or None,
+                base_url=billing_base_url or None,
+            )
+            billing_mode = _route.billing_mode
+        except Exception as _br_err:
+            # Fail-open toward BILLING it: an unresolvable route must never
+            # silently zero real spend. Keep the raw cost and say why.
+            eprint("[opencode_exec] WRITER-LIVENESS: billing route failed, "
+                   f"recording raw cost (fail-open): {_br_err!r}")
+        result["raw_cost_usd"] = raw_cost
+        result["cost_usd"] = cost_usd
         record = {
             "ts":                   time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "task_id":              result.get("task_id", "unknown"),
@@ -448,7 +481,11 @@ def _record_served(result, armed):
             "degraded":             degraded,
             "writer_cascade":       result.get("writer_cascade"),
             "failover_tried":       result.get("failover_tried", []),
-            "cost_usd":             result.get("cost_usd"),
+            "cost_usd":             cost_usd,
+            "raw_cost_usd":         raw_cost,
+            "billing_mode":         billing_mode,
+            "billing_provider":     billing_provider,
+            "billing_base_url":     billing_base_url,
             "ok":                   result.get("ok", False),
         }
         os.makedirs(os.path.dirname(_LIVENESS_LEDGER), exist_ok=True)
@@ -459,7 +496,7 @@ def _record_served(result, armed):
         # pinned-vs-actual drift should be impossible to miss in the log,
         # the executor brief, and the ClickUp closeout comment that quotes it.
         eprint(f"[opencode_exec] served-by: {served_model} (task={result.get('task_id', 'unknown')}, "
-               f"cost_usd={result.get('cost_usd')})")
+               f"cost_usd={cost_usd} raw_cost_usd={raw_cost} billing={billing_mode})")
         if degraded:
             eprint(f"[opencode_exec] WRITER-LIVENESS: DEGRADED — armed={armed} "
                    f"expected={_EXPECTED_PRIMARY} served={served_model}")
