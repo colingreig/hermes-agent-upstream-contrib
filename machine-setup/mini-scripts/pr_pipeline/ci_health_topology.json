@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "description": "Hermes-hosted hermes-ci VM topology and fail-closed recovery policy for ci_health_watch.py.",
+  "no_agent_interval_seconds": 300,
+  "vm": {
+    "name": "hermes-ci",
+    "status_command": ["orb", "list", "--format", "json"],
+    "boot_id_command": ["orb", "exec", "hermes-ci", "cat", "/proc/sys/kernel/random/boot_id"],
+    "uptime_command": ["orb", "exec", "hermes-ci", "cut", "-d.", "-f1", "/proc/uptime"],
+    "managed_commands": {
+      "start": ["orb", "start", "hermes-ci"],
+      "stop": ["orb", "stop", "hermes-ci"],
+      "restart": ["orb", "restart", "hermes-ci"]
+    }
+  },
+  "expected_runners": [
+    {
+      "repo": "colingreig/jdmbuysell-v4",
+      "name": "hermes-jdmbuysell-v4"
+    },
+    {
+      "repo": "colingreig/topdynamicspartners",
+      "name": "hermes-topdynamicspartners"
+    },
+    {
+      "repo": "colingreig/elevatoruptime.com",
+      "name": "hermes-elevatoruptime.com"
+    }
+  ],
+  "recovery_allowlist": [
+    {
+      "repo": "colingreig/jdmbuysell-v4",
+      "workflow": "Dead-image monitor",
+      "event": "schedule",
+      "max_reruns": 1
+    }
+  ]
+}
