@@ -249,7 +249,7 @@ def main():
         prompt = assemble_prompt(task, slug, current_post, exemplars, cfg)
         prompt_file = os.path.join("/tmp", f"oc_prompt_{args.task_id}.txt")
         try:
-            with open(prompt_file, "w") as f:
+            with open(prompt_file, "w", encoding="utf-8") as f:
                 f.write(prompt)
         except Exception as e:
             result["stage"] = "prompt"; result["error"] = f"could not write prompt file: {e}"
@@ -368,7 +368,7 @@ def main():
                 "ts": datetime.datetime.now().astimezone().isoformat(),
             }
             tmp = os.path.join(mdir, "publish_result.json.tmp")
-            with open(tmp, "w") as fh:
+            with open(tmp, "w", encoding="utf-8") as fh:
                 json.dump(marker, fh, indent=2)
             os.replace(tmp, os.path.join(mdir, "publish_result.json"))
             result["publish_marker"] = "written"
