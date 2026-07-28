@@ -1,7 +1,7 @@
 {
   "bundle": "hermes-self-report",
   "source_task": "86e2gnz60",
-  "generated": "2026-07-27",
+  "generated": "2026-07-28",
   "description": "Declared deploy bundle for the hermes-self-report cron. This file IS the bundle the installer copies; nothing outside its 'files' list is written. Canon bytes are the live mini copies (RC4) except postmark_send_report.py and hermes_self_report_delivery_probe.py, whose canon is the hermes-agent deploy mirror (live behavior + encoding=utf-8 on file opens). SKILL.md is authored in Brain and installed only with --include-skill --brain-path.",
   "coexist_required": [
     {
@@ -11,6 +11,10 @@
     {
       "dest_abs": "~/.hermes/scripts/queue_snapshot.json",
       "reason": "Read by the claim/snapshot-freshness logic. Runtime state, outside the bundle. Installer warns, never installs or removes it."
+    },
+    {
+      "dest_abs": "~/.hermes/scripts/spend_opencode.py",
+      "reason": "hermes_report_build._row_cost() imports spend_opencode.served_row_cost to strip subscription-covered (Codex OAuth) phantom spend from LEGACY writer-served rows (86e2hap1g). Owned by the spend bundle, not this one; a missing copy fails open to the raw recorded cost, so the digest over-reports rather than breaks. Installer warns, never installs or removes it."
     }
   ],
   "files": [
@@ -18,7 +22,7 @@
       "src_rel": "hermes_report_build.py",
       "src_base": "mirror",
       "dest_abs": "~/.hermes/scripts/hermes_report_build.py",
-      "sha256": "bfc8eb728fb86025fa93c103415089e92c313c5a4d62f0f9f7022299c1273546",
+      "sha256": "2b35e527353397445240592115c0a32e8a1e04ed075c70597e96864d7a1a579c",
       "role": "report builder (HTML+text+subject+JSON); imports hermes_report_build_v1lib + claim_store",
       "deploy_mode": "script"
     },
@@ -34,7 +38,7 @@
       "src_rel": "hermes_report_build_v2.py",
       "src_base": "mirror",
       "dest_abs": "~/.hermes/scripts/hermes_report_build_v2.py",
-      "sha256": "b0b5f0467a54105e3bf29e9761cf93638bae622e0138a36a22f2dc8e88e95bf2",
+      "sha256": "71e5ad4f2ef8e3cf6001d2034c7bd47c429493412689eecb8e8870eceda11762",
       "role": "compat-only orphan; no live importer (survey confirmed). Ships until a follow-up PR retires it after a final cross-surface caller check",
       "deploy_mode": "script"
     },

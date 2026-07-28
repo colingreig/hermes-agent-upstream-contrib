@@ -9,8 +9,8 @@ Two spend sources are summed for "today" (midnight-local to now):
      This covers Hermes gateway/orchestrator sessions (gpt-5-mini, haiku, minimax, etc.)
 
   2. ~/.hermes/logs/opencode/<task>-YYYYMMDD-HHMMSS.jsonl  step_finish events:
-     SUM(part.cost) from every file whose filename contains today's YYYYMMDD string.
-     This covers OpenCode/gpt-5 delegations (the main money-spender).
+     SUM(subscription-aware marginal part.cost) from files containing today's
+     YYYYMMDD string. Codex OAuth / local Codex proxy logs are $0 marginal spend.
 
 Public API:
     daily_spend_usd(today_str=None) -> float   # today_str: "YYYYMMDD" or None=today
@@ -74,6 +74,12 @@ import sys
 import time
 from datetime import date, datetime
 
+from spend_opencode import (
+    configured_codex_oauth_proxy_metadata,
+    opencode_event_marginal_cost,
+    route_metadata_from_event,
+)
+
 HOME = os.path.expanduser("~")
 STATE_DB = os.path.join(HOME, ".hermes", "state.db")
 OC_LOG_DIR = os.path.join(HOME, ".hermes", "logs", "opencode")
@@ -130,7 +136,7 @@ def _state_db_spend(today_epoch: float) -> float:
 
 
 def _opencode_log_spend(today_str: str) -> float:
-    """Sum step_finish.part.cost from opencode JSONL logs for today.
+    """Sum marginal step_finish.part.cost from opencode JSONL logs for today.
 
     Log filenames contain the date as YYYYMMDD (e.g. taskid-20260623-154853.jsonl).
     Returns 0.0 on any error (fail-open).
@@ -140,6 +146,8 @@ def _opencode_log_spend(today_str: str) -> float:
         pattern = os.path.join(OC_LOG_DIR, f"*{today_str}*.jsonl")
         for log_path in glob.glob(pattern):
             try:
+                route_metadata = None
+                events = []
                 with open(log_path, "r", encoding="utf-8", errors="replace") as f:
                     for line in f:
                         line = line.strip()
@@ -149,10 +157,19 @@ def _opencode_log_spend(today_str: str) -> float:
                             ev = json.loads(line)
                         except json.JSONDecodeError:
                             continue
-                        if ev.get("type") == "step_finish":
-                            cost = ev.get("part", {}).get("cost")
-                            if cost is not None:
-                                total += float(cost)
+                        metadata = route_metadata_from_event(ev)
+                        if metadata is not None:
+                            route_metadata = metadata
+                            continue
+                        events.append(ev)
+                if route_metadata is None:
+                    # Historical logs predate Hermes' run-level route event. Only
+                    # classify them as subscription-covered when the local
+                    # OpenCode config still proves the Codex OAuth proxy route.
+                    route_metadata = configured_codex_oauth_proxy_metadata()
+                for ev in events:
+                    if ev.get("type") == "step_finish":
+                        total += opencode_event_marginal_cost(ev, route_metadata=route_metadata)
             except Exception as e:
                 print(
                     f"[spend_guard] WARN: failed reading {log_path} (skipping, fail-open): {e!r}",
@@ -199,6 +216,8 @@ def _opencode_log_spend_strict(today_str: str) -> float:
         raise SpendDataUnavailable(f"opencode log glob failed: {e!r}") from e
     for log_path in log_paths:
         try:
+            route_metadata = None
+            events = []
             with open(log_path, "r", encoding="utf-8", errors="replace") as f:
                 for line in f:
                     line = line.strip()
@@ -208,10 +227,16 @@ def _opencode_log_spend_strict(today_str: str) -> float:
                         ev = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    if ev.get("type") == "step_finish":
-                        cost = ev.get("part", {}).get("cost")
-                        if cost is not None:
-                            total += float(cost)
+                    metadata = route_metadata_from_event(ev)
+                    if metadata is not None:
+                        route_metadata = metadata
+                        continue
+                    events.append(ev)
+            if route_metadata is None:
+                route_metadata = configured_codex_oauth_proxy_metadata()
+            for ev in events:
+                if ev.get("type") == "step_finish":
+                    total += opencode_event_marginal_cost(ev, route_metadata=route_metadata)
         except Exception as e:
             print(
                 f"[spend_guard] WARN: failed reading {log_path} (skipping, fail-open): {e!r}",

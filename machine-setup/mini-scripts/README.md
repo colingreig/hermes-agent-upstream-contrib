@@ -391,6 +391,21 @@ under `pr_pipeline/`. Do not compare or copy those files one at a time.
   `mini-release-cut.sh` (previously never pruned, so old release dirs
   accumulated unbounded — `mini-release-cut.sh` already had `--prune` wired
   and tested, it just wasn't being invoked).
+- `wt-new` (ClickUp 86e2evnx0) — Python3 CLI that creates a per-task worktree
+  off the shared bare mirror (`git worktree add`), resolving the mirror's
+  default ref from `refs/remotes/origin/HEAD` when present, falling back to
+  the mirror's own `HEAD` symbolic ref (typically `refs/heads/main` on a true
+  `--mirror` clone), and failing clearly (`--base` hint) when neither
+  resolves.
+  Was previously live-only at `~/.hermes/scripts/wt-new` with no repo history;
+  vendored here verbatim (byte-for-byte, sha256-matched) so future changes are
+  reviewable and revertible through source control like every other
+  manual-copy script. Deploy by scp-by-name:
+  `scp machine-setup/mini-scripts/wt-new mini:~/.hermes/scripts/wt-new`.
+- `tests/test_wt_new_default_ref.py` — covers `default_ref()`'s three cases:
+  true mirror falling back to `refs/heads/main`, an ordinary clone with
+  `origin/HEAD` set, and a bare repo with neither ref resolving cleanly to a
+  `SystemExit` with the `--base` hint.
 
 ## Cron-context GitHub auth (2026-07-26)
 
