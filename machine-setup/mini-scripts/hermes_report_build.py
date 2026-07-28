@@ -38,6 +38,8 @@ import html
 import json
 import os
 import sys
+import urllib.parse
+import urllib.request
 from urllib.parse import urlparse
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -52,6 +54,11 @@ except Exception:
 
 HERMES = os.path.expanduser("~/.hermes")
 SERVED_LEDGER_DEFAULT = os.path.join(HERMES, "logs", "writer-served.jsonl")
+DEFAULT_CLICKUP_TEAM_ID = "9017245888"
+REVIEW_STATUSES = ("in review", "ready for review")
+# Documented production default: alert once the workspace-wide review backlog
+# reaches 25 tasks. Override only for deterministic tests or emergency tuning.
+DEFAULT_REVIEW_BACKLOG_ALERT_THRESHOLD = 25
 
 STUCK_IN_PROGRESS_HOURS = 2.0
 MAX_SECTION_ROWS = 10
@@ -301,6 +308,7 @@ def summarize_spend(window_rows, today_rows, previous_window_rows):
 
     return {
         "total_cost": total_cost,
+        "writer_total_cost": total_cost,
         "today_cost": today_cost,
         "previous_window_cost": previous_window_cost,
         "cost_delta": total_cost - previous_window_cost,
@@ -310,6 +318,26 @@ def summarize_spend(window_rows, today_rows, previous_window_rows):
         "drift_n": len(drift),
         "top_drift_model": top_drift_model,
     }
+
+
+def load_guard_tracked_spend(today_str=None, spend_guard_module=None):
+    """Return canonical spend-guard daily spend, distinct from writer receipts.
+
+    spend_guard.py is the blocking cap's source of truth. Prefer its strict
+    calculation so unreadable state.db/opencode data is reported as degraded
+    instead of formatted as a false $0.00.
+    """
+    try:
+        sg = spend_guard_module
+        if sg is None:
+            import spend_guard as sg  # noqa: F401
+        if hasattr(sg, "_daily_spend_usd_strict"):
+            total = sg._daily_spend_usd_strict(today_str)
+        else:
+            total = sg.daily_spend_usd(today_str)
+        return {"guard_total_cost": float(total), "guard_error": None}
+    except Exception as e:
+        return {"guard_total_cost": None, "guard_error": str(e)}
 
 
 def _cost_display(spend):
@@ -322,7 +350,89 @@ def _cost_display(spend):
     """
     if spend.get("error"):
         return "spend UNKNOWN (ledger unreadable)"
-    return f"${(spend.get('total_cost') or 0.0):.2f}"
+    return f"writer ${((spend.get('writer_total_cost', spend.get('total_cost')) or 0.0)):.2f}"
+
+
+# ---------- workspace-wide review queue ----------
+
+def _clickup_token():
+    token = (os.environ.get("CLICKUP_API_TOKEN") or "").strip()
+    if token:
+        return token
+    try:
+        from agent import lazy_secret_resolver
+        token = lazy_secret_resolver.get("CLICKUP_API_TOKEN")
+    except Exception:
+        token = None
+    return (token or "").strip()
+
+
+def _clickup_get_json(url, token=None):
+    req = urllib.request.Request(url, headers={"Authorization": token or _clickup_token()})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.loads(resp.read().decode("utf-8", "replace"))
+
+
+def _task_row_from_clickup(t):
+    folder = t.get("folder") or t.get("project") or {}
+    lst = t.get("list") or {}
+    st = t.get("status") or {}
+    status = st.get("status") if isinstance(st, dict) else (st or "")
+    return {
+        "id": t.get("id"),
+        "project": (folder.get("name") or "—") if isinstance(folder, dict) else "—",
+        "list": (lst.get("name") or "—") if isinstance(lst, dict) else "—",
+        "list_id": (lst.get("id") or "") if isinstance(lst, dict) else "",
+        "name": t.get("name") or t.get("id"),
+        "url": t.get("url") or f'https://app.clickup.com/t/{t.get("id")}',
+        "status": status or "unknown",
+        "status_type": st.get("type", "") if isinstance(st, dict) else "",
+        "date_closed": t.get("date_closed"),
+        "date_done": t.get("date_done"),
+        "date_updated": t.get("date_updated"),
+        "parent": t.get("parent"),
+        "resolution_error": None,
+    }
+
+
+def fetch_workspace_review_queue(team_id=DEFAULT_CLICKUP_TEAM_ID, token=None, get_json=None, max_pages=100):
+    """Paginated, deduplicated team-wide ClickUp query for all review tasks.
+
+    This deliberately does not discover boards/lists first: status filtering at
+    the team/task endpoint sees unmapped-board tasks and subtasks across the
+    whole workspace. On failure, returns a degraded metadata error instead of a
+    false zero.
+    """
+    get_json = get_json or _clickup_get_json
+    token = token if token is not None else _clickup_token()
+    if not token:
+        return [], {"error": "CLICKUP_API_TOKEN unavailable", "statuses": list(REVIEW_STATUSES)}
+
+    rows_by_id = {}
+    pages = 0
+    try:
+        for status in REVIEW_STATUSES:
+            page = 0
+            while True:
+                params = [("page", str(page)), ("subtasks", "true"), ("include_closed", "false"), ("statuses[]", status)]
+                q = urllib.parse.urlencode(params)
+                data = get_json(f"https://api.clickup.com/api/v2/team/{team_id}/task?{q}", token)
+                pages += 1
+                tasks = data.get("tasks") or []
+                for task in tasks:
+                    row = _task_row_from_clickup(task)
+                    if row.get("id") and (row.get("status") or "").lower() in REVIEW_STATUSES:
+                        rows_by_id.setdefault(row["id"], row)
+                if data.get("last_page", True) or not tasks:
+                    break
+                page += 1
+                if page >= max_pages:
+                    raise RuntimeError(f"ClickUp pagination exceeded {max_pages} pages for status {status!r}")
+    except Exception as e:
+        return [], {"error": f"ClickUp review queue degraded: {e}", "statuses": list(REVIEW_STATUSES), "pages": pages}
+
+    rows = sorted(rows_by_id.values(), key=lambda r: ((r.get("status") or ""), (r.get("list") or ""), (r.get("name") or "")))
+    return rows, {"error": None, "statuses": list(REVIEW_STATUSES), "pages": pages, "deduped": len(rows)}
 
 
 # ---------- alerts ----------
@@ -413,10 +523,13 @@ def build_alerts(hermes_rows, snap_tasks_by_id, header, now=None):
 
 # ---------- scoreboard ----------
 
-def build_scoreboard(hermes_rows, snap_tasks, hermes_meta, work_completed):
+def build_scoreboard(hermes_rows, snap_tasks, hermes_meta, work_completed, review_rows=None, review_error=False):
     statuses = collections.Counter((r.get("status") or "").lower() for r in hermes_rows)
     in_progress = statuses.get("in progress", 0)
-    in_review = statuses.get("in review", 0) + statuses.get("ready for review", 0)
+    if review_error:
+        in_review = "UNKNOWN"
+    else:
+        in_review = len(review_rows) if review_rows is not None else statuses.get("in review", 0) + statuses.get("ready for review", 0)
     blocked = statuses.get("blocked", 0) + statuses.get("needs human", 0)
 
     lanes = collections.Counter()
@@ -446,6 +559,7 @@ def summarize_alerts(alerts):
         "watch_list": counts.get("stuck", 0),
         "action_required": counts.get("blocked", 0),
         "system_signals": counts.get("health", 0),
+        "review_backlog": counts.get("review_backlog", 0),
         "alerts_n": len(alerts),
     }
 
@@ -458,10 +572,31 @@ def _alert_count_text(alert_summary):
     )
 
 
+def build_review_backlog_alert(review_rows, review_meta, threshold):
+    if review_meta.get("error"):
+        return {
+            "kind": "health",
+            "name": "Workspace review queue degraded",
+            "url": None,
+            "detail": review_meta["error"] + " — review count unknown, not zero",
+            "sub": "ClickUp team-wide review query",
+        }
+    if len(review_rows) >= threshold:
+        return {
+            "kind": "review_backlog",
+            "name": "Workspace review backlog threshold breached",
+            "url": None,
+            "detail": f"{len(review_rows)} tasks in review/ready for review (threshold {threshold})",
+            "sub": "ClickUp team-wide review query",
+        }
+    return None
+
+
 def build_subject(scoreboard, spend, alert_summary):
-    completed = scoreboard["validator_completed_window"]
+    completed = scoreboard.get("validator_completed_window", scoreboard.get("shipped", 0))
+    prefix = "🚨 REVIEW BACKLOG · " if alert_summary.get("review_backlog", 0) else ""
     subj = (
-        f"Hermes: {completed} validator-completed · {_alert_count_text(alert_summary)} · "
+        f"{prefix}Hermes: {completed} validator-completed · {_alert_count_text(alert_summary)} · "
         f"{_cost_display(spend)} · {scoreboard['ready']} ready"
     )
     return subj
@@ -470,7 +605,7 @@ def build_subject(scoreboard, spend, alert_summary):
 def build_headline_emoji_text(scoreboard, spend, alert_summary):
     alerts_n = alert_summary["alerts_n"]
     dot = "🟢" if alerts_n == 0 else "⚠️"
-    completed = scoreboard["validator_completed_window"]
+    completed = scoreboard.get("validator_completed_window", scoreboard.get("shipped", 0))
     return (
         f"{dot} {completed} validator-completed · "
         f"{'⚠️' if alert_summary['action_required'] else '✓'} "
@@ -479,6 +614,8 @@ def build_headline_emoji_text(scoreboard, spend, alert_summary):
         f"{alert_summary['watch_list']} watch list · "
         f"{'⚠️' if alert_summary['system_signals'] else '✓'} "
         f"{alert_summary['system_signals']} system signals · "
+        f"{'🚨' if alert_summary.get('review_backlog') else '✓'} "
+        f"{scoreboard['in_review']} review · "
         f"💸 {_cost_display(spend)} · {scoreboard['ready']} ready"
     )
 
@@ -505,16 +642,23 @@ def _bounded(rows):
     return {"rows": rows[:MAX_SECTION_ROWS], "total": len(rows), "shown": min(len(rows), MAX_SECTION_ROWS)}
 
 
-def build_report_view_model(header, scoreboard, spend, alerts, hermes_rows, hermes_meta, work_rows, window_min):
+def build_report_view_model(
+    header, scoreboard, spend, alerts, hermes_rows, hermes_meta, work_rows, window_min,
+    review_rows=None, review_meta=None, review_threshold=DEFAULT_REVIEW_BACKLOG_ALERT_THRESHOLD,
+):
     """Single structured report model consumed by subject, body, and JSON summary."""
     h = header or {}
+    review_rows = list(review_rows or [])
+    review_meta = review_meta or {"error": None}
     action_required = [a for a in alerts if a.get("kind") == "blocked"]
     watch_list = [a for a in alerts if a.get("kind") == "stuck"]
     system_signals = [a for a in alerts if a.get("kind") == "health"]
+    review_backlog = [a for a in alerts if a.get("kind") == "review_backlog"]
     sections = {
         "action_required": {"title": "Action required", "items": action_required},
         "watch_list": {"title": "Watch list", "items": watch_list},
         "system_signals": {"title": "System signals", "items": system_signals},
+        "workspace_review_queue": {"title": "Workspace review queue", **_bounded(review_rows)},
         "what_hermes_did": {"title": "What Hermes did", **_bounded(work_rows)},
         "queue": {"title": "Queue", **_bounded(hermes_rows)},
     }
@@ -522,7 +666,8 @@ def build_report_view_model(header, scoreboard, spend, alerts, hermes_rows, herm
         "action_required": len(action_required),
         "watch_list": len(watch_list),
         "system_signals": len(system_signals),
-        "alerts_n": len(action_required) + len(watch_list) + len(system_signals),
+        "review_backlog": len(review_backlog),
+        "alerts_n": len(action_required) + len(watch_list) + len(system_signals) + len(review_backlog),
     }
     subject = build_subject(scoreboard, spend, alert_summary)
     return {
@@ -532,6 +677,8 @@ def build_report_view_model(header, scoreboard, spend, alerts, hermes_rows, herm
         "sections": sections,
         "counts": alert_summary,
         "hermes_meta": hermes_meta or {},
+        "review_meta": review_meta,
+        "review_threshold": review_threshold,
         "window_min": window_min,
         "subject": subject,
         "headline": build_headline_emoji_text(scoreboard, spend, alert_summary),
@@ -631,6 +778,8 @@ def render_html_view(model):
     spend = model["spend"]
     sections = model["sections"]
     hermes_meta = model["hermes_meta"]
+    review_meta = model.get("review_meta") or {"error": None}
+    review_threshold = model.get("review_threshold", DEFAULT_REVIEW_BACKLOG_ALERT_THRESHOLD)
     window_min = model["window_min"]
     subject_line = model["subject"]
     when = _esc(h.get("when", ""))
@@ -742,20 +891,34 @@ def render_html_view(model):
 
     # 6. Model & spend
     parts.append('<h2 style="margin:0 0 12px;font-size:16px;color:#1a1a1a">💸 Model &amp; spend</h2>')
+    if spend.get("guard_error"):
+        parts.append(
+            '<div style="padding:12px 14px;background:#fdecea;border:1px solid #b00020;'
+            'border-radius:4px;font-size:14px;color:#b00020;margin-bottom:10px">'
+            f'⚠️ Guard-tracked daily spend UNKNOWN ({_esc(str(spend["guard_error"]))}) — '
+            'not reported as $0.00.</div>'
+        )
+    else:
+        parts.append(
+            '<div style="font-size:14px;color:#1a1a1a;margin-bottom:10px">'
+            f'Guard-tracked daily spend (spend_guard: state.db + opencode logs): '
+            f'<b>${spend["guard_total_cost"]:.2f}</b></div>'
+        )
+
     if spend.get("error"):
         parts.append(
             '<div style="padding:12px 14px;background:#fdecea;border:1px solid #b00020;'
             'border-radius:4px;font-size:14px;color:#b00020;margin-bottom:24px">'
-            f'⚠️ Served ledger UNREADABLE ({_esc(str(spend["error"]))}) — spend this window is '
+            f'⚠️ Writer-served receipt ledger UNREADABLE ({_esc(str(spend["error"]))}) — spend this window is '
             'UNKNOWN, not $0.00.</div>'
         )
     elif spend.get("empty"):
         parts.append(
             '<div style="padding:12px 14px;background:#f7f7f8;border-radius:4px;font-size:14px;'
-            'color:#666;margin-bottom:24px">No served-by receipts in the window.</div>'
+            'color:#666;margin-bottom:24px">No writer-served receipts in the window.</div>'
         )
     else:
-        cost_line = f'Total est. cost this window: <b>${spend["total_cost"]:.2f}</b>'
+        cost_line = f'Writer-served receipts this window: <b>${spend["writer_total_cost"]:.2f}</b>'
         delta = spend["cost_delta"]
         if delta > 0.0001:
             cost_line += f' &nbsp; <span style="color:#b00020">▲ ${delta:.2f} vs previous window</span>'
@@ -792,7 +955,36 @@ def render_html_view(model):
                 '✓ All runs served on the pinned model.</div>'
             )
 
-    # 7. Roster
+    # 7. Workspace-wide review queue
+    review_section = sections["workspace_review_queue"]
+    review_rows = review_section["rows"]
+    review_count_label = "UNKNOWN" if review_meta.get("error") else str(review_section["total"])
+    parts.append(
+        f'<h2 style="margin:0 0 12px;font-size:16px;color:#1a1a1a">🚨 Workspace review queue '
+        f'({review_count_label})</h2>'
+    )
+    if review_meta.get("error"):
+        parts.append(
+            '<div style="padding:12px 14px;background:#fdecea;border:1px solid #b00020;'
+            'border-radius:4px;font-size:14px;color:#b00020;margin-bottom:16px">'
+            f'ClickUp review queue degraded: {_esc(review_meta.get("error"))}. Count is UNKNOWN, not zero.</div>'
+        )
+    elif review_section["total"] >= review_threshold:
+        parts.append(
+            '<div style="padding:14px 16px;background:#fdecea;border:2px solid #b00020;'
+            'border-radius:4px;font-size:15px;color:#b00020;margin-bottom:16px;font-weight:700">'
+            f'REVIEW BACKLOG ALERT: {review_section["total"]} tasks at/above threshold {review_threshold}.</div>'
+        )
+    else:
+        parts.append(
+            f'<div style="font-size:13px;color:#555;margin-bottom:12px">'
+            f'Threshold {review_threshold}; team-wide query includes subtasks and both review statuses.</div>'
+        )
+    parts.append(render_html_cards(review_rows))
+    if review_section["shown"] < review_section["total"]:
+        parts.append(f'<div style="font-size:12px;color:#888;margin-bottom:16px">Showing {review_section["shown"]} of {review_section["total"]}.</div>')
+
+    # 8. Roster
     work_section = sections["what_hermes_did"]
     parts.append(
         f'<h2 style="margin:0 0 12px;font-size:16px;color:#1a1a1a">📋 What Hermes did '
@@ -850,8 +1042,23 @@ def render_html_alert_card(a, color):
     )
 
 
-def render_html(header, scoreboard, spend, alerts, hermes_rows, hermes_meta, work_rows, window_min, subject_line=None):
-    model = build_report_view_model(header, scoreboard, spend, alerts, hermes_rows, hermes_meta, work_rows, window_min)
+def render_html(header, scoreboard, spend, alerts, hermes_rows, hermes_meta, work_rows, *args, subject_line=None):
+    if len(args) == 1:
+        review_rows, review_meta, review_threshold, window_min = [], {"error": None}, DEFAULT_REVIEW_BACKLOG_ALERT_THRESHOLD, args[0]
+    elif len(args) == 2:
+        review_rows, review_meta, review_threshold, window_min = [], {"error": None}, DEFAULT_REVIEW_BACKLOG_ALERT_THRESHOLD, args[0]
+        subject_line = subject_line or args[1]
+    elif len(args) == 4:
+        review_rows, review_meta, review_threshold, window_min = args
+    elif len(args) == 5:
+        review_rows, review_meta, review_threshold, window_min = args[:4]
+        subject_line = subject_line or args[4]
+    else:
+        raise TypeError("render_html expects window_min or review_rows, review_meta, review_threshold, window_min[, subject_line]")
+    model = build_report_view_model(
+        header, scoreboard, spend, alerts, hermes_rows, hermes_meta, work_rows, window_min,
+        review_rows, review_meta, review_threshold,
+    )
     if subject_line:
         model["subject"] = subject_line
     return render_html_view(model)
@@ -913,6 +1120,8 @@ def build_text_view(model):
     spend = model["spend"]
     sections = model["sections"]
     hermes_meta = model["hermes_meta"]
+    review_meta = model.get("review_meta") or {"error": None}
+    review_threshold = model.get("review_threshold", DEFAULT_REVIEW_BACKLOG_ALERT_THRESHOLD)
     window_h = model["window_min"] / 60.0
     window_h_str = f"{window_h:.0f}" if window_h == int(window_h) else f"{window_h:.1f}"
 
@@ -940,17 +1149,17 @@ def build_text_view(model):
         "=" * 40,
         f'  Ready: {scoreboard["ready"]}   In progress: {scoreboard["in_progress"]}   '
         f'Current in review: {scoreboard["in_review"]}   Blocked: {scoreboard["blocked"]}   '
-        f'Validator-completed (window): {scoreboard["validator_completed_window"]}',
+        f'Validator-completed (window): {scoreboard.get("validator_completed_window", scoreboard.get("shipped", 0))}',
         f'  Lanes - Code: {scoreboard["lane_code"]} · Content: {scoreboard["lane_content"]}',
         "",
     ]
 
     lines += ["=" * 40, "MODEL & SPEND", "=" * 40]
     if spend.get("error"):
-        lines.append(f"  WARNING: served ledger UNREADABLE ({spend['error']}) — "
+        lines.append(f"  WARNING: writer-served receipt ledger UNREADABLE ({spend['error']}) — "
                       "spend this window is UNKNOWN, not $0.00.")
     elif spend.get("empty"):
-        lines.append("  No served-by receipts in the window.")
+        lines.append("  No writer-served receipts in the window.")
     else:
         delta = spend["cost_delta"]
         if delta > 0.0001:
@@ -959,7 +1168,7 @@ def build_text_view(model):
             delta_str = f'(down ${abs(delta):.2f} vs previous window)'
         else:
             delta_str = '(flat vs previous window)'
-        lines.append(f'  Total est. cost this window: ${spend["total_cost"]:.2f} {delta_str}')
+        lines.append(f'  Writer-served receipts this window: ${spend["writer_total_cost"]:.2f} {delta_str}')
         lines.append(f'  Today so far: ${spend["today_cost"]:.2f}')
         for pr in spend["provider_rows"]:
             deg = f' · {pr["degraded"]} degraded' if pr["degraded"] else ''
@@ -969,6 +1178,29 @@ def build_text_view(model):
             lines.append(f'  WARNING: {spend["drift_n"]} runs fell off the pinned model{top}')
         else:
             lines.append('  All runs served on the pinned model.')
+    if spend.get("guard_error"):
+        lines.append(f'  WARNING: guard-tracked daily spend UNKNOWN ({spend["guard_error"]}) — not $0.00.')
+    else:
+        lines.append(f'  Guard-tracked daily spend (spend_guard: state.db + opencode logs): ${spend["guard_total_cost"]:.2f}')
+    lines.append("  Writer-served and guard-tracked figures are separate sources; no combined total is reported.")
+    lines.append("")
+
+    lines += [
+        "=" * 40,
+        f'WORKSPACE REVIEW QUEUE ({"UNKNOWN" if review_meta.get("error") else sections["workspace_review_queue"]["total"]})',
+        "=" * 40,
+    ]
+    review_section = sections["workspace_review_queue"]
+    review_rows = review_section["rows"]
+    if review_meta.get("error"):
+        lines.append(f'  WARNING: ClickUp review queue degraded ({review_meta["error"]}); count UNKNOWN, not zero.')
+    elif review_section["total"] >= review_threshold:
+        lines.append(f'  REVIEW BACKLOG ALERT: {review_section["total"]} tasks at/above threshold {review_threshold}.')
+    else:
+        lines.append(f'  Threshold {review_threshold}; team-wide query includes subtasks and both review statuses.')
+    lines.append(render_text_cards(review_rows))
+    if review_section["shown"] < review_section["total"]:
+        lines.append(f'  Showing {review_section["shown"]} of {review_section["total"]}.')
     lines.append("")
 
     work_section = sections["what_hermes_did"]
@@ -990,8 +1222,17 @@ def build_text_view(model):
     return "\n".join(lines)
 
 
-def build_text(header, scoreboard, spend, alerts, hermes_rows, hermes_meta, work_rows, window_min):
-    model = build_report_view_model(header, scoreboard, spend, alerts, hermes_rows, hermes_meta, work_rows, window_min)
+def build_text(header, scoreboard, spend, alerts, hermes_rows, hermes_meta, work_rows, *args):
+    if len(args) == 1:
+        review_rows, review_meta, review_threshold, window_min = [], {"error": None}, DEFAULT_REVIEW_BACKLOG_ALERT_THRESHOLD, args[0]
+    elif len(args) == 4:
+        review_rows, review_meta, review_threshold, window_min = args
+    else:
+        raise TypeError("build_text expects window_min or review_rows, review_meta, review_threshold, window_min")
+    model = build_report_view_model(
+        header, scoreboard, spend, alerts, hermes_rows, hermes_meta, work_rows, window_min,
+        review_rows, review_meta, review_threshold,
+    )
     return build_text_view(model)
 
 
@@ -1003,6 +1244,10 @@ def main():
     p.add_argument("--out-text", default="/tmp/hermes_report.txt")
     p.add_argument("--out-subject", default="/tmp/hermes_report_subject.txt")
     p.add_argument("--served-ledger", default=SERVED_LEDGER_DEFAULT)
+    p.add_argument("--clickup-team-id", default=os.environ.get("CLICKUP_TEAM_ID", DEFAULT_CLICKUP_TEAM_ID))
+    p.add_argument("--review-backlog-alert-threshold", type=int,
+                   default=int(os.environ.get("HERMES_REVIEW_BACKLOG_ALERT_THRESHOLD", DEFAULT_REVIEW_BACKLOG_ALERT_THRESHOLD)),
+                   help="Prominent alert threshold for workspace-wide review backlog (default: 25).")
     args = p.parse_args()
 
     header = {}
@@ -1015,6 +1260,7 @@ def main():
     cache = {}
     hermes_rows, hermes_meta, snap = v1.build_hermes_list(cache)
     work_rows, work_counts = v1.build_work_list(args.window_min, cache)
+    review_rows, review_meta = fetch_workspace_review_queue(team_id=args.clickup_team_id)
     header = add_resolution_health(header, work_counts)
 
     snap_tasks = (snap or {}).get("tasks", [])
@@ -1031,7 +1277,8 @@ def main():
         spend = {
             "empty": True,
             "error": ledger_err,
-            "total_cost": None, "today_cost": None, "previous_window_cost": None, "cost_delta": None,
+            "total_cost": None, "writer_total_cost": None,
+            "today_cost": None, "previous_window_cost": None, "cost_delta": None,
             "provider_rows": [], "providers_n": 0, "runs_n": 0, "drift_n": 0, "top_drift_model": None,
         }
         print(f"WARN: served ledger issue: {ledger_err}", file=sys.stderr)
@@ -1044,6 +1291,7 @@ def main():
             "empty": True,
             "error": None,
             "total_cost": 0.0,
+            "writer_total_cost": 0.0,
             "today_cost": sum(float(r.get("cost_usd") or 0) for r in today_rows),
             "previous_window_cost": sum(float(r.get("cost_usd") or 0) for r in previous_window_rows),
             "cost_delta": -sum(float(r.get("cost_usd") or 0) for r in previous_window_rows),
@@ -1053,8 +1301,12 @@ def main():
         spend = summarize_spend(window_rows, today_rows, previous_window_rows)
         spend["empty"] = False
         spend["error"] = None
+    spend.update(load_guard_tracked_spend())
 
-    scoreboard = build_scoreboard(hermes_rows, snap_tasks, hermes_meta, work_counts["completed"])
+    scoreboard = build_scoreboard(
+        hermes_rows, snap_tasks, hermes_meta, work_counts["completed"], review_rows,
+        review_error=bool(review_meta.get("error")),
+    )
 
     # Deterministic verdict OVERWRITES whatever the header-file guessed for
     # work_stoppage — see "work-stoppage verdict" section above. The cron
@@ -1066,8 +1318,12 @@ def main():
     )
 
     alerts = build_alerts(hermes_rows, snap_tasks_by_id, header)
+    review_alert = build_review_backlog_alert(review_rows, review_meta, args.review_backlog_alert_threshold)
+    if review_alert:
+        alerts.insert(0, review_alert)
     model = build_report_view_model(
         header, scoreboard, spend, alerts, hermes_rows, hermes_meta, work_rows, args.window_min,
+        review_rows, review_meta, args.review_backlog_alert_threshold,
     )
     subject = model["subject"]
 
@@ -1087,6 +1343,9 @@ def main():
         "out_subject": args.out_subject,
         "hermes_list_n": len(hermes_rows),
         "work_list_n": len(work_rows),
+        "workspace_review_queue_n": len(review_rows) if not review_meta.get("error") else None,
+        "workspace_review_queue_error": review_meta.get("error"),
+        "review_backlog_alert_threshold": args.review_backlog_alert_threshold,
         "work_completed": work_counts["completed"],
         "work_completed_task_ids": work_counts.get("completed_task_ids", []),
         "briefs_scanned": work_counts["briefs_scanned"],
@@ -1107,6 +1366,9 @@ def main():
         "today_so_far_cost_usd": (round(spend["today_cost"], 4) if spend.get("today_cost") is not None else None),
         "previous_window_cost_usd": (round(spend["previous_window_cost"], 4) if spend.get("previous_window_cost") is not None else None),
         "cost_delta_vs_previous_window_usd": (round(spend["cost_delta"], 4) if spend.get("cost_delta") is not None else None),
+        "writer_served_cost_usd": (round(spend["writer_total_cost"], 4) if spend.get("writer_total_cost") is not None else None),
+        "guard_tracked_spend_usd": (round(spend["guard_total_cost"], 4) if spend.get("guard_total_cost") is not None else None),
+        "guard_tracked_spend_error": spend.get("guard_error"),
         "spend_ledger_error": spend.get("error"),
         **model["counts"],
         "providers_n": spend["providers_n"],
