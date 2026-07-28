@@ -4,13 +4,13 @@
   "no_agent_interval_seconds": 300,
   "vm": {
     "name": "hermes-ci",
-    "status_command": ["orb", "list", "--format", "json"],
-    "boot_id_command": ["orb", "exec", "hermes-ci", "cat", "/proc/sys/kernel/random/boot_id"],
-    "uptime_command": ["orb", "exec", "hermes-ci", "cut", "-d.", "-f1", "/proc/uptime"],
+    "status_command": ["/usr/local/bin/orb", "list", "--format", "json"],
+    "boot_id_command": ["/usr/local/bin/orb", "exec", "hermes-ci", "cat", "/proc/sys/kernel/random/boot_id"],
+    "uptime_command": ["/usr/local/bin/orb", "exec", "hermes-ci", "cut", "-d.", "-f1", "/proc/uptime"],
     "managed_commands": {
-      "start": ["orb", "start", "hermes-ci"],
-      "stop": ["orb", "stop", "hermes-ci"],
-      "restart": ["orb", "restart", "hermes-ci"]
+      "start": ["/usr/local/bin/orb", "start", "hermes-ci"],
+      "stop": ["/usr/local/bin/orb", "stop", "hermes-ci"],
+      "restart": ["/usr/local/bin/orb", "restart", "hermes-ci"]
     }
   },
   "expected_runners": [

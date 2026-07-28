@@ -46,13 +46,13 @@ class FakeRunner:
     def __call__(self, cmd, **_kwargs):
         cmd = [str(part) for part in cmd]
         self.calls.append(cmd)
-        if cmd[:2] == ["orb", "list"]:
+        if Path(cmd[0]).name == "orb" and cmd[1:2] == ["list"]:
             if self.orb_list_stdout is not None:
                 return subprocess.CompletedProcess(cmd, 0, self.orb_list_stdout, "")
             return subprocess.CompletedProcess(cmd, 0, json.dumps({"vms": [{"name": "hermes-ci", "state": self.vm_state}]}), "")
-        if cmd[:4] == ["orb", "exec", "hermes-ci", "cat"]:
+        if Path(cmd[0]).name == "orb" and cmd[1:4] == ["exec", "hermes-ci", "cat"]:
             return subprocess.CompletedProcess(cmd, self.boot_rc, self.boot_id + "\n" if self.boot_rc == 0 else "", "boot failed")
-        if cmd[:4] == ["orb", "exec", "hermes-ci", "cut"]:
+        if Path(cmd[0]).name == "orb" and cmd[1:4] == ["exec", "hermes-ci", "cut"]:
             return subprocess.CompletedProcess(cmd, 0, "120\n", "")
         if cmd[:3] == ["gh", "api", "repos/colingreig/jdmbuysell-v4/actions/runners"]:
             payload = {"runners": [{"name": "hermes-jdmbuysell-v4", "status": self.runner_statuses["colingreig/jdmbuysell-v4"], "busy": False}]}
@@ -71,7 +71,7 @@ class FakeRunner:
         if "hermes" in Path(cmd[0]).name and cmd[1:4] == ["send", "--to", "slack:hermes"]:
             self.sent.append(cmd[4])
             return subprocess.CompletedProcess(cmd, 0, "", "")
-        if cmd[:2] == ["orb", "restart"]:
+        if Path(cmd[0]).name == "orb" and cmd[1:2] == ["restart"]:
             return subprocess.CompletedProcess(cmd, 0, "", "")
         raise AssertionError(f"unexpected command: {cmd}")
 
@@ -113,6 +113,10 @@ class CiHealthWatchTests(unittest.TestCase):
         self.assertEqual(topology["recovery_allowlist"][0]["repo"], "colingreig/jdmbuysell-v4")
         self.assertEqual(topology["recovery_allowlist"][0]["workflow"], "Dead-image monitor")
 
+        vm = topology["vm"]
+        commands = [vm["status_command"], vm["boot_id_command"], vm["uptime_command"], *vm["managed_commands"].values()]
+        self.assertTrue(all(command[0] == "/usr/local/bin/orb" for command in commands))
+
     def test_topology_is_manifest_managed(self):
         manifest = json.loads((SCRIPTS / "pr_pipeline" / "manifest.json").read_text(encoding="utf-8"))
 
@@ -148,7 +152,7 @@ class CiHealthWatchTests(unittest.TestCase):
         self.assertEqual(intent["actor"], "operator@example.com")
         self.assertEqual(intent["action"], "restart")
         self.assertEqual(intent["reason"], "controlled idle-window verification")
-        self.assertEqual(self.runner.calls[-1], ["orb", "restart", "hermes-ci"])
+        self.assertEqual(self.runner.calls[-1], ["/usr/local/bin/orb", "restart", "hermes-ci"])
 
         self._poll()
         self.runner.boot_id = "boot-b"
@@ -204,7 +208,7 @@ class CiHealthWatchTests(unittest.TestCase):
 
         self.assertFalse(json.loads(self.state_path.read_text(encoding="utf-8"))["vm"]["available"])
         self.assertEqual(report["rerun_ids"], [])
-        self.assertFalse(any(call[:2] == ["orb", "exec"] for call in self.runner.calls))
+        self.assertFalse(any(Path(call[0]).name == "orb" and call[1:2] == ["exec"] for call in self.runner.calls))
 
     def test_first_poll_baseline_does_not_authorize_allowlisted_rerun(self):
         self.runner.runs = [
