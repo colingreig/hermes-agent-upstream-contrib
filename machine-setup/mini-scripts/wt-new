@@ -1,0 +1,194 @@
+#!/usr/bin/env python3
+"""
+wt-new — create a per-task git worktree from a shared bare mirror.
+
+RECREATED 2026-07-22 during wipe-recovery (ClickUp 86e2ddcpb). The original wt-new was
+mini-local, untracked host tooling lost in the 2026-07-19 home-directory wipe (no known
+backup existed anywhere, including restic — only ~/.hermes/scripts is covered, and this
+tool did not live there before the wipe). This is a from-scratch reconstruction based on
+the documented convention (see hermes MEMORY.md "Mini worktrees are bare-mirror based"):
+shared bare mirrors at ~/.hermes/bare/<owner>__<repo>.git + `git worktree add` per task,
+NOT full clones.
+
+Usage:
+  wt-new <repo> <task-id> [--branch NAME] [--base REF] [--no-fetch]
+
+<repo> resolves (in order) to a bare mirror at ~/.hermes/bare/<owner>__<repo>.git via:
+  1. an exact bare-mirror directory name (e.g. "colingreig__ignite-skills.git")
+  2. an "<owner>/<repo>" pair (e.g. "colingreig/ignite-skills")
+  3. a short repo key looked up in ~/.hermes/bare-repo-map.tsv (e.g. "ignite-skills")
+
+Creates a linked worktree at ~/.hermes/worktrees/ignite-<task-id> on a new branch
+(default: ignite-<task-id>) based off the mirror's default branch (origin/HEAD, or
+--base). Refuses to touch anything outside ~/.hermes/worktrees or ~/.hermes/bare.
+
+By default, attempts `git remote update` on the bare mirror first so the worktree starts
+from fresh history. This is a network operation and can hang indefinitely if the mirror's
+credential helper has no way to authenticate non-interactively (observed live during this
+recovery: `git ls-remote` over HTTPS hung with no TTY). To make that fail fast instead of
+hanging the caller forever, the fetch runs under a hard timeout (default 20s, override
+with WT_NEW_FETCH_TIMEOUT) and any failure/timeout is a non-fatal warning — the worktree
+is still created from whatever history the mirror already has. Use --no-fetch to skip the
+network step entirely (e.g. known-offline runs).
+"""
+import argparse
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+HERMES_HOME = Path(os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")))
+BARE_ROOT = HERMES_HOME / "bare"
+WORKTREE_ROOT = HERMES_HOME / "worktrees"
+REPO_MAP_PATH = HERMES_HOME.parent / ".hermes" / "bare-repo-map.tsv"
+
+TASK_ID_RE = re.compile(r"^[A-Za-z0-9]{6,}$")
+FETCH_TIMEOUT = int(os.environ.get("WT_NEW_FETCH_TIMEOUT", "20"))
+
+
+def _log(msg: str) -> None:
+    print(f"[wt-new] {msg}", file=sys.stderr)
+
+
+def _load_repo_map() -> dict:
+    mapping = {}
+    if not REPO_MAP_PATH.exists():
+        return mapping
+    for line in REPO_MAP_PATH.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split("\t")
+        if len(parts) < 2:
+            continue
+        mapping[parts[0]] = parts[1]
+    return mapping
+
+
+def resolve_bare_dir(repo: str) -> Path:
+    # 1. exact bare-mirror directory name
+    direct = BARE_ROOT / repo
+    if direct.is_dir():
+        return direct
+    direct_git = BARE_ROOT / f"{repo}.git" if not repo.endswith(".git") else direct
+    if direct_git.is_dir():
+        return direct_git
+
+    # 2. "<owner>/<repo>" pair
+    if "/" in repo:
+        owner, name = repo.split("/", 1)
+        candidate = BARE_ROOT / f"{owner}__{name}.git"
+        if candidate.is_dir():
+            return candidate
+
+    # 3. short repo key -> owner/repo via map file
+    mapping = _load_repo_map()
+    if repo in mapping:
+        owner_repo = mapping[repo]
+        owner, name = owner_repo.split("/", 1)
+        candidate = BARE_ROOT / f"{owner}__{name}.git"
+        if candidate.is_dir():
+            return candidate
+
+    known = sorted(p.name for p in BARE_ROOT.glob("*.git")) if BARE_ROOT.is_dir() else []
+    raise SystemExit(
+        f"ERROR: no bare mirror found for {repo!r}. Known mirrors: {known or '(none)'}. "
+        f"To bootstrap a new one: git clone --mirror <url> {BARE_ROOT}/<owner>__<repo>.git "
+        f"(or add a row to {REPO_MAP_PATH} mapping a short key to <owner>/<repo>)."
+    )
+
+
+def default_ref(bare_dir: Path) -> str:
+    checked = []
+
+    for symbolic_ref in ("refs/remotes/origin/HEAD", "HEAD"):
+        try:
+            out = subprocess.run(
+                ["git", "-C", str(bare_dir), "symbolic-ref", symbolic_ref],
+                capture_output=True, text=True, timeout=10, check=True,
+            ).stdout.strip()
+        except Exception:
+            checked.append(symbolic_ref)
+            continue
+
+        checked.append(out)
+        proc = subprocess.run(
+            ["git", "-C", str(bare_dir), "rev-parse", "--verify", "--quiet", f"{out}^{{commit}}"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if proc.returncode == 0:
+            if out.startswith("refs/remotes/"):
+                return out.replace("refs/remotes/", "", 1)
+            if out.startswith("refs/heads/"):
+                return out.replace("refs/heads/", "", 1)
+            return out
+
+    raise SystemExit(
+        f"ERROR: could not resolve mirror default branch in {bare_dir}. "
+        f"Checked: {', '.join(checked)}. Pass --base with an existing ref."
+    )
+
+
+def try_fetch(bare_dir: Path) -> None:
+    _log(f"fetching {bare_dir.name} (timeout={FETCH_TIMEOUT}s)...")
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(bare_dir), "remote", "update", "--prune"],
+            capture_output=True, text=True, timeout=FETCH_TIMEOUT,
+        )
+        if proc.returncode != 0:
+            _log(f"WARN: fetch failed (non-fatal, using cached history): {proc.stderr.strip()[:300]}")
+        else:
+            _log("fetch ok")
+    except subprocess.TimeoutExpired:
+        _log(f"WARN: fetch timed out after {FETCH_TIMEOUT}s (non-fatal, using cached history — "
+             "likely no non-interactive credential available; this is expected until repo "
+             "auth is provisioned)")
+    except Exception as exc:
+        _log(f"WARN: fetch errored (non-fatal, using cached history): {exc}")
+
+
+def main(argv=None) -> int:
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("repo")
+    p.add_argument("task_id")
+    p.add_argument("--branch", default=None, help="branch name (default: ignite-<task-id>)")
+    p.add_argument("--base", default=None, help="base ref (default: mirror's origin/HEAD)")
+    p.add_argument("--no-fetch", action="store_true", help="skip `git remote update` on the bare mirror")
+    args = p.parse_args(argv)
+
+    if not TASK_ID_RE.match(args.task_id):
+        raise SystemExit(f"ERROR: task-id {args.task_id!r} doesn't look like a ClickUp task id")
+
+    WORKTREE_ROOT.mkdir(parents=True, exist_ok=True)
+    bare_dir = resolve_bare_dir(args.repo)
+
+    if not args.no_fetch:
+        try_fetch(bare_dir)
+
+    branch = args.branch or f"ignite-{args.task_id}"
+    base = args.base or default_ref(bare_dir)
+    target = WORKTREE_ROOT / f"ignite-{args.task_id}"
+
+    if target.exists():
+        raise SystemExit(f"ERROR: worktree already exists: {target}")
+
+    # Hard safety fence: never let a resolved path escape the scoped worktree root.
+    if not str(target.resolve()).startswith(str(WORKTREE_ROOT.resolve()) + os.sep):
+        raise SystemExit(f"ERROR: refusing to create worktree outside {WORKTREE_ROOT}: {target}")
+
+    cmd = ["git", "-C", str(bare_dir), "worktree", "add", "-b", branch, str(target), base]
+    _log(f"running: {' '.join(cmd)}")
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        _log(proc.stdout)
+        _log(proc.stderr)
+        raise SystemExit(f"ERROR: git worktree add failed (exit {proc.returncode})")
+
+    print(str(target))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

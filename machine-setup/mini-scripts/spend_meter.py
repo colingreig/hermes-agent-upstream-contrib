@@ -19,6 +19,9 @@ Data sources:
      A bad/unreadable line here is still skipped and warned about
      (informational-only signal, not the primary spend figure).
 
+  3. ~/.hermes/logs/opencode/*.jsonl step_finish events:
+      subscription-aware marginal OpenCode spend, grouped by billing route.
+
 Public API:
     per_provider_spend(today_str=None) -> dict[str, float]
         Raises SpendDataUnavailable if state.db could not be read at all.
@@ -49,14 +52,22 @@ from __future__ import annotations
 
 import json
 import os
+import glob
 import sqlite3
 import sys
 from collections import defaultdict
 from datetime import date, datetime
 
+from spend_opencode import (
+    configured_codex_oauth_proxy_metadata,
+    opencode_event_provider_cost,
+    route_metadata_from_event,
+)
+
 HOME = os.path.expanduser("~")
 STATE_DB = os.path.join(HOME, ".hermes", "state.db")
 FALLBACK_RECEIPTS = os.path.join(HOME, ".hermes", "logs", "fallback-receipts.jsonl")
+OC_LOG_DIR = os.path.join(HOME, ".hermes", "logs", "opencode")
 
 DEFAULT_CAP = 10.0
 
@@ -174,6 +185,42 @@ def _fallback_quota_count(today_str: str) -> dict[str, int]:
     return out
 
 
+def _opencode_provider_spend(today_str: str) -> dict[str, float]:
+    """Per-provider marginal spend from OpenCode JSONL logs for today."""
+    out: dict[str, float] = defaultdict(float)
+    try:
+        pattern = os.path.join(OC_LOG_DIR, f"*{today_str}*.jsonl")
+        for log_path in glob.glob(pattern):
+            try:
+                route_metadata = None
+                events = []
+                with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            ev = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        metadata = route_metadata_from_event(ev)
+                        if metadata is not None:
+                            route_metadata = metadata
+                            continue
+                        events.append(ev)
+                if route_metadata is None:
+                    route_metadata = configured_codex_oauth_proxy_metadata()
+                for ev in events:
+                    provider, cost = opencode_event_provider_cost(ev, route_metadata=route_metadata)
+                    if provider:
+                        out[provider] += cost
+            except Exception as e:
+                sys.stderr.write(f"[spend_meter] opencode log read failed for {log_path} (skipping): {e!r}\n")
+    except Exception as e:
+        sys.stderr.write(f"[spend_meter] opencode log glob failed (fail-open): {e!r}\n")
+    return out
+
+
 def per_provider_spend(today_str: str | None = None) -> dict[str, float]:
     """Return {provider_label: usd} for today (sessions only).
 
@@ -185,6 +232,9 @@ def per_provider_spend(today_str: str | None = None) -> dict[str, float]:
     combined: dict[str, float] = defaultdict(float)
     for k, v in _state_db_provider_spend(today_epoch).items():
         # Normalize None / empty keys to "unknown" so the result is JSON-safe.
+        label = k if isinstance(k, str) and k else "unknown"
+        combined[label] += float(v or 0.0)
+    for k, v in _opencode_provider_spend(today_str).items():
         label = k if isinstance(k, str) and k else "unknown"
         combined[label] += float(v or 0.0)
     return dict(combined)

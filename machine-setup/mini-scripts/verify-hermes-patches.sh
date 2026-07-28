@@ -970,7 +970,7 @@ if [ -n "$SKILLS_BRIDGE_ALERT" ]; then
         ylw "alert      FAILED to post ClickUp escalation comment (network/auth) — see console output above for the actual failure"
       fi
     else
-      ylw "alert      CLICKUP_API_TOKEN unavailable (op read failed) — skipping ClickUp escalation, console output above is authoritative"
+      ylw "alert      CLICKUP_API_TOKEN unavailable (SDK resolver failed) — skipping ClickUp escalation, console output above is authoritative"
     fi
   fi
 fi
@@ -1924,48 +1924,146 @@ else
 fi
 
 # --- 29. Writer-chain conformance (Codex-OAuth primary, GLM failover) --------
-# 2026-06-25: The Hermes Codex-OAuth code-writer chain has 4 coupled points
-# that must ALL be healthy for OpenCode to use openai/gpt-5.4 (via the codex
-# proxy) rather than silently degrading to zai-coding/glm-5.2. §18 checks the
-# STRUCTURAL wiring (on hermes update only): binary, script guards, plist file,
-# jsonc substring. §29 adds the LIVE conformance check on every run:
-#   - Doppler HERMES_WRITER_CODEX == "1" (the only durable home for the flag)
+# 2026-06-25, repaired 2026-07-27: The Hermes Codex-OAuth code-writer chain has
+# 4 coupled points that must ALL be healthy for OpenCode to use openai/gpt-5.5
+# (via the codex proxy) rather than silently degrading to zai-coding/glm-5.2.
+# §18 checks the STRUCTURAL wiring (on hermes update only): binary, script
+# guards, plist file, jsonc substring. §29 adds the LIVE conformance check on
+# every run:
+#   - 1Password HERMES_WRITER_CODEX == "1" via the non-interactive SDK resolver
 #   - codex-proxy launchd loaded + port 8646 listening (auto-repair if --apply --restart)
 #   - opencode.jsonc openai.options.baseURL == http://127.0.0.1:8646/v1 (auto-repair)
 #   - OAuth access_token JWT not expired/near-expiry (HARD-REFUSE, no auto-repair)
 #   - WRITER_CASCADE[0] in opencode_exec.py matches writer-chain.json primary
-# Source of truth: ~/.hermes/writer-chain.json (read-only, authored 2026-06-25).
-# Verifier: ~/.hermes/scripts/verify-writer-chain.py (lives outside the repo).
+# Canonical sources live in this repo under machine-setup/mini-scripts/ and are
+# installed/restored into ~/.hermes only when this script is run with --apply.
 hdr "29. Writer-chain conformance (Codex-OAuth writer — flag / proxy / jsonc / OAuth)"
 WC_MANIFEST="$HOME/.hermes/writer-chain.json"
 WC_VERIFIER="$HOME/.hermes/scripts/verify-writer-chain.py"
-HOOK_PY="${HOOK_PY:-python3}"
-# 29a. manifest file exists + parses as JSON
+WC_SDK_RESOLVER="$HOME/.hermes/scripts/op_sdk_resolve.py"
+WC_CANON_MANIFEST="$REPO/machine-setup/mini-scripts/writer-chain.json"
+WC_CANON_VERIFIER="$REPO/machine-setup/mini-scripts/verify-writer-chain.py"
+WC_CANON_SDK_RESOLVER="$REPO/machine-setup/mini-scripts/op_sdk_resolve.py"
+WC_RUNTIME_PY=""
+WC_RUNTIME_PY_CANDIDATES=(
+  "$REPO/venv/bin/python"
+  "$HOME/.hermes/runtime-current/venv/bin/python"
+)
+for candidate_py in "${WC_RUNTIME_PY_CANDIDATES[@]}"; do
+  [ -n "$candidate_py" ] || continue
+  [ -x "$candidate_py" ] || continue
+  if "$candidate_py" -c "import onepassword" >/dev/null 2>&1; then
+    WC_RUNTIME_PY="$candidate_py"
+    break
+  fi
+done
+if [ -z "$WC_RUNTIME_PY" ]; then
+  red "runtime    MISSING SDK-capable Hermes runtime Python for writer-chain verifier; checked $REPO/venv/bin/python and $HOME/.hermes/runtime-current/venv/bin/python; refusing to fall back to plain python3"
+  FAIL=1
+else
+  grn "runtime    writer-chain verifier will use SDK-capable interpreter $WC_RUNTIME_PY"
+fi
+
+# 29a. canonical repo sources exist + parse before touching live files
+if [ ! -f "$WC_CANON_MANIFEST" ]; then
+  red "canonical  MISSING $WC_CANON_MANIFEST — cannot restore writer-chain manifest"; FAIL=1
+elif [ -z "$WC_RUNTIME_PY" ] || ! "$WC_RUNTIME_PY" -c "import json; json.load(open('$WC_CANON_MANIFEST'))" 2>/dev/null; then
+  red "canonical  $WC_CANON_MANIFEST FAILS json.load — repo source corrupt?"; FAIL=1
+else
+  grn "canonical  writer-chain.json present + json-valid"
+fi
+if [ ! -f "$WC_CANON_VERIFIER" ]; then
+  red "canonical  MISSING $WC_CANON_VERIFIER — cannot restore writer-chain verifier"; FAIL=1
+elif [ -z "$WC_RUNTIME_PY" ] || ! "$WC_RUNTIME_PY" -c "import ast; ast.parse(open('$WC_CANON_VERIFIER').read())" 2>/dev/null; then
+  red "canonical  $WC_CANON_VERIFIER fails ast.parse — repo source corrupt?"; FAIL=1
+else
+  grn "canonical  verify-writer-chain.py present + parse-ok"
+fi
+if [ ! -f "$WC_CANON_SDK_RESOLVER" ]; then
+  red "canonical  MISSING $WC_CANON_SDK_RESOLVER — cannot restore SDK resolver required by writer-chain verifier"; FAIL=1
+elif [ -z "$WC_RUNTIME_PY" ] || ! "$WC_RUNTIME_PY" -c "import ast; ast.parse(open('$WC_CANON_SDK_RESOLVER').read())" 2>/dev/null; then
+  red "canonical  $WC_CANON_SDK_RESOLVER fails ast.parse — repo source corrupt?"; FAIL=1
+else
+  grn "canonical  op_sdk_resolve.py present + parse-ok"
+fi
+
+# 29b. live manifest/verifier are restored from canonical only in --apply mode
+if [ -f "$WC_CANON_MANIFEST" ] && [ -f "$WC_CANON_VERIFIER" ] && [ -f "$WC_CANON_SDK_RESOLVER" ]; then
+  if [ ! -f "$WC_MANIFEST" ] || ! cmp -s "$WC_CANON_MANIFEST" "$WC_MANIFEST"; then
+    if [ "$APPLY" -eq 1 ]; then
+      mkdir -p "$(dirname "$WC_MANIFEST")"
+      cp "$WC_CANON_MANIFEST" "$WC_MANIFEST"
+      chmod 0644 "$WC_MANIFEST"
+      CHANGED=1
+      grn "manifest   restored $WC_MANIFEST from canonical repo source"
+    else
+      red "manifest   $WC_MANIFEST missing or drifted from canonical — run with --apply to restore"; FAIL=1
+    fi
+  else
+    grn "manifest   $WC_MANIFEST matches canonical repo source"
+  fi
+
+  if [ ! -f "$WC_VERIFIER" ] || ! cmp -s "$WC_CANON_VERIFIER" "$WC_VERIFIER" || [ ! -x "$WC_VERIFIER" ]; then
+    if [ "$APPLY" -eq 1 ]; then
+      mkdir -p "$(dirname "$WC_VERIFIER")"
+      cp "$WC_CANON_VERIFIER" "$WC_VERIFIER"
+      chmod 0755 "$WC_VERIFIER"
+      CHANGED=1
+      grn "verifier   restored $WC_VERIFIER from canonical repo source"
+    else
+      red "verifier   $WC_VERIFIER missing, non-executable, or drifted from canonical — run with --apply to restore"; FAIL=1
+    fi
+  else
+    grn "verifier   $WC_VERIFIER matches canonical repo source + executable"
+  fi
+
+  if [ ! -f "$WC_SDK_RESOLVER" ] || ! cmp -s "$WC_CANON_SDK_RESOLVER" "$WC_SDK_RESOLVER"; then
+    if [ "$APPLY" -eq 1 ]; then
+      mkdir -p "$(dirname "$WC_SDK_RESOLVER")"
+      cp "$WC_CANON_SDK_RESOLVER" "$WC_SDK_RESOLVER"
+      chmod 0644 "$WC_SDK_RESOLVER"
+      CHANGED=1
+      grn "resolver   restored $WC_SDK_RESOLVER from canonical repo source"
+    else
+      red "resolver   $WC_SDK_RESOLVER missing or drifted from canonical — run with --apply to restore"; FAIL=1
+    fi
+  else
+    grn "resolver   $WC_SDK_RESOLVER matches canonical repo source"
+  fi
+fi
+
+# 29c. live manifest/verifier parse after any apply restore
 if [ ! -f "$WC_MANIFEST" ]; then
   red "manifest   MISSING $WC_MANIFEST — writer-chain source of truth not present"; FAIL=1
-elif ! python3 -c "import json; json.load(open('$WC_MANIFEST'))" 2>/dev/null; then
+elif [ -z "$WC_RUNTIME_PY" ] || ! "$WC_RUNTIME_PY" -c "import json; json.load(open('$WC_MANIFEST'))" 2>/dev/null; then
   red "manifest   $WC_MANIFEST FAILS json.load — file corrupt?"; FAIL=1
 else
   grn "manifest   $WC_MANIFEST present + json-valid"
 fi
-# 29b. verifier script exists + is executable + parses as Python
 if [ ! -f "$WC_VERIFIER" ]; then
   red "verifier   MISSING $WC_VERIFIER — cannot run live conformance checks"; FAIL=1
 elif [ ! -x "$WC_VERIFIER" ]; then
   red "verifier   $WC_VERIFIER not executable (chmod +x needed)"; FAIL=1
-elif ! python3 -c "import ast; ast.parse(open('$WC_VERIFIER').read())" 2>/dev/null; then
+elif [ -z "$WC_RUNTIME_PY" ] || ! "$WC_RUNTIME_PY" -c "import ast; ast.parse(open('$WC_VERIFIER').read())" 2>/dev/null; then
   red "verifier   $WC_VERIFIER fails ast.parse — syntax error?"; FAIL=1
 else
   grn "verifier   $WC_VERIFIER present + executable + parse-ok"
 fi
-# 29c. invoke the verifier, surface its pass/fail
-if [ -f "$WC_VERIFIER" ] && [ -x "$WC_VERIFIER" ] && [ -f "$WC_MANIFEST" ]; then
+if [ ! -f "$WC_SDK_RESOLVER" ]; then
+  red "resolver   MISSING $WC_SDK_RESOLVER — writer-chain verifier cannot resolve 1Password refs safely"; FAIL=1
+elif [ -z "$WC_RUNTIME_PY" ] || ! "$WC_RUNTIME_PY" -c "import ast; ast.parse(open('$WC_SDK_RESOLVER').read())" 2>/dev/null; then
+  red "resolver   $WC_SDK_RESOLVER fails ast.parse — syntax error?"; FAIL=1
+else
+  grn "resolver   $WC_SDK_RESOLVER present + parse-ok"
+fi
+# 29d. invoke the verifier, surface its pass/fail
+if [ -n "$WC_RUNTIME_PY" ] && [ -f "$WC_VERIFIER" ] && [ -x "$WC_VERIFIER" ] && [ -f "$WC_MANIFEST" ] && [ -f "$WC_SDK_RESOLVER" ]; then
   if [ "$APPLY" -eq 1 ] && [ "$RESTART" -eq 1 ]; then
-    wc_out=$(python3 "$WC_VERIFIER" --apply --restart --alert 2>&1); wc_rc=$?
+    wc_out=$("$WC_RUNTIME_PY" "$WC_VERIFIER" --apply --restart --alert 2>&1); wc_rc=$?
   elif [ "$APPLY" -eq 1 ]; then
-    wc_out=$(python3 "$WC_VERIFIER" --apply --alert 2>&1); wc_rc=$?
+    wc_out=$("$WC_RUNTIME_PY" "$WC_VERIFIER" --apply --alert 2>&1); wc_rc=$?
   else
-    wc_out=$(python3 "$WC_VERIFIER" 2>&1); wc_rc=$?
+    wc_out=$("$WC_RUNTIME_PY" "$WC_VERIFIER" 2>&1); wc_rc=$?
   fi
   # Print each verifier output line with an indent for readability
   while IFS= read -r line; do

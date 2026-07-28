@@ -13,6 +13,7 @@ MARKETPLACE="${IGNITE_MARKETPLACE_SYNC_SOURCE:-$MINI_SCRIPTS_DIR/ignite-marketpl
 GATEWAY_WRAPPER="${GATEWAY_WRAPPER_SOURCE:-$MINI_SCRIPTS_DIR/gateway_secrets_wrap.sh}"
 DASHBOARD_WRAPPER="${DASHBOARD_WRAPPER_SOURCE:-$MINI_SCRIPTS_DIR/dashboard_secrets_wrap.sh}"
 GATEWAY_INNER="${GATEWAY_INNER_SOURCE:-$MINI_SCRIPTS_DIR/gateway_launch_inner.sh}"
+VERIFY_PATCHES="${VERIFY_HERMES_PATCHES_SOURCE:-$MINI_SCRIPTS_DIR/verify-hermes-patches.sh}"
 PYTHON="${OP_SDK_RESOLVE_PYTHON:-$REPO_ROOT/.venv/bin/python}"
 if [ ! -x "$PYTHON" ]; then
   PYTHON=python3
@@ -23,6 +24,7 @@ bash -n "$SENTINEL"
 bash -n "$GATEWAY_WRAPPER"
 bash -n "$DASHBOARD_WRAPPER"
 bash -n "$GATEWAY_INNER"
+bash -n "$VERIFY_PATCHES"
 "$PYTHON" - "$SOURCE" "$DEGRADED" <<'PY'
 from pathlib import Path
 import sys
@@ -39,6 +41,12 @@ grep -Fq 'SENTINEL_SMOKE_ONLY' "$SENTINEL"
 grep -Fq 'RUNTIME_PYTHON="$HERMES_HOME/runtime-current/venv/bin/python"' "$GATEWAY_WRAPPER"
 grep -Fq 'RUNTIME_PYTHON="$HERMES_HOME/runtime-current/venv/bin/python"' "$DASHBOARD_WRAPPER"
 grep -Fq 'exec /bin/bash "$INNER"' "$GATEWAY_WRAPPER"
+grep -Fq 'WC_RUNTIME_PY_CANDIDATES=(' "$VERIFY_PATCHES"
+grep -Fq '"$REPO/venv/bin/python"' "$VERIFY_PATCHES"
+grep -Fq '"$HOME/.hermes/runtime-current/venv/bin/python"' "$VERIFY_PATCHES"
+grep -Fq 'import onepassword' "$VERIFY_PATCHES"
+grep -Fq 'refusing to fall back to plain python3' "$VERIFY_PATCHES"
+! grep -Fq 'HOOK_PY="${HOOK_PY:-python3}"' "$VERIFY_PATCHES"
 
 marketplace_result="marketplace=not-bundled"
 if [ -f "$MARKETPLACE" ]; then
