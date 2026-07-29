@@ -17,6 +17,7 @@ on:
 permissions:
   actions: read
   contents: write
+  variables: read
 
 concurrency:
   group: sync-prod-live-patches
