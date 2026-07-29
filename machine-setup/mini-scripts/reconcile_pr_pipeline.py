@@ -37,6 +37,22 @@ CI_HEALTH_CRON_MAX_SECONDS = 300
 SOURCE_COMMIT_RE = re.compile(r"[0-9a-f]{7,64}\Z")
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 REMOTE_HOST_RE = re.compile(r"[A-Za-z0-9_.@:-]+\Z")
+REVIEW_GATE_ROOT_SHIM = Path("review_poll_gate.py")
+REVIEW_GATE_PACKAGE_CLOSURE = (
+    Path("pr_pipeline/__init__.py"),
+    Path("pr_pipeline/autonomous_merge.py"),
+    Path("pr_pipeline/pr_pipeline_event_driven.py"),
+    Path("pr_pipeline/pr_pipeline_improvements.py"),
+    Path("pr_pipeline/review_poll_gate.py"),
+    Path("pr_pipeline/validator_verdict.py"),
+)
+RETIRED_REVIEW_GATE_FLAT_IMPLEMENTATIONS = frozenset(
+    {
+        "pr_pipeline_event_driven.py",
+        "pr_pipeline_improvements.py",
+        "review_poll_gate.py",
+    }
+)
 
 
 class ManifestError(ValueError):
@@ -157,17 +173,27 @@ def resolve_manifest(path: Path = DEFAULT_MANIFEST) -> ResolvedManifest:
     )
     if tuple(sorted(source_root_entrypoints)) != source_root_entrypoints or len(set(source_root_entrypoints)) != len(source_root_entrypoints):
         raise ManifestError("source_root_entrypoints must be unique and sorted")
+    if REVIEW_GATE_ROOT_SHIM.name not in source_root_entrypoints:
+        raise ManifestError("source_root_entrypoints must include the review-poll compatibility shim")
     raw_flat = data.get("legacy_flat_entrypoints")
     if not isinstance(raw_flat, list) or not raw_flat:
         raise ManifestError("legacy_flat_entrypoints must be a non-empty list")
     flat = tuple(_safe_filename(name, field="legacy_flat_entrypoints item") for name in raw_flat)
     if tuple(sorted(flat)) != flat or len(set(flat)) != len(flat):
         raise ManifestError("legacy_flat_entrypoints must be unique and sorted")
+    retired_flat = RETIRED_REVIEW_GATE_FLAT_IMPLEMENTATIONS.intersection(flat)
+    if retired_flat:
+        raise ManifestError(
+            "review-poll implementation modules must be package-only, not legacy flat entrypoints: "
+            + ", ".join(sorted(retired_flat))
+        )
 
     package_glob = data.get("package_glob")
     if package_glob != "*.py":
         raise ManifestError("package_glob must be the fixed '*.py' source set")
     package_destination = _safe_directory(data.get("package_destination"), field="package_destination")
+    if package_destination != "pr_pipeline":
+        raise ManifestError("package_destination must be the canonical 'pr_pipeline' package")
     root_patterns_raw = data.get("managed_root_patterns")
     if not isinstance(root_patterns_raw, list) or not all(isinstance(item, str) and item for item in root_patterns_raw):
         raise ManifestError("managed_root_patterns must be a non-empty string list")
@@ -214,6 +240,18 @@ def resolve_manifest(path: Path = DEFAULT_MANIFEST) -> ResolvedManifest:
         raise ManifestError("pr_pipeline package must contain __init__.py and at least one Python file")
     for source in package_sources:
         add(source, Path(package_destination) / source.name)
+
+    required_review_gate_paths = (REVIEW_GATE_ROOT_SHIM, *REVIEW_GATE_PACKAGE_CLOSURE)
+    missing_review_gate_sources = [
+        relative.as_posix()
+        for relative in required_review_gate_paths
+        if relative not in destination_names
+    ]
+    if missing_review_gate_sources:
+        raise ManifestError(
+            "review-poll runtime closure is incomplete: "
+            + ", ".join(missing_review_gate_sources)
+        )
 
     indexes = {item.destination.as_posix(): index for index, item in enumerate(resolved)}
     unmanaged_patches = sorted(set(expected_local_patches).difference(indexes))
@@ -495,6 +533,16 @@ def verify(
         if actual != expected_hash:
             mismatches[relative] = {"expected": expected_hash, "actual": actual}
 
+    review_gate_errors: list[str] = []
+    for required in (REVIEW_GATE_ROOT_SHIM, *REVIEW_GATE_PACKAGE_CLOSURE):
+        relative = required.as_posix()
+        if relative not in expected_hashes:
+            review_gate_errors.append(f"review-gate-manifest-missing:{relative}")
+        elif relative in missing:
+            review_gate_errors.append(f"review-gate-runtime-missing:{relative}")
+        elif relative in mismatches:
+            review_gate_errors.append(f"review-gate-hash-mismatch:{relative}")
+
     marker, marker_errors = _read_marker(destination / MARKER_NAME)
     recorded_commit: str | None = None
     if marker is not None:
@@ -519,7 +567,14 @@ def verify(
     except ManifestError as exc:
         cron_errors = [f"ci-health-cron-invalid:{exc}"]
     report = {
-        "ok": not missing and not mismatches and not extras and not marker_errors and not cron_errors,
+        "ok": (
+            not missing
+            and not mismatches
+            and not extras
+            and not marker_errors
+            and not cron_errors
+            and not review_gate_errors
+        ),
         "deployment": str(destination),
         "manifest": str(manifest.path),
         "manifest_sha256": manifest.sha256,
@@ -530,6 +585,7 @@ def verify(
         "extra": extras,
         "marker_errors": marker_errors,
         "cron_errors": cron_errors,
+        "review_gate_errors": review_gate_errors,
         "managed_cron": {
             "name": CI_HEALTH_CRON_NAME,
             "max_interval_seconds": CI_HEALTH_CRON_MAX_SECONDS,

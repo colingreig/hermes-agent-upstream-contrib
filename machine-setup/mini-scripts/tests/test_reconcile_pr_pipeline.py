@@ -5,6 +5,7 @@ import importlib.util
 import hashlib
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -178,6 +179,9 @@ class PipelineDeploymentTests(unittest.TestCase):
             self.local_patch_bytes,
         )
         self.assertIn("verify-hermes-patches.sh", report["expected_local_patches"])
+        self.assertTrue((self.destination / "review_poll_gate.py").is_file())
+        self.assertTrue((self.destination / "pr_pipeline" / "__init__.py").is_file())
+        self.assertTrue((self.destination / "pr_pipeline" / "review_poll_gate.py").is_file())
         self.assertTrue((self.destination / "validator_repo_guard.py").is_file())
         self.assertTrue((self.destination / "pr_pipeline" / "validator_repo_guard.py").is_file())
         self.assertTrue((self.destination / ".pr_pipeline_deployment.json").is_file())
@@ -290,6 +294,82 @@ class PipelineDeploymentTests(unittest.TestCase):
         self.assertIn("validator_repo_guard.py", destinations)
         self.assertIn("pr_pipeline/validator_repo_guard.py", destinations)
         self.assertIn("validator_repo_guard.py", self.mod._expected_hashes(manifest))
+
+    def test_manifest_routes_review_gate_through_root_shim_and_package_closure(self):
+        manifest_data = json.loads((PIPELINE / "manifest.json").read_text(encoding="utf-8"))
+        manifest = self._fixture_manifest_for_local_patch(self.local_patch_bytes)
+        destinations = {item.destination.as_posix() for item in manifest.files}
+
+        self.assertIn("review_poll_gate.py", manifest_data["source_root_entrypoints"])
+        self.assertNotIn("review_poll_gate.py", manifest_data["legacy_flat_entrypoints"])
+        self.assertNotIn("pr_pipeline_event_driven.py", manifest_data["legacy_flat_entrypoints"])
+        self.assertNotIn("pr_pipeline_improvements.py", manifest_data["legacy_flat_entrypoints"])
+        self.assertIn("review_poll_gate.py", destinations)
+        for required in self.mod.REVIEW_GATE_PACKAGE_CLOSURE:
+            self.assertIn(required.as_posix(), destinations)
+
+    def test_installed_root_review_gate_runs_from_real_cwd_without_flat_helpers(self):
+        self._install()
+        for helper in (
+            "autonomous_merge.py",
+            "pr_pipeline_event_driven.py",
+            "pr_pipeline_improvements.py",
+            "validator_verdict.py",
+        ):
+            (self.destination / helper).unlink(missing_ok=True)
+
+        isolated_home = Path(self.tmp.name) / "sanitized-home"
+        isolated_home.mkdir()
+        result = subprocess.run(
+            [sys.executable, str(self.destination / "review_poll_gate.py")],
+            cwd=self.destination,
+            env={
+                "HOME": str(isolated_home),
+                "PATH": os.defpath,
+                "LANG": "C.UTF-8",
+                "LC_ALL": "C.UTF-8",
+                "TZ": "UTC",
+            },
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("CLICKUP_API_TOKEN not set", result.stderr)
+        self.assertEqual(json.loads(result.stdout), {"wakeAgent": False})
+
+    def test_verify_reports_review_gate_package_marker_and_transitive_import_missing(self):
+        self._install()
+        (self.destination / "pr_pipeline" / "__init__.py").unlink()
+        (self.destination / "pr_pipeline" / "pr_pipeline_event_driven.py").unlink()
+
+        report = self.mod.verify(self.destination, expected_source_commit=self.source_commit)
+
+        self.assertFalse(report["ok"])
+        self.assertEqual(
+            report["review_gate_errors"],
+            [
+                "review-gate-runtime-missing:pr_pipeline/__init__.py",
+                "review-gate-runtime-missing:pr_pipeline/pr_pipeline_event_driven.py",
+            ],
+        )
+
+    def test_verify_reports_review_gate_shim_hash_mismatch(self):
+        self._install()
+        (self.destination / "review_poll_gate.py").write_text(
+            "raise SystemExit('tampered')\n",
+            encoding="utf-8",
+        )
+
+        report = self.mod.verify(self.destination, expected_source_commit=self.source_commit)
+
+        self.assertFalse(report["ok"])
+        self.assertEqual(
+            report["review_gate_errors"],
+            ["review-gate-hash-mismatch:review_poll_gate.py"],
+        )
 
     def test_installed_merge_surface_loads_as_a_standalone_entrypoint(self):
         self._install()
