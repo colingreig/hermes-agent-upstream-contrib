@@ -5,6 +5,19 @@ the immutable release directory. Most remain manual-copy assets; governed
 exceptions below are installed transactionally by `scripts/mini-release-cut.sh`
 with source/deployed identity checks and rollback snapshots.
 
+**Sibling bundle — `../fleet-config/`.** The manifest-verified,
+sha256-pinned, fail-closed installer pattern established here
+(`self_report_manifest.json` + `install_self_report.py`,
+`spend_manifest.json` + `install_spend.py`) is also used for the
+2026-07-29 rebuild's `fleet-config` bundle at `machine-setup/fleet-config/`,
+which governs three different destinations: a `config.yaml` **overlay**
+(deep-merge, not replace), the five kanban-swarm profiles under
+`~/.hermes/profiles/`, and a curated `~/.hermes/cron/jobs.json`
+(wholesale replace). See `machine-setup/fleet-config/README.md` for that
+bundle's own deploy/rollback instructions — it is a separate installer
+(`install_fleet_config.py`) with its own manifest, not part of this
+directory's manual-copy convention.
+
 The 2026-07-19 mini home-directory data-loss incident (see ClickUp 86e2ddcpb)
 proved that gap real: the `op_sdk_resolve.py` resilience patch (300s cache +
 retry/backoff + serve-stale, added 2026-07-13 after a ~13h 1Password

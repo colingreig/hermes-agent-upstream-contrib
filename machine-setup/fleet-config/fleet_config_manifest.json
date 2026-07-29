@@ -1,0 +1,92 @@
+{
+  "bundle": "fleet-config",
+  "source_task": "kyiv-v1-fleet-rebuild-cutover",
+  "generated": "2026-07-29",
+  "description": "Declarative fleet-config bundle for the 2026-07-29 Hermes mini rebuild cutover: a governed OVERLAY for ~/.hermes/config.yaml (model/fallback/delegation/kanban dispatch only \u2014 every other config section is left untouched by the deep-merge), five kanban-swarm profiles under ~/.hermes/profiles/, and a curated ~/.hermes/cron/jobs.json (16 jobs: 13 carried forward from the pre-freeze live config, 3 new consolidated hygiene/digest jobs). install_fleet_config.py is the sole writer of all three destinations; sha256-pinned against this manifest, fails closed on any source drift or a config.yaml/jobs.json that doesn't parse.",
+  "files": [
+    {
+      "src_rel": "config-overlay.yaml",
+      "dest_abs": "~/.hermes/config.yaml",
+      "sha256": "58d38ecdaee885fc057f69803a48a941f26167d5adc96508fff9081a7e710659",
+      "role": "governed overlay deep-merged into the live config.yaml (model/fallback_providers/delegation/kanban dispatch)",
+      "deploy_mode": "config_overlay"
+    },
+    {
+      "src_rel": "profiles/coder/config.yaml",
+      "dest_abs": "~/.hermes/profiles/coder/config.yaml",
+      "sha256": "1b213d0b8159feaeceea1f0c0895c1eecb4bfa629ef10cfced57906fc8cd7533",
+      "role": "senior engineer profile \u2014 openai-codex/gpt-5.5, works ClickUp code tasks via kanban swarm",
+      "deploy_mode": "profile_file"
+    },
+    {
+      "src_rel": "profiles/coder/SOUL.md",
+      "dest_abs": "~/.hermes/profiles/coder/SOUL.md",
+      "sha256": "af85082efd923fcd3893e96b373abc4a6fbe1f0aaa59751d2568183b7d932125",
+      "role": "coder persona/SOUL",
+      "deploy_mode": "profile_file"
+    },
+    {
+      "src_rel": "profiles/content/config.yaml",
+      "dest_abs": "~/.hermes/profiles/content/config.yaml",
+      "sha256": "da173d2f4f70f870c2af18f54a82ff2b08a6fe29adfd7ce18d0cae9fbb9ddfbe",
+      "role": "content writer profile \u2014 anthropic/claude-sonnet-5, NO fallback (fail-closed, model substitution is a defect)",
+      "deploy_mode": "profile_file"
+    },
+    {
+      "src_rel": "profiles/content/SOUL.md",
+      "dest_abs": "~/.hermes/profiles/content/SOUL.md",
+      "sha256": "6a416dd748cec80797e798f9d89b2b4fd9e6a0a2f5618613c9dfbf2dee652706",
+      "role": "content persona/SOUL",
+      "deploy_mode": "profile_file"
+    },
+    {
+      "src_rel": "profiles/design/config.yaml",
+      "dest_abs": "~/.hermes/profiles/design/config.yaml",
+      "sha256": "65da98d91b542b5355d70473b02461a6cdecc4d6d821436869e6ab78089897fd",
+      "role": "designer profile \u2014 openai-codex/gpt-5.5, drives Open Design headless via the od CLI/daemon",
+      "deploy_mode": "profile_file"
+    },
+    {
+      "src_rel": "profiles/design/SOUL.md",
+      "dest_abs": "~/.hermes/profiles/design/SOUL.md",
+      "sha256": "763f18b198db035d40fe2bee76178b0b75dda01290006d61fcc2e830618a64c1",
+      "role": "design persona/SOUL",
+      "deploy_mode": "profile_file"
+    },
+    {
+      "src_rel": "profiles/research/config.yaml",
+      "dest_abs": "~/.hermes/profiles/research/config.yaml",
+      "sha256": "2c9163b98ac4e00a59cfa1aa089cee5540cd6e34a372bc369991f913498a9c58",
+      "role": "researcher profile \u2014 zai/glm-4.7, grounded findings feeding other profiles",
+      "deploy_mode": "profile_file"
+    },
+    {
+      "src_rel": "profiles/research/SOUL.md",
+      "dest_abs": "~/.hermes/profiles/research/SOUL.md",
+      "sha256": "25c820a407e2e98c29e4764bea8d7a484490e794756b07c38952c67d996ed2ca",
+      "role": "research persona/SOUL",
+      "deploy_mode": "profile_file"
+    },
+    {
+      "src_rel": "profiles/ops/config.yaml",
+      "dest_abs": "~/.hermes/profiles/ops/config.yaml",
+      "sha256": "85f6a01b1c1ff64ecdd7bccdbfdfcfbeadfd7e0a945eb3ded1f03805bf5132f7",
+      "role": "fleet operator profile \u2014 zai/glm-4.7, monitors + lifecycle hygiene + truthful reporting",
+      "deploy_mode": "profile_file"
+    },
+    {
+      "src_rel": "profiles/ops/SOUL.md",
+      "dest_abs": "~/.hermes/profiles/ops/SOUL.md",
+      "sha256": "23249466cfc509fb46fcf9c8fbf684b9950830bd4188868a3a00280373ab64b9",
+      "role": "ops persona/SOUL",
+      "deploy_mode": "profile_file"
+    },
+    {
+      "src_rel": "jobs.json",
+      "dest_abs": "~/.hermes/cron/jobs.json",
+      "sha256": "28bead754c5d09ef4edd95b5b14b9b1187756af218c1306d09fe215d82f9cb4d",
+      "role": "curated 16-job cron set (13 kept + 3 consolidated), wholesale-replaces the live jobs.json",
+      "deploy_mode": "jobs_json"
+    }
+  ]
+}

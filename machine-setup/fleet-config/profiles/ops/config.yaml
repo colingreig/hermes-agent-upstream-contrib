@@ -1,0 +1,4 @@
+# ops profile — model config only.
+model:
+  provider: zai
+  default: glm-4.7
