@@ -478,6 +478,28 @@ class PipelineDeploymentTests(unittest.TestCase):
         self.assertFalse(dead.exists())
         self.assertTrue(live.exists())
 
+    def test_shared_slot_reclaims_only_aged_empty_legacy_lease(self):
+        root, _home, _runner_dir, env = self._runner_test_tree()
+        slots = root / "sem" / "slots"
+        aged = slots / "hermes-topdynamicspartners"
+        fresh = slots / "hermes-jdmbuysell-v4"
+        aged.touch()
+        fresh.touch()
+        os.utime(aged, (1, 1))
+        env["HERMES_RUNNER_TEST_ACTION"] = "reconcile-leases"
+
+        result = subprocess.run(
+            [str(PIPELINE / "hermes-runner-acquire.sh")],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(aged.exists())
+        self.assertTrue(fresh.exists())
+
     def test_empty_restart_cycles_do_not_archive_or_prune_real_job_evidence(self):
         root, _home, runner_dir, env = self._runner_test_tree()
         archives = root / "diagnostics" / "thermal"
