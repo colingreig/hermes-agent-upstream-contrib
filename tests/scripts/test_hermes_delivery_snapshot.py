@@ -4,6 +4,7 @@ import importlib.util
 import json
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -210,3 +211,156 @@ def test_clickup_reads_disable_the_cli_cache(monkeypatch, tmp_path):
     backend.clickup_list("901714465284")
 
     assert calls[0][1]["env"]["CLICKUP_NO_CACHE"] == "1"
+
+
+def test_ledger_evidence_never_falls_back_to_clickup_text(tmp_path):
+    fixture = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    fixture["mini_sqlite"]["ledger"] = [
+        row
+        for row in fixture["mini_sqlite"]["ledger"]
+        if row.get("id") != "repo-execution"
+    ]
+    broken = tmp_path / "missing-ledger.json"
+    broken.write_text(json.dumps(fixture), encoding="utf-8")
+
+    snapshot = producer.build_snapshot(
+        producer.FixtureBackend(broken), _config(), now=NOW
+    )
+    task = next(task for task in snapshot["tasks"] if task["task"]["id"] == "REPO-1")
+
+    assert task["ledger"] == {}
+    assert task["sources"]["mini:ledger-join:REPO-1"]["status"] == "UNKNOWN"
+    assert delivery.correlate(task)["delivery_status"] == "UNKNOWN"
+
+
+def test_detached_and_unadmitted_live_owners_are_visible_to_overlap_alerts():
+    mini = {
+        "admission": [
+            {
+                "task_id": "TASK-A",
+                "job_id": "executor",
+                "owner_run_id": "admitted",
+                "fencing_token": 7,
+                "acquired_at": "2026-07-29T16:00:00Z",
+                "heartbeat_at": "2026-07-29T16:29:00Z",
+                "expires_at": "2026-07-29T17:00:00Z",
+                "ledger_execution_id": "exec-a",
+                "state": "active",
+            }
+        ],
+        "ledger": [
+            {
+                "id": "exec-a",
+                "job_id": "executor",
+                "pid": 100,
+                "owner_token": "cron-a",
+                "status": "running",
+                "claimed_at": "2026-07-29T16:00:00Z",
+                "started_at": "2026-07-29T16:00:01Z",
+                "heartbeat_at": "2026-07-29T16:29:00Z",
+                "lease_expires_at": "2026-07-29T17:00:00Z",
+            },
+            {
+                "id": "exec-b",
+                "job_id": "executor",
+                "pid": 200,
+                "owner_token": "cron-b",
+                "status": "running",
+                "claimed_at": "2026-07-29T16:10:00Z",
+                "started_at": "2026-07-29T16:10:01Z",
+                "heartbeat_at": "2026-07-29T16:29:00Z",
+                "lease_expires_at": "2026-07-29T17:00:00Z",
+            },
+        ],
+        "claims": [{"_path": "/x/legacy.claim", "task_id": "legacy", "pid": 300}],
+        "processes": [
+            {"pid": 100, "command": "gateway"},
+            {"pid": 200, "command": "clickup-queue-poller"},
+            {"pid": 300, "command": "ignite-execute"},
+            {"pid": 400, "command": "opencode_exec detached"},
+        ],
+    }
+
+    owners = producer._owners(mini)
+    assert {owner["owner_kind"] for owner in owners if owner.get("owner_kind")} == {
+        "cron-ledger",
+        "legacy-claim",
+        "detached-process",
+    }
+    watch = _load("watch_for_owner_test", SCRIPTS / "hermes_delivery_watch.py")
+    alerts = watch.evaluate_alerts(
+        {"watch": {"owners": owners}}, [], now=NOW
+    )
+    kinds = {alert["kind"] for alert in alerts}
+    assert "duplicate_ownership" in kinds
+    assert "unfenced_owner" in kinds
+
+
+def test_unconfigured_workflow_path_is_unknown(tmp_path):
+    fixture = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    fixture["github_runs"]["owner/repo#201"]["path"] = ".github/workflows/release.yml"
+    broken = tmp_path / "wrong-workflow.json"
+    broken.write_text(json.dumps(fixture), encoding="utf-8")
+
+    snapshot = producer.build_snapshot(
+        producer.FixtureBackend(broken), _config(), now=NOW
+    )
+    task = next(task for task in snapshot["tasks"] if task["task"]["id"] == "REPO-1")
+    assert task["sources"]["github-run:owner/repo#201"]["status"] == "UNKNOWN"
+    assert delivery.correlate(task)["delivery_status"] == "UNKNOWN"
+
+
+def test_legacy_or_wrong_target_release_cannot_authorize_mini(tmp_path):
+    fixture = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    fixture["mini_json"]["release"]["schema_version"] = 1
+    broken = tmp_path / "legacy-release.json"
+    broken.write_text(json.dumps(fixture), encoding="utf-8")
+
+    snapshot = producer.build_snapshot(
+        producer.FixtureBackend(broken), _config(), now=NOW
+    )
+    task = next(task for task in snapshot["tasks"] if task["task"]["id"] == "MINI-1")
+    assert task["deployment"]["target"] is None
+    assert task["release"]["authority"] is None
+    assert task["sources"]["mini:delivery-join:MINI-1"]["status"] == "UNKNOWN"
+
+
+def test_expired_whole_poll_deadline_stops_before_subprocess(monkeypatch):
+    called = False
+
+    def forbidden(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("subprocess must not start")
+
+    monkeypatch.setattr(producer.subprocess, "run", forbidden)
+    with __import__("pytest").raises(producer.SnapshotError, match="deadline exhausted"):
+        producer.LiveBackend._run(
+            ["/usr/bin/false"],
+            timeout=30,
+            source="deadline-fixture",
+            deadline=time.monotonic() - 1,
+        )
+    assert called is False
+
+
+def test_config_clamps_work_below_launchd_cadence(tmp_path):
+    config = tmp_path / "config.json"
+    config.write_text(
+        json.dumps(
+            {
+                "delivery_snapshot": {
+                    "clickup_list_id": "901714465284",
+                    "max_tasks": 999,
+                    "poll_timeout_seconds": 999,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = producer._load_config(config)
+
+    assert loaded["max_tasks"] == 25
+    assert loaded["poll_timeout_seconds"] == 240
+    assert loaded["poll_timeout_seconds"] < 300

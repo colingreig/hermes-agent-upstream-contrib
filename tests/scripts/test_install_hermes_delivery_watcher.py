@@ -45,6 +45,9 @@ def test_installer_copies_repo_sources_and_pins_a_proven_python(tmp_path):
     assert (installed_dir / "hermes_delivery_snapshot.py").read_bytes() == (
         ROOT / "scripts" / "hermes_delivery_snapshot.py"
     ).read_bytes()
+    assert (installed_dir / "delivery_watch_safety.py").read_bytes() == (
+        ROOT / "scripts" / "delivery_watch_safety.py"
+    ).read_bytes()
     config_path = hermes_home / "config.delivery-watch.yaml"
     config = __import__("json").loads(config_path.read_text(encoding="utf-8"))
     assert config["delivery_snapshot"]["clickup_list_id"] == "901714465284"

@@ -159,6 +159,8 @@ def correlate(snapshot: dict[str, Any], *, generated_at: str | None = None) -> d
     _append_missing(missing, _nonempty(ledger.get("job_id")), "ledger.job_id")
     _append_missing(missing, _nonempty(ledger.get("run_id")), "ledger.run_id")
     _append_missing(missing, _nonempty(ledger.get("fencing_token")), "ledger.fencing_token")
+    _append_missing(missing, _nonempty(ledger.get("owner_token")), "ledger.owner_token")
+    _append_missing(missing, ledger.get("status") == "completed", "ledger.status_completed")
 
     for field in ("job_id", "run_id", "fencing_token"):
         if _nonempty(executor.get(field)) and _nonempty(ledger.get(field)):

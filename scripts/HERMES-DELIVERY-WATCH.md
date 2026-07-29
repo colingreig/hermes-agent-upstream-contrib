@@ -33,6 +33,19 @@ only one atomic local snapshot:
 Each upstream failure is retained as `collection.<source>.status=UNKNOWN`.
 The watcher imports those nested source states, so a successful local file read
 cannot mask a failed ClickUp, GitHub, SSH, ledger, lifecycle, or receipt read.
+The file collector accepts only `hermes_delivery_snapshot/v1` with a parseable
+`generated_at` no more than ten minutes old. Wrong-schema, stale, and
+future-dated snapshots are `UNKNOWN`.
+
+Observed PR checks only discover candidate Actions run IDs. They never
+self-authorize CI: the producer independently reads each workflow run and
+requires its configured workflow path, optional workflow ID, event, exact head
+SHA, terminal status, and conclusion. The default permits only
+`.github/workflows/ci.yml` on `pull_request` or `push`.
+
+The producer clamps a poll to 25 tasks, runs bounded six-way evidence reads,
+and enforces a 240-second whole-poll deadline so one run cannot consume the
+300-second launchd cadence. Deadline exhaustion is persisted as `UNKNOWN`.
 
 ## Configuration
 
@@ -46,7 +59,11 @@ delivery_snapshot:
   clickup_list_id: "901714465284"
   mini_host: mini
   lookback_hours: 72
-  max_tasks: 40
+  max_tasks: 25
+  poll_timeout_seconds: 240
+  governing_ci:
+    - path: ".github/workflows/ci.yml"
+      events: ["pull_request", "push"]
 delivery_watch:
   collectors:
     - name: live-delivery-snapshot

@@ -38,6 +38,8 @@ def _task(task_id: str = "TASK-1", run_id: str = "run-1", sha: str = "sha-1") ->
             "job_id": f"job-{task_id}",
             "run_id": run_id,
             "fencing_token": run_id,
+            "owner_token": f"owner-{run_id}",
+            "status": "completed",
         },
         "repository": "owner/repo",
         "governing_workflows": ["governing-ci"],
@@ -67,6 +69,8 @@ def _task(task_id: str = "TASK-1", run_id: str = "run-1", sha: str = "sha-1") ->
 
 def _snapshot() -> dict:
     return {
+        "schema": "hermes_delivery_snapshot/v1",
+        "generated_at": NOW.isoformat(),
         "collection": {"feed": {"status": "OK"}},
         "tasks": [_task()],
         "watch": {
@@ -240,7 +244,8 @@ def test_collector_payload_propagates_underlying_source_unknown(tmp_path):
     source.write_text(json.dumps(payload), encoding="utf-8")
 
     merged = watch.collect_snapshot(
-        {"collectors": [{"name": "producer", "kind": "file", "path": str(source)}]}
+        {"collectors": [{"name": "producer", "kind": "file", "path": str(source)}]},
+        now=NOW,
     )
 
     assert merged["collection"]["producer"] == {"status": "OK"}
@@ -376,13 +381,67 @@ def test_collectors_are_limited_to_read_only_transports(tmp_path):
     payload = tmp_path / "snapshot.json"
     payload.write_text(json.dumps(_snapshot()), encoding="utf-8")
     collected = watch.collect_snapshot(
-        {"collectors": [{"name": "local", "kind": "file", "path": str(payload)}]}
+        {"collectors": [{"name": "local", "kind": "file", "path": str(payload)}]},
+        now=NOW,
     )
 
     assert collected["collection"]["local"]["status"] == "OK"
     assert len(collected["tasks"]) == 1
 
     unsupported = watch.collect_snapshot(
-        {"collectors": [{"name": "bad", "kind": "command", "argv": ["touch", "/tmp/no"]}]}
+        {"collectors": [{"name": "bad", "kind": "command", "argv": ["touch", "/tmp/no"]}]},
+        now=NOW,
     )
     assert unsupported["collection"]["bad"]["status"] == "UNKNOWN"
+
+
+def test_file_collector_rejects_wrong_schema_and_stale_snapshot(tmp_path):
+    source = tmp_path / "snapshot.json"
+    source.write_text(
+        json.dumps({"schema": "wrong/v1", "generated_at": NOW.isoformat()}),
+        encoding="utf-8",
+    )
+    wrong = watch.collect_snapshot(
+        {"collectors": [{"name": "feed", "kind": "file", "path": str(source)}]},
+        now=NOW,
+    )
+    assert wrong["collection"]["feed"]["status"] == "UNKNOWN"
+    assert "schema" in wrong["collection"]["feed"]["error"]
+
+    source.write_text(
+        json.dumps(
+            {
+                "schema": "hermes_delivery_snapshot/v1",
+                "generated_at": (NOW - timedelta(minutes=11)).isoformat(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    stale = watch.collect_snapshot(
+        {"collectors": [{"name": "feed", "kind": "file", "path": str(source)}]},
+        now=NOW,
+    )
+    assert stale["collection"]["feed"]["status"] == "UNKNOWN"
+    assert "stale" in stale["collection"]["feed"]["error"]
+
+
+def test_persisted_collector_errors_are_credential_redacted(monkeypatch):
+    secret = (
+        "Authorization: Bearer abc123 Cookie: session=topsecret "
+        "https://user:pass@example.com/x?token=querysecret&ok=yes"
+    )
+    monkeypatch.setattr(
+        watch,
+        "_collect_file",
+        lambda _collector: (_ for _ in ()).throw(watch.WatchError(secret)),
+    )
+    collected = watch.collect_snapshot(
+        {"collectors": [{"name": "feed", "kind": "file", "path": "/safe"}]},
+        now=NOW,
+    )
+    error = collected["collection"]["feed"]["error"]
+    assert "abc123" not in error
+    assert "topsecret" not in error
+    assert "user:pass" not in error
+    assert "querysecret" not in error
+    assert "<redacted>" in error

@@ -36,6 +36,8 @@ def _snapshot(*, lane: str = "mini", sha: str = "abc123") -> dict:
             "job_id": "job-1",
             "run_id": "run-1",
             "fencing_token": "17",
+            "owner_token": "cron-owner-1",
+            "status": "completed",
         },
         "repository": "owner/repo",
         "governing_workflows": ["governing-ci"],
@@ -195,3 +197,17 @@ def test_stacked_pr_membership_must_be_unique():
 
     assert result["delivery_status"] == "INCOMPLETE"
     assert "stacked_pull_request_membership_unique" in result["identity_mismatches"]
+
+
+def test_ledger_requires_terminal_status_and_exact_run_fence_identity():
+    snapshot = _snapshot()
+    snapshot["ledger"]["status"] = "running"
+    snapshot["ledger"]["run_id"] = "other-run"
+    snapshot["ledger"]["fencing_token"] = "99"
+
+    result = delivery.correlate(snapshot)
+
+    assert result["delivery_status"] == "INCOMPLETE"
+    assert "ledger.status_completed" in result["missing_evidence"]
+    assert "executor_ledger.run_id" in result["identity_mismatches"]
+    assert "executor_ledger.fencing_token" in result["identity_mismatches"]

@@ -17,9 +17,13 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
+
+from delivery_watch_safety import redact_sensitive
 
 
 SCHEMA = "hermes_delivery_snapshot/v1"
@@ -76,12 +80,7 @@ def _list_of_mappings(value: object) -> list[dict[str, Any]]:
 
 
 def _redact_error(value: str) -> str:
-    text = re.sub(
-        r"(?i)(authorization|token|secret|password)(\s*[:=]\s*)\S+",
-        r"\1\2<redacted>",
-        value,
-    )
-    return text.replace("\n", " ")[:300]
+    return redact_sensitive(value, limit=300)
 
 
 def _decode_json(raw: bytes, source: str) -> Any:
@@ -135,19 +134,62 @@ def _load_config(path: Path) -> dict[str, Any]:
         raise SnapshotError("delivery_snapshot.clickup_list_id must be numeric")
     if SAFE_HOST_RE.fullmatch(host) is None:
         raise SnapshotError("delivery_snapshot.mini_host must be one safe host token")
+    governing_ci = config.get(
+        "governing_ci",
+        [{"path": ".github/workflows/ci.yml", "events": ["pull_request", "push"]}],
+    )
+    if not isinstance(governing_ci, list) or not governing_ci or len(governing_ci) > 10:
+        raise SnapshotError("delivery_snapshot.governing_ci must be a non-empty bounded list")
+    normalized_ci: list[dict[str, Any]] = []
+    for item in governing_ci:
+        if not isinstance(item, dict):
+            raise SnapshotError("each governing_ci entry must be an object")
+        path_value = item.get("path")
+        events = item.get("events")
+        workflow_id = item.get("workflow_id")
+        if (
+            not isinstance(path_value, str)
+            or re.fullmatch(r"\.github/workflows/[A-Za-z0-9_.-]+\.ya?ml", path_value)
+            is None
+        ):
+            raise SnapshotError("governing_ci.path must be a canonical workflow path")
+        if (
+            not isinstance(events, list)
+            or not events
+            or any(event not in {"pull_request", "push"} for event in events)
+        ):
+            raise SnapshotError("governing_ci.events must contain only pull_request/push")
+        if workflow_id not in (None, "") and not str(workflow_id).isdigit():
+            raise SnapshotError("governing_ci.workflow_id must be numeric")
+        normalized_ci.append(
+            {
+                "path": path_value,
+                "events": list(dict.fromkeys(events)),
+                **(
+                    {"workflow_id": str(workflow_id)}
+                    if workflow_id not in (None, "")
+                    else {}
+                ),
+            }
+        )
     return {
         "clickup_list_id": list_id,
         "mini_host": host,
         "lookback_hours": max(24, min(168, int(config.get("lookback_hours", 72)))),
-        "max_tasks": max(1, min(100, int(config.get("max_tasks", 40)))),
+        "max_tasks": max(1, min(25, int(config.get("max_tasks", 25)))),
+        "poll_timeout_seconds": max(
+            30, min(240, int(config.get("poll_timeout_seconds", 240)))
+        ),
+        "governing_ci": normalized_ci,
     }
 
 
 class LiveBackend:
     """Bounded adapters for the three live read-only authorities."""
 
-    def __init__(self, *, mini_host: str):
+    def __init__(self, *, mini_host: str, deadline: float | None = None):
         self.mini_host = mini_host
+        self.deadline = deadline
         self.node = shutil.which("node")
         self.gh = shutil.which("gh")
         self.ssh = shutil.which("ssh")
@@ -165,7 +207,13 @@ class LiveBackend:
         source: str,
         input_bytes: bytes | None = None,
         env: dict[str, str] | None = None,
+        deadline: float | None = None,
     ) -> bytes:
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise SnapshotError(f"{source} skipped: whole-poll deadline exhausted")
+            timeout = max(1, min(timeout, int(remaining)))
         try:
             result = subprocess.run(
                 argv,
@@ -201,6 +249,7 @@ class LiveBackend:
             timeout=45,
             source="clickup-list",
             env={**os.environ, "CLICKUP_NO_CACHE": "1"},
+            deadline=self.deadline,
         )
         return _list_of_mappings(_decode_json(raw, "clickup-list"))
 
@@ -214,6 +263,7 @@ class LiveBackend:
             timeout=30,
             source=f"clickup-comments:{task_id}",
             env={**os.environ, "CLICKUP_NO_CACHE": "1"},
+            deadline=self.deadline,
         )
         return _list_of_mappings(_decode_json(raw, f"clickup-comments:{task_id}"))
 
@@ -235,6 +285,7 @@ class LiveBackend:
             ],
             timeout=30,
             source=f"github-pr:{repository}#{number}",
+            deadline=self.deadline,
         )
         value = _decode_json(raw, f"github-pr:{repository}#{number}")
         if not isinstance(value, dict):
@@ -251,16 +302,12 @@ class LiveBackend:
         raw = self._run(
             [
                 self.gh,
-                "run",
-                "view",
-                str(run_id),
-                "--repo",
-                repository,
-                "--json",
-                "databaseId,headSha,status,conclusion,workflowName,url",
+                "api",
+                f"repos/{repository}/actions/runs/{run_id}",
             ],
             timeout=30,
             source=f"github-run:{repository}#{run_id}",
+            deadline=self.deadline,
         )
         value = _decode_json(raw, f"github-run:{repository}#{run_id}")
         if not isinstance(value, dict):
@@ -290,6 +337,7 @@ class LiveBackend:
             timeout=timeout + 5,
             source=source,
             input_bytes=input_bytes,
+            deadline=self.deadline,
         )
 
     def mini_json(self, name: str) -> dict[str, Any]:
@@ -316,6 +364,76 @@ class LiveBackend:
                 if isinstance(value, dict):
                     records.append(value)
         return records
+
+    def mini_processes(self) -> list[dict[str, Any]]:
+        raw = self._ssh(
+            ["/bin/ps", "-axo", "pid=,lstart=,command="],
+            timeout=20,
+            source="mini:processes",
+        )
+        processes: list[dict[str, Any]] = []
+        pattern = re.compile(
+            r"^\s*(\d+)\s+(.{24})\s+(.+)$"
+        )
+        for line in raw.decode("utf-8", errors="replace").splitlines():
+            match = pattern.match(line)
+            if match:
+                processes.append(
+                    {
+                        "pid": int(match.group(1)),
+                        "started_at": match.group(2).strip(),
+                        "command": match.group(3),
+                    }
+                )
+        return processes
+
+    def mini_runtime(self) -> dict[str, Any]:
+        link = "/Users/colingreig/.hermes/runtime-current"
+        target = self._ssh(
+            ["/bin/readlink", link], timeout=15, source="mini:runtime-target"
+        ).decode("utf-8", errors="strict").strip()
+        head = self._ssh(
+            ["/usr/bin/git", "-C", link, "rev-parse", "HEAD^{commit}"],
+            timeout=20,
+            source="mini:runtime-head",
+        ).decode("utf-8", errors="strict").strip()
+        if not target.startswith("/Users/colingreig/.hermes/releases/"):
+            raise SnapshotError("Mini runtime target is outside the governed releases directory")
+        if SHA_RE.fullmatch(head) is None:
+            raise SnapshotError("Mini runtime head is not a full SHA")
+        return {"target": target, "head_sha": head}
+
+    def mini_claims(self) -> list[dict[str, Any]]:
+        raw = self._ssh(
+            [
+                "/usr/bin/find",
+                "/Users/colingreig/.hermes/state/claims",
+                "-maxdepth",
+                "1",
+                "-type",
+                "f",
+                "-name",
+                r"\*.claim",
+                "-print",
+            ],
+            timeout=20,
+            source="mini:claims-index",
+        )
+        claims: list[dict[str, Any]] = []
+        paths = raw.decode("utf-8", errors="strict").splitlines()[:50]
+        for raw_path in paths:
+            if re.fullmatch(
+                r"/Users/colingreig/\.hermes/state/claims/[A-Za-z0-9_-]+\.claim",
+                raw_path,
+            ) is None:
+                raise SnapshotError("Mini claim index returned an unsafe path")
+            payload = self._ssh(
+                ["cat", "--", raw_path], timeout=10, source="mini:claim"
+            )
+            value = _decode_json(payload, "mini:claim")
+            if isinstance(value, dict):
+                claims.append({"_path": raw_path, **value})
+        return claims
 
     def mini_sqlite(self, name: str) -> list[dict[str, Any]]:
         if name == "admission":
@@ -381,6 +499,18 @@ class FixtureBackend:
 
     def mini_lifecycle(self) -> list[dict[str, Any]]:
         return _list_of_mappings(self.value.get("mini_lifecycle"))
+
+    def mini_processes(self) -> list[dict[str, Any]]:
+        return _list_of_mappings(self.value.get("mini_processes"))
+
+    def mini_runtime(self) -> dict[str, Any]:
+        value = self.value.get("mini_runtime")
+        if not isinstance(value, dict):
+            raise SnapshotError("fixture Mini runtime missing")
+        return value
+
+    def mini_claims(self) -> list[dict[str, Any]]:
+        return _list_of_mappings(self.value.get("mini_claims"))
 
     def mini_sqlite(self, name: str) -> list[dict[str, Any]]:
         value = _mapping(self.value.get("mini_sqlite")).get(name)
@@ -454,11 +584,43 @@ def _field(text: str, names: Iterable[str]) -> str | None:
     return match.group(1).strip("`\"") if match else None
 
 
+def _authorized_run(
+    run: dict[str, Any], governing_ci: list[dict[str, Any]]
+) -> tuple[str, str, str]:
+    path = str(run.get("path") or "")
+    event = str(run.get("event") or "")
+    workflow_id = str(run.get("workflow_id") or run.get("workflowDatabaseId") or "")
+    head_sha = str(run.get("head_sha") or run.get("headSha") or "").lower()
+    if not path or not event or not workflow_id or SHA_RE.fullmatch(head_sha) is None:
+        raise SnapshotError("workflow path/id/event or full head SHA is missing")
+    authority = next(
+        (
+            item
+            for item in governing_ci
+            if item.get("path") == path
+            and event in item.get("events", [])
+            and (
+                item.get("workflow_id") in (None, "")
+                or str(item.get("workflow_id")) == workflow_id
+            )
+        ),
+        None,
+    )
+    if authority is None:
+        raise SnapshotError(
+            f"workflow {path}@{workflow_id}:{event} is not configured governing CI"
+        )
+    return f"{path}@{workflow_id}:{event}", head_sha, str(
+        run.get("id") or run.get("databaseId") or ""
+    )
+
+
 def _github_identity(
     task: dict[str, Any],
     comments: list[dict[str, Any]],
     backend: LiveBackend | FixtureBackend,
     collection: dict[str, Any],
+    governing_ci: list[dict[str, Any]],
 ) -> tuple[str | None, list[dict[str, Any]], list[dict[str, Any]], list[str]]:
     text = _combined_text(task, comments)
     memberships: list[tuple[str, int]] = []
@@ -505,15 +667,14 @@ def _github_identity(
                 run_source = f"github-run:{repo}#{run_id}"
                 try:
                     run = backend.github_run(repo, run_id)
-                    workflow = str(run.get("workflowName") or "").strip()
-                    run_head = str(run.get("headSha") or "").lower()
-                    if not workflow or SHA_RE.fullmatch(run_head) is None:
-                        raise SnapshotError("workflow identity or full head SHA is missing")
+                    workflow, run_head, observed_run_id = _authorized_run(
+                        run, governing_ci
+                    )
                     ci_runs.append(
                         {
                             "repository": repo,
                             "workflow": workflow,
-                            "run_id": str(run.get("databaseId") or run_id),
+                            "run_id": observed_run_id or run_id,
                             "head_sha": run_head,
                             "status": str(run.get("status") or "").lower(),
                             "conclusion": str(run.get("conclusion") or "").lower(),
@@ -577,6 +738,19 @@ def _mini_sources(
     for name in ("admission", "ledger"):
         try:
             result[name] = backend.mini_sqlite(name)
+            collection[f"mini:{name}"] = {"status": "OK"}
+        except SnapshotError as exc:
+            collection[f"mini:{name}"] = {
+                "status": "UNKNOWN",
+                "error": _redact_error(str(exc)),
+            }
+    for name, method in (
+        ("claims", backend.mini_claims),
+        ("processes", backend.mini_processes),
+        ("runtime", backend.mini_runtime),
+    ):
+        try:
+            result[name] = method()
             collection[f"mini:{name}"] = {"status": "OK"}
         except SnapshotError as exc:
             collection[f"mini:{name}"] = {
@@ -687,8 +861,13 @@ def _owners(mini: dict[str, Any]) -> list[dict[str, Any]]:
         str(row.get("id")): row for row in _list_of_mappings(mini.get("ledger"))
     }
     owners: list[dict[str, Any]] = []
+    represented_executions: set[str] = set()
+    represented_pids: set[int] = set()
     for lease in admission:
         ledger = _mapping(ledger_by_id.get(str(lease.get("ledger_execution_id"))))
+        represented_executions.add(str(lease.get("ledger_execution_id")))
+        if isinstance(ledger.get("pid"), int):
+            represented_pids.add(ledger["pid"])
         owners.append(
             {
                 "task_id": lease.get("task_id"),
@@ -700,6 +879,78 @@ def _owners(mini: dict[str, Any]) -> list[dict[str, Any]]:
                 "lease_expires_at": lease.get("expires_at"),
                 "execution_started_at": ledger.get("started_at") or lease.get("acquired_at"),
                 "execution_finished_at": ledger.get("finished_at") or lease.get("finalized_at"),
+            }
+        )
+    for ledger in _list_of_mappings(mini.get("ledger")):
+        if (
+            ledger.get("status") not in {"claimed", "running"}
+            or str(ledger.get("id")) in represented_executions
+        ):
+            continue
+        pid = ledger.get("pid")
+        if isinstance(pid, int):
+            represented_pids.add(pid)
+        owners.append(
+            {
+                "task_id": f"cron:{ledger.get('job_id')}",
+                "job_id": ledger.get("job_id"),
+                "run_id": ledger.get("id"),
+                "fencing_token": ledger.get("owner_token"),
+                "claimed_at": ledger.get("claimed_at"),
+                "heartbeat_at": ledger.get("heartbeat_at"),
+                "lease_expires_at": ledger.get("lease_expires_at"),
+                "execution_started_at": ledger.get("started_at") or ledger.get("claimed_at"),
+                "execution_finished_at": ledger.get("finished_at"),
+                "pid": pid,
+                "owner_kind": "cron-ledger",
+            }
+        )
+    process_by_pid = {
+        row.get("pid"): row for row in _list_of_mappings(mini.get("processes"))
+    }
+    for claim in _list_of_mappings(mini.get("claims")):
+        pid = claim.get("pid") or _mapping(claim.get("owner")).get("pid")
+        if not isinstance(pid, int) or pid not in process_by_pid or pid in represented_pids:
+            continue
+        represented_pids.add(pid)
+        owners.append(
+            {
+                "task_id": claim.get("task_id")
+                or Path(str(claim.get("_path") or "unknown")).stem,
+                "run_id": claim.get("run_id") or f"legacy-pid:{pid}",
+                "fencing_token": claim.get("fencing_token"),
+                "claimed_at": claim.get("claimed_at"),
+                "heartbeat_at": claim.get("heartbeat_at"),
+                "lease_expires_at": claim.get("expires_at"),
+                "execution_started_at": claim.get("started_at") or claim.get("claimed_at"),
+                "execution_finished_at": claim.get("finished_at"),
+                "pid": pid,
+                "owner_kind": "legacy-claim",
+            }
+        )
+    executor_process = re.compile(
+        r"(?i)(ignite-execute|clickup-queue-poller|opencode_exec|executor[_-]admission)"
+    )
+    for process in _list_of_mappings(mini.get("processes")):
+        pid = process.get("pid")
+        if (
+            not isinstance(pid, int)
+            or pid in represented_pids
+            or executor_process.search(str(process.get("command") or "")) is None
+        ):
+            continue
+        owners.append(
+            {
+                "task_id": f"detached-process:{pid}",
+                "run_id": f"pid:{pid}",
+                "fencing_token": None,
+                "claimed_at": process.get("started_at"),
+                "heartbeat_at": None,
+                "lease_expires_at": None,
+                "execution_started_at": process.get("started_at"),
+                "execution_finished_at": None,
+                "pid": pid,
+                "owner_kind": "detached-process",
             }
         )
     return owners
@@ -717,11 +968,12 @@ def _normalize_task(
     backend: LiveBackend | FixtureBackend,
     mini: dict[str, Any],
     collection: dict[str, Any],
+    governing_ci: list[dict[str, Any]],
 ) -> dict[str, Any]:
     task_id = str(raw.get("id") or "")
     text = _combined_text(raw, comments)
     repository, prs, ci_runs, workflows = _github_identity(
-        raw, comments, backend, collection
+        raw, comments, backend, collection, governing_ci
     )
     handoff, validator = _handoff_and_validator(comments)
     lane = _task_lane(text)
@@ -741,18 +993,40 @@ def _normalize_task(
         ),
         {},
     )
+    ledger_join_ok = bool(
+        admission
+        and ledger
+        and str(ledger.get("id")) == str(admission.get("ledger_execution_id"))
+        and str(ledger.get("job_id")) == str(admission.get("job_id"))
+        and ledger.get("owner_token")
+        and ledger.get("status") in {"claimed", "running", "completed", "failed", "interrupted"}
+    )
+    join_source = f"mini:ledger-join:{task_id}"
+    collection[join_source] = (
+        {"status": "OK"}
+        if ledger_join_ok
+        else {
+            "status": "UNKNOWN",
+            "error": "no exact admission-to-ledger execution/job/fence/status match",
+        }
+    )
     executor = {
-        "job_id": admission.get("job_id") or _field(text, ("executor_job_id", "job_id")),
-        "run_id": admission.get("owner_run_id") or _field(text, ("owner_run_id", "run_id")),
-        "fencing_token": admission.get("fencing_token") or _field(text, ("fencing_token",)),
+        "job_id": admission.get("job_id"),
+        "run_id": admission.get("owner_run_id"),
+        "fencing_token": admission.get("fencing_token"),
     }
-    ledger_evidence = {
-        "execution_id": admission.get("ledger_execution_id")
-        or _field(text, ("ledger_execution_id", "execution_id")),
-        "job_id": admission.get("job_id") or _field(text, ("ledger_job_id", "job_id")),
-        "run_id": admission.get("owner_run_id") or _field(text, ("ledger_run_id", "run_id")),
-        "fencing_token": admission.get("fencing_token") or _field(text, ("ledger_fencing_token", "fencing_token")),
-    }
+    ledger_evidence = (
+        {
+            "execution_id": ledger.get("id"),
+            "job_id": ledger.get("job_id"),
+            "run_id": admission.get("owner_run_id"),
+            "fencing_token": admission.get("fencing_token"),
+            "owner_token": ledger.get("owner_token"),
+            "status": ledger.get("status"),
+        }
+        if ledger_join_ok
+        else {}
+    )
     delivery_head = prs[-1]["head_sha"] if prs else _field(text, ("delivery_head_sha", "head_sha"))
     allow_no_pr = bool(re.search(r"(?im)^\s*allow_no_pr\s*:\s*true\s*$", text))
     no_pr_authority = {
@@ -766,16 +1040,15 @@ def _normalize_task(
             source = f"github-run:{repository}#{no_pr_run}"
             try:
                 run = backend.github_run(repository, no_pr_run)
-                workflow = str(run.get("workflowName") or "")
-                head_sha = str(run.get("headSha") or "").lower()
-                if not workflow or SHA_RE.fullmatch(head_sha) is None:
-                    raise SnapshotError("workflow identity or full head SHA is missing")
+                workflow, head_sha, observed_run_id = _authorized_run(
+                    run, governing_ci
+                )
                 workflows.append(workflow)
                 ci_runs.append(
                     {
                         "repository": repository,
                         "workflow": workflow,
-                        "run_id": str(run.get("databaseId") or no_pr_run),
+                        "run_id": observed_run_id or no_pr_run,
                         "head_sha": head_sha,
                         "status": str(run.get("status") or "").lower(),
                         "conclusion": str(run.get("conclusion") or "").lower(),
@@ -795,6 +1068,7 @@ def _normalize_task(
             f"clickup-comments:{task_id}", {"status": "UNKNOWN"}
         ),
     }
+    task_sources[join_source] = collection[join_source]
     for key, status in collection.items():
         if (key.startswith("github:") or key.startswith("github-run:")) and (
             f"github:{task_id}" == key
@@ -828,16 +1102,44 @@ def _normalize_task(
     }
     if lane == "mini":
         release = _mapping(mini.get("release"))
+        deployment = _mapping(mini.get("deployment"))
+        runtime = _mapping(mini.get("runtime"))
         receipt_head = release.get("to_commit")
-        exact = bool(delivery_head and receipt_head == delivery_head)
+        content_receipt = release.get("_content_sha256")
+        promotion_receipt = release.get("promotion_authority_receipt_id")
+        runtime_target = runtime.get("target")
+        exact = bool(
+            delivery_head
+            and release.get("schema_version") == 2
+            and receipt_head == delivery_head
+            and release.get("certified_source_commit") == delivery_head
+            and deployment.get("source_commit") == delivery_head
+            and runtime.get("head_sha") == delivery_head
+            and release.get("runtime_target") == runtime_target
+            and isinstance(content_receipt, str)
+            and re.fullmatch(r"[0-9a-f]{64}", content_receipt)
+            and isinstance(promotion_receipt, str)
+            and re.fullmatch(r"[0-9a-f]{64}", promotion_receipt)
+        )
+        delivery_source = f"mini:delivery-join:{task_id}"
+        collection[delivery_source] = (
+            {"status": "OK"}
+            if exact
+            else {
+                "status": "UNKNOWN",
+                "error": "runtime/deployment/certification/promotion/release receipt identity mismatch",
+            }
+        )
+        normalized["sources"][delivery_source] = collection[delivery_source]
         normalized["deployment"] = {
-            "target": "mini" if exact else None,
+            "target": runtime_target if exact else None,
             "head_sha": receipt_head if exact else None,
         }
         normalized["release"] = {
             "authority": "mini-release-cut" if exact else None,
-            "receipt_id": release.get("_content_sha256") if exact else None,
+            "receipt_id": content_receipt if exact else None,
             "head_sha": receipt_head if exact else None,
+            "promotion_authority_receipt_id": promotion_receipt if exact else None,
         }
     # Retain read-only timestamps for SLA evaluation without treating them as
     # delivery proof.
@@ -856,6 +1158,9 @@ def build_snapshot(
     now: datetime | None = None,
 ) -> dict[str, Any]:
     observed = now or _now()
+    poll_deadline = time.monotonic() + config.get("poll_timeout_seconds", 240)
+    if isinstance(backend, LiveBackend):
+        backend.deadline = poll_deadline
     collection: dict[str, Any] = {}
     try:
         raw_tasks = backend.clickup_list(config["clickup_list_id"])
@@ -870,27 +1175,44 @@ def build_snapshot(
         limit=config["max_tasks"],
     )
     comments_by_task: dict[str, list[dict[str, Any]]] = {}
-    for task in candidates:
+
+    def collect_comments(task: dict[str, Any]) -> tuple[str, list[dict[str, Any]], dict[str, Any]]:
         task_id = str(task.get("id") or "")
-        source = f"clickup-comments:{task_id}"
         try:
-            comments_by_task[task_id] = backend.clickup_comments(task_id)
-            collection[source] = {"status": "OK"}
+            return task_id, backend.clickup_comments(task_id), {"status": "OK"}
         except SnapshotError as exc:
-            comments_by_task[task_id] = []
-            collection[source] = {"status": "UNKNOWN", "error": _redact_error(str(exc))}
+            return task_id, [], {
+                "status": "UNKNOWN",
+                "error": _redact_error(str(exc)),
+            }
+
+    with ThreadPoolExecutor(max_workers=min(6, max(1, len(candidates)))) as pool:
+        for task_id, comments, state in pool.map(collect_comments, candidates):
+            comments_by_task[task_id] = comments
+            collection[f"clickup-comments:{task_id}"] = state
 
     mini = _mini_sources(backend, collection)
-    normalized = [
-        _normalize_task(
+
+    def normalize(task: dict[str, Any]) -> dict[str, Any]:
+        return _normalize_task(
             task,
             comments_by_task.get(str(task.get("id") or ""), []),
             backend,
             mini,
             collection,
+            config.get(
+                "governing_ci",
+                [{"path": ".github/workflows/ci.yml", "events": ["pull_request", "push"]}],
+            ),
         )
-        for task in candidates
-    ]
+
+    with ThreadPoolExecutor(max_workers=min(6, max(1, len(candidates)))) as pool:
+        normalized = list(pool.map(normalize, candidates))
+    if time.monotonic() >= poll_deadline:
+        collection["poll-deadline"] = {
+            "status": "UNKNOWN",
+            "error": "whole-poll deadline exhausted",
+        }
     owners = _owners(mini)
     owner_by_task = {
         str(owner.get("task_id")): owner.get("run_id") for owner in owners

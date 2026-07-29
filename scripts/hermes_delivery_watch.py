@@ -26,9 +26,11 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from task_delivery import CorrelationError, correlate
+from delivery_watch_safety import redact_sensitive
 
 
 SCHEMA = "hermes_delivery_watch/v1"
+SNAPSHOT_SCHEMA = "hermes_delivery_snapshot/v1"
 DEFAULT_INTERVAL_SECONDS = 300
 DEFAULT_STATE_DIR = Path(
     os.path.expanduser(os.environ.get("HERMES_HOME", "~/.hermes"))
@@ -163,6 +165,28 @@ def _decode_payload(raw: bytes, source_name: str) -> dict[str, Any]:
     return value
 
 
+def _validate_snapshot_payload(
+    payload: dict[str, Any],
+    source_name: str,
+    *,
+    now: datetime,
+    max_age_seconds: int,
+) -> dict[str, Any]:
+    if payload.get("schema") != SNAPSHOT_SCHEMA:
+        raise WatchError(
+            f"{source_name} schema must be exactly {SNAPSHOT_SCHEMA}"
+        )
+    generated_at = _parse_time(payload.get("generated_at"))
+    if generated_at is None:
+        raise WatchError(f"{source_name} generated_at is missing or invalid")
+    age = (now - generated_at).total_seconds()
+    if age < -60 or age > max_age_seconds:
+        raise WatchError(
+            f"{source_name} generated_at is stale or future-dated: age_seconds={round(age, 3)}"
+        )
+    return payload
+
+
 def _collect_file(collector: dict[str, Any]) -> dict[str, Any]:
     path = Path(os.path.expanduser(str(collector.get("path", ""))))
     if not path.is_absolute():
@@ -170,7 +194,7 @@ def _collect_file(collector: dict[str, Any]) -> dict[str, Any]:
     try:
         return _decode_payload(path.read_bytes(), f"file:{path}")
     except OSError as exc:
-        raise WatchError(f"cannot read collector file {path}: {exc}") from exc
+        raise WatchError(redact_sensitive(f"cannot read collector file {path}: {exc}")) from exc
 
 
 def _collect_https(collector: dict[str, Any]) -> dict[str, Any]:
@@ -188,7 +212,7 @@ def _collect_https(collector: dict[str, Any]) -> dict[str, Any]:
         with urllib.request.urlopen(request, timeout=int(collector.get("timeout_seconds", 30))) as response:
             return _decode_payload(response.read(), url)
     except (OSError, urllib.error.URLError) as exc:
-        raise WatchError(f"HTTPS GET failed for {url}: {exc}") from exc
+        raise WatchError(redact_sensitive(f"HTTPS GET failed for {url}: {exc}")) from exc
 
 
 def _collect_ssh_cat(collector: dict[str, Any]) -> dict[str, Any]:
@@ -220,7 +244,11 @@ def _collect_ssh_cat(collector: dict[str, Any]) -> dict[str, Any]:
         raise WatchError(f"ssh-json collection failed: {exc}") from exc
     if result.returncode != 0:
         stderr = result.stderr.decode("utf-8", errors="replace").strip()
-        raise WatchError(f"ssh-json collection returned {result.returncode}: {stderr[:200]}")
+        raise WatchError(
+            redact_sensitive(
+                f"ssh-json collection returned {result.returncode}: {stderr}", limit=300
+            )
+        )
     return _decode_payload(result.stdout, f"ssh:{host}:{path}")
 
 
@@ -245,14 +273,21 @@ def _merge_payload(target: dict[str, Any], payload: dict[str, Any]) -> None:
             if state.get("status") != "OK":
                 merged_collection[source_name] = {
                     "status": "UNKNOWN",
-                    **({"error": state.get("error")} if state.get("error") else {}),
+                    **(
+                        {"error": redact_sensitive(state.get("error"))}
+                        if state.get("error")
+                        else {}
+                    ),
                 }
             elif _mapping(merged_collection.get(source_name)).get("status") != "UNKNOWN":
                 merged_collection[source_name] = {"status": "OK"}
 
 
-def collect_snapshot(config: dict[str, Any]) -> dict[str, Any]:
+def collect_snapshot(
+    config: dict[str, Any], *, now: datetime | None = None
+) -> dict[str, Any]:
     """Collect a normalized snapshot using read-only transports only."""
+    observed = now or _now()
     merged: dict[str, Any] = {"tasks": [], "watch": {}, "collection": {}}
     for index, raw_collector in enumerate(config["collectors"]):
         collector = _mapping(raw_collector)
@@ -267,10 +302,21 @@ def collect_snapshot(config: dict[str, Any]) -> dict[str, Any]:
                 payload = _collect_ssh_cat(collector)
             else:
                 raise WatchError(f"unsupported read-only collector kind {kind!r}")
+            payload = _validate_snapshot_payload(
+                payload,
+                name,
+                now=observed,
+                max_age_seconds=max(
+                    60, min(3600, int(collector.get("max_age_seconds", 600)))
+                ),
+            )
             _merge_payload(merged, payload)
             merged["collection"][name] = {"status": "OK"}
         except WatchError as exc:
-            merged["collection"][name] = {"status": "UNKNOWN", "error": str(exc)}
+            merged["collection"][name] = {
+                "status": "UNKNOWN",
+                "error": redact_sensitive(exc),
+            }
     return merged
 
 
@@ -489,7 +535,7 @@ def run_once(
 ) -> dict[str, Any]:
     observed = now or _now()
     observed_at = _iso(observed)
-    evidence = snapshot if snapshot is not None else collect_snapshot(config)
+    evidence = snapshot if snapshot is not None else collect_snapshot(config, now=observed)
     global_unknown = [
         name
         for name, state in _mapping(evidence.get("collection")).items()
@@ -519,7 +565,7 @@ def run_once(
                     "unknown_sources": ["correlator_input"],
                     "missing_evidence": [],
                     "identity_mismatches": [],
-                    "error": str(exc),
+                    "error": redact_sensitive(exc),
                 }
             )
     alerts = evaluate_alerts(evidence, correlations, now=observed)

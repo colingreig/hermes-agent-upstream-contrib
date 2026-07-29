@@ -27,11 +27,13 @@ REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 WATCHER_SOURCE="$SCRIPT_DIR/hermes_delivery_watch.py"
 CORRELATOR_SOURCE="$SCRIPT_DIR/task_delivery.py"
 PRODUCER_SOURCE="$SCRIPT_DIR/hermes_delivery_snapshot.py"
+SAFETY_SOURCE="$SCRIPT_DIR/delivery_watch_safety.py"
 SOURCE_PLIST="$SCRIPT_DIR/launchd/com.colingreig.hermes.delivery-watch.plist"
 TARGET_DIR="$HERMES_HOME/libexec/delivery-watch"
 WATCHER="$TARGET_DIR/hermes_delivery_watch.py"
 CORRELATOR="$TARGET_DIR/task_delivery.py"
 PRODUCER="$TARGET_DIR/hermes_delivery_snapshot.py"
+SAFETY="$TARGET_DIR/delivery_watch_safety.py"
 WATCH_CONFIG="$HERMES_HOME/config.delivery-watch.yaml"
 SNAPSHOT="$HERMES_HOME/state/delivery-input/macbook.json"
 TARGET_PLIST="$HOME/Library/LaunchAgents/com.colingreig.hermes.delivery-watch.plist"
@@ -44,6 +46,8 @@ DOMAIN="gui/$(id -u)"
   || { echo "ERROR: missing or symlinked correlator source: $CORRELATOR_SOURCE" >&2; exit 1; }
 [ -f "$PRODUCER_SOURCE" ] && [ ! -L "$PRODUCER_SOURCE" ] \
   || { echo "ERROR: missing or symlinked producer source: $PRODUCER_SOURCE" >&2; exit 1; }
+[ -f "$SAFETY_SOURCE" ] && [ ! -L "$SAFETY_SOURCE" ] \
+  || { echo "ERROR: missing or symlinked safety source: $SAFETY_SOURCE" >&2; exit 1; }
 [ -f "$SOURCE_PLIST" ] && [ ! -L "$SOURCE_PLIST" ] \
   || { echo "ERROR: missing or symlinked source plist: $SOURCE_PLIST" >&2; exit 1; }
 
@@ -88,6 +92,7 @@ install_source() {
 install_source "$WATCHER_SOURCE" "$WATCHER" 0755
 install_source "$CORRELATOR_SOURCE" "$CORRELATOR" 0644
 install_source "$PRODUCER_SOURCE" "$PRODUCER" 0755
+install_source "$SAFETY_SOURCE" "$SAFETY" 0644
 
 # Prove the exact installed files load under the interpreter written into the
 # LaunchAgent.
@@ -112,8 +117,15 @@ payload = {
     "delivery_snapshot": {
         "clickup_list_id": "901714465284",
         "lookback_hours": 72,
-        "max_tasks": 40,
+        "max_tasks": 25,
         "mini_host": "mini",
+        "poll_timeout_seconds": 240,
+        "governing_ci": [
+            {
+                "path": ".github/workflows/ci.yml",
+                "events": ["pull_request", "push"],
+            }
+        ],
     },
     "delivery_watch": {
         "collectors": [

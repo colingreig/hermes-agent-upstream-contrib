@@ -125,37 +125,52 @@
     "owner/hermes-agent#204": {
       "conclusion": "success",
       "databaseId": 204,
+      "event": "pull_request",
       "headSha": "dddddddddddddddddddddddddddddddddddddddd",
+      "path": ".github/workflows/ci.yml",
       "status": "completed",
-      "workflowName": "governing-ci"
+      "workflowName": "governing-ci",
+      "workflow_id": 9001
     },
     "owner/no-pr#303": {
       "conclusion": "success",
       "databaseId": 303,
+      "event": "push",
       "headSha": "cccccccccccccccccccccccccccccccccccccccc",
+      "path": ".github/workflows/ci.yml",
       "status": "completed",
-      "workflowName": "no-pr-ci"
+      "workflowName": "no-pr-ci",
+      "workflow_id": 9001
     },
     "owner/repo#201": {
       "conclusion": "success",
       "databaseId": 201,
+      "event": "pull_request",
       "headSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "path": ".github/workflows/ci.yml",
       "status": "completed",
-      "workflowName": "governing-ci"
+      "workflowName": "governing-ci",
+      "workflow_id": 9001
     },
     "owner/stack#202": {
       "conclusion": "success",
       "databaseId": 202,
+      "event": "pull_request",
       "headSha": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "path": ".github/workflows/ci.yml",
       "status": "completed",
-      "workflowName": "governing-ci"
+      "workflowName": "governing-ci",
+      "workflow_id": 9001
     },
     "owner/stack#203": {
       "conclusion": "success",
       "databaseId": 203,
+      "event": "pull_request",
       "headSha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "path": ".github/workflows/ci.yml",
       "status": "completed",
-      "workflowName": "governing-ci"
+      "workflowName": "governing-ci",
+      "workflow_id": 9001
     }
   },
   "mini_json": {
@@ -179,6 +194,8 @@
       "_content_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
       "certified_source_commit": "dddddddddddddddddddddddddddddddddddddddd",
       "promotion_authority_receipt_id": "1111111111111111111111111111111111111111111111111111111111111111",
+      "runtime_target": "/Users/colingreig/.hermes/releases/v0.18.2-dddddddddddd",
+      "schema_version": 2,
       "to_commit": "dddddddddddddddddddddddddddddddddddddddd"
     },
     "review_gate": {
@@ -194,8 +211,50 @@
       "timestamp": "2026-07-29T15:50:36Z"
     }
   ],
+  "mini_claims": [],
+  "mini_processes": [],
+  "mini_runtime": {
+    "head_sha": "dddddddddddddddddddddddddddddddddddddddd",
+    "target": "/Users/colingreig/.hermes/releases/v0.18.2-dddddddddddd"
+  },
   "mini_sqlite": {
     "admission": [
+      {
+        "acquired_at": "2026-07-29T14:00:00Z",
+        "expires_at": "2026-07-29T14:30:00Z",
+        "fencing_token": 14,
+        "finalized_at": "2026-07-29T14:20:00Z",
+        "heartbeat_at": "2026-07-29T14:19:30Z",
+        "job_id": "repo-job",
+        "ledger_execution_id": "repo-execution",
+        "owner_run_id": "repo-run",
+        "state": "finalized",
+        "task_id": "REPO-1"
+      },
+      {
+        "acquired_at": "2026-07-29T14:30:00Z",
+        "expires_at": "2026-07-29T15:00:00Z",
+        "fencing_token": 15,
+        "finalized_at": "2026-07-29T14:50:00Z",
+        "heartbeat_at": "2026-07-29T14:49:30Z",
+        "job_id": "stack-job",
+        "ledger_execution_id": "stack-execution",
+        "owner_run_id": "stack-run",
+        "state": "finalized",
+        "task_id": "STACK-1"
+      },
+      {
+        "acquired_at": "2026-07-29T15:00:00Z",
+        "expires_at": "2026-07-29T15:30:00Z",
+        "fencing_token": 16,
+        "finalized_at": "2026-07-29T15:20:00Z",
+        "heartbeat_at": "2026-07-29T15:19:30Z",
+        "job_id": "no-pr-job",
+        "ledger_execution_id": "no-pr-execution",
+        "owner_run_id": "no-pr-run",
+        "state": "finalized",
+        "task_id": "NOPR-1"
+      },
       {
         "acquired_at": "2026-07-29T16:00:00Z",
         "expires_at": "2026-07-29T17:00:00Z",
@@ -204,19 +263,50 @@
         "job_id": "executor-job",
         "ledger_execution_id": "ledger-mini-1",
         "owner_run_id": "mini-run-1",
-        "state": "active",
+        "finalized_at": "2026-07-29T16:25:00Z",
+        "state": "finalized",
         "task_id": "MINI-1"
       }
     ],
     "ledger": [
       {
+        "claimed_at": "2026-07-29T14:00:00Z",
+        "finished_at": "2026-07-29T14:20:00Z",
+        "id": "repo-execution",
+        "job_id": "repo-job",
+        "owner_token": "repo-owner",
+        "status": "completed",
+        "terminal_at": "2026-07-29T14:20:00Z"
+      },
+      {
+        "claimed_at": "2026-07-29T14:30:00Z",
+        "finished_at": "2026-07-29T14:50:00Z",
+        "id": "stack-execution",
+        "job_id": "stack-job",
+        "owner_token": "stack-owner",
+        "status": "completed",
+        "terminal_at": "2026-07-29T14:50:00Z"
+      },
+      {
+        "claimed_at": "2026-07-29T15:00:00Z",
+        "finished_at": "2026-07-29T15:20:00Z",
+        "id": "no-pr-execution",
+        "job_id": "no-pr-job",
+        "owner_token": "no-pr-owner",
+        "status": "completed",
+        "terminal_at": "2026-07-29T15:20:00Z"
+      },
+      {
         "claimed_at": "2026-07-29T16:00:00Z",
         "heartbeat_at": "2026-07-29T16:29:30Z",
         "id": "ledger-mini-1",
         "job_id": "executor-job",
-        "lease_expires_at": "2026-07-29T17:00:00Z",
+        "finished_at": "2026-07-29T16:25:00Z",
+        "lease_expires_at": "2026-07-29T16:25:00Z",
+        "owner_token": "mini-owner",
         "started_at": "2026-07-29T16:00:01Z",
-        "status": "running"
+        "status": "completed",
+        "terminal_at": "2026-07-29T16:25:00Z"
       },
       {
         "claimed_at": "2026-07-29T16:25:00Z",
