@@ -238,7 +238,6 @@ grep -Fq "install --source-root $(dirname "$LAUNCHD_RECONCILER")" \
 cmp -s "$LAUNCHD_RECONCILER" \
   "$HERMES_HOME/scripts/reconcile_launchd_environment.py" \
   || fail "launchd install did not deploy its rollback reconciler"
-
 MISSING_RECONCILER_RELEASE="$RELEASES_DIR/v1.1.1-missing-reconciler"
 mkdir "$MISSING_RECONCILER_RELEASE"
 if install_governed_launchd_environment "$MISSING_RECONCILER_RELEASE"; then
