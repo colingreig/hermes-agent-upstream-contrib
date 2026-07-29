@@ -391,15 +391,37 @@ def test_admission_store_rejects_group_or_world_writable_path(
     assert "group/world-writable" in result["error"]
 
 
+def test_admission_store_accepts_matching_posix_owner(monkeypatch, tmp_path):
+    admission, database = _store(monkeypatch, tmp_path)
+    database.parent.mkdir(parents=True)
+    owner_uid = database.parent.lstat().st_uid
+    monkeypatch.setattr(admission.os, "getuid", lambda: owner_uid, raising=False)
+
+    assert admission.executor_drain_status()["state"] == "idle"
+
+
 def test_admission_store_rejects_non_owner(monkeypatch, tmp_path):
     admission, database = _store(monkeypatch, tmp_path)
-    assert admission.executor_drain_status()["state"] == "idle"
-    real_uid = os.getuid()
-    monkeypatch.setattr(admission.os, "getuid", lambda: real_uid + 1)
+    database.parent.mkdir(parents=True)
+    owner_uid = database.parent.lstat().st_uid
+    monkeypatch.setattr(admission.os, "getuid", lambda: owner_uid + 1, raising=False)
 
     result = admission.executor_drain_status()
     assert result["state"] == "unknown"
     assert "not owned by the current user" in result["error"]
+
+
+def test_admission_store_rejects_unverifiable_owner_without_posix_uid_api(
+    monkeypatch, tmp_path
+):
+    admission, _database = _store(monkeypatch, tmp_path)
+    monkeypatch.delattr(admission.os, "getuid", raising=False)
+
+    result = admission.executor_drain_status()
+    assert result["state"] == "unknown"
+    assert result["safe_to_cutover"] is False
+    assert "ownership cannot be verified" in result["error"]
+    assert "POSIX user identity API is unavailable" in result["error"]
 
 
 def test_drain_status_never_reaps_or_kills(monkeypatch, tmp_path):

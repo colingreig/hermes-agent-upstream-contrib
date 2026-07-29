@@ -70,7 +70,20 @@ def _assert_owned_safe_path(path: Path, *, kind: str) -> None:
         raise ExecutorAdmissionError(f"cannot inspect executor admission {kind}: {exc}") from exc
     if path.is_symlink():
         raise ExecutorAdmissionError(f"executor admission {kind} must not be a symlink: {path}")
-    if stat.st_uid != os.getuid():
+    getuid = getattr(os, "getuid", None)
+    if not callable(getuid):
+        raise ExecutorAdmissionError(
+            "executor admission ownership cannot be verified because the "
+            f"POSIX user identity API is unavailable: {path}"
+        )
+    try:
+        current_uid = getuid()
+    except Exception as exc:
+        raise ExecutorAdmissionError(
+            "executor admission ownership cannot be verified because the "
+            f"current user ID is unavailable: {path}: {exc}"
+        ) from exc
+    if stat.st_uid != current_uid:
         raise ExecutorAdmissionError(
             f"executor admission {kind} is not owned by the current user: {path}"
         )
