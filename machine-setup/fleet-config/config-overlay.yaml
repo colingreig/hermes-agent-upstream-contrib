@@ -1,0 +1,43 @@
+# Governed OVERLAY for ~/.hermes/config.yaml (NOT a full replacement).
+#
+# install_fleet_config.py deep-merges these keys over the live config.
+# Every section not named here — platforms, secrets wiring, security,
+# approvals, credential_pool_strategies, etc. — is left byte-for-byte
+# untouched.
+#
+# Merge rule (see install_fleet_config.py::merge_overlay):
+#   - dict value, non-empty  -> recurse (merge into the existing subtree)
+#   - dict value, EMPTY ({}) -> replace the whole destination key with {}
+#     (this is how `delegation: {}` below means "clear it", not "merge
+#     nothing" — an empty dict overlay is a deliberate reset, never a no-op)
+#   - list / scalar value    -> replace the destination key wholesale
+#     (fallback_providers below REPLACES the live chain; it does not append)
+#
+# NEVER set delegation.base_url together with a named delegation.provider —
+# that combination previously leaked the parent cron's credential to a
+# third-party endpoint (see hermes-delegation-credential-routing-fix in
+# memory). Profile-based kanban routing (profiles/) replaces delegation-based
+# subagent routing, so this bundle always ships delegation cleared.
+#
+# NEVER use provider `openai-api` (billed OpenAI) anywhere in this bundle —
+# `openai-codex` (Codex OAuth, subscription-covered) is the only sanctioned
+# OpenAI surface for fleet work.
+
+model:
+  provider: openai-codex
+  default: gpt-5.5
+
+fallback_providers:
+  - provider: zai
+    model: glm-4.7
+  - provider: google
+    model: gemini-2.5-flash
+
+# Cleared — profile-based kanban routing (profiles/) replaces delegation-based
+# subagent routing. See the merge-rule note above: this empty dict REPLACES
+# whatever delegation block is live, it does not leave it untouched.
+delegation: {}
+
+kanban:
+  dispatch_in_gateway: true
+  dispatch_interval_seconds: 60

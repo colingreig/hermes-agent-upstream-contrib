@@ -1,0 +1,11 @@
+# content profile — Sonnet-only, HARD RULE, no exceptions.
+#
+# fallback_providers is explicitly EMPTY here (not omitted): if
+# anthropic/claude-sonnet-5 is unavailable, the task must FAIL CLOSED, not
+# silently substitute a different model. Model substitution on content is a
+# defect (see content-sonnet-only-no-rampdown in memory). Do not add entries
+# to this list — that would defeat the fail-closed contract.
+model:
+  provider: anthropic
+  default: claude-sonnet-5
+fallback_providers: []
