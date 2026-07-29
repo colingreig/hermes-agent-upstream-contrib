@@ -1,13 +1,17 @@
 """Behavioral tests for the source-controlled Mini PR-pipeline deployer."""
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import hashlib
+import io
 import json
 import os
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -64,16 +68,21 @@ class PipelineDeploymentTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.destination = Path(self.tmp.name) / "scripts"
+        self.runtime_python = Path(sys.executable)
         self.local_patch_bytes = b"test-local verify-hermes-patches.sh\n"
         self.fixture_manifest = self._fixture_manifest_for_local_patch(self.local_patch_bytes)
         self.mod.resolve_manifest = lambda path=self.mod.DEFAULT_MANIFEST: self.fixture_manifest
         self.addCleanup(lambda: setattr(self.mod, "resolve_manifest", self.real_resolve_manifest))
 
-    def _install(self):
+    def _install(self, *, runtime_python=None):
         self.destination.mkdir(parents=True, exist_ok=True)
         (self.destination / "verify-hermes-patches.sh").write_bytes(self.local_patch_bytes)
         self._write_jobs([self._stable_ci_health_job()])
-        return self.mod.install(self.destination, source_commit=self.source_commit)
+        return self.mod.install(
+            self.destination,
+            source_commit=self.source_commit,
+            runtime_python=runtime_python or self.runtime_python,
+        )
 
     def _jobs_path(self):
         return self.destination.parent / "cron" / "jobs.json"
@@ -174,6 +183,18 @@ class PipelineDeploymentTests(unittest.TestCase):
             "review-poll-gate-import-smoke: ok",
         )
         self.assertEqual(report["review_gate_smoke"]["cwd"], "/")
+        self.assertEqual(
+            report["review_gate_smoke"]["runtime_python"],
+            str(self.runtime_python),
+        )
+        self.assertEqual(
+            report["review_gate_smoke"]["runtime_sys_executable"],
+            str(self.runtime_python),
+        )
+        self.assertIsInstance(
+            report["review_gate_smoke"]["runtime_sys_prefix"],
+            str,
+        )
         self.assertFalse(report["missing"])
         self.assertFalse(report["hash_mismatches"])
         self.assertFalse(report["extra"])
@@ -210,9 +231,17 @@ class PipelineDeploymentTests(unittest.TestCase):
         self._write_jobs([self._stable_ci_health_job()])
 
         with self.assertRaisesRegex(self.mod.ManifestError, "full lowercase"):
-            self.mod.install(self.destination, source_commit="a" * 12)
+            self.mod.install(
+                self.destination,
+                source_commit="a" * 12,
+                runtime_python=self.runtime_python,
+            )
 
-        self.mod.install(self.destination, source_commit=self.source_commit)
+        self.mod.install(
+            self.destination,
+            source_commit=self.source_commit,
+            runtime_python=self.runtime_python,
+        )
         report = self.mod.verify(
             self.destination,
             expected_source_commit="b" * 40,
@@ -221,6 +250,76 @@ class PipelineDeploymentTests(unittest.TestCase):
         self.assertIn(
             "deployment-marker-source-commit-mismatch",
             report["marker_errors"],
+        )
+
+    def test_install_requires_explicit_runtime_python_before_writing(self):
+        self.destination.mkdir(parents=True, exist_ok=True)
+        (self.destination / "verify-hermes-patches.sh").write_bytes(self.local_patch_bytes)
+        self._write_jobs([self._stable_ci_health_job()])
+
+        with self.assertRaisesRegex(
+            self.mod.ManifestError,
+            "--runtime-python is required",
+        ):
+            self.mod.install(
+                self.destination,
+                source_commit=self.source_commit,
+                runtime_python=None,
+            )
+
+        self.assertFalse((self.destination / self.mod.MARKER_NAME).exists())
+
+    def test_remote_reconcile_requires_runtime_python_before_staging(self):
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(self.mod, "_remote_run") as remote_run,
+            contextlib.redirect_stderr(stderr),
+        ):
+            result = self.mod.main(
+                [
+                    "reconcile",
+                    "--host",
+                    "mini",
+                    "--source-commit",
+                    self.source_commit,
+                ]
+            )
+
+        self.assertEqual(result, 2)
+        self.assertIn("--runtime-python is required", stderr.getvalue())
+        remote_run.assert_not_called()
+
+    def test_smoke_preserves_supplied_absolute_python_symlink(self):
+        runtime_root = Path(self.tmp.name) / "release" / "venv"
+        subprocess.run(
+            [
+                str(self.runtime_python),
+                "-m",
+                "venv",
+                "--without-pip",
+                str(runtime_root),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        runtime_python = runtime_root / "bin" / "python"
+        self.assertTrue(runtime_python.is_symlink())
+
+        report = self._install(runtime_python=runtime_python)
+
+        smoke = report["review_gate_smoke"]
+        self.assertEqual(smoke["runtime_python"], str(runtime_python))
+        self.assertTrue(smoke["runtime_executable_samefile"])
+        self.assertTrue(
+            os.path.samefile(smoke["runtime_sys_executable"], runtime_python)
+        )
+        self.assertNotEqual(smoke["runtime_python"], str(runtime_python.resolve()))
+        self.assertIsInstance(smoke["runtime_sys_prefix"], str)
+        self.assertIsInstance(smoke["runtime_base_prefix"], str)
+        self.assertEqual(
+            smoke["runtime_is_venv"],
+            smoke["runtime_sys_prefix"] != smoke["runtime_base_prefix"],
         )
 
     def test_smoke_receipt_tampering_fails_verification(self):
@@ -241,6 +340,48 @@ class PipelineDeploymentTests(unittest.TestCase):
             report["marker_errors"],
         )
         self.assertIn("deployment-marker-receipt-invalid", report["marker_errors"])
+
+    def test_root_review_gate_write_failure_uses_shared_safe_boundary(self):
+        self._install()
+        injection = Path(self.tmp.name) / "injection"
+        injection.mkdir()
+        missing_snapshot = Path(self.tmp.name) / "missing-parent" / "snapshot.json"
+        (injection / "sitecustomize.py").write_text(
+            "\n".join(
+                [
+                    "import pr_pipeline.review_poll_gate as gate",
+                    "gate._merge_sweep = lambda: 0",
+                    "gate._revalidation_sweep = lambda: 0",
+                    "gate._human_merge_sweep = lambda: 0",
+                    "gate._orphan_pr_sweep = lambda: 0",
+                    "gate._scan = lambda: []",
+                    f"gate.SNAPSHOT_PATH = {str(missing_snapshot)!r}",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        result = subprocess.run(
+            [str(self.runtime_python), str(self.destination / "review_poll_gate.py")],
+            cwd="/",
+            env={
+                "CLICKUP_API_TOKEN": "fixture-token",
+                "HOME": str(Path(self.tmp.name) / "home"),
+                "PATH": os.defpath,
+                "PYTHONPATH": os.pathsep.join(
+                    [str(self.destination), str(injection)]
+                ),
+                "PYTHONNOUSERSITE": "1",
+            },
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), {"wakeAgent": False})
+        self.assertIn("[review-gate] unexpected: FileNotFoundError", result.stderr)
 
     def test_verify_accepts_correct_managed_ci_health_schedule(self):
         self._install()
@@ -285,7 +426,11 @@ class PipelineDeploymentTests(unittest.TestCase):
             ),
         ])
 
-        report = self.mod.install(self.destination, source_commit=self.source_commit)
+        report = self.mod.install(
+            self.destination,
+            source_commit=self.source_commit,
+            runtime_python=self.runtime_python,
+        )
 
         self.assertTrue(report["ok"])
         document = self._read_jobs_document()
@@ -303,13 +448,88 @@ class PipelineDeploymentTests(unittest.TestCase):
         self.assertIn("next_run_at", jobs[1])
         self.assertEqual(jobs[1]["custom"], "preserved")
 
+    def test_schedule_repair_uses_scheduler_lock_and_preserves_concurrent_update(self):
+        if self.mod.fcntl is None:
+            self.skipTest("POSIX fcntl/flock required")
+        self._write_jobs([self._stable_ci_health_job()])
+        jobs_path = self._jobs_path()
+        lock_path = jobs_path.parent / ".jobs.lock"
+        ready = Path(self.tmp.name) / "holder-ready"
+        release = Path(self.tmp.name) / "holder-release"
+        holder_code = """
+import fcntl, json, sys, time
+from pathlib import Path
+lock_path, jobs_path, ready, release = map(Path, sys.argv[1:])
+with lock_path.open("a+", encoding="utf-8") as handle:
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    document = json.loads(jobs_path.read_text(encoding="utf-8"))
+    document.setdefault("metadata", {})["concurrent_update"] = "preserved"
+    jobs_path.write_text(json.dumps(document), encoding="utf-8")
+    ready.touch()
+    while not release.exists():
+        time.sleep(0.01)
+    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+"""
+        holder = subprocess.Popen(
+            [
+                str(self.runtime_python),
+                "-c",
+                holder_code,
+                str(lock_path),
+                str(jobs_path),
+                str(ready),
+                str(release),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        self.addCleanup(lambda: holder.poll() is None and holder.kill())
+        deadline = time.monotonic() + 5
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertTrue(ready.exists(), "concurrent writer did not acquire jobs lock")
+
+        failures = []
+
+        def repair():
+            try:
+                self.mod._repair_ci_health_schedule(self.destination)
+            except Exception as exc:
+                failures.append(exc)
+
+        repair_thread = threading.Thread(target=repair)
+        repair_thread.start()
+        time.sleep(0.15)
+        self.assertTrue(repair_thread.is_alive(), "repair bypassed held .jobs.lock")
+        release.touch()
+        repair_thread.join(timeout=5)
+        stdout, stderr = holder.communicate(timeout=5)
+
+        self.assertFalse(repair_thread.is_alive())
+        self.assertEqual(holder.returncode, 0, stderr or stdout)
+        self.assertEqual(failures, [])
+        document = self._read_jobs_document()
+        self.assertEqual(
+            document["metadata"]["concurrent_update"],
+            "preserved",
+        )
+        self.assertEqual(
+            document["jobs"][0]["schedule"],
+            self.mod.CI_HEALTH_CRON_SCHEDULE,
+        )
+
     def test_install_fails_closed_when_ci_health_job_is_missing(self):
         self.destination.mkdir(parents=True, exist_ok=True)
         (self.destination / "verify-hermes-patches.sh").write_bytes(self.local_patch_bytes)
         self._write_jobs([{"id": "other", "name": "other"}])
 
         with self.assertRaises(self.mod.ManifestError):
-            self.mod.install(self.destination, source_commit=self.source_commit)
+            self.mod.install(
+                self.destination,
+                source_commit=self.source_commit,
+                runtime_python=self.runtime_python,
+            )
 
     def test_install_fails_closed_when_ci_health_job_is_duplicated(self):
         self.destination.mkdir(parents=True, exist_ok=True)
@@ -317,7 +537,11 @@ class PipelineDeploymentTests(unittest.TestCase):
         self._write_jobs([self._stable_ci_health_job(id="one"), self._stable_ci_health_job(id="two")])
 
         with self.assertRaises(self.mod.ManifestError):
-            self.mod.install(self.destination, source_commit=self.source_commit)
+            self.mod.install(
+                self.destination,
+                source_commit=self.source_commit,
+                runtime_python=self.runtime_python,
+            )
 
     def test_install_reports_wrong_local_patch_without_resyncing_it(self):
         self.destination.mkdir(parents=True, exist_ok=True)
@@ -325,7 +549,11 @@ class PipelineDeploymentTests(unittest.TestCase):
         (self.destination / "verify-hermes-patches.sh").write_bytes(wrong)
         self._write_jobs([self._stable_ci_health_job()])
 
-        report = self.mod.install(self.destination, source_commit=self.source_commit)
+        report = self.mod.install(
+            self.destination,
+            source_commit=self.source_commit,
+            runtime_python=self.runtime_python,
+        )
 
         self.assertFalse(report["ok"])
         self.assertIn("verify-hermes-patches.sh", report["hash_mismatches"])

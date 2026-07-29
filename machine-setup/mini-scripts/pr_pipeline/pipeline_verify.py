@@ -64,6 +64,11 @@ def _managed_root(name: str) -> bool:
     return any(fnmatch.fnmatchcase(name, pattern) for pattern in _MANAGED_ROOT)
 
 
+def _marker_receipt_id(marker: dict[str, Any]) -> str:
+    canonical = json.dumps(marker, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(canonical).hexdigest()
+
+
 def _load_marker(scripts_dir: Path) -> dict[str, Any]:
     marker_path = scripts_dir / MARKER_NAME
     try:
@@ -72,8 +77,8 @@ def _load_marker(scripts_dir: Path) -> dict[str, Any]:
         raise VerificationError(f"cannot read deployment marker: {exc}") from exc
     if not isinstance(marker, dict):
         raise VerificationError("deployment marker must be an object")
-    if marker.get("schema_version") != 1 or marker.get("deployment_mode") != "shadow":
-        raise VerificationError("deployment marker must pin schema 1 and shadow mode")
+    if marker.get("schema_version") != 2 or marker.get("deployment_mode") != "shadow":
+        raise VerificationError("deployment marker must pin schema 2 and shadow mode")
     if not isinstance(marker.get("source_commit"), str) or not _COMMIT.fullmatch(marker["source_commit"]):
         raise VerificationError("deployment marker has no immutable source commit")
     if not isinstance(marker.get("manifest_sha256"), str) or not _SHA.fullmatch(marker["manifest_sha256"]):
@@ -90,6 +95,43 @@ def _load_marker(scripts_dir: Path) -> dict[str, Any]:
     missing_contract = sorted(_REQUIRED_FILES.difference(files))
     if missing_contract:
         raise VerificationError(f"deployment marker omits trust-boundary files: {', '.join(missing_contract)}")
+    marker_without_receipt = dict(marker)
+    receipt_id = marker_without_receipt.pop("reconciliation_receipt_id", None)
+    if (
+        not isinstance(receipt_id, str)
+        or not _SHA.fullmatch(receipt_id)
+        or receipt_id != _marker_receipt_id(marker_without_receipt)
+    ):
+        raise VerificationError("deployment marker reconciliation receipt is invalid")
+    smoke = marker.get("review_gate_smoke")
+    runtime_paths_match = False
+    if isinstance(smoke, dict):
+        try:
+            runtime_paths_match = os.path.samefile(
+                smoke.get("runtime_python", ""),
+                smoke.get("runtime_sys_executable", ""),
+            )
+        except (OSError, TypeError, ValueError):
+            runtime_paths_match = False
+    if (
+        not isinstance(smoke, dict)
+        or smoke.get("ok") is not True
+        or smoke.get("cwd") != "/"
+        or smoke.get("output") != "review-poll-gate-import-smoke: ok"
+        or "HERMES_REVIEW_POLL_GATE_IMPORT_SMOKE"
+        not in (smoke.get("environment_keys") or [])
+        or not isinstance(smoke.get("runtime_python"), str)
+        or not Path(smoke["runtime_python"]).is_absolute()
+        or smoke.get("runtime_executable_samefile") is not True
+        or not runtime_paths_match
+        or not isinstance(smoke.get("runtime_sys_prefix"), str)
+        or not Path(smoke["runtime_sys_prefix"]).is_absolute()
+        or not isinstance(smoke.get("runtime_base_prefix"), str)
+        or not Path(smoke["runtime_base_prefix"]).is_absolute()
+        or smoke.get("runtime_is_venv")
+        != (smoke.get("runtime_sys_prefix") != smoke.get("runtime_base_prefix"))
+    ):
+        raise VerificationError("deployment marker review-gate smoke receipt is invalid")
     return marker
 
 

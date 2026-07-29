@@ -477,8 +477,16 @@ def main():
     state["last_poll"] = _now_iso(); _save(STATE_PATH, state)
     print(json.dumps({"wakeAgent": bool(woke), "pending": len(pending)})); return 0
 
-if __name__ == "__main__":
-    try: sys.exit(main())
+
+def safe_main():
+    """Run the gate without letting an operational failure break cron delivery."""
+    try:
+        return main()
     except Exception as e:
         print(f"[review-gate] unexpected: {e!r}", file=sys.stderr)
-        print(json.dumps({"wakeAgent": False})); sys.exit(0)
+        print(json.dumps({"wakeAgent": False}))
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(safe_main())

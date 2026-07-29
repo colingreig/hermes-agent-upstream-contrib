@@ -11,6 +11,7 @@ calls a PR merge command.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import fnmatch
 import hashlib
 import json
@@ -21,10 +22,16 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - the governed Mini is POSIX
+    fcntl = None
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -34,6 +41,7 @@ CI_HEALTH_CRON_NAME = "ci-health-watch"
 CI_HEALTH_CRON_SCHEDULE = {"kind": "cron", "expr": "*/5 * * * *", "display": "*/5 * * * *"}
 CI_HEALTH_CRON_SCHEDULE_DISPLAY = "*/5 * * * *"
 CI_HEALTH_CRON_MAX_SECONDS = 300
+CRON_JOBS_LOCK_TIMEOUT_SECONDS = 30.0
 SOURCE_COMMIT_RE = re.compile(r"[0-9a-f]{40,64}\Z")
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 REMOTE_HOST_RE = re.compile(r"[A-Za-z0-9_.@:-]+\Z")
@@ -346,6 +354,31 @@ def _cron_jobs_path(destination: Path) -> Path:
     return destination.parent / "cron" / "jobs.json"
 
 
+@contextlib.contextmanager
+def _cron_jobs_lock(jobs_path: Path):
+    """Hold the scheduler's cross-process lock for one jobs.json transaction."""
+    if fcntl is None:
+        raise ManifestError("cron jobs reconciliation requires POSIX fcntl locking")
+    lock_path = jobs_path.parent / ".jobs.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+", encoding="utf-8") as handle:
+        deadline = time.monotonic() + CRON_JOBS_LOCK_TIMEOUT_SECONDS
+        while True:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except (OSError, IOError) as exc:
+                if time.monotonic() >= deadline:
+                    raise ManifestError(
+                        f"timed out waiting for cron jobs lock {lock_path}"
+                    ) from exc
+                time.sleep(0.1)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 def _managed_ci_health_script(destination: Path) -> str:
     return "ci_health_watch.py"
 
@@ -423,23 +456,26 @@ def _next_ci_health_run_at() -> str:
 
 def _repair_ci_health_schedule(destination: Path) -> None:
     jobs_path = _cron_jobs_path(destination)
-    document = _load_cron_jobs_document(jobs_path)
-    jobs = document["jobs"]
-    index = _ci_health_job_index(jobs)
-    repaired = dict(jobs[index])
-    repaired.update({
-        "name": CI_HEALTH_CRON_NAME,
-        "schedule": CI_HEALTH_CRON_SCHEDULE,
-        "script": _managed_ci_health_script(destination),
-        "schedule_display": CI_HEALTH_CRON_SCHEDULE_DISPLAY,
-        "enabled": True,
-        "no_agent": True,
-        "state": "scheduled",
-        "next_run_at": _next_ci_health_run_at(),
-    })
-    jobs[index] = repaired
-    document["jobs"] = jobs
-    _atomic_json(jobs_path, document)
+    with _cron_jobs_lock(jobs_path):
+        # Re-read only after acquiring the same .jobs.lock used by cron.jobs;
+        # an earlier snapshot may have been superseded by a scheduler tick.
+        document = _load_cron_jobs_document(jobs_path)
+        jobs = document["jobs"]
+        index = _ci_health_job_index(jobs)
+        repaired = dict(jobs[index])
+        repaired.update({
+            "name": CI_HEALTH_CRON_NAME,
+            "schedule": CI_HEALTH_CRON_SCHEDULE,
+            "script": _managed_ci_health_script(destination),
+            "schedule_display": CI_HEALTH_CRON_SCHEDULE_DISPLAY,
+            "enabled": True,
+            "no_agent": True,
+            "state": "scheduled",
+            "next_run_at": _next_ci_health_run_at(),
+        })
+        jobs[index] = repaired
+        document["jobs"] = jobs
+        _atomic_json(jobs_path, document)
 
 
 def _validate_source_commit(value: str | None) -> str:
@@ -448,11 +484,78 @@ def _validate_source_commit(value: str | None) -> str:
     return value
 
 
-def _smoke_review_gate(destination: Path, runtime_python: Path) -> dict[str, Any]:
+def _absolute_runtime_python(runtime_python: Path | None) -> Path:
+    if runtime_python is None:
+        raise ManifestError(
+            "--runtime-python is required for install/reconcile and must name "
+            "the exact active release Python"
+        )
+    expanded = runtime_python.expanduser()
+    if not expanded.is_absolute():
+        raise ManifestError("--runtime-python must be an absolute path")
+    # Normalize spelling without dereferencing the venv's Python symlink.
+    absolute = Path(os.path.normpath(os.fspath(expanded)))
+    if not absolute.is_file():
+        raise ManifestError(f"runtime Python is missing: {absolute}")
+    return absolute
+
+
+def _runtime_python_identity(runtime_python: Path, env: dict[str, str]) -> dict[str, Any]:
+    probe = (
+        "import json,sys;"
+        "print(json.dumps({"
+        "'sys_executable':sys.executable,"
+        "'sys_prefix':sys.prefix,"
+        "'base_prefix':sys.base_prefix"
+        "},sort_keys=True))"
+    )
+    result = subprocess.run(
+        [str(runtime_python), "-c", probe],
+        cwd="/",
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    try:
+        identity = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise ManifestError(
+            "runtime Python identity probe returned invalid JSON "
+            f"(exit={result.returncode}, stderr={result.stderr.strip()!r})"
+        ) from exc
+    expected_executable = str(runtime_python)
+    reported_executable = identity.get("sys_executable") if isinstance(identity, dict) else None
+    try:
+        executable_samefile = (
+            isinstance(reported_executable, str)
+            and os.path.samefile(reported_executable, runtime_python)
+        )
+    except OSError:
+        executable_samefile = False
+    if (
+        result.returncode != 0
+        or not isinstance(identity, dict)
+        or not executable_samefile
+        or not isinstance(identity.get("sys_prefix"), str)
+        or not Path(identity["sys_prefix"]).is_absolute()
+        or not isinstance(identity.get("base_prefix"), str)
+        or not Path(identity["base_prefix"]).is_absolute()
+    ):
+        raise ManifestError(
+            "runtime Python identity did not match the supplied executable "
+            f"(expected={expected_executable!r}, identity={identity!r}, "
+            f"exit={result.returncode}, stderr={result.stderr.strip()!r})"
+        )
+    identity["is_venv"] = identity["sys_prefix"] != identity["base_prefix"]
+    identity["executable_samefile"] = True
+    return identity
+
+
+def _smoke_review_gate(destination: Path, runtime_python: Path | None) -> dict[str, Any]:
     """Import the actual deployed root command from `/` with a minimal env."""
-    runtime_python = runtime_python.expanduser().resolve()
-    if not runtime_python.is_file() or runtime_python.is_symlink():
-        raise ManifestError(f"runtime Python is missing or symlinked: {runtime_python}")
+    runtime_python = _absolute_runtime_python(runtime_python)
     entrypoint = destination / REVIEW_GATE_ROOT_SHIM
     env = {
         "HOME": str(destination.parent.parent),
@@ -461,6 +564,7 @@ def _smoke_review_gate(destination: Path, runtime_python: Path) -> dict[str, Any
         "PYTHONNOUSERSITE": "1",
         "HERMES_REVIEW_POLL_GATE_IMPORT_SMOKE": "1",
     }
+    identity = _runtime_python_identity(runtime_python, env)
     result = subprocess.run(
         [str(runtime_python), str(entrypoint)],
         cwd="/",
@@ -479,6 +583,11 @@ def _smoke_review_gate(destination: Path, runtime_python: Path) -> dict[str, Any
     return {
         "ok": True,
         "runtime_python": str(runtime_python),
+        "runtime_sys_executable": identity["sys_executable"],
+        "runtime_executable_samefile": identity["executable_samefile"],
+        "runtime_sys_prefix": identity["sys_prefix"],
+        "runtime_base_prefix": identity["base_prefix"],
+        "runtime_is_venv": identity["is_venv"],
         "entrypoint": str(entrypoint),
         "cwd": "/",
         "environment_keys": sorted(env),
@@ -500,6 +609,7 @@ def install(
 ) -> dict[str, Any]:
     """Atomically write only manifest paths and the deployment marker."""
     source_commit = _validate_source_commit(source_commit)
+    runtime_python = _absolute_runtime_python(runtime_python)
     manifest = resolve_manifest(manifest_path)
     destination = destination.expanduser().resolve()
     destination.mkdir(parents=True, exist_ok=True)
@@ -511,7 +621,7 @@ def install(
         if item.install:
             _atomic_copy(item.source, destination / item.destination, item.mode)
     _repair_ci_health_schedule(destination)
-    smoke = _smoke_review_gate(destination, runtime_python or Path(sys.executable))
+    smoke = _smoke_review_gate(destination, runtime_python)
 
     marker = {
         "schema_version": 2,
@@ -620,6 +730,15 @@ def verify(
         ):
             marker_errors.append("deployment-marker-receipt-invalid")
         smoke = marker.get("review_gate_smoke")
+        runtime_paths_match = False
+        if isinstance(smoke, dict):
+            try:
+                runtime_paths_match = os.path.samefile(
+                    smoke.get("runtime_python", ""),
+                    smoke.get("runtime_sys_executable", ""),
+                )
+            except (OSError, TypeError, ValueError):
+                runtime_paths_match = False
         if not isinstance(smoke, dict) or smoke.get("ok") is not True:
             marker_errors.append("deployment-marker-review-gate-smoke-invalid")
         elif (
@@ -627,6 +746,16 @@ def verify(
             or smoke.get("output") != "review-poll-gate-import-smoke: ok"
             or "HERMES_REVIEW_POLL_GATE_IMPORT_SMOKE"
             not in (smoke.get("environment_keys") or [])
+            or not isinstance(smoke.get("runtime_python"), str)
+            or not Path(smoke["runtime_python"]).is_absolute()
+            or smoke.get("runtime_executable_samefile") is not True
+            or not runtime_paths_match
+            or not isinstance(smoke.get("runtime_sys_prefix"), str)
+            or not Path(smoke["runtime_sys_prefix"]).is_absolute()
+            or not isinstance(smoke.get("runtime_base_prefix"), str)
+            or not Path(smoke["runtime_base_prefix"]).is_absolute()
+            or smoke.get("runtime_is_venv")
+            != (smoke.get("runtime_sys_prefix") != smoke.get("runtime_base_prefix"))
         ):
             marker_errors.append("deployment-marker-review-gate-smoke-contract-drift")
         if recorded_commit is None or not SOURCE_COMMIT_RE.fullmatch(recorded_commit):
@@ -757,6 +886,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Iterable[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
+        if args.action in {"install", "reconcile"}:
+            _absolute_runtime_python(args.runtime_python)
         if args.host:
             return _remote_run(args)
         if args.action in {"install", "reconcile"}:

@@ -95,7 +95,10 @@ Two supporting notes:
 ```bash
 # The guard's canonical source is machine-setup/mini-scripts/pr_pipeline/validator_repo_guard.py.
 # It is manifest-managed — do NOT scp it by hand; deploy the whole boundary:
-python3 machine-setup/mini-scripts/reconcile_pr_pipeline.py install --host mini --source-commit <sha>
+ACTIVE_RELEASE="$(ssh mini 'readlink "$HOME/.hermes/runtime-current"')"
+python3 machine-setup/mini-scripts/reconcile_pr_pipeline.py install \
+  --host mini --source-commit <sha> \
+  --runtime-python "$ACTIVE_RELEASE/venv/bin/python"
 # (installs both ~/.hermes/scripts/validator_repo_guard.py and
 #  ~/.hermes/scripts/pr_pipeline/validator_repo_guard.py — the CLI paths above
 #  are unchanged.)
@@ -116,7 +119,10 @@ with `ci_health_topology.json`, so install or verify through the PR-pipeline
 reconciler rather than copying individual files:
 
 ```bash
-python3 machine-setup/mini-scripts/reconcile_pr_pipeline.py install --host mini --source-commit <sha>
+ACTIVE_RELEASE="$(ssh mini 'readlink "$HOME/.hermes/runtime-current"')"
+python3 machine-setup/mini-scripts/reconcile_pr_pipeline.py install \
+  --host mini --source-commit <sha> \
+  --runtime-python "$ACTIVE_RELEASE/venv/bin/python"
 python3 machine-setup/mini-scripts/reconcile_pr_pipeline.py verify  --host mini --source-commit <sha>
 ```
 
@@ -629,8 +635,10 @@ the recorded source commit. Supply the exact already-approved source commit;
 the tool never derives it from, or mutates, a Mini checkout.
 
 ```bash
+ACTIVE_RELEASE="$(ssh mini 'readlink "$HOME/.hermes/runtime-current"')"
 python3 machine-setup/mini-scripts/reconcile_pr_pipeline.py reconcile \
-  --host mini --source-commit <approved-source-commit>
+  --host mini --source-commit <approved-source-commit> \
+  --runtime-python "$ACTIVE_RELEASE/venv/bin/python"
 
 python3 machine-setup/mini-scripts/reconcile_pr_pipeline.py verify \
   --host mini --source-commit <approved-source-commit>
