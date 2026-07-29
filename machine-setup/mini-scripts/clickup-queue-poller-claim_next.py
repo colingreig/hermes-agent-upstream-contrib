@@ -126,6 +126,32 @@ def _tags(t):
     return [x for x in out if x]
 
 
+def _is_content_lane(task):
+    """True iff the task is tagged lane:content — reserved for the
+    content-lane-executor cron (86e2hw6fc). The general clickup-executor has
+    no lane awareness and must not grab these: a content-dominant task run
+    through the code-lane executor produced nothing after 8 hours."""
+    return "lane:content" in _tags(task)
+
+
+def _lane_arg(argv=None):
+    """Parse --lane {code,content,all} from CLI args. Default 'code' (skip
+    lane:content tasks — the fix for 86e2hw6fc). 'content' restricts to
+    lane:content tasks only (mirrors content-lane-executor's own claim path).
+    'all' disables the filter entirely (backward compat with pre-fix behavior).
+    Any unrecognized value falls back to the safe default 'code'."""
+    argv = sys.argv[1:] if argv is None else argv
+    lane = "code"
+    for i, a in enumerate(argv):
+        if a == "--lane" and i + 1 < len(argv):
+            lane = argv[i + 1]
+        elif a.startswith("--lane="):
+            lane = a.split("=", 1)[1]
+    if lane not in ("code", "content", "all"):
+        lane = "code"
+    return lane
+
+
 def _blocked_operator_ts(tags):
     """Return the embedded unix timestamp if a blocked-operator-<ts> tag is
     present, else None."""
@@ -239,6 +265,25 @@ def main():
     if merged_lifecycle:
         print(f"  [claim_next] {len(merged_lifecycle)} task(s) skipped — merged lifecycle requires writeback: "
               f"{', '.join(merged_lifecycle)}")
+
+    # Lane filter (86e2hw6fc): runs after the existing tag checks above, but
+    # before any claim is attempted below — a content-lane task must never be
+    # locked by this (code-lane) executor in the first place.
+    lane = _lane_arg()
+    if lane != "all":
+        lane_filtered = []
+        for t in claimable:
+            is_content = _is_content_lane(t)
+            if lane == "code" and is_content:
+                tid = t.get("id")
+                name = t.get("name")
+                print(f"  [claim_next] content-lane skip: {tid}({name!r}) — reserved for content-lane-executor")
+                continue
+            if lane == "content" and not is_content:
+                continue
+            lane_filtered.append(t)
+        claimable = lane_filtered
+
     claimable.sort(key=lambda x: (PRI.get(x.get("priority"), 4), _age(x)))
     print("FIRST-CLAIM CANDIDATES:", len(claimable))
     for t in claimable[:5]:
