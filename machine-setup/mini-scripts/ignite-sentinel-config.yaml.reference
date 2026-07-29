@@ -1,0 +1,123 @@
+# REFERENCE MIRROR — not loaded by sentinel at runtime.
+# This is a git-trackable durability copy of the LIVE routing config at
+# ~/.hermes/repos/ignite-sentinel/config.yaml (gitignored there, zero git
+# history — that is what let it get silently lost in the 2026-07-19 mini
+# wipe and fall back to config.example.yaml undetected for 5 days).
+# ~/.hermes/scripts/ is covered by offbox_restic_backup.py, and the live
+# path itself was separately added to BACKUP_TARGETS on 2026-07-25 — this
+# file is belt-and-suspenders, kept in sync manually when config.yaml changes.
+# If this drifts from the live file, the live file at
+# ~/.hermes/repos/ignite-sentinel/config.yaml is authoritative.
+#
+# ignite-sentinel routing config. Non-secret (list ids, assignees, repo slugs)
+# — committed. Copy to config.yaml and fill in real per-site values. Tokens come
+# from the gateway process env (sourced from 1Password at boot via op-secrets.env):
+# SENTRY_AUTH_TOKEN, SENTRY_WRITE_TOKEN, CLICKUP_API_TOKEN, and the LLM key
+# SENTINEL_LLM_API_KEY. Inside the Hermes agent sandbox the LLM key MUST be
+# SENTINEL_LLM_API_KEY (provider keys like ANTHROPIC_API_KEY are scrubbed there).
+#
+# THIS IS THE LIVE ROUTING CONFIG (gitignored — see .gitignore comment below).
+# Restored 2026-07-25 after the 2026-07-19 mini wipe silently fell back to
+# config.example.yaml for 5 days (214 REPLACE_ME ClickUp errors + 3 projects
+# — ignite-workbench, jdmbuysell-scrapers, thermal — completely unmonitored
+# per drift.unmapped_projects). A durable reference copy lives at
+# ~/.hermes/scripts/ignite-sentinel-config.yaml.reference (restic-covered);
+# ~/.hermes/repos/ignite-sentinel/config.yaml itself was also added to
+# offbox_restic_backup.py's BACKUP_TARGETS the same day so this file survives
+# a rebuild directly, not just via the reference copy.
+
+org: ignite-marketing
+
+# Trailing window re-filtered client-side against issue lastSeen. Keep aligned
+# with the cron interval so one missed run is recoverable on the next tick.
+lookback_minutes: 60
+
+# State-based catch-up ceiling: if the gap since the last FULLY SUCCESSFUL run
+# exceeds lookback_minutes (a missed cron tick, an outage), the effective
+# lookback widens to cover that gap (plus a small overlap buffer) instead of
+# silently dropping one-shot/low-count issues whose lastSeen falls in the
+# missed window — but it never widens past this many minutes even for a very
+# long outage. 4320 = 3 days.
+max_backfill_minutes: 4320
+
+max_issues_per_run: 30
+
+self_heal:
+  # Lane B (agent-ready) caps — backpressure so a noisy deploy can't flood the
+  # single daily executor (~68% of high-risk PRs BLOCK at the validator).
+  per_project_budget: 3      # max new self-heal tasks per project per run
+  org_budget: 10             # max new self-heal tasks org-wide per run
+  in_flight_cap: 15          # skip Lane B while this many agent-filed tasks are open
+  # Set true (or env SENTINEL_SELF_HEAL=off) for triage-notify-only burn-in
+  # before arming self-heal.
+  disabled: false
+
+suppress:
+  # Lane C auto-suppresses verdict-confirmed expected/transient issues only
+  # while they are still small. Burn-in is currently armed by config disabled=true;
+  # SENTINEL_SUPPRESS=off is also supported as an immediate env kill switch.
+  max_events: 50
+  max_users: 10
+  disabled: true
+  # A suppressed issue surfaces again once it grows this far beyond the
+  # suppression baseline recorded in state.sqlite.
+  re_review_events: 500
+  re_review_users: 25
+
+# Sentry projects that exist in the org but are DELIBERATELY left unmonitored.
+# The daily project-drift check flags any org project missing from `projects`
+# below as "completely unmonitored" and emails a Lane-A digest every UTC day.
+# List a slug here once you've reviewed it and decided it's intentionally out of
+# scope (operational health beacons, crawler ops, low-signal internal tools) —
+# that acknowledgement suppresses the recurring drift alert. A slug here is
+# NEVER acted on; it only silences the nag. A brand-new project still surfaces
+# because it's in neither map. A slug may not appear in both lists.
+ignore_projects:
+  # - ignite-workbench       # ETL data-freshness beacons, not app bugs
+  # - jdmbuysell-scrapers    # Scrapy crawler ops (mostly fatal — barred from Lane B)
+
+# project slug → routing. ONLY projects listed here are acted on (default-deny
+# on unmapped projects). `repo` MUST be the canonical owner/repo on
+# ~/.hermes/allowed-repos.txt for Lane B to engage.
+projects:
+  jdmbuysell-v4-web:
+    repo: colingreig/jdmbuysell-v4
+    clickup_list_id: "901714054795"   # "jdm.com Sentry Triage"
+    assignee: "168143285"             # Colin Greig
+    environment: production
+
+  elevatoruptime:
+    repo: colingreig/elevatoruptime.com
+    clickup_list_id: "901714666506"   # "elevatoruptime.com Sentry Triage"
+    environment: production
+
+  topdynamicspartnerscom:
+    repo: colingreig/topdynamicspartners
+    clickup_list_id: "901714666507"   # "topdynamicspartners.com Sentry Triage"
+    environment: production
+
+  # 2026-07-25 restore (86e25xww8 lineage): these three were never wired at
+  # all under the fallback config.example.yaml — not even with REPLACE_ME —
+  # so they filed zero ClickUp errors but were fully unmonitored per
+  # drift.unmapped_projects. Slugs confirmed against ignite-sentinel.log
+  # drift entries (org_project_count: 6, unmapped_projects: [ignite-workbench,
+  # jdmbuysell-scrapers, thermal]) and cross-checked against Sentry short-id
+  # prefixes on existing ClickUp task names.
+  # repo confirmed canonical (colingreig/jdmbuysell-scrapers) via its own
+  # bare-mirror remote on this box, but it is NOT on
+  # ~/.hermes/allowed-repos.txt — Lane B self-heal will NOT engage until it's
+  # added there. Lane A triage-notify works today regardless. NEEDS COLIN.
+  jdmbuysell-scrapers:
+    repo: colingreig/jdmbuysell-scrapers
+    clickup_list_id: "901715328776"   # "jdm.com Scraper Sentry Triage"
+    environment: production
+
+  ignite-workbench:
+    repo: colingreig/ignite-workbench
+    clickup_list_id: "901715328778"   # "Ignite Workbench Sentry Triage"
+    environment: production
+
+  thermal:
+    repo: colingreig/thermal
+    clickup_list_id: "901715328775"   # "trythermal.com Sentry Triage"
+    environment: production
