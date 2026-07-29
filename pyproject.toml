@@ -414,10 +414,7 @@ select = ["PLW1514"]
 "skills/**" = ["PLW1514"]
 "optional-skills/**" = ["PLW1514"]
 "plugins/**" = ["PLW1514"]
-# Vendored canon bytes for the hermes-self-report deploy bundle: these two
-# files must stay byte-identical to the mini's live copies (their sha256 is
-# pinned in self_report_manifest.json and re-verified by
-# install_self_report.py before every install). Fix encoding drift upstream
-# on the mini and re-vendor instead of editing these in place.
-"machine-setup/mini-scripts/hermes_report_build_v1lib.py" = ["PLW1514"]
-"machine-setup/mini-scripts/hermes_report_build_v2.py" = ["PLW1514"]
+# Vendored live Mini operational snapshots must remain byte-identical to the
+# running Mini copies; fix encoding drift upstream and re-vendor instead of
+# rewriting these files in place.
+"machine-setup/mini-scripts/**/*.py" = ["PLW1514"]
