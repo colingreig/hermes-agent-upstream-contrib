@@ -13,6 +13,8 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
+import json
+import os
 import sqlite3
 import threading
 import uuid
@@ -61,11 +63,43 @@ def _iso(value: datetime) -> str:
     return value.isoformat()
 
 
+def _assert_owned_safe_path(path: Path, *, kind: str) -> None:
+    try:
+        stat = path.lstat()
+    except OSError as exc:
+        raise ExecutorAdmissionError(f"cannot inspect executor admission {kind}: {exc}") from exc
+    if path.is_symlink():
+        raise ExecutorAdmissionError(f"executor admission {kind} must not be a symlink: {path}")
+    if stat.st_uid != os.getuid():
+        raise ExecutorAdmissionError(
+            f"executor admission {kind} is not owned by the current user: {path}"
+        )
+    if stat.st_mode & 0o022:
+        raise ExecutorAdmissionError(
+            f"executor admission {kind} is group/world-writable: {path}"
+        )
+
+
 def _connect() -> sqlite3.Connection:
     path = _database_path()
+    conn: sqlite3.Connection | None = None
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
+        parent_existed = path.parent.exists()
+        path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+        if not parent_existed:
+            os.chmod(path.parent, 0o700)
+        _assert_owned_safe_path(path.parent, kind="directory")
+        existed = path.exists() or path.is_symlink()
+        if existed:
+            _assert_owned_safe_path(path, kind="database")
         conn = sqlite3.connect(path, timeout=0, isolation_level=None)
+        if not existed:
+            if path.is_symlink():
+                raise ExecutorAdmissionError(
+                    f"executor admission database became a symlink: {path}"
+                )
+            os.chmod(path, 0o600)
+        _assert_owned_safe_path(path, kind="database")
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA busy_timeout=0")
         conn.execute("PRAGMA synchronous=FULL")
@@ -100,11 +134,30 @@ def _connect() -> sqlite3.Connection:
                     reason TEXT NOT NULL,
                     requested_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS recovery_receipts (
+                    receipt_id TEXT PRIMARY KEY,
+                    task_id TEXT NOT NULL,
+                    job_id TEXT NOT NULL,
+                    owner_run_id TEXT NOT NULL,
+                    fencing_token INTEGER NOT NULL,
+                    ledger_execution_id TEXT NOT NULL,
+                    reviewed_by TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    recovered_at TEXT NOT NULL,
+                    proof_json TEXT NOT NULL
+                );
                 PRAGMA user_version = 1;
                 """
             )
         return conn
+    except ExecutorAdmissionError:
+        if conn is not None:
+            conn.close()
+        raise
     except (OSError, sqlite3.Error) as exc:
+        if conn is not None:
+            conn.close()
         raise ExecutorAdmissionError(
             f"executor admission database unavailable: {exc}"
         ) from exc
@@ -401,6 +454,150 @@ def release_executor_lease(lease: ExecutorLease) -> None:
         except sqlite3.Error:
             pass
         raise ExecutorAdmissionError(f"executor lease release failed: {exc}") from exc
+    finally:
+        conn.close()
+
+
+def _reviewed_dead_owner_proof(lease: sqlite3.Row) -> dict[str, Any]:
+    """Return exact durable-ledger proof that this lease's owner is dead."""
+    try:
+        from cron.executions import classify_stale_executions
+
+        manifest = classify_stale_executions()
+    except Exception as exc:
+        raise ExecutorAdmissionError(
+            f"cannot classify executor ledger owner: {exc}"
+        ) from exc
+    matches = [
+        entry
+        for entry in manifest.get("entries", [])
+        if entry.get("execution_id") == lease["ledger_execution_id"]
+        and str(entry.get("job_id")) == str(lease["job_id"])
+    ]
+    if len(matches) != 1:
+        raise ExecutorAdmissionError(
+            "expired executor lease lacks one exact ledger owner proof"
+        )
+    proof = matches[0]
+    if (
+        proof.get("disposition") != "stale"
+        or proof.get("owner_liveness") != "dead"
+        or proof.get("proposed_terminal_status") != "interrupted"
+    ):
+        raise ExecutorAdmissionError(
+            "expired executor lease owner is not proven dead by PID/start-time evidence"
+        )
+    return proof
+
+
+def recover_expired_executor_lease(
+    *,
+    owner_run_id: str,
+    fencing_token: int,
+    ledger_execution_id: str,
+    reviewed_by: str,
+    reason: str,
+) -> dict[str, Any]:
+    """Finalize one expired owner only with exact CAS and reviewed death proof.
+
+    Expiry alone is never sufficient. The execution ledger must independently
+    prove the recorded PID/start-time identity dead, and the caller must bind
+    the reviewed action to the exact owner, token, and ledger execution.
+    """
+    reviewer = str(reviewed_by or "").strip()
+    rationale = str(reason or "").strip()
+    if not reviewer or not rationale:
+        raise ExecutorAdmissionError("reviewed_by and reason are required")
+    now_iso = _iso(_now())
+    conn = _connect()
+    try:
+        current = conn.execute(
+            "SELECT * FROM executor_lease WHERE singleton=1"
+        ).fetchone()
+        if (
+            current is None
+            or current["state"] != "active"
+            or current["expires_at"] >= now_iso
+            or current["owner_run_id"] != owner_run_id
+            or int(current["fencing_token"]) != int(fencing_token)
+            or current["ledger_execution_id"] != ledger_execution_id
+        ):
+            raise ExecutorAdmissionError(
+                "expired executor recovery rejected by exact fencing CAS"
+            )
+        proof = _reviewed_dead_owner_proof(current)
+        receipt_body = {
+            "task_id": current["task_id"],
+            "job_id": current["job_id"],
+            "owner_run_id": owner_run_id,
+            "fencing_token": int(fencing_token),
+            "ledger_execution_id": ledger_execution_id,
+            "reviewed_by": reviewer,
+            "reason": rationale,
+            "recovered_at": now_iso,
+            "proof": proof,
+        }
+        receipt_id = uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            json.dumps(receipt_body, sort_keys=True, separators=(",", ":")),
+        ).hex
+        conn.execute("BEGIN IMMEDIATE")
+        cur = conn.execute(
+            """
+            UPDATE executor_lease
+            SET state='finalized', terminal_status='interrupted', finalized_at=?
+            WHERE singleton=1 AND state='active' AND expires_at<?
+              AND owner_run_id=? AND fencing_token=? AND ledger_execution_id=?
+            """,
+            (
+                now_iso,
+                now_iso,
+                owner_run_id,
+                int(fencing_token),
+                ledger_execution_id,
+            ),
+        )
+        if cur.rowcount != 1:
+            conn.execute("ROLLBACK")
+            raise ExecutorAdmissionError(
+                "expired executor recovery lost its fencing CAS"
+            )
+        conn.execute(
+            """
+            INSERT INTO recovery_receipts(
+                receipt_id,task_id,job_id,owner_run_id,fencing_token,
+                ledger_execution_id,reviewed_by,reason,recovered_at,proof_json
+            ) VALUES (?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                receipt_id,
+                current["task_id"],
+                current["job_id"],
+                owner_run_id,
+                int(fencing_token),
+                ledger_execution_id,
+                reviewer,
+                rationale,
+                now_iso,
+                json.dumps(proof, sort_keys=True, separators=(",", ":")),
+            ),
+        )
+        conn.execute("COMMIT")
+        return {**receipt_body, "receipt_id": receipt_id}
+    except ExecutorAdmissionError:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        raise
+    except (ValueError, TypeError, sqlite3.Error) as exc:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        raise ExecutorAdmissionError(
+            f"expired executor recovery failed: {exc}"
+        ) from exc
     finally:
         conn.close()
 

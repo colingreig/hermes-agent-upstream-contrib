@@ -38,10 +38,15 @@ def _snapshot(*, lane: str = "mini", sha: str = "abc123") -> dict:
             "fencing_token": "17",
         },
         "repository": "owner/repo",
-        "pull_requests": [{"number": 12, "head_sha": sha}],
+        "governing_workflows": ["governing-ci"],
+        "pull_requests": [
+            {"repository": "owner/repo", "number": 12, "head_sha": sha}
+        ],
         "ci": {
             "runs": [
                 {
+                    "repository": "owner/repo",
+                    "workflow": "governing-ci",
                     "run_id": 99,
                     "head_sha": sha,
                     "status": "completed",
@@ -95,11 +100,18 @@ def test_stacked_pr_requires_exact_terminal_ci_for_every_head():
     snapshot = _snapshot(lane="repo-only", sha="base")
     snapshot["stacked"] = True
     snapshot["pull_requests"] = [
-        {"number": 12, "head_sha": "base", "stack_index": 0},
-        {"number": 13, "head_sha": "tip", "stack_index": 1},
+        {"repository": "owner/repo", "number": 12, "head_sha": "base", "stack_index": 0},
+        {"repository": "owner/repo", "number": 13, "head_sha": "tip", "stack_index": 1},
     ]
     snapshot["ci"]["runs"].append(
-        {"run_id": 100, "head_sha": "tip", "status": "completed", "conclusion": "success"}
+        {
+            "repository": "owner/repo",
+            "workflow": "governing-ci",
+            "run_id": 100,
+            "head_sha": "tip",
+            "status": "completed",
+            "conclusion": "success",
+        }
     )
     snapshot["handoff"]["head_sha"] = "tip"
     snapshot["validator"]["head_sha"] = "tip"
@@ -144,3 +156,42 @@ def test_repo_only_does_not_require_deployment_or_release():
     result = delivery.correlate(snapshot)
 
     assert result["delivery_status"] == "DELIVERED"
+
+
+def test_cross_repository_or_unapproved_workflow_evidence_never_delivers():
+    snapshot = _snapshot()
+    snapshot["pull_requests"][0]["repository"] = "attacker/other"
+    snapshot["ci"]["runs"][0]["repository"] = "attacker/other"
+    snapshot["ci"]["runs"][0]["workflow"] = "unrelated"
+
+    result = delivery.correlate(snapshot)
+
+    assert result["delivery_status"] == "INCOMPLETE"
+    assert "pull_requests[0].repository" in result["identity_mismatches"]
+    assert "ci.runs[0].repository" in result["identity_mismatches"]
+    assert "ci.runs[0].workflow" in result["identity_mismatches"]
+    assert "ci_exact_terminal_success:abc123" in result["identity_mismatches"]
+
+
+def test_stacked_pr_membership_must_be_unique():
+    snapshot = _snapshot(lane="repo-only")
+    snapshot["stacked"] = True
+    snapshot["pull_requests"] = [
+        {
+            "repository": "owner/repo",
+            "number": 12,
+            "head_sha": "abc123",
+            "stack_index": 0,
+        },
+        {
+            "repository": "owner/repo",
+            "number": 12,
+            "head_sha": "abc123",
+            "stack_index": 1,
+        },
+    ]
+
+    result = delivery.correlate(snapshot)
+
+    assert result["delivery_status"] == "INCOMPLETE"
+    assert "stacked_pull_request_membership_unique" in result["identity_mismatches"]

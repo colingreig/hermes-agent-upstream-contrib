@@ -425,6 +425,7 @@ class _ExecutorAdmissionHeartbeat:
     def __init__(self, lease: ExecutorLease):
         self.lease = lease
         self.error: Optional[ExecutorAdmissionError] = None
+        self.cancel_event = threading.Event()
         self._stop = threading.Event()
         self._thread = threading.Thread(
             target=self._run,
@@ -445,6 +446,7 @@ class _ExecutorAdmissionHeartbeat:
                 self.lease = heartbeat_executor_lease(self.lease)
             except ExecutorAdmissionError as exc:
                 self.error = exc
+                self.cancel_event.set()
                 return
 
 
@@ -3543,7 +3545,10 @@ def _is_route_chain_exhausted_no_work(
 
 
 def run_job(
-    job: dict, *, defer_agent_teardown: Optional[list] = None
+    job: dict,
+    *,
+    defer_agent_teardown: Optional[list] = None,
+    cancellation_event: Optional[threading.Event] = None,
 ) -> tuple[bool, str, str, Optional[str]]:
     """
     Execute a single cron job.
@@ -3557,6 +3562,11 @@ def run_job(
     torn-down async client (defense-in-depth alongside the interpreter-shutdown
     guard). When ``None`` (the default) teardown happens inline as before, so
     every existing caller is unchanged.
+
+    ``cancellation_event`` is set by the fenced executor-admission heartbeat
+    when ownership can no longer be proven. The worker is interrupted and the
+    run fails closed promptly instead of waiting for ``run_conversation()`` to
+    return.
 
     Returns:
         Tuple of (success, full_output_doc, final_response, error_message)
@@ -4451,6 +4461,11 @@ def run_job(
             _cron_timeout = 600.0
         _cron_inactivity_limit = _cron_timeout if _cron_timeout > 0 else None
         _POLL_INTERVAL = 5.0
+        _admission_poll_interval = (
+            min(_POLL_INTERVAL, 0.25)
+            if cancellation_event is not None
+            else _POLL_INTERVAL
+        )
         # Keep the one-shot run_claim fresh while the run is alive (#62002):
         # the claim TTL is a dead-owner detector, but without a heartbeat a
         # run that legitimately outlives it (stream stall, laptop asleep
@@ -4495,6 +4510,28 @@ def run_job(
         _cron_context = contextvars.copy_context()
         _cron_future = None
         _inactivity_timeout = False
+        _ownership_cancelled = False
+
+        def _raise_if_admission_cancelled() -> None:
+            nonlocal _ownership_cancelled
+            if cancellation_event is None or not cancellation_event.is_set():
+                return
+            if not _ownership_cancelled:
+                _ownership_cancelled = True
+                try:
+                    agent.interrupt(
+                        "Executor admission ownership was lost; cancelling work."
+                    )
+                except Exception:
+                    logger.warning(
+                        "Job '%s': failed to interrupt after admission ownership loss",
+                        job_name,
+                        exc_info=True,
+                    )
+            raise ExecutorAdmissionError(
+                "executor admission ownership was lost during the run"
+            )
+
         try:
             _cron_future = _cron_pool.submit(_cron_context.run, agent.run_conversation, prompt)
         except RuntimeError as exc:
@@ -4525,13 +4562,16 @@ Skipped because Python was already shutting down before the cron worker could be
         try:
             if _cron_inactivity_limit is None:
                 # Unlimited — no inactivity watchdog, but a one-shot still
-                # needs its run_claim heartbeat, so poll instead of blocking.
-                if _is_oneshot:
+                # needs its run_claim heartbeat and executor admission still
+                # needs prompt cancellation on ownership loss.
+                if _is_oneshot or cancellation_event is not None:
                     result = None
                     while True:
+                        _raise_if_admission_cancelled()
                         done, _ = concurrent.futures.wait(
-                            {_cron_future}, timeout=_POLL_INTERVAL,
+                            {_cron_future}, timeout=_admission_poll_interval,
                         )
+                        _raise_if_admission_cancelled()
                         if done:
                             result = _cron_future.result()
                             break
@@ -4541,9 +4581,11 @@ Skipped because Python was already shutting down before the cron worker could be
             else:
                 result = None
                 while True:
+                    _raise_if_admission_cancelled()
                     done, _ = concurrent.futures.wait(
-                        {_cron_future}, timeout=_POLL_INTERVAL,
+                        {_cron_future}, timeout=_admission_poll_interval,
                     )
+                    _raise_if_admission_cancelled()
                     if done:
                         result = _cron_future.result()
                         break
@@ -4998,26 +5040,49 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
                 _run_job_params = inspect.signature(run_job).parameters
             except (TypeError, ValueError):
                 _run_job_params = {}
+            _accepts_run_job_kwargs = any(
+                p.kind is inspect.Parameter.VAR_KEYWORD
+                for p in _run_job_params.values()
+            )
+            _run_job_kwargs = {}
             if (
                 "defer_agent_teardown" in _run_job_params
-                or any(
-                    p.kind is inspect.Parameter.VAR_KEYWORD
-                    for p in _run_job_params.values()
+                or _accepts_run_job_kwargs
+            ):
+                _run_job_kwargs["defer_agent_teardown"] = _deferred_agents
+            if (
+                executor_lease_heartbeat is not None
+                and (
+                    "cancellation_event" in _run_job_params
+                    or _accepts_run_job_kwargs
                 )
             ):
+                _run_job_kwargs["cancellation_event"] = (
+                    executor_lease_heartbeat.cancel_event
+                )
+            if _run_job_kwargs:
                 try:
-                    result = run_job(job, defer_agent_teardown=_deferred_agents)
+                    result = run_job(job, **_run_job_kwargs)
                 except TypeError as exc:
                     # unittest.mock and some legacy custom runners expose a
                     # permissive **kwargs signature while forwarding to a
                     # side-effect callable that still has the old shape.
+                    _error_text = str(exc)
+                    _retry_kwargs = dict(_run_job_kwargs)
                     if (
-                        _deferred_agents
-                        or "unexpected keyword argument 'defer_agent_teardown'"
-                        not in str(exc)
+                        "unexpected keyword argument 'cancellation_event'"
+                        in _error_text
                     ):
+                        _retry_kwargs.pop("cancellation_event", None)
+                    elif (
+                        not _deferred_agents
+                        and "unexpected keyword argument 'defer_agent_teardown'"
+                        in _error_text
+                    ):
+                        _retry_kwargs.pop("defer_agent_teardown", None)
+                    else:
                         raise
-                    result = run_job(job)
+                    result = run_job(job, **_retry_kwargs)
             else:
                 # Backward compatibility for custom/test replacements that
                 # implement the pre-deferred-teardown run_job contract.
@@ -5118,16 +5183,18 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         executor_terminal_status = "interrupted"
         raise
     finally:
-        if lease_heartbeat is not None:
-            lease_heartbeat.stop()
-        if executor_lease_heartbeat is not None:
-            executor_lease_heartbeat.stop()
-        if executor_lease is not None:
-            finalize_executor_lease(
-                executor_lease, status=executor_terminal_status
-            )
-            release_executor_lease(executor_lease)
-        reset_env_passthrough_scope(_env_scope_tokens)
+        try:
+            if lease_heartbeat is not None:
+                lease_heartbeat.stop()
+            if executor_lease_heartbeat is not None:
+                executor_lease_heartbeat.stop()
+            if executor_lease is not None:
+                finalize_executor_lease(
+                    executor_lease, status=executor_terminal_status
+                )
+                release_executor_lease(executor_lease)
+        finally:
+            reset_env_passthrough_scope(_env_scope_tokens)
 
 
 def _notify_provider_jobs_changed() -> None:

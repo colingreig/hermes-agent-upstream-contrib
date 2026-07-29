@@ -40,10 +40,19 @@ def _task(task_id: str = "TASK-1", run_id: str = "run-1", sha: str = "sha-1") ->
             "fencing_token": run_id,
         },
         "repository": "owner/repo",
-        "pull_requests": [{"number": int(task_id.rsplit("-", 1)[1]), "head_sha": sha}],
+        "governing_workflows": ["governing-ci"],
+        "pull_requests": [
+            {
+                "repository": "owner/repo",
+                "number": int(task_id.rsplit("-", 1)[1]),
+                "head_sha": sha,
+            }
+        ],
         "ci": {
             "runs": [
                 {
+                    "repository": "owner/repo",
+                    "workflow": "governing-ci",
                     "run_id": f"ci-{run_id}",
                     "head_sha": sha,
                     "status": "completed",
@@ -221,6 +230,34 @@ def test_failed_collector_makes_delivery_unknown(tmp_path):
     }
 
 
+def test_executor_overlap_is_global_across_different_tasks():
+    snapshot = _snapshot()
+    snapshot["watch"]["owners"] = [
+        {
+            "task_id": "TASK-1",
+            "run_id": "run-a",
+            "fencing_token": "fence-a",
+            "execution_started_at": "2026-07-29T10:00:00Z",
+            "execution_finished_at": "2026-07-29T11:00:00Z",
+            "heartbeat_at": "2026-07-29T10:59:00Z",
+            "lease_expires_at": "2026-07-29T13:00:00Z",
+        },
+        {
+            "task_id": "TASK-2",
+            "run_id": "run-b",
+            "fencing_token": "fence-b",
+            "execution_started_at": "2026-07-29T10:30:00Z",
+            "execution_finished_at": "2026-07-29T11:30:00Z",
+            "heartbeat_at": "2026-07-29T11:29:00Z",
+            "lease_expires_at": "2026-07-29T13:00:00Z",
+        },
+    ]
+
+    alerts = watch.evaluate_alerts(snapshot, [], now=NOW)
+
+    assert "duplicate_ownership" in {item["kind"] for item in alerts}
+
+
 def test_final_evidence_accepts_three_distinct_chains_after_24_hours(tmp_path):
     config = {"collectors": [{"kind": "file", "path": "/unused"}]}
     snapshot = _snapshot()
@@ -259,6 +296,50 @@ def test_final_evidence_accepts_three_distinct_chains_after_24_hours(tmp_path):
 
     assert result["accepted"] is True
     assert result["delivered_task_ids"] == ["TASK-1", "TASK-2", "TASK-3"]
+
+
+def test_final_twelve_hours_rejects_even_a_closed_alert(tmp_path):
+    config = {"collectors": [{"kind": "file", "path": "/unused"}]}
+    snapshot = _snapshot()
+    snapshot["tasks"] = [
+        _task("TASK-1", "run-1", "sha-1"),
+        _task("TASK-2", "run-2", "sha-2"),
+        _task("TASK-3", "run-3", "sha-3"),
+    ]
+    watch.run_once(
+        config,
+        tmp_path,
+        snapshot=snapshot,
+        now=NOW - timedelta(hours=25),
+        alert=False,
+        ping_deadman=False,
+    )
+    first_event = json.loads(
+        (tmp_path / "events.jsonl").read_text(encoding="utf-8").splitlines()[0]
+    )
+    for offset in range(5, 25 * 60, 5):
+        event = dict(first_event)
+        event["timestamp"] = (
+            NOW - timedelta(hours=25) + timedelta(minutes=offset)
+        ).isoformat()
+        if offset == 20 * 60:
+            event["alerts"] = [
+                {"kind": "eligible_unowned_sla", "signature": "transient"}
+            ]
+        watch._append_jsonl(tmp_path / "events.jsonl", event)
+    watch.run_once(
+        config,
+        tmp_path,
+        snapshot=snapshot,
+        now=NOW,
+        alert=False,
+        ping_deadman=False,
+    )
+
+    result = watch.final_evidence(tmp_path, now=NOW)
+
+    assert result["checks"]["final_12h_no_unknown_or_open_alert"] is False
+    assert result["accepted"] is False
 
 
 def test_collectors_are_limited_to_read_only_transports(tmp_path):

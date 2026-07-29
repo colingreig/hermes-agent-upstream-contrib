@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import timedelta
+import os
 import sqlite3
+import time
 
 import pytest
 
@@ -113,6 +115,163 @@ def test_expiry_never_reclaims_an_uncertain_owner(monkeypatch, tmp_path):
     assert status["safe_to_cutover"] is False
     assert status["lease"]["expired"] is True
     assert status["mutated"] is False
+
+
+def test_expired_owner_recovery_requires_reviewed_exact_dead_owner_proof(
+    monkeypatch, tmp_path
+):
+    admission, database = _store(monkeypatch, tmp_path)
+    clock = [admission._now()]
+    monkeypatch.setattr(admission, "_now", lambda: clock[0])
+    lease = admission.acquire_executor_lease(
+        job_id="62714b869845",
+        task_id="task",
+        owner_run_id="owner",
+        ledger_execution_id="ledger",
+        lease_seconds=1,
+    )
+    assert lease is not None
+    clock[0] += timedelta(seconds=2)
+
+    monkeypatch.setattr(
+        admission,
+        "_reviewed_dead_owner_proof",
+        lambda _row: (_ for _ in ()).throw(
+            admission.ExecutorAdmissionError("owner is not proven dead")
+        ),
+    )
+    with pytest.raises(admission.ExecutorAdmissionError, match="not proven dead"):
+        admission.recover_expired_executor_lease(
+            owner_run_id=lease.owner_run_id,
+            fencing_token=lease.fencing_token,
+            ledger_execution_id=lease.ledger_execution_id,
+            reviewed_by="validator",
+            reason="reviewed exact PID and start-time proof",
+        )
+    assert admission.acquire_executor_lease(
+        job_id="baa3251e033d",
+        owner_run_id="successor",
+        ledger_execution_id="successor-ledger",
+    ) is None
+
+    proof = {
+        "execution_id": "ledger",
+        "job_id": "62714b869845",
+        "disposition": "stale",
+        "owner_liveness": "dead",
+        "proposed_terminal_status": "interrupted",
+    }
+    monkeypatch.setattr(admission, "_reviewed_dead_owner_proof", lambda _row: proof)
+    receipt = admission.recover_expired_executor_lease(
+        owner_run_id=lease.owner_run_id,
+        fencing_token=lease.fencing_token,
+        ledger_execution_id=lease.ledger_execution_id,
+        reviewed_by="validator",
+        reason="reviewed exact PID and start-time proof",
+    )
+    assert receipt["proof"] == proof
+    assert admission.executor_drain_status()["state"] == "finalized"
+
+    successor = admission.acquire_executor_lease(
+        job_id="baa3251e033d",
+        owner_run_id="successor",
+        ledger_execution_id="successor-ledger",
+    )
+    assert successor is not None
+    assert successor.fencing_token > lease.fencing_token
+    with sqlite3.connect(database) as conn:
+        stored = conn.execute(
+            "SELECT reviewed_by,owner_run_id,fencing_token FROM recovery_receipts"
+        ).fetchone()
+    assert stored == ("validator", "owner", lease.fencing_token)
+
+
+def test_recovery_rejects_wrong_owner_fence_or_ledger(monkeypatch, tmp_path):
+    admission, _database = _store(monkeypatch, tmp_path)
+    clock = [admission._now()]
+    monkeypatch.setattr(admission, "_now", lambda: clock[0])
+    lease = admission.acquire_executor_lease(
+        job_id="62714b869845",
+        task_id="task",
+        owner_run_id="owner",
+        ledger_execution_id="ledger",
+        lease_seconds=1,
+    )
+    assert lease is not None
+    clock[0] += timedelta(seconds=2)
+    monkeypatch.setattr(
+        admission,
+        "_reviewed_dead_owner_proof",
+        lambda _row: pytest.fail("wrong identity must fail before proof review"),
+    )
+
+    for owner, fence, ledger in (
+        ("wrong", lease.fencing_token, "ledger"),
+        ("owner", lease.fencing_token + 1, "ledger"),
+        ("owner", lease.fencing_token, "wrong"),
+    ):
+        with pytest.raises(admission.ExecutorAdmissionError, match="exact fencing"):
+            admission.recover_expired_executor_lease(
+                owner_run_id=owner,
+                fencing_token=fence,
+                ledger_execution_id=ledger,
+                reviewed_by="validator",
+                reason="review",
+            )
+
+
+def test_admission_rejects_symlink_and_unsafe_permissions(monkeypatch, tmp_path):
+    admission, database = _store(monkeypatch, tmp_path)
+    database.parent.mkdir(parents=True)
+    target = tmp_path / "attacker.db"
+    target.write_bytes(b"not trusted")
+    database.symlink_to(target)
+
+    with pytest.raises(admission.ExecutorAdmissionError, match="symlink"):
+        admission.acquire_executor_lease(
+            job_id="62714b869845",
+            owner_run_id="owner",
+            ledger_execution_id="ledger",
+        )
+
+
+def test_admission_rejects_symlinked_parent(monkeypatch, tmp_path):
+    admission, database = _store(monkeypatch, tmp_path)
+    attacker_directory = tmp_path / "attacker"
+    attacker_directory.mkdir()
+    database.parent.symlink_to(attacker_directory, target_is_directory=True)
+
+    result = admission.executor_drain_status()
+    assert result["state"] == "unknown"
+    assert "symlink" in result["error"]
+
+
+@pytest.mark.parametrize("unsafe_target", ["directory", "database"])
+def test_admission_store_rejects_group_or_world_writable_path(
+    monkeypatch, tmp_path, unsafe_target
+):
+    admission, database = _store(monkeypatch, tmp_path)
+    if unsafe_target == "directory":
+        database.parent.mkdir(parents=True)
+        os.chmod(database.parent, 0o777)
+    else:
+        admission.executor_drain_status()
+        os.chmod(database, 0o666)
+
+    result = admission.executor_drain_status()
+    assert result["state"] == "unknown"
+    assert "group/world-writable" in result["error"]
+
+
+def test_admission_store_rejects_non_owner(monkeypatch, tmp_path):
+    admission, database = _store(monkeypatch, tmp_path)
+    assert admission.executor_drain_status()["state"] == "idle"
+    real_uid = os.getuid()
+    monkeypatch.setattr(admission.os, "getuid", lambda: real_uid + 1)
+
+    result = admission.executor_drain_status()
+    assert result["state"] == "unknown"
+    assert "not owned by the current user" in result["error"]
 
 
 def test_drain_status_never_reaps_or_kills(monkeypatch, tmp_path):
@@ -243,3 +402,159 @@ def test_shared_run_body_denies_executor_before_agent_dispatch(monkeypatch):
         }
     ) is False
     assert recorded["reason"] == "executor_admission_denied"
+
+
+def test_heartbeat_ownership_loss_signals_running_executor_promptly(monkeypatch):
+    import cron.scheduler as scheduler
+
+    lease = scheduler.ExecutorLease(
+        task_id="task",
+        job_id="62714b869845",
+        owner_run_id="owner",
+        fencing_token=1,
+        acquired_at="2026-07-29T12:00:00+00:00",
+        heartbeat_at="2026-07-29T12:00:00+00:00",
+        expires_at="2026-07-29T12:02:00+00:00",
+        ledger_execution_id="ledger",
+    )
+    monkeypatch.setattr(scheduler, "_EXECUTION_HEARTBEAT_SECONDS", 0.01)
+    monkeypatch.setattr(
+        scheduler,
+        "heartbeat_executor_lease",
+        lambda _lease: (_ for _ in ()).throw(
+            scheduler.ExecutorAdmissionError("fencing ownership lost")
+        ),
+    )
+    heartbeat = scheduler._ExecutorAdmissionHeartbeat(lease)
+
+    heartbeat.start()
+    assert heartbeat.cancel_event.wait(timeout=0.5)
+    heartbeat.stop()
+    assert heartbeat.error is not None
+
+
+def test_executor_run_receives_heartbeat_cancellation_event(monkeypatch):
+    import cron.scheduler as scheduler
+
+    lease = scheduler.ExecutorLease(
+        task_id="task",
+        job_id="62714b869845",
+        owner_run_id="owner",
+        fencing_token=1,
+        acquired_at="2026-07-29T12:00:00+00:00",
+        heartbeat_at="2026-07-29T12:00:00+00:00",
+        expires_at="2026-07-29T12:02:00+00:00",
+        ledger_execution_id="ledger",
+    )
+    monkeypatch.setattr(scheduler, "_EXECUTION_HEARTBEAT_SECONDS", 0.01)
+    monkeypatch.setattr(scheduler, "acquire_executor_lease", lambda **_kwargs: lease)
+    monkeypatch.setattr(
+        scheduler,
+        "heartbeat_executor_lease",
+        lambda _lease: (_ for _ in ()).throw(
+            scheduler.ExecutorAdmissionError("fencing ownership lost")
+        ),
+    )
+    monkeypatch.setattr(scheduler, "claim_dispatch", lambda *_args: True)
+    monkeypatch.setattr(
+        scheduler, "mark_execution_running", lambda *_args, **_kwargs: {"id": "ledger"}
+    )
+
+    class NoopExecutionHeartbeat:
+        def __init__(self, *_args):
+            pass
+
+        def start(self):
+            pass
+
+        def stop(self):
+            pass
+
+    monkeypatch.setattr(scheduler, "_ExecutionLeaseHeartbeat", NoopExecutionHeartbeat)
+    observed = {}
+
+    def fake_run_job(
+        _job, *, defer_agent_teardown=None, cancellation_event=None
+    ):
+        started = time.monotonic()
+        assert cancellation_event is not None
+        assert cancellation_event.wait(timeout=0.5)
+        observed["elapsed"] = time.monotonic() - started
+        return False, "", "", "cancelled"
+
+    monkeypatch.setattr(scheduler, "run_job", fake_run_job)
+    monkeypatch.setattr(scheduler, "save_job_output", lambda *_args: "/tmp/out")
+    monkeypatch.setattr(scheduler, "_deliver_result", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        scheduler,
+        "_record_cron_outcome",
+        lambda *_args, **_kwargs: False,
+    )
+    monkeypatch.setattr(scheduler, "finalize_executor_lease", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(scheduler, "release_executor_lease", lambda *_args, **_kwargs: None)
+
+    assert scheduler.run_one_job(
+        {
+            "id": "62714b869845",
+            "name": "clickup-executor",
+            "execution_id": "ledger",
+            "execution_owner_token": "ledger-token",
+        }
+    ) is False
+    assert observed["elapsed"] < 0.5
+
+
+def test_env_scope_reset_runs_even_when_executor_finalize_fails(monkeypatch):
+    import cron.scheduler as scheduler
+    from tools import env_passthrough
+
+    lease = scheduler.ExecutorLease(
+        task_id="task",
+        job_id="62714b869845",
+        owner_run_id="owner",
+        fencing_token=1,
+        acquired_at="2026-07-29T12:00:00+00:00",
+        heartbeat_at="2026-07-29T12:00:00+00:00",
+        expires_at="2026-07-29T12:02:00+00:00",
+        ledger_execution_id="ledger",
+    )
+    monkeypatch.setattr(scheduler, "acquire_executor_lease", lambda **_kwargs: lease)
+    monkeypatch.setattr(scheduler._ExecutorAdmissionHeartbeat, "start", lambda _self: None)
+    monkeypatch.setattr(scheduler._ExecutorAdmissionHeartbeat, "stop", lambda _self: None)
+    monkeypatch.setattr(scheduler, "claim_dispatch", lambda *_args: False)
+    monkeypatch.setattr(
+        scheduler,
+        "_record_cron_outcome",
+        lambda *_args, **_kwargs: False,
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "finalize_executor_lease",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            scheduler.ExecutorAdmissionError("finalization failed")
+        ),
+    )
+    released = []
+    reset = []
+    monkeypatch.setattr(
+        scheduler,
+        "release_executor_lease",
+        lambda *_args, **_kwargs: released.append(True),
+    )
+    monkeypatch.setattr(
+        env_passthrough,
+        "reset_env_passthrough_scope",
+        lambda token: reset.append(token),
+    )
+
+    with pytest.raises(scheduler.ExecutorAdmissionError, match="finalization failed"):
+        scheduler.run_one_job(
+            {
+                "id": "62714b869845",
+                "name": "clickup-executor",
+                "execution_id": "ledger",
+                "execution_owner_token": "ledger-token",
+            }
+        )
+    assert reset
+    assert released == []

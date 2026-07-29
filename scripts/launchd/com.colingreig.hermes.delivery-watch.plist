@@ -6,18 +6,18 @@
     <string>com.colingreig.hermes.delivery-watch</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/bin/python3</string>
-        <string>/Users/colingreig/.hermes/runtime-current/scripts/hermes_delivery_watch.py</string>
+        <string>__HERMES_DELIVERY_WATCH_PYTHON__</string>
+        <string>__HERMES_DELIVERY_WATCH_SCRIPT__</string>
         <string>--once</string>
     </array>
     <key>EnvironmentVariables</key>
     <dict>
         <key>HOME</key>
-        <string>/Users/colingreig</string>
+        <string>__HOME__</string>
         <key>HERMES_HOME</key>
-        <string>/Users/colingreig/.hermes</string>
+        <string>__HERMES_HOME__</string>
         <key>PATH</key>
-        <string>/Users/colingreig/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <string>__HOME__/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     </dict>
     <key>RunAtLoad</key>
     <true/>
@@ -26,8 +26,8 @@
     <key>ProcessType</key>
     <string>Background</string>
     <key>StandardErrorPath</key>
-    <string>/Users/colingreig/.hermes/logs/delivery-watch.err.log</string>
+    <string>__HERMES_HOME__/logs/delivery-watch.err.log</string>
     <key>StandardOutPath</key>
-    <string>/Users/colingreig/.hermes/logs/delivery-watch.log</string>
+    <string>__HERMES_HOME__/logs/delivery-watch.log</string>
 </dict>
 </plist>

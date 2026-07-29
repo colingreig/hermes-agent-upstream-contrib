@@ -304,17 +304,28 @@ def evaluate_alerts(
 
     watch = _mapping(snapshot.get("watch"))
     owners = _list_of_mappings(watch.get("owners"))
-    by_task: dict[str, list[dict[str, Any]]] = {}
+    ownership_intervals: list[
+        tuple[datetime, datetime, str, dict[str, Any]]
+    ] = []
+    active_owners: list[dict[str, Any]] = []
     for owner in owners:
-        by_task.setdefault(str(owner.get("task_id")), []).append(owner)
         identity = f"{owner.get('task_id')}:{owner.get('run_id')}"
+        started = _parse_time(
+            owner.get("execution_started_at") or owner.get("claimed_at")
+        )
+        finished = _parse_time(owner.get("execution_finished_at"))
+        if finished is None:
+            active_owners.append(owner)
+        if started is not None:
+            ownership_intervals.append(
+                (started, finished or now, identity, owner)
+            )
         if not owner.get("fencing_token"):
             _alert(alerts, "unfenced_owner", identity, f"Owner {identity} has no fencing token")
         heartbeat = _parse_time(owner.get("heartbeat_at"))
         expires = _parse_time(owner.get("lease_expires_at"))
         if heartbeat is None or expires is None or heartbeat > expires or now > expires:
             _alert(alerts, "lease_heartbeat_missing", identity, f"Owner {identity} has no current lease heartbeat")
-        started = _parse_time(owner.get("execution_started_at"))
         budget = owner.get("budget_seconds")
         if started and isinstance(budget, (int, float)) and not owner.get("execution_finished_at"):
             if now - started > timedelta(seconds=float(budget)):
@@ -327,11 +338,41 @@ def evaluate_alerts(
             _alert(alerts, "ci_to_review_sla", identity, f"Execution {identity} was not handed to review within 20 minutes")
         if _older_than(owner.get("in_review_at"), now, ALERT_THRESHOLDS["review_to_validator"]) and not owner.get("validator_started_at"):
             _alert(alerts, "review_to_validator_sla", identity, f"Execution {identity} has no validator after 90 minutes")
-    for task_id, task_owners in by_task.items():
-        active = [owner for owner in task_owners if not owner.get("execution_finished_at")]
-        tokens = {str(owner.get("fencing_token")) for owner in active if owner.get("fencing_token")}
-        if len(active) > 1 or len(tokens) > 1:
-            _alert(alerts, "duplicate_ownership", task_id, f"Task {task_id} has overlapping active owners")
+    overlap_pairs: set[tuple[str, str]] = set()
+    for index, (left_start, left_end, left_identity, left_owner) in enumerate(
+        ownership_intervals
+    ):
+        for right_start, right_end, right_identity, right_owner in ownership_intervals[
+            index + 1 :
+        ]:
+            left_key = (
+                str(left_owner.get("run_id")),
+                str(left_owner.get("fencing_token")),
+            )
+            right_key = (
+                str(right_owner.get("run_id")),
+                str(right_owner.get("fencing_token")),
+            )
+            if left_key == right_key:
+                continue
+            if max(left_start, right_start) < min(left_end, right_end):
+                overlap_pairs.add(tuple(sorted((left_identity, right_identity))))
+    if len(active_owners) > 1 and not overlap_pairs:
+        # Missing start times must not make multiple current owners invisible.
+        active_identities = sorted(
+            f"{owner.get('task_id')}:{owner.get('run_id')}"
+            for owner in active_owners
+        )
+        overlap_pairs.add((active_identities[0], active_identities[-1]))
+    for left_identity, right_identity in sorted(overlap_pairs):
+        identity = f"{left_identity}|{right_identity}"
+        _alert(
+            alerts,
+            "duplicate_ownership",
+            identity,
+            "Executor ownership intervals overlap globally: "
+            f"{left_identity} and {right_identity}",
+        )
 
     for queued in _list_of_mappings(watch.get("queue")):
         task_id = str(queued.get("task_id"))
@@ -539,33 +580,42 @@ def final_evidence(state_dir: Path, *, now: datetime | None = None) -> dict[str,
             later - earlier <= timedelta(minutes=10)
             for earlier, later in zip(observed_times, observed_times[1:])
         )
-    window_events = [
+    window_events = sorted([
         event
         for event in events
         if (_parse_time(event.get("timestamp")) or datetime.min.replace(tzinfo=timezone.utc))
         >= current - timedelta(hours=72)
-    ]
+    ], key=lambda event: _parse_time(event.get("timestamp")) or datetime.min.replace(tzinfo=timezone.utc))
     delivered: dict[str, dict[str, Any]] = {}
     all_alert_kinds: set[str] = set()
-    unknown_in_final_12h = False
+    violation_in_final_12h = False
     review_clean_max = 0
+    review_clean_current = 0
     for event in window_events:
         event_time = _parse_time(event.get("timestamp"))
-        for alert_item in _list_of_mappings(event.get("alerts")):
+        event_alerts = _list_of_mappings(event.get("alerts"))
+        for alert_item in event_alerts:
             all_alert_kinds.add(str(alert_item.get("kind")))
         gate = _mapping(event.get("review_gate"))
         if gate.get("status") == "clean":
-            review_clean_max = max(review_clean_max, int(gate.get("consecutive_clean_runs", 0)))
+            review_clean_current += 1
+            review_clean_max = max(review_clean_max, review_clean_current)
+        else:
+            review_clean_current = 0
         if event_time and event_time >= current - timedelta(hours=12):
-            if event.get("collection_unknown"):
-                unknown_in_final_12h = True
+            if (
+                event_alerts
+                or event.get("collection_unknown")
+                or event.get("status") == "UNKNOWN"
+            ):
+                violation_in_final_12h = True
         for result in _list_of_mappings(event.get("correlations")):
             task_id = str(_mapping(result.get("task")).get("id"))
             if result.get("delivery_status") == "DELIVERED":
                 delivered[task_id] = result
             elif event_time and event_time >= current - timedelta(hours=12):
                 if result.get("delivery_status") == "UNKNOWN":
-                    unknown_in_final_12h = True
+                    violation_in_final_12h = True
 
     chains = list(delivered.values())
     run_ids = [str(_mapping(chain.get("executor")).get("run_id")) for chain in chains]
@@ -591,11 +641,6 @@ def final_evidence(state_dir: Path, *, now: datetime | None = None) -> dict[str,
         "promotion_receipt_mismatch",
     }
     open_incidents = _mapping(checkpoint.get("open_incidents"))
-    final_12h_open = any(
-        (_parse_time(_mapping(value).get("last_seen_at")) or datetime.min.replace(tzinfo=timezone.utc))
-        >= current - timedelta(hours=12)
-        for value in open_incidents.values()
-    )
     checks = {
         "window_at_least_24h": duration >= timedelta(hours=24),
         "window_at_most_72h": duration <= timedelta(hours=72),
@@ -604,7 +649,7 @@ def final_evidence(state_dir: Path, *, now: datetime | None = None) -> dict[str,
         "no_ownership_lifecycle_or_promotion_violation": not bool(forbidden & all_alert_kinds),
         "three_consecutive_clean_review_runs": review_clean_max >= 3,
         "final_12h_no_unknown_or_open_alert": (
-            not unknown_in_final_12h and not open_incidents and not final_12h_open
+            not violation_in_final_12h and not open_incidents
         ),
     }
     result = {

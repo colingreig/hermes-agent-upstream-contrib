@@ -63,6 +63,7 @@ def _pull_requests(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
     for index, pr in enumerate(pull_requests):
         normalized.append(
             {
+                "repository": pr.get("repository"),
                 "number": pr.get("number"),
                 "head_sha": pr.get("head_sha"),
                 "stack_index": pr.get("stack_index", index),
@@ -78,6 +79,8 @@ def _ci_runs(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
         runs = [ci]
     return [
         {
+            "repository": run.get("repository"),
+            "workflow": run.get("workflow"),
             "run_id": run.get("run_id"),
             "head_sha": run.get("head_sha"),
             "status": run.get("status"),
@@ -125,6 +128,13 @@ def correlate(snapshot: dict[str, Any], *, generated_at: str | None = None) -> d
     no_pr_authority = _mapping(snapshot.get("no_pr_authority"))
     pull_requests = _pull_requests(snapshot)
     ci_runs = _ci_runs(snapshot)
+    expected_repository = snapshot.get("repository")
+    governing_workflows = snapshot.get("governing_workflows")
+    allowed_workflows = {
+        str(item)
+        for item in governing_workflows
+        if _nonempty(item)
+    } if isinstance(governing_workflows, list) else set()
     pr_head_shas = _unique(
         str(pr["head_sha"]) for pr in pull_requests if _nonempty(pr.get("head_sha"))
     )
@@ -136,7 +146,12 @@ def correlate(snapshot: dict[str, Any], *, generated_at: str | None = None) -> d
     mismatches: list[str] = []
     unknown_sources = _source_failures(snapshot)
 
-    _append_missing(missing, _nonempty(snapshot.get("repository")), "repository")
+    _append_missing(missing, _nonempty(expected_repository), "repository")
+    _append_missing(
+        missing,
+        bool(allowed_workflows),
+        "governing_workflows",
+    )
     _append_missing(missing, _nonempty(executor.get("job_id")), "executor.job_id")
     _append_missing(missing, _nonempty(executor.get("run_id")), "executor.run_id")
     _append_missing(missing, _nonempty(executor.get("fencing_token")), "executor.fencing_token")
@@ -164,10 +179,36 @@ def correlate(snapshot: dict[str, Any], *, generated_at: str | None = None) -> d
                 delivery_head_sha = no_pr_authority["head_sha"]
     else:
         for index, pr in enumerate(pull_requests):
+            _append_missing(
+                missing,
+                _nonempty(pr.get("repository")),
+                f"pull_requests[{index}].repository",
+            )
             _append_missing(missing, _nonempty(pr.get("number")), f"pull_requests[{index}].number")
             _append_missing(missing, _nonempty(pr.get("head_sha")), f"pull_requests[{index}].head_sha")
+            if (
+                _nonempty(expected_repository)
+                and _nonempty(pr.get("repository"))
+                and str(pr["repository"]) != str(expected_repository)
+            ):
+                mismatches.append(f"pull_requests[{index}].repository")
         if snapshot.get("stacked") is True:
             _append_missing(missing, len(pull_requests) >= 2, "stacked_pull_request_chain")
+            pr_memberships = [
+                (str(pr.get("repository")), str(pr.get("number")))
+                for pr in pull_requests
+                if _nonempty(pr.get("repository")) and _nonempty(pr.get("number"))
+            ]
+            pr_heads = [
+                str(pr["head_sha"])
+                for pr in pull_requests
+                if _nonempty(pr.get("head_sha"))
+            ]
+            if (
+                len(pr_memberships) != len(set(pr_memberships))
+                or len(pr_heads) != len(set(pr_heads))
+            ):
+                mismatches.append("stacked_pull_request_membership_unique")
         elif len(pull_requests) > 1:
             missing.append("explicit_stacked_configuration")
 
@@ -180,12 +221,44 @@ def correlate(snapshot: dict[str, Any], *, generated_at: str | None = None) -> d
     required_ci_heads = pr_head_shas if pull_requests else (
         [str(delivery_head_sha)] if _nonempty(delivery_head_sha) else []
     )
+    for index, run in enumerate(ci_runs):
+        _append_missing(
+            missing,
+            _nonempty(run.get("repository")),
+            f"ci.runs[{index}].repository",
+        )
+        _append_missing(
+            missing,
+            _nonempty(run.get("workflow")),
+            f"ci.runs[{index}].workflow",
+        )
+        if (
+            _nonempty(expected_repository)
+            and _nonempty(run.get("repository"))
+            and str(run["repository"]) != str(expected_repository)
+        ):
+            mismatches.append(f"ci.runs[{index}].repository")
+        if (
+            _nonempty(run.get("workflow"))
+            and allowed_workflows
+            and str(run["workflow"]) not in allowed_workflows
+        ):
+            mismatches.append(f"ci.runs[{index}].workflow")
+        if (
+            _nonempty(run.get("head_sha"))
+            and required_ci_heads
+            and str(run["head_sha"]) not in required_ci_heads
+        ):
+            mismatches.append(f"ci.runs[{index}].head_sha")
+
     for head_sha in required_ci_heads:
         exact_runs = ci_by_head.get(head_sha, [])
         terminal_success = [
             run
             for run in exact_runs
             if _nonempty(run.get("run_id"))
+            and str(run.get("repository")) == str(expected_repository)
+            and str(run.get("workflow")) in allowed_workflows
             and run.get("status") == "completed"
             and run.get("conclusion") == "success"
         ]
@@ -236,7 +309,8 @@ def correlate(snapshot: dict[str, Any], *, generated_at: str | None = None) -> d
             "fencing_token": executor.get("fencing_token"),
         },
         "ledger_execution_id": ledger.get("execution_id"),
-        "repository": snapshot.get("repository"),
+        "repository": expected_repository,
+        "governing_workflows": sorted(allowed_workflows),
         "pull_requests": pull_requests,
         "pr_head_sha_set": pr_head_shas,
         "ci": {"runs": ci_runs},
