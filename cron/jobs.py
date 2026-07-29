@@ -1960,6 +1960,29 @@ def claim_job_for_fire(job_id: str, *, claim_ttl_seconds: int = 300) -> bool:
         return False
 
 
+def request_job_run_now(job_id: str) -> bool:
+    """Mark one runnable job due without executing it in this process.
+
+    Used by no-agent gates that need to wake a model-driven job.  The gateway
+    ticker remains the only launcher, so the run enters the same durable
+    admission path as native schedules.  Existing fire ownership is never
+    cleared or guessed at.
+    """
+    with _jobs_lock():
+        jobs = load_jobs()
+        for job in jobs:
+            if job.get("id") != job_id:
+                continue
+            if not job.get("enabled", True) or job.get("state") == "paused":
+                return False
+            if job.get("fire_claim"):
+                return False
+            job["next_run_at"] = _hermes_now().isoformat()
+            save_jobs(jobs)
+            return True
+    return False
+
+
 def get_due_jobs() -> List[Dict[str, Any]]:
     """Get all jobs that are due to run now.
 

@@ -53,8 +53,6 @@ Token: CLICKUP_API_TOKEN (Doppler-injected into the gateway env).
 import fcntl
 import json
 import os
-import shutil
-import subprocess
 import sys
 import time
 import urllib.parse
@@ -652,17 +650,6 @@ def _pick_continuation(continuations, state, now):
     return pick, pick_rec, stale_ids
 
 
-def _hermes_bin():
-    for cand in (
-        shutil.which("hermes"),
-        os.path.expanduser("~/.hermes/bin/hermes"),
-        os.path.expanduser("~/.local/bin/hermes"),
-    ):
-        if cand and os.path.exists(cand):
-            return cand
-    return None
-
-
 def _claim_lock_path(task_id):
     os.makedirs(CLAIMS_DIR, exist_ok=True)
     return os.path.join(CLAIMS_DIR, f"{task_id}.lock")
@@ -834,90 +821,31 @@ def _self_park(parked_tasks):
             _delete_tag(tid, READY_TAG)
 
 
-def _clear_stale_fire_claim(executor_id):
-    """SELF-HEAL (2026-06-30, babysit — recurring bug, see brain 'Hermes executor
-    fire_claim stuck pattern' 06-29 + 06-30 recurrence). The scheduler's fire_claim
-    mutex is meant to be released when the claiming process actually starts the job.
-    If that process dies first (crash, kill, gateway restart mid-dispatch), the
-    mutex is held forever by a dead PID and EVERY future wake — gate-triggered or
-    native-scheduled — gets rejected with "Already being fired by the scheduler",
-    even though nothing is actually running. Previously this required a human to
-    notice and hand-clear jobs.json. Detect + clear it here instead, so Hermes
-    recovers on its own without a caretaker tick catching it.
-
-    Returns True if a stale claim was found and cleared (safe to retry the wake)."""
-    d = _load_json(JOBS_PATH, {})
-    jobs = d if isinstance(d, list) else d.get("jobs", list(d.values()) if isinstance(d, dict) else d)
-    changed = False
-    for j in jobs:
-        if j.get("id") != executor_id:
-            continue
-        fc = j.get("fire_claim")
-        if not fc or not isinstance(fc, dict):
-            continue
-        by = fc.get("by") or ""
-        pid_s = by.rsplit(":", 1)[-1] if ":" in by else by
-        try:
-            pid = int(pid_s)
-        except (TypeError, ValueError):
-            continue
-        try:
-            os.kill(pid, 0)  # windows-footgun: ok — liveness probe only, POSIX-only script (uses fcntl elsewhere)
-            continue  # PID alive: genuinely in-flight, not stale. Leave it.
-        except ProcessLookupError:
-            pass  # dead — fall through and clear
-        except (PermissionError, OSError):
-            continue  # can't confirm dead (e.g. PID reused by another user) — don't touch
-        print(f"[gate] self-heal: fire_claim on {executor_id} held by dead pid {pid} "
-              f"(claimed {fc.get('at')}) — clearing stale mutex", file=sys.stderr)
-        j["fire_claim"] = None
-        changed = True
-    if changed:
-        _save_json(JOBS_PATH, d)
-    return changed
-
-
-def _wake(reason, executor_id=EXECUTOR_ID):
+def _wake(reason, executor_id=EXECUTOR_ID, task_id=None):
     if os.environ.get("DRY_RUN"):
-        print(f"[gate] DRY_RUN set — would wake executor {executor_id} ({reason})")
-        return True
-    hb = _hermes_bin()
-    if not hb:
-        print("[gate] hermes binary not found — cannot wake executor", file=sys.stderr)
-        return False
-    # SELF-HEAL: clear any dead-PID fire_claim wedge left by a previously-killed wake
-    # before firing. Safe — _clear_stale_fire_claim only clears a fire_claim held by a
-    # CONFIRMED-dead PID; an alive/uncertain holder is left untouched.
-    _clear_stale_fire_claim(executor_id)
-    try:
-        # DETACHED WAKE (2026-07-01, babysit — ROOT-CAUSE fix for the frozen board /
-        # "healthy but doing nothing"). `hermes cron run <id>` runs the ENTIRE agent turn
-        # SYNCHRONOUSLY IN-PROCESS (cronjob_tools._execute_job_now -> cron.scheduler.run_one_job;
-        # no hand-off to the gateway daemon, no backgrounding). A real glm-4.7/z.ai turn needs
-        # ~15-20s of CLI/plugin/MCP bootstrap + 10-30s per LLM call, so the OLD
-        # subprocess.run(timeout=25) SIGKILLed EVERY gate-triggered wake mid-bootstrap — 0 API
-        # calls, 0 work — and left dead-PID fire_claim wedges (the recurring 06-29/06-30 bug the
-        # sync self-heal retry tried and failed to fix, since the retry was under the SAME 25s
-        # cap). The board froze because every wake died before it could claim/work a task; the
-        # scheduled 5AM run and long-lived manual fires worked only because they aren't wrapped
-        # in that timeout. Fix: fire-and-forget in a NEW SESSION (start_new_session=True) so the
-        # executor runs to completion independent of this gate script's 120s outer budget and
-        # survives the gate's process group exiting. Concurrency is bounded by WAKE_COOLDOWN_S +
-        # last_wake_ts, by the fire_claim mutex (a still-alive executor makes the next
-        # `hermes cron run` a harmless "already being fired" no-op), and by claim_store (no
-        # double-claim of a task) — so a detached fire is safe.
-        wake_log = os.path.expanduser("~/.hermes/logs/gate_wake_executor.log")
-        logf = open(wake_log, "a", encoding="utf-8")  # inherited by the child; parent exit closes its own handle
-        proc = subprocess.Popen(
-            [hb, "cron", "run", executor_id],
-            stdout=logf, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-            start_new_session=True,
+        print(
+            f"[gate] DRY_RUN set — would request executor {executor_id} "
+            f"through fenced admission ({reason})"
         )
-        print(f"[gate] woke executor {executor_id} ({reason}): detached pid={proc.pid} "
-              f"(runs to completion outside the gate's budget; output -> {wake_log})")
+        return True
+    try:
+        from cron.executor_admission import request_executor_wake
+
+        request_executor_wake(
+            job_id=executor_id,
+            task_id=task_id,
+            reason=reason,
+        )
+        print(
+            f"[gate] requested executor {executor_id} ({reason}); "
+            "gateway ticker owns launch through fenced admission"
+        )
         return True
     except Exception as e:
-        print(f"[gate] failed to wake executor {executor_id}: {e!r}", file=sys.stderr)
+        print(
+            f"[gate] failed closed requesting executor {executor_id}: {e!r}",
+            file=sys.stderr,
+        )
         return False
 
 
@@ -1077,7 +1005,9 @@ def main():
             )
             task = None  # let the `elif unclaimed` path below run this tick
         else:
-            woke = _wake(f"continuation of {task['id']}")
+            woke = _wake(
+                f"continuation of {task['id']}", task_id=task["id"]
+            )
             if woke:
                 # WORKED-BY STAMP (86e29q8pg): the ClickUp task_id is known here
                 # (unlike the unclaimed path below, where the executor self-
@@ -1115,7 +1045,7 @@ def main():
                 file=sys.stderr,
             )
         else:
-            woke = _wake("unclaimed work")
+            woke = _wake("unclaimed work", task_id="__unclaimed__")
             # No single pin for unclaimed — executor picks per its own rule.
             if woke and not os.environ.get("DRY_RUN"):
                 _save_json(TARGET_PATH, {"task_id": None, "reason": "unclaimed", "ts": now})
@@ -1125,7 +1055,11 @@ def main():
             # at worst produces a no-work tick. Only on the unclaimed path —
             # never for a single pinned continuation.
             if woke and _executor_concurrency() >= 2 and len(unclaimed) >= 2:
-                woke2 = _wake("unclaimed work (executor-2, N>=2)", EXECUTOR_ID_2)
+                woke2 = _wake(
+                    "unclaimed work (executor-2, N>=2)",
+                    EXECUTOR_ID_2,
+                    task_id="__unclaimed__",
+                )
                 print(f"[gate] N>=2: second executor wake -> {woke2}")
     elif task is None and not unclaimed:
         # No continuation eligible AND no unclaimed work — nothing to wake.
@@ -1173,6 +1107,7 @@ def main():
                 woke2 = _wake(
                     "unclaimed work (executor-2, N>=2, parallel to continuation)",
                     EXECUTOR_ID_2,
+                    task_id="__unclaimed__",
                 )
                 print(
                     f"[gate] N>=2: second executor wake (parallel to continuation) -> {woke2}"

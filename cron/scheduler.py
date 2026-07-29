@@ -360,6 +360,15 @@ from cron.executions import (
     heartbeat_execution,
     mark_execution_running,
 )
+from cron.executor_admission import (
+    ExecutorAdmissionError,
+    ExecutorLease,
+    acquire_executor_lease,
+    finalize_executor_lease,
+    heartbeat_executor_lease,
+    is_executor_job,
+    release_executor_lease,
+)
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -408,6 +417,35 @@ class _ExecutionLeaseHeartbeat:
                     return
             except Exception:
                 logger.warning("Execution %s heartbeat failed", self._execution_id, exc_info=True)
+
+
+class _ExecutorAdmissionHeartbeat:
+    """Keep the fenced singleton executor lease alive during the agent run."""
+
+    def __init__(self, lease: ExecutorLease):
+        self.lease = lease
+        self.error: Optional[ExecutorAdmissionError] = None
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run,
+            name=f"executor-admission-heartbeat-{lease.job_id}",
+            daemon=True,
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=1.0)
+
+    def _run(self) -> None:
+        while not self._stop.wait(_EXECUTION_HEARTBEAT_SECONDS):
+            try:
+                self.lease = heartbeat_executor_lease(self.lease)
+            except ExecutorAdmissionError as exc:
+                self.error = exc
+                return
 
 
 def _is_cron_silence_response(text: str) -> bool:
@@ -4855,6 +4893,9 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
     if not owner_token:
         raise ValueError("execution owner token is required for cron finalization")
     lease_heartbeat = None
+    executor_lease = None
+    executor_lease_heartbeat = None
+    executor_terminal_status = "failed"
     interrupted_by_gateway = False
     from tools.env_passthrough import (
         begin_env_passthrough_scope,
@@ -4863,6 +4904,37 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
 
     _env_scope_tokens = begin_env_passthrough_scope()
     try:
+        if is_executor_job(job):
+            try:
+                executor_lease = acquire_executor_lease(
+                    job_id=job["id"],
+                    owner_run_id=job.get("executor_owner_run_id"),
+                    ledger_execution_id=execution_id,
+                    task_id=job.get("executor_task_id"),
+                )
+            except ExecutorAdmissionError as exc:
+                logger.error(
+                    "Executor job '%s' denied because admission state is "
+                    "uncertain: %s",
+                    job["id"],
+                    exc,
+                )
+                outcome = _normalize_cron_outcome(
+                    False, "", f"Executor admission failed closed: {exc}"
+                )._replace(reason="executor_admission_uncertain")
+                return _record_cron_outcome(
+                    job, execution_id, owner_token, outcome
+                )
+            if executor_lease is None:
+                outcome = _normalize_cron_outcome(
+                    False, "", "Another fenced executor owner is active."
+                )._replace(reason="executor_admission_denied")
+                return _record_cron_outcome(
+                    job, execution_id, owner_token, outcome
+                )
+            executor_lease_heartbeat = _ExecutorAdmissionHeartbeat(executor_lease)
+            executor_lease_heartbeat.start()
+
         # Pre-run dispatch claim (issue #38758): atomically commit a finite
         # one-shot's dispatch BEFORE its side effect runs, so a tick that dies
         # mid-execution (gateway kill, OOM, segfault, hard-timeout) cannot
@@ -4878,9 +4950,11 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             outcome = _normalize_cron_outcome(
                 False, "", "Dispatch claim rejected; execution was not started."
             )._replace(reason="dispatch_rejected")
-            return _record_cron_outcome(
+            recorded = _record_cron_outcome(
                 job, execution_id, owner_token, outcome, skip_job_status=True
             )
+            executor_terminal_status = "completed" if recorded else "failed"
+            return recorded
 
         # The attempt is claimed durably before executor/provider dispatch and
         # becomes running only immediately before the actual run.
@@ -4992,13 +5066,25 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             for _deferred_agent in _deferred_agents:
                 _teardown_cron_agent(_deferred_agent, job["id"])
 
-        return _record_cron_outcome(
+        if (
+            executor_lease_heartbeat is not None
+            and executor_lease_heartbeat.error is not None
+        ):
+            outcome = _normalize_cron_outcome(
+                False,
+                "",
+                "Executor admission heartbeat failed closed: "
+                f"{executor_lease_heartbeat.error}",
+            )._replace(reason="executor_admission_heartbeat_failed")
+        recorded = _record_cron_outcome(
             job,
             execution_id,
             owner_token,
             outcome,
             skip_job_status=_consume_interrupted_flag(job["id"]),
         )
+        executor_terminal_status = "completed" if recorded else "failed"
+        return recorded
 
     except Exception as e:
         logger.error("Error processing job %s: %s", job['id'], e)
@@ -5008,13 +5094,15 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         outcome = _deliver_cron_outcome(
             job, outcome, "", adapters=adapters, loop=loop
         )
-        return _record_cron_outcome(
+        recorded = _record_cron_outcome(
             job,
             execution_id,
             owner_token,
             outcome,
             skip_job_status=_consume_interrupted_flag(job["id"]),
         )
+        executor_terminal_status = "completed" if recorded else "failed"
+        return recorded
     except BaseException as e:
         # Preserve q7's durable terminal fact even for signals/interpreter exits.
         outcome = _normalize_cron_outcome(
@@ -5027,10 +5115,18 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             outcome,
             skip_job_status=_consume_interrupted_flag(job["id"]),
         )
+        executor_terminal_status = "interrupted"
         raise
     finally:
         if lease_heartbeat is not None:
             lease_heartbeat.stop()
+        if executor_lease_heartbeat is not None:
+            executor_lease_heartbeat.stop()
+        if executor_lease is not None:
+            finalize_executor_lease(
+                executor_lease, status=executor_terminal_status
+            )
+            release_executor_lease(executor_lease)
         reset_env_passthrough_scope(_env_scope_tokens)
 
 
@@ -5115,16 +5211,22 @@ def tick(
         for job in due_jobs:
             advance_next_run(job["id"])
 
-        # Resolve max parallel workers: env var > config.yaml > unbounded.
+        # Resolve max parallel workers: env var > config.yaml > bounded default.
         # Set HERMES_CRON_MAX_PARALLEL=1 to restore old serial behaviour.
         _max_workers: Optional[int] = None
+        _parallel_was_configured = False
         try:
             _env_par = os.getenv("HERMES_CRON_MAX_PARALLEL", "").strip()
             if _env_par:
-                _max_workers = int(_env_par) or None
+                _parallel_was_configured = True
+                _env_value = int(_env_par)
+                _max_workers = len(due_jobs) if _env_value == 0 else _env_value
         except (ValueError, TypeError):
-            logger.warning("Invalid HERMES_CRON_MAX_PARALLEL value; defaulting to unbounded")
-        if _max_workers is None:
+            logger.warning(
+                "Invalid HERMES_CRON_MAX_PARALLEL value; defaulting to bounded config"
+            )
+            _parallel_was_configured = False
+        if not _parallel_was_configured:
             try:
                 _ucfg = load_config() or {}
                 _cfg_par = (
@@ -5144,9 +5246,18 @@ def tick(
                         "max_parallel_jobs"
                     )
                 if _cfg_par is not None:
-                    _max_workers = int(_cfg_par) or None
+                    _cfg_value = int(_cfg_par)
+                    # Zero means "all jobs in this due set", not the stdlib's
+                    # platform-dependent default worker count.
+                    _max_workers = (
+                        len(due_jobs) if _cfg_value == 0 else _cfg_value
+                    )
             except Exception:
-                pass
+                _max_workers = int(
+                    (DEFAULT_CONFIG.get("cron") or {}).get(
+                        "max_parallel_jobs", 4
+                    )
+                )
 
         if verbose:
             logger.info(
