@@ -441,7 +441,17 @@ class LiveBackend:
             query = (
                 "SELECT task_id,job_id,owner_run_id,fencing_token,acquired_at,"
                 "heartbeat_at,expires_at,ledger_execution_id,state,terminal_status,"
-                "finalized_at FROM executor_lease LIMIT 1"
+                "finalized_at FROM executor_lease WHERE state='active' LIMIT 1"
+            )
+        elif name == "admission_history":
+            db = MINI_ADMISSION_DB
+            query = (
+                "SELECT task_id,job_id,owner_run_id,fencing_token,acquired_at,"
+                "heartbeat_at,expires_at,ledger_execution_id,state,terminal_status,"
+                "finalized_at,released_at,recovered_at,recovery_receipt_id,revision "
+                "FROM executor_lease_history "
+                "WHERE julianday(acquired_at) >= julianday('now','-72 hours') "
+                "ORDER BY acquired_at DESC LIMIT 100"
             )
         elif name == "ledger":
             db = MINI_LEDGER_DB
@@ -735,7 +745,7 @@ def _mini_sources(
             "status": "UNKNOWN",
             "error": _redact_error(str(exc)),
         }
-    for name in ("admission", "ledger"):
+    for name in ("admission", "admission_history", "ledger"):
         try:
             result[name] = backend.mini_sqlite(name)
             collection[f"mini:{name}"] = {"status": "OK"}
@@ -977,14 +987,18 @@ def _normalize_task(
     )
     handoff, validator = _handoff_and_validator(comments)
     lane = _task_lane(text)
-    admission = next(
-        (
-            row
-            for row in _list_of_mappings(mini.get("admission"))
-            if str(row.get("task_id")) == task_id
-        ),
-        {},
+    admission_rows = [
+        row
+        for row in (
+            _list_of_mappings(mini.get("admission"))
+            + _list_of_mappings(mini.get("admission_history"))
+        )
+        if str(row.get("task_id")) == task_id
+    ]
+    admission_rows.sort(
+        key=lambda row: str(row.get("acquired_at") or ""), reverse=True
     )
+    admission = admission_rows[0] if admission_rows else {}
     ledger = next(
         (
             row
@@ -993,13 +1007,23 @@ def _normalize_task(
         ),
         {},
     )
+    admission_state = str(admission.get("state") or "")
+    ledger_status = str(ledger.get("status") or "")
+    terminal_status = str(admission.get("terminal_status") or "")
+    lifecycle_join_ok = (
+        admission_state == "active" and ledger_status in {"claimed", "running"}
+    ) or (
+        admission_state in {"finalized", "released", "recovered"}
+        and terminal_status in {"completed", "failed", "interrupted"}
+        and ledger_status == terminal_status
+    )
     ledger_join_ok = bool(
         admission
         and ledger
         and str(ledger.get("id")) == str(admission.get("ledger_execution_id"))
         and str(ledger.get("job_id")) == str(admission.get("job_id"))
         and ledger.get("owner_token")
-        and ledger.get("status") in {"claimed", "running", "completed", "failed", "interrupted"}
+        and lifecycle_join_ok
     )
     join_source = f"mini:ledger-join:{task_id}"
     collection[join_source] = (

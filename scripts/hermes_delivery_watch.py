@@ -288,7 +288,13 @@ def collect_snapshot(
 ) -> dict[str, Any]:
     """Collect a normalized snapshot using read-only transports only."""
     observed = now or _now()
-    merged: dict[str, Any] = {"tasks": [], "watch": {}, "collection": {}}
+    merged: dict[str, Any] = {
+        "schema": SNAPSHOT_SCHEMA,
+        "generated_at": _iso(observed),
+        "tasks": [],
+        "watch": {},
+        "collection": {},
+    }
     for index, raw_collector in enumerate(config["collectors"]):
         collector = _mapping(raw_collector)
         name = str(collector.get("name") or f"collector-{index}")
@@ -535,7 +541,37 @@ def run_once(
 ) -> dict[str, Any]:
     observed = now or _now()
     observed_at = _iso(observed)
-    evidence = snapshot if snapshot is not None else collect_snapshot(config, now=observed)
+    if snapshot is None:
+        evidence = collect_snapshot(config, now=observed)
+    else:
+        source_name = "direct-snapshot"
+        try:
+            validated = _validate_snapshot_payload(
+                snapshot,
+                source_name,
+                now=observed,
+                max_age_seconds=max(
+                    60,
+                    min(3600, int(config.get("snapshot_max_age_seconds", 600))),
+                ),
+            )
+            collection = dict(_mapping(validated.get("collection")))
+            collection.setdefault(source_name, {"status": "OK"})
+            evidence = {
+                **validated,
+                "collection": collection,
+            }
+        except (WatchError, TypeError, ValueError) as exc:
+            evidence = {
+                "tasks": [],
+                "watch": {},
+                "collection": {
+                    source_name: {
+                        "status": "UNKNOWN",
+                        "error": redact_sensitive(exc),
+                    }
+                },
+            }
     global_unknown = [
         name
         for name, state in _mapping(evidence.get("collection")).items()

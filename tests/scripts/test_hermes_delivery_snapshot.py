@@ -54,6 +54,11 @@ def test_fixture_builds_repo_stacked_no_pr_and_mini_delivery_chains():
     assert tasks["NOPR-1"]["ci"]["runs"][0]["run_id"] == "303"
     assert tasks["MINI-1"]["task"]["lane"] == "mini"
     assert tasks["MINI-1"]["release"]["head_sha"] == "d" * 40
+    assert tasks["REPO-1"]["executor"]["run_id"] == "repo-run"
+    assert tasks["MINI-1"]["executor"]["run_id"] == "mini-run-1"
+    assert [
+        owner["task_id"] for owner in snapshot["watch"]["owners"]
+    ] == ["ACTIVE-1"]
     assert snapshot["watch"]["review_gate"]["status"] == "clean"
     assert snapshot["watch"]["review_gate"]["consecutive_clean_runs"] == 3
     assert snapshot["watch"]["lifecycle_events"] == [
@@ -190,6 +195,32 @@ def test_live_commands_are_shell_free_and_remote_queries_are_fixed(monkeypatch):
     assert kwargs["input"].startswith(b"SELECT id,job_id")
 
 
+def test_admission_reads_active_singleton_and_bounded_recent_history(monkeypatch):
+    calls: list[tuple[list[str], dict]] = []
+
+    class Result:
+        returncode = 0
+        stdout = b"[]"
+        stderr = b""
+
+    def fake_run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return Result()
+
+    monkeypatch.setattr(producer.subprocess, "run", fake_run)
+    backend = producer.LiveBackend(mini_host="mini")
+    backend.ssh = "/usr/bin/ssh"
+    backend.mini_sqlite("admission")
+    backend.mini_sqlite("admission_history")
+
+    active_query = calls[0][1]["input"].decode()
+    history_query = calls[1][1]["input"].decode()
+    assert "WHERE state='active' LIMIT 1" in active_query
+    assert "executor_lease_history" in history_query
+    assert "'-72 hours'" in history_query
+    assert "LIMIT 100" in history_query
+
+
 def test_clickup_reads_disable_the_cli_cache(monkeypatch, tmp_path):
     calls: list[tuple[list[str], dict]] = []
 
@@ -229,6 +260,24 @@ def test_ledger_evidence_never_falls_back_to_clickup_text(tmp_path):
     task = next(task for task in snapshot["tasks"] if task["task"]["id"] == "REPO-1")
 
     assert task["ledger"] == {}
+    assert task["sources"]["mini:ledger-join:REPO-1"]["status"] == "UNKNOWN"
+    assert delivery.correlate(task)["delivery_status"] == "UNKNOWN"
+
+
+def test_missing_admission_history_cannot_correlate_completed_delivery(tmp_path):
+    fixture = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    fixture["mini_sqlite"]["admission_history"] = []
+    broken = tmp_path / "missing-history.json"
+    broken.write_text(json.dumps(fixture), encoding="utf-8")
+
+    snapshot = producer.build_snapshot(
+        producer.FixtureBackend(broken), _config(), now=NOW
+    )
+    task = next(
+        task for task in snapshot["tasks"] if task["task"]["id"] == "REPO-1"
+    )
+
+    assert task["executor"]["run_id"] is None
     assert task["sources"]["mini:ledger-join:REPO-1"]["status"] == "UNKNOWN"
     assert delivery.correlate(task)["delivery_status"] == "UNKNOWN"
 

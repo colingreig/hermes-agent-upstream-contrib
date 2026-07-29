@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import re
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import urlsplit
 
 
 _SENSITIVE_KEY = re.compile(
@@ -31,14 +31,12 @@ def _redact_url(match: re.Match[str]) -> str:
         host = parts.hostname or ""
         if parts.port is not None:
             host = f"{host}:{parts.port}"
-        netloc = f"<redacted>@{host}" if parts.username or parts.password else host
-        query = urlencode(
-            [
-                (key, "<redacted>" if _SENSITIVE_KEY.search(key) else value)
-                for key, value in parse_qsl(parts.query, keep_blank_values=True)
-            ]
-        )
-        return urlunsplit((parts.scheme, netloc, parts.path, query, parts.fragment)) + trailing
+        if not parts.scheme or not host:
+            return "<redacted-url>" + trailing
+        # Persist only the origin. Paths can themselves contain webhook tokens
+        # or authorization codes, and every query value and fragment is secret
+        # regardless of its key name.
+        return f"{parts.scheme}://{host}/" + trailing
     except ValueError:
         return "<redacted-url>" + trailing
 

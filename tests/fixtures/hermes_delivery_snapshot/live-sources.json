@@ -220,6 +220,31 @@
   "mini_sqlite": {
     "admission": [
       {
+        "acquired_at": "2026-07-29T16:26:00Z",
+        "expires_at": "2026-07-29T17:00:00Z",
+        "fencing_token": 18,
+        "heartbeat_at": "2026-07-29T16:29:30Z",
+        "job_id": "executor-job",
+        "ledger_execution_id": "active-execution",
+        "owner_run_id": "active-run",
+        "state": "active",
+        "task_id": "ACTIVE-1"
+      }
+    ],
+    "admission_history": [
+      {
+        "acquired_at": "2026-07-29T16:26:00Z",
+        "expires_at": "2026-07-29T17:00:00Z",
+        "fencing_token": 18,
+        "heartbeat_at": "2026-07-29T16:29:30Z",
+        "job_id": "executor-job",
+        "ledger_execution_id": "active-execution",
+        "owner_run_id": "active-run",
+        "revision": 2,
+        "state": "active",
+        "task_id": "ACTIVE-1"
+      },
+      {
         "acquired_at": "2026-07-29T14:00:00Z",
         "expires_at": "2026-07-29T14:30:00Z",
         "fencing_token": 14,
@@ -228,7 +253,10 @@
         "job_id": "repo-job",
         "ledger_execution_id": "repo-execution",
         "owner_run_id": "repo-run",
-        "state": "finalized",
+        "released_at": "2026-07-29T14:20:01Z",
+        "revision": 3,
+        "state": "released",
+        "terminal_status": "completed",
         "task_id": "REPO-1"
       },
       {
@@ -240,7 +268,10 @@
         "job_id": "stack-job",
         "ledger_execution_id": "stack-execution",
         "owner_run_id": "stack-run",
-        "state": "finalized",
+        "released_at": "2026-07-29T14:50:01Z",
+        "revision": 3,
+        "state": "released",
+        "terminal_status": "completed",
         "task_id": "STACK-1"
       },
       {
@@ -252,7 +283,10 @@
         "job_id": "no-pr-job",
         "ledger_execution_id": "no-pr-execution",
         "owner_run_id": "no-pr-run",
-        "state": "finalized",
+        "released_at": "2026-07-29T15:20:01Z",
+        "revision": 3,
+        "state": "released",
+        "terminal_status": "completed",
         "task_id": "NOPR-1"
       },
       {
@@ -264,11 +298,24 @@
         "ledger_execution_id": "ledger-mini-1",
         "owner_run_id": "mini-run-1",
         "finalized_at": "2026-07-29T16:25:00Z",
-        "state": "finalized",
+        "released_at": "2026-07-29T16:25:01Z",
+        "revision": 3,
+        "state": "released",
+        "terminal_status": "completed",
         "task_id": "MINI-1"
       }
     ],
     "ledger": [
+      {
+        "claimed_at": "2026-07-29T16:26:00Z",
+        "heartbeat_at": "2026-07-29T16:29:30Z",
+        "id": "active-execution",
+        "job_id": "executor-job",
+        "lease_expires_at": "2026-07-29T17:00:00Z",
+        "owner_token": "active-owner",
+        "started_at": "2026-07-29T16:26:01Z",
+        "status": "running"
+      },
       {
         "claimed_at": "2026-07-29T14:00:00Z",
         "finished_at": "2026-07-29T14:20:00Z",

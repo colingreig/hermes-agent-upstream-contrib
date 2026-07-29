@@ -26,7 +26,7 @@ from hermes_constants import get_hermes_home
 
 EXECUTOR_JOB_IDS = frozenset({"62714b869845", "baa3251e033d"})
 DEFAULT_LEASE_SECONDS = 120
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 
 
 class ExecutorAdmissionError(RuntimeError):
@@ -147,7 +147,61 @@ def _connect() -> sqlite3.Connection:
                     recovered_at TEXT NOT NULL,
                     proof_json TEXT NOT NULL
                 );
-                PRAGMA user_version = 1;
+
+                CREATE TABLE IF NOT EXISTS executor_lease_history (
+                    history_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id TEXT NOT NULL,
+                    job_id TEXT NOT NULL,
+                    owner_run_id TEXT NOT NULL,
+                    fencing_token INTEGER NOT NULL UNIQUE,
+                    acquired_at TEXT NOT NULL,
+                    heartbeat_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    ledger_execution_id TEXT NOT NULL UNIQUE,
+                    state TEXT NOT NULL CHECK(
+                        state IN ('active', 'finalized', 'released', 'recovered')
+                    ),
+                    terminal_status TEXT,
+                    finalized_at TEXT,
+                    released_at TEXT,
+                    recovered_at TEXT,
+                    recovery_receipt_id TEXT,
+                    revision INTEGER NOT NULL DEFAULT 1
+                );
+                CREATE INDEX IF NOT EXISTS executor_lease_history_recent
+                ON executor_lease_history(acquired_at DESC);
+
+                CREATE TRIGGER IF NOT EXISTS executor_lease_history_identity_immutable
+                BEFORE UPDATE OF
+                    task_id, job_id, owner_run_id, fencing_token,
+                    acquired_at, ledger_execution_id
+                ON executor_lease_history
+                BEGIN
+                    SELECT RAISE(ABORT, 'executor lease history identity is immutable');
+                END;
+
+                INSERT OR IGNORE INTO executor_lease_history(
+                    task_id, job_id, owner_run_id, fencing_token, acquired_at,
+                    heartbeat_at, expires_at, ledger_execution_id, state,
+                    terminal_status, finalized_at
+                )
+                SELECT
+                    task_id, job_id, owner_run_id, fencing_token, acquired_at,
+                    heartbeat_at, expires_at, ledger_execution_id, state,
+                    terminal_status, finalized_at
+                FROM executor_lease;
+
+                UPDATE admission_state
+                SET last_fencing_token = MAX(
+                    last_fencing_token,
+                    COALESCE(
+                        (SELECT MAX(fencing_token) FROM executor_lease_history),
+                        0
+                    )
+                )
+                WHERE singleton = 1;
+
+                PRAGMA user_version = 2;
                 """
             )
         return conn
@@ -300,6 +354,24 @@ def acquire_executor_lease(
                 str(ledger_execution_id),
             ),
         )
+        conn.execute(
+            """
+            INSERT INTO executor_lease_history(
+                task_id, job_id, owner_run_id, fencing_token, acquired_at,
+                heartbeat_at, expires_at, ledger_execution_id, state
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active')
+            """,
+            (
+                resolved_task,
+                job_id,
+                run_id,
+                fencing_token,
+                now_iso,
+                now_iso,
+                expires_iso,
+                str(ledger_execution_id),
+            ),
+        )
         if pending is not None:
             conn.execute("DELETE FROM pending_wakes WHERE job_id=?", (job_id,))
         conn.execute("COMMIT")
@@ -361,6 +433,27 @@ def heartbeat_executor_lease(
             raise ExecutorAdmissionError(
                 "executor lease heartbeat rejected by fencing CAS"
             )
+        history_cur = conn.execute(
+            """
+            UPDATE executor_lease_history
+            SET heartbeat_at=?, expires_at=?, revision=revision+1
+            WHERE state='active' AND job_id=? AND owner_run_id=?
+              AND fencing_token=? AND ledger_execution_id=?
+            """,
+            (
+                now_iso,
+                expires_iso,
+                lease.job_id,
+                lease.owner_run_id,
+                lease.fencing_token,
+                lease.ledger_execution_id,
+            ),
+        )
+        if history_cur.rowcount != 1:
+            conn.execute("ROLLBACK")
+            raise ExecutorAdmissionError(
+                "executor lease heartbeat history rejected by fencing CAS"
+            )
         conn.execute("COMMIT")
         return ExecutorLease(
             **{
@@ -410,6 +503,28 @@ def finalize_executor_lease(lease: ExecutorLease, *, status: str) -> None:
             raise ExecutorAdmissionError(
                 "executor lease finalization rejected by fencing CAS"
             )
+        history_cur = conn.execute(
+            """
+            UPDATE executor_lease_history
+            SET state='finalized', terminal_status=?, finalized_at=?,
+                revision=revision+1
+            WHERE state='active' AND job_id=? AND owner_run_id=?
+              AND fencing_token=? AND ledger_execution_id=?
+            """,
+            (
+                status,
+                now_iso,
+                lease.job_id,
+                lease.owner_run_id,
+                lease.fencing_token,
+                lease.ledger_execution_id,
+            ),
+        )
+        if history_cur.rowcount != 1:
+            conn.execute("ROLLBACK")
+            raise ExecutorAdmissionError(
+                "executor lease finalization history rejected by fencing CAS"
+            )
         conn.execute("COMMIT")
     except ExecutorAdmissionError:
         raise
@@ -424,9 +539,35 @@ def finalize_executor_lease(lease: ExecutorLease, *, status: str) -> None:
 
 
 def release_executor_lease(lease: ExecutorLease) -> None:
+    now_iso = _iso(_now())
     conn = _connect()
     try:
         conn.execute("BEGIN IMMEDIATE")
+        history_cur = conn.execute(
+            """
+            UPDATE executor_lease_history
+            SET state='released',
+                terminal_status=COALESCE(terminal_status, 'interrupted'),
+                finalized_at=COALESCE(finalized_at, ?),
+                released_at=?, revision=revision+1
+            WHERE state IN ('active', 'finalized', 'recovered')
+              AND job_id=? AND owner_run_id=? AND fencing_token=?
+              AND ledger_execution_id=?
+            """,
+            (
+                now_iso,
+                now_iso,
+                lease.job_id,
+                lease.owner_run_id,
+                lease.fencing_token,
+                lease.ledger_execution_id,
+            ),
+        )
+        if history_cur.rowcount != 1:
+            conn.execute("ROLLBACK")
+            raise ExecutorAdmissionError(
+                "executor lease release rejected by history fencing CAS"
+            )
         cur = conn.execute(
             """
             DELETE FROM executor_lease
@@ -582,6 +723,30 @@ def recover_expired_executor_lease(
                 json.dumps(proof, sort_keys=True, separators=(",", ":")),
             ),
         )
+        history_cur = conn.execute(
+            """
+            UPDATE executor_lease_history
+            SET state='recovered', terminal_status='interrupted',
+                finalized_at=?, recovered_at=?, recovery_receipt_id=?,
+                revision=revision+1
+            WHERE state='active' AND job_id=? AND owner_run_id=?
+              AND fencing_token=? AND ledger_execution_id=?
+            """,
+            (
+                now_iso,
+                now_iso,
+                receipt_id,
+                current["job_id"],
+                owner_run_id,
+                int(fencing_token),
+                ledger_execution_id,
+            ),
+        )
+        if history_cur.rowcount != 1:
+            conn.execute("ROLLBACK")
+            raise ExecutorAdmissionError(
+                "expired executor recovery history lost its fencing CAS"
+            )
         conn.execute("COMMIT")
         return {**receipt_body, "receipt_id": receipt_id}
     except ExecutorAdmissionError:

@@ -22,7 +22,7 @@ def _store(monkeypatch, tmp_path):
 def test_lease_contains_required_identity_and_fences_all_executor_jobs(
     monkeypatch, tmp_path
 ):
-    admission, _database = _store(monkeypatch, tmp_path)
+    admission, database = _store(monkeypatch, tmp_path)
 
     lease = admission.acquire_executor_lease(
         job_id="62714b869845",
@@ -63,6 +63,123 @@ def test_lease_contains_required_identity_and_fences_all_executor_jobs(
     )
     assert successor is not None
     assert successor.fencing_token > lease.fencing_token
+    admission.release_executor_lease(successor)
+    with sqlite3.connect(database) as conn:
+        released = conn.execute(
+            "SELECT state,terminal_status,finalized_at,released_at "
+            "FROM executor_lease_history WHERE fencing_token=?",
+            (successor.fencing_token,),
+        ).fetchone()
+    assert released[0:2] == ("released", "interrupted")
+    assert released[2] == released[3]
+
+
+def test_history_preserves_immutable_identity_through_lifecycle(
+    monkeypatch, tmp_path
+):
+    admission, database = _store(monkeypatch, tmp_path)
+    clock = [admission._now()]
+    monkeypatch.setattr(admission, "_now", lambda: clock[0])
+    lease = admission.acquire_executor_lease(
+        job_id="62714b869845",
+        task_id="task",
+        owner_run_id="owner",
+        ledger_execution_id="ledger",
+    )
+    assert lease is not None
+    clock[0] += timedelta(seconds=10)
+    refreshed = admission.heartbeat_executor_lease(lease)
+    clock[0] += timedelta(seconds=10)
+    admission.finalize_executor_lease(refreshed, status="completed")
+    clock[0] += timedelta(seconds=10)
+    admission.release_executor_lease(refreshed)
+
+    with sqlite3.connect(database) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM executor_lease_history WHERE fencing_token=?",
+            (lease.fencing_token,),
+        ).fetchone()
+        assert row is not None
+        assert {
+            "task_id": row["task_id"],
+            "job_id": row["job_id"],
+            "owner_run_id": row["owner_run_id"],
+            "fencing_token": row["fencing_token"],
+            "ledger_execution_id": row["ledger_execution_id"],
+        } == {
+            "task_id": "task",
+            "job_id": "62714b869845",
+            "owner_run_id": "owner",
+            "fencing_token": lease.fencing_token,
+            "ledger_execution_id": "ledger",
+        }
+        assert row["state"] == "released"
+        assert row["terminal_status"] == "completed"
+        assert row["finalized_at"] is not None
+        assert row["released_at"] is not None
+        assert row["revision"] == 4
+        with pytest.raises(
+            sqlite3.IntegrityError, match="history identity is immutable"
+        ):
+            conn.execute(
+                "UPDATE executor_lease_history SET task_id='changed' "
+                "WHERE fencing_token=?",
+                (lease.fencing_token,),
+            )
+
+
+def test_v1_store_migrates_current_lease_into_history(monkeypatch, tmp_path):
+    admission, database = _store(monkeypatch, tmp_path)
+    database.parent.mkdir(parents=True)
+    with sqlite3.connect(database) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE executor_lease (
+                singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                task_id TEXT NOT NULL,
+                job_id TEXT NOT NULL,
+                owner_run_id TEXT NOT NULL,
+                fencing_token INTEGER NOT NULL,
+                acquired_at TEXT NOT NULL,
+                heartbeat_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                ledger_execution_id TEXT NOT NULL,
+                state TEXT NOT NULL CHECK(state IN ('active', 'finalized')),
+                terminal_status TEXT,
+                finalized_at TEXT
+            );
+            INSERT INTO executor_lease VALUES (
+                1, 'legacy-task', '62714b869845', 'legacy-owner', 9,
+                '2026-07-29T10:00:00+00:00',
+                '2026-07-29T10:01:00+00:00',
+                '2026-07-29T10:03:00+00:00',
+                'legacy-ledger', 'finalized', 'completed',
+                '2026-07-29T10:02:00+00:00'
+            );
+            PRAGMA user_version = 1;
+            """
+        )
+    os.chmod(database, 0o600)
+
+    assert admission.executor_drain_status()["state"] == "finalized"
+
+    with sqlite3.connect(database) as conn:
+        row = conn.execute(
+            "SELECT task_id,owner_run_id,fencing_token,ledger_execution_id,"
+            "state,terminal_status,revision FROM executor_lease_history"
+        ).fetchone()
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+    assert row == (
+        "legacy-task",
+        "legacy-owner",
+        9,
+        "legacy-ledger",
+        "finalized",
+        "completed",
+        1,
+    )
+    assert version == admission._SCHEMA_VERSION == 2
 
 
 def test_every_mutation_rejects_a_stale_fencing_token(monkeypatch, tmp_path):
@@ -183,7 +300,18 @@ def test_expired_owner_recovery_requires_reviewed_exact_dead_owner_proof(
         stored = conn.execute(
             "SELECT reviewed_by,owner_run_id,fencing_token FROM recovery_receipts"
         ).fetchone()
+        history = conn.execute(
+            "SELECT state,terminal_status,recovered_at,recovery_receipt_id "
+            "FROM executor_lease_history WHERE fencing_token=?",
+            (lease.fencing_token,),
+        ).fetchone()
     assert stored == ("validator", "owner", lease.fencing_token)
+    assert history == (
+        "recovered",
+        "interrupted",
+        receipt["recovered_at"],
+        receipt["receipt_id"],
+    )
 
 
 def test_recovery_rejects_wrong_owner_fence_or_ledger(monkeypatch, tmp_path):

@@ -301,6 +301,7 @@ def test_final_evidence_accepts_three_distinct_chains_after_24_hours(tmp_path):
         _task("TASK-2", "run-2", "sha-2"),
         _task("TASK-3", "run-3", "sha-3"),
     ]
+    snapshot["generated_at"] = (NOW - timedelta(hours=25)).isoformat()
 
     watch.run_once(
         config,
@@ -322,7 +323,7 @@ def test_final_evidence_accepts_three_distinct_chains_after_24_hours(tmp_path):
     watch.run_once(
         config,
         tmp_path,
-        snapshot=snapshot,
+        snapshot={**snapshot, "generated_at": NOW.isoformat()},
         now=NOW,
         alert=False,
         ping_deadman=False,
@@ -341,6 +342,7 @@ def test_final_twelve_hours_rejects_even_a_closed_alert(tmp_path):
         _task("TASK-2", "run-2", "sha-2"),
         _task("TASK-3", "run-3", "sha-3"),
     ]
+    snapshot["generated_at"] = (NOW - timedelta(hours=25)).isoformat()
     watch.run_once(
         config,
         tmp_path,
@@ -365,7 +367,7 @@ def test_final_twelve_hours_rejects_even_a_closed_alert(tmp_path):
     watch.run_once(
         config,
         tmp_path,
-        snapshot=snapshot,
+        snapshot={**snapshot, "generated_at": NOW.isoformat()},
         now=NOW,
         alert=False,
         ping_deadman=False,
@@ -425,6 +427,39 @@ def test_file_collector_rejects_wrong_schema_and_stale_snapshot(tmp_path):
     assert "stale" in stale["collection"]["feed"]["error"]
 
 
+def test_direct_snapshot_rejects_wrong_stale_and_future_payloads(tmp_path):
+    config = {"collectors": [{"kind": "file", "path": "/unused"}]}
+    invalid = [
+        {**_snapshot(), "schema": "wrong/v1"},
+        {
+            **_snapshot(),
+            "generated_at": (NOW - timedelta(minutes=11)).isoformat(),
+        },
+        {
+            **_snapshot(),
+            "generated_at": (NOW + timedelta(minutes=2)).isoformat(),
+        },
+    ]
+
+    for index, snapshot in enumerate(invalid):
+        state_dir = tmp_path / str(index)
+        result = watch.run_once(
+            config,
+            state_dir,
+            snapshot=snapshot,
+            now=NOW,
+            alert=False,
+            ping_deadman=False,
+        )
+        event = json.loads(
+            (state_dir / "events.jsonl").read_text(encoding="utf-8")
+        )
+        assert result["status"] == "UNKNOWN"
+        assert result["task_count"] == 0
+        assert result["correlations"] == []
+        assert event["collection_unknown"] == ["direct-snapshot"]
+
+
 def test_persisted_collector_errors_are_credential_redacted(monkeypatch):
     secret = (
         "Authorization: Bearer abc123 Cookie: session=topsecret "
@@ -445,3 +480,26 @@ def test_persisted_collector_errors_are_credential_redacted(monkeypatch):
     assert "user:pass" not in error
     assert "querysecret" not in error
     assert "<redacted>" in error
+
+
+def test_persisted_urls_keep_only_scheme_and_host():
+    secret = (
+        "https://user:pass@example.com/webhook/authorization-code"
+        "?sig=abc&signature=def&code=ghi&ordinary=still-secret#fragment-secret"
+    )
+
+    redacted = watch.redact_sensitive(secret)
+
+    assert redacted == "https://example.com/"
+    for value in (
+        "user",
+        "pass",
+        "webhook",
+        "authorization-code",
+        "abc",
+        "def",
+        "ghi",
+        "still-secret",
+        "fragment-secret",
+    ):
+        assert value not in redacted
