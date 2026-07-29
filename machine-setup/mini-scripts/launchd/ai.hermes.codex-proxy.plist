@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>ai.hermes.codex-proxy</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/colingreig/.hermes/runtime-current/venv/bin/python</string>
+		<string>-m</string>
+		<string>hermes_cli.main</string>
+		<string>proxy</string>
+		<string>start</string>
+		<string>--provider</string>
+		<string>openai-codex</string>
+		<string>--port</string>
+		<string>8646</string>
+	</array>
+	<key>WorkingDirectory</key>
+	<string>/Users/colingreig/.hermes/runtime-current</string>
+	<key>StandardOutPath</key>
+	<string>/Users/colingreig/.hermes/logs/codex-proxy.log</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/colingreig/.hermes/logs/codex-proxy.error.log</string>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>VIRTUAL_ENV</key>
+		<string>/Users/colingreig/.hermes/runtime-current/venv</string>
+		<key>PATH</key>
+		<string>/Users/colingreig/.hermes/runtime-current/venv/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+		<key>HOME</key>
+		<string>/Users/colingreig</string>
+	</dict>
+</dict>
+</plist>

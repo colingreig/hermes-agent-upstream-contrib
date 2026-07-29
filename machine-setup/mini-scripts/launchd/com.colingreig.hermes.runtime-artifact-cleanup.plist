@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.colingreig.hermes.runtime-artifact-cleanup</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/colingreig/.hermes/runtime-current/venv/bin/python</string>
+    <string>/Users/colingreig/.hermes/scripts/runtime_artifact_cleanup.py</string>
+    <string>--min-age-hours</string>
+    <string>72</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/colingreig/.hermes</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HERMES_HOME</key>
+    <string>/Users/colingreig/.hermes</string>
+    <key>PATH</key>
+    <string>/Users/colingreig/.hermes/runtime-current/venv/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>VIRTUAL_ENV</key>
+    <string>/Users/colingreig/.hermes/runtime-current/venv</string>
+  </dict>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>3</integer>
+    <key>Minute</key>
+    <integer>35</integer>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>/Users/colingreig/.hermes/logs/runtime-artifact-cleanup.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/colingreig/.hermes/logs/runtime-artifact-cleanup.log</string>
+</dict>
+</plist>

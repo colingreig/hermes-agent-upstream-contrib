@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.hermes.offbox-restic-backup</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/colingreig/.hermes/runtime-current/venv/bin/python</string>
+    <string>/Users/colingreig/.hermes/scripts/offbox_restic_backup.py</string>
+    <string>backup</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/colingreig/.hermes</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HERMES_HOME</key>
+    <string>/Users/colingreig/.hermes</string>
+    <key>PATH</key>
+    <string>/Users/colingreig/.hermes/runtime-current/venv/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>VIRTUAL_ENV</key>
+    <string>/Users/colingreig/.hermes/runtime-current/venv</string>
+  </dict>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>2</integer>
+    <key>Minute</key>
+    <integer>17</integer>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>/Users/colingreig/Library/Logs/Hermes/offbox-restic-backup.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/colingreig/Library/Logs/Hermes/offbox-restic-backup.log</string>
+</dict>
+</plist>
