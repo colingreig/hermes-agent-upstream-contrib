@@ -459,6 +459,26 @@ def install(
         receipt["failure_detail"] = str(exc)
         _rollback(receipt["steps"])
 
+    except Exception as exc:
+        # Broadened beyond `except InstallError` (the pre-fix scope) — any
+        # OTHER exception raised during the write phase (e.g. an unexpected
+        # OSError mid-copy, a permissions error, disk full) must still
+        # trigger rollback of whatever was already written; previously only
+        # our own fail-closed InstallError checks did. Write the receipt here
+        # (the success-path receipt write below is skipped once we re-raise)
+        # and re-raise so the underlying failure isn't swallowed — callers
+        # and tests must still see the real exception, not a silent 1.
+        receipt["result"] = "failed"
+        receipt["failure_detail"] = str(exc)
+        _rollback(receipt["steps"])
+        receipt_path = snapshot_dir / "install-receipt.json"
+        with open(receipt_path, "w", encoding="utf-8") as fh:
+            json.dump(receipt, fh, indent=2)
+            fh.write("\n")
+        print(f"receipt: {receipt_path}")
+        print(f"install FAILED and was rolled back where possible: {receipt['failure_detail']}", file=sys.stderr)
+        raise
+
     receipt_path = snapshot_dir / "install-receipt.json"
     with open(receipt_path, "w", encoding="utf-8") as fh:
         json.dump(receipt, fh, indent=2)
