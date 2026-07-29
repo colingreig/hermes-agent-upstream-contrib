@@ -152,11 +152,26 @@ def _state_has_synthetic_fixtures(data: dict[str, Any]) -> bool:
     recovery = data.get("recovery") if isinstance(data.get("recovery"), dict) else {}
     run_111 = recovery.get("111")
 
-    def contains_boot_a(value: object) -> bool:
+    def is_boot_a_marker(value: object) -> bool:
         if value == "boot-a":
             return True
+        if not isinstance(value, str):
+            return False
+        transition = value.split(":", 1)[0]
+        if "->" not in transition:
+            return False
+        prior, current = transition.split("->", 1)
+        return prior == "boot-a" or current == "boot-a"
+
+    def contains_boot_a(value: object) -> bool:
+        if is_boot_a_marker(value):
+            return True
         if isinstance(value, dict):
-            return any(contains_boot_a(item) for item in value.values())
+            return any(
+                is_boot_a_marker(key)
+                or contains_boot_a(item)
+                for key, item in value.items()
+            )
         if isinstance(value, list):
             return any(contains_boot_a(item) for item in value)
         return False
@@ -166,8 +181,8 @@ def _state_has_synthetic_fixtures(data: dict[str, Any]) -> bool:
     )
 
 
-def _quarantine_synthetic_state(path: Path, *, force: bool = False) -> Path | None:
-    if not force and path != PRODUCTION_STATE_PATH:
+def _quarantine_synthetic_state(path: Path) -> Path | None:
+    if path != PRODUCTION_STATE_PATH:
         return None
     if not path.exists():
         return None

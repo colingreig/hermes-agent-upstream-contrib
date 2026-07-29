@@ -9,6 +9,7 @@ import threading
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 
 
 SCRIPTS = Path(__file__).resolve().parent.parent
@@ -850,13 +851,23 @@ class CiHealthWatchTests(unittest.TestCase):
     def test_synthetic_production_fixture_state_is_quarantined_without_touching_lifecycle_log(self):
         fixture = {
             "vm": {"boot_id": "real-uuid", "available": True},
-            "last_transition": {"prior_boot_id": "boot-a", "current_boot_id": "real-uuid"},
+            "last_transition": {"prior_boot_id": "real-uuid-1", "current_boot_id": "real-uuid-2"},
             "recovery": {"111": {"original_run_id": 111, "attempt": 1}},
+            "vm_alerts": {
+                "sent": {
+                    "boot-a->real-uuid:True->True:transition": "2026-07-29T12:15:19+00:00"
+                }
+            },
         }
         self.state_path.write_text(json.dumps(fixture), encoding="utf-8")
         self.evidence_path.write_text(json.dumps({"event": "prior-lifecycle"}) + "\n", encoding="utf-8")
+        quarantine_dir = Path(self.tmp.name) / "automatic-quarantine"
 
-        backup = self.mod._quarantine_synthetic_state(self.state_path, force=True)
+        with (
+            mock.patch.object(self.mod, "PRODUCTION_STATE_PATH", self.state_path),
+            mock.patch.object(self.mod, "QUARANTINE_DIR", quarantine_dir),
+        ):
+            backup = self.mod._quarantine_synthetic_state(self.state_path)
 
         self.assertIsNotNone(backup)
         self.assertFalse(self.state_path.exists())
@@ -866,6 +877,52 @@ class CiHealthWatchTests(unittest.TestCase):
         self.assertEqual(evidence[-1]["event"], "ci-health-state-quarantined")
         self.assertEqual(backup.stat().st_mode & 0o777, 0o600)
         self.assertEqual(backup.parent.stat().st_mode & 0o777, 0o700)
+
+    def test_synthetic_state_migration_requires_both_exact_sentinels(self):
+        cases = {
+            "substring-only": {
+                "recovery": {"111": {"original_run_id": 111}},
+                "vm_alerts": {"sent": {"reboot-alert": "present"}},
+            },
+            "boot-without-run": {
+                "recovery": {},
+                "vm_alerts": {"sent": {"real->boot-a:True->True:transition": "present"}},
+            },
+            "run-without-boot": {
+                "recovery": {"111": {"original_run_id": 111}},
+                "vm_alerts": {"sent": {"real->other:True->True:transition": "present"}},
+            },
+        }
+        for name, fixture in cases.items():
+            with self.subTest(name=name):
+                self.assertFalse(self.mod._state_has_synthetic_fixtures(fixture))
+        self.assertTrue(
+            self.mod._state_has_synthetic_fixtures(
+                {
+                    "recovery": {"111": {"original_run_id": 111}},
+                    "vm_alerts": {"sent": {"real->boot-a:True->True:transition": "present"}},
+                }
+            )
+        )
+
+    def test_synthetic_state_migration_is_noop_for_nonproduction_path(self):
+        fixture = {
+            "recovery": {"111": {"original_run_id": 111}},
+            "vm_alerts": {"sent": {"boot-a->real:True->True:transition": "present"}},
+        }
+        self.state_path.write_text(json.dumps(fixture), encoding="utf-8")
+        isolated_production = Path(self.tmp.name) / "different-production-state.json"
+        quarantine_dir = Path(self.tmp.name) / "must-not-exist"
+
+        with (
+            mock.patch.object(self.mod, "PRODUCTION_STATE_PATH", isolated_production),
+            mock.patch.object(self.mod, "QUARANTINE_DIR", quarantine_dir),
+        ):
+            backup = self.mod._quarantine_synthetic_state(self.state_path)
+
+        self.assertIsNone(backup)
+        self.assertTrue(self.state_path.exists())
+        self.assertFalse(quarantine_dir.exists())
 
     def test_thermal_only_newest_qualifying_scheduled_run_is_considered(self):
         self._poll()
