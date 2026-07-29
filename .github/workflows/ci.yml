@@ -287,9 +287,11 @@ jobs:
         env:
           REPORT_URL: ${{ steps.ci-timings-artifact.outputs.artifact-url}}
         run: |
-          echo "# CI Timing report" >> "$GITHUB_STEP_SUMMARY"
-          echo "[View the full interactive report]($REPORT_URL)" >> "$GITHUB_STEP_SUMMARY"
-          cat ci-timings-summary.md >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "# CI Timing report"
+            echo "[View the full interactive report]($REPORT_URL)"
+            cat ci-timings-summary.md
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Save baseline cache (main only)
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
