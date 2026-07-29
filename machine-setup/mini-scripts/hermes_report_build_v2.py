@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# COMPAT-ONLY, NO LIVE CALLER — RETIREMENT PENDING (q60 / 86e2gnz60).
+# Vendored from live ~/.hermes/scripts/hermes_report_build_v2.py (sha256 b0b5f046…).
+# The v2 card layout was folded into hermes_report_build.py; nothing imports this
+# module. Kept in the canonical bundle only until a cross-surface caller check
+# confirms zero callers, then a follow-up PR drops it. Do not build new deps on it.
 """
 hermes_report_build_v2.py — CANDIDATE v2 of the Hermes status email (HTML + text).
 
@@ -38,6 +43,7 @@ import html
 import json
 import os
 import sys
+from urllib.parse import urlparse
 
 sys.path.insert(0, os.path.expanduser("~/.hermes/scripts"))
 import hermes_report_build_v1lib as v1  # noqa: E402  (reuse v1's data-collection layer)
@@ -55,6 +61,158 @@ STUCK_IN_PROGRESS_HOURS = 2.0
 
 
 # ---------- spend / model ledger ----------
+
+_CODEX_PROVIDER_ALIASES = {
+    "codex",
+    "codex-oauth",
+    "openai-codex",
+    "openai-codex-proxy",
+}
+
+_CODEX_PROXY_PORTS = {"8646", "8647"}
+
+
+def _codex_proxy_base_url_is_proven(base_url):
+    try:
+        parsed = urlparse(base_url or "")
+        host = (parsed.hostname or "").lower()
+        port = parsed.port
+    except Exception:
+        return False
+    return host in {"127.0.0.1", "localhost"} and str(port) in _CODEX_PROXY_PORTS
+
+
+def _strip_jsonc_comments(text):
+    out = []
+    in_string = False
+    escaped = False
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        nxt = text[i + 1] if i + 1 < len(text) else ""
+        if in_string:
+            out.append(ch)
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            i += 1
+            continue
+        if ch == '"':
+            in_string = True
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "/" and nxt == "/":
+            i += 2
+            while i < len(text) and text[i] not in "\r\n":
+                i += 1
+            continue
+        if ch == "/" and nxt == "*":
+            i += 2
+            while i + 1 < len(text) and not (text[i] == "*" and text[i + 1] == "/"):
+                i += 1
+            i += 2
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _strip_jsonc_trailing_commas(text):
+    out = []
+    in_string = False
+    escaped = False
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if in_string:
+            out.append(ch)
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            i += 1
+            continue
+        if ch == '"':
+            in_string = True
+            out.append(ch)
+            i += 1
+            continue
+        if ch == ",":
+            j = i + 1
+            while j < len(text) and text[j] in " \t\r\n":
+                j += 1
+            if j < len(text) and text[j] in "}]":
+                i += 1
+                continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _configured_base_urls(value):
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key in {"baseURL", "base_url"} and isinstance(item, str):
+                yield item.strip()
+            yield from _configured_base_urls(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _configured_base_urls(item)
+
+
+def _configured_codex_proxy_base_url():
+    paths = [
+        os.path.expanduser("~/.config/opencode/opencode.jsonc"),
+        os.path.expanduser("~/.config/opencode/opencode.json"),
+        os.path.expanduser("~/.config/opencode/config.jsonc"),
+        os.path.expanduser("~/.config/opencode/config.json"),
+    ]
+    for path in paths:
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                text = f.read()
+        except Exception:
+            continue
+        lowered = text.lower()
+        if "baseurl" not in lowered and "base_url" not in lowered:
+            continue
+        try:
+            data = json.loads(_strip_jsonc_trailing_commas(_strip_jsonc_comments(text)))
+        except Exception:
+            continue
+        for base_url in _configured_base_urls(data):
+            if _codex_proxy_base_url_is_proven(base_url):
+                return base_url
+    return ""
+
+
+def served_row_cost(row):
+    """Return billable USD for a writer-served ledger row."""
+    if not isinstance(row, dict):
+        return 0.0
+    raw = row.get("cost_usd")
+    if raw is None:
+        return 0.0
+    try:
+        cost = float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+    if row.get("billing_mode"):
+        return cost
+    provider = (row.get("billing_provider") or row.get("served_provider") or "").strip().lower()
+    base_url = (row.get("billing_base_url") or row.get("base_url") or row.get("baseURL") or "").strip()
+    if provider in _CODEX_PROVIDER_ALIASES:
+        if _codex_proxy_base_url_is_proven(base_url):
+            return 0.0
+        if not base_url and _configured_codex_proxy_base_url():
+            return 0.0
+    return cost
 
 def _parse_ts(ts):
     try:
@@ -111,35 +269,16 @@ def load_served_ledger(path, window_min):
     return window_rows, today_rows, yesterday_rows, None
 
 
-def _row_cost(row):
-    """Billable USD for one served-ledger row (86e2hap1g).
-
-    Rows written after the fix already carry a subscription-routed ``cost_usd``;
-    LEGACY rows carry OpenCode's raw API-rate-card cost, which is phantom spend
-    for a Codex-OAuth-proxied run. Normalize at READ time through the SAME
-    shared resolver the spend meters use, so the digest stops reporting phantom
-    spend for rows already on disk without rewriting the append-only ledger. If
-    the helper isn't importable, fall back to the recorded cost — an unroutable
-    row must never be under-reported.
-    """
-    try:
-        from spend_opencode import served_row_cost
-
-        return float(served_row_cost(row) or 0)
-    except Exception:
-        return float(row.get("cost_usd") or 0)
-
-
 def summarize_spend(window_rows, today_rows, yesterday_rows):
-    total_cost = sum(_row_cost(r) for r in window_rows)
-    today_cost = sum(_row_cost(r) for r in today_rows)
-    yesterday_cost = sum(_row_cost(r) for r in yesterday_rows)
+    total_cost = sum(served_row_cost(r) for r in window_rows)
+    today_cost = sum(served_row_cost(r) for r in today_rows)
+    yesterday_cost = sum(served_row_cost(r) for r in yesterday_rows)
 
     by_provider = collections.defaultdict(lambda: {"n": 0, "cost": 0.0, "degraded": 0})
     for r in window_rows:
         prov = r.get("served_provider") or r.get("served_model") or "unknown"
         by_provider[prov]["n"] += 1
-        by_provider[prov]["cost"] += _row_cost(r)
+        by_provider[prov]["cost"] += served_row_cost(r)
         if r.get("degraded"):
             by_provider[prov]["degraded"] += 1
     provider_rows = sorted(
