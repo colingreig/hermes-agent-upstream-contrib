@@ -1,135 +1,236 @@
 name: Sync prod-live-patches with main
 
-# The mini's deploy branch (prod-live-patches, tracked by release-poll) has
-# historically required a manual forward-merge from main. When nobody
-# remembers to do it, merged fixes silently never deploy — on 2026-07-28
-# prod-live-patches was found 6 commits behind main (task 86e2hw6fp).
-#
-# This workflow keeps prod-live-patches current automatically:
-#   - on every push to main, merge main into prod-live-patches immediately
-#   - on a daily schedule, as a safety net in case a push-triggered run
-#     was skipped/failed/never fired (e.g. workflow file itself changed)
-#   - on-demand via workflow_dispatch
-#
-# A clean (no-conflict) merge is fast-forwarded/pushed directly to
-# prod-live-patches. A conflicting merge is aborted and instead opened as a
-# PR against prod-live-patches so a human resolves the conflicts — we never
-# want to push an unresolved merge onto the deploy branch.
+# prod-live-patches is a release input, not a second development branch.
+# Advancement is allowed only for the exact current main SHA after the
+# governing push CI and its aggregate job have both completed successfully.
+# Schedule/manual recovery use this same certificate path; they are not bypasses.
 
 on:
-  push:
-    branches:
-      - main
+  workflow_run:
+    workflows: [CI]
+    branches: [main]
+    types: [completed]
   schedule:
     - cron: '0 6 * * *'
   workflow_dispatch: {}
 
 permissions:
+  actions: read
   contents: write
-  pull-requests: write
 
 concurrency:
   group: sync-prod-live-patches
   cancel-in-progress: false
 
 jobs:
-  sync:
-    name: Merge main into prod-live-patches
+  promote:
+    name: Certify and promote exact main SHA
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+      FREEZE_STATE: ${{ vars.PROD_LIVE_PATCHES_FREEZE }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          fetch-depth: 0
-          ref: prod-live-patches
-
-      - name: Configure git identity
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
-      - name: Attempt merge of origin/main into prod-live-patches
-        id: merge
+      - name: Resolve exact current main SHA
+        id: main
+        env:
+          REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
+          MAIN_SHA=$(gh api "repos/$REPOSITORY/git/ref/heads/main" --jq .object.sha)
+          if ! [[ "$MAIN_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::GitHub returned an invalid main object id"
+            exit 1
+          fi
+          echo "sha=$MAIN_SHA" >> "$GITHUB_OUTPUT"
 
-          git fetch origin main prod-live-patches
+      - name: Checkout exact current main
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          ref: ${{ steps.main.outputs.sha }}
 
-          # Already up to date — nothing to do.
-          if git merge-base --is-ancestor origin/main HEAD; then
-            echo "prod-live-patches already contains all of main. Nothing to do."
-            echo "conflict=false" >> "$GITHUB_OUTPUT"
+      - name: Collect governing CI evidence
+        id: evidence
+        env:
+          REPOSITORY: ${{ github.repository }}
+          MAIN_SHA: ${{ steps.main.outputs.sha }}
+          TRIGGER_RUN_ID: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.id || '' }}
+          EVIDENCE_PATH: ${{ runner.temp }}/prod-live-patches-evidence.json
+        run: |
+          set -euo pipefail
+          RUNS_PATH="$RUNNER_TEMP/ci-runs.json"
+          JOBS_PATH="$RUNNER_TEMP/ci-jobs.json"
+          gh api \
+            "repos/$REPOSITORY/actions/workflows/ci.yml/runs?branch=main&event=push&per_page=100" \
+            > "$RUNS_PATH"
+          RUN_ID=$(python3 - "$RUNS_PATH" "$MAIN_SHA" <<'PY'
+          import json
+          import sys
+
+          payload = json.load(open(sys.argv[1], encoding="utf-8"))
+          head = sys.argv[2]
+          candidates = [
+              run for run in payload.get("workflow_runs", [])
+              if run.get("name") == "CI"
+              and run.get("path") == ".github/workflows/ci.yml"
+              and run.get("event") == "push"
+              and run.get("head_branch") == "main"
+              and run.get("head_sha") == head
+          ]
+          if not candidates:
+              raise SystemExit("no exact current-main push CI run")
+          latest = max(
+              candidates,
+              key=lambda run: (
+                  int(run.get("run_number") or 0),
+                  int(run.get("run_attempt") or 0),
+                  int(run.get("id") or 0),
+              ),
+          )
+          print(latest["id"])
+          PY
+          )
+          gh api "repos/$REPOSITORY/actions/runs/$RUN_ID/jobs?filter=latest&per_page=100" \
+            > "$JOBS_PATH"
+          python3 - "$RUNS_PATH" "$JOBS_PATH" "$EVIDENCE_PATH" <<'PY'
+          import json
+          import os
+          import sys
+
+          runs_path, jobs_path, output_path = sys.argv[1:]
+          raw_freeze = os.environ.get("FREEZE_STATE", "")
+          try:
+              freeze = json.loads(raw_freeze)
+          except json.JSONDecodeError:
+              freeze = {"invalid_raw_value": raw_freeze}
+          evidence = {
+              "repository": os.environ["REPOSITORY"],
+              "current_main_sha": os.environ["MAIN_SHA"],
+              "trigger_run_id": os.environ.get("TRIGGER_RUN_ID") or None,
+              "freeze": freeze,
+              "workflow_runs": json.load(open(runs_path, encoding="utf-8")),
+              "jobs": json.load(open(jobs_path, encoding="utf-8")),
+          }
+          with open(output_path, "w", encoding="utf-8") as handle:
+              json.dump(evidence, handle, sort_keys=True)
+              handle.write("\n")
+          PY
+          echo "path=$EVIDENCE_PATH" >> "$GITHUB_OUTPUT"
+
+      - name: Certify exact SHA, aggregate job, and freeze state
+        id: certificate
+        env:
+          CERTIFICATE_PATH: ${{ runner.temp }}/prod-live-patches-certificate.json
+        run: |
+          set -euo pipefail
+          RESULT=$(python3 scripts/certify_prod_live_patches.py certify \
+            --evidence "${{ steps.evidence.outputs.path }}" \
+            --output "$CERTIFICATE_PATH")
+          echo "path=$CERTIFICATE_PATH" >> "$GITHUB_OUTPUT"
+          echo "id=$(python3 -c 'import json,sys; print(json.load(sys.stdin)[\"certificate_id\"])' <<<"$RESULT")" \
+            >> "$GITHUB_OUTPUT"
+
+      - name: Prepare strict descendant promotion
+        id: prepare
+        env:
+          CERTIFIED_SHA: ${{ steps.main.outputs.sha }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin \
+            +refs/heads/main:refs/remotes/origin/main \
+            +refs/heads/prod-live-patches:refs/remotes/origin/prod-live-patches
+          OBSERVED_MAIN=$(git rev-parse refs/remotes/origin/main)
+          OBSERVED_PROD=$(git rev-parse refs/remotes/origin/prod-live-patches)
+          if [ "$OBSERVED_MAIN" != "$CERTIFIED_SHA" ]; then
+            echo "::error::main moved after certification"
+            exit 1
+          fi
+          echo "prod_sha=$OBSERVED_PROD" >> "$GITHUB_OUTPUT"
+          if [ "$OBSERVED_PROD" = "$CERTIFIED_SHA" ]; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-
-          if git merge --no-edit origin/main; then
-            echo "conflict=false" >> "$GITHUB_OUTPUT"
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-          else
-            # Capture conflicting files before aborting — `git merge --abort`
-            # clears the merge state we'd otherwise report on.
-            git diff --name-only --diff-filter=U > /tmp/conflicts.txt || true
-            git merge --abort
-            echo "conflict=true" >> "$GITHUB_OUTPUT"
-            echo "changed=false" >> "$GITHUB_OUTPUT"
+          if ! git merge-base --is-ancestor "$OBSERVED_PROD" "$CERTIFIED_SHA"; then
+            echo "::error::prod-live-patches is not an ancestor of certified main"
+            exit 1
           fi
+          echo "changed=true" >> "$GITHUB_OUTPUT"
 
-      - name: Push clean merge to prod-live-patches
-        if: steps.merge.outputs.conflict == 'false' && steps.merge.outputs.changed == 'true'
-        run: |
-          set -euo pipefail
-          git push origin HEAD:prod-live-patches
-
-      - name: Open PR for conflicting merge
-        if: steps.merge.outputs.conflict == 'true'
+      - name: Re-fetch, CAS assert, and push certified SHA
+        if: steps.prepare.outputs.changed == 'true'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CERTIFIED_SHA: ${{ steps.main.outputs.sha }}
+          EXPECTED_PROD_SHA: ${{ steps.prepare.outputs.prod_sha }}
         run: |
           set -euo pipefail
+          # This fetch and equality check intentionally sit immediately before
+          # the push. Wrong-SHA, ancestor-only, or stale CI evidence cannot pass.
+          git fetch --no-tags origin \
+            +refs/heads/main:refs/remotes/origin/main \
+            +refs/heads/prod-live-patches:refs/remotes/origin/prod-live-patches
+          FRESH_MAIN=$(git rev-parse refs/remotes/origin/main)
+          FRESH_PROD=$(git rev-parse refs/remotes/origin/prod-live-patches)
+          [ "$FRESH_MAIN" = "$CERTIFIED_SHA" ] || {
+            echo "::error::CAS failed: origin/main no longer equals certified SHA"
+            exit 1
+          }
+          [ "$FRESH_PROD" = "$EXPECTED_PROD_SHA" ] || {
+            echo "::error::CAS failed: prod-live-patches changed during certification"
+            exit 1
+          }
+          git merge-base --is-ancestor "$FRESH_PROD" "$CERTIFIED_SHA" || {
+            echo "::error::certified SHA is not a strict descendant"
+            exit 1
+          }
+          git push \
+            --force-with-lease="refs/heads/prod-live-patches:$FRESH_PROD" \
+            origin "$CERTIFIED_SHA:refs/heads/prod-live-patches"
+          PUSHED_SHA=$(git ls-remote origin refs/heads/prod-live-patches | awk '{print $1}')
+          [ "$PUSHED_SHA" = "$CERTIFIED_SHA" ] || {
+            echo "::error::post-push exact-SHA verification failed"
+            exit 1
+          }
 
-          DATE_TAG=$(date -u +%Y%m%d)
-          BRANCH="auto-merge/main-to-prod-live-patches-${DATE_TAG}"
+      - name: Create content-addressed promotion receipt
+        if: steps.prepare.outputs.changed == 'true'
+        id: receipt
+        env:
+          RECEIPT_DIR: ${{ runner.temp }}/prod-live-patches-receipt
+        run: |
+          set -euo pipefail
+          RECEIPT_PATH=$(python3 scripts/certify_prod_live_patches.py receipt \
+            --certificate "${{ steps.certificate.outputs.path }}" \
+            --output-dir "$RECEIPT_DIR" \
+            --from-sha "${{ steps.prepare.outputs.prod_sha }}" \
+            --authority-run-id "$GITHUB_RUN_ID" \
+            --authority-run-attempt "$GITHUB_RUN_ATTEMPT")
+          RECEIPT_ID=${RECEIPT_PATH##*promotion-receipt-}
+          RECEIPT_ID=${RECEIPT_ID%.json}
+          echo "path=$RECEIPT_PATH" >> "$GITHUB_OUTPUT"
+          echo "id=$RECEIPT_ID" >> "$GITHUB_OUTPUT"
 
-          # Re-run the merge on a temp branch so the conflict markers are
-          # visible in the PR diff for whoever resolves them.
-          git checkout -b "$BRANCH"
-          git merge --no-edit origin/main || true
-          git add -A
-          git commit -m "chore: conflicted auto-merge of main into prod-live-patches (${DATE_TAG})" || true
-          git push --force origin "$BRANCH"
+      - name: Publish immutable promotion receipt
+        if: steps.prepare.outputs.changed == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: prod-live-patches-promotion-${{ steps.receipt.outputs.id }}
+          path: ${{ steps.receipt.outputs.path }}
+          if-no-files-found: error
+          retention-days: 90
 
-          CONFLICT_FILES="(unknown — see workflow run logs)"
-          if [ -s /tmp/conflicts.txt ]; then
-            CONFLICT_FILES=$(sed 's/^/- /' /tmp/conflicts.txt)
-          fi
-
-          # Build the PR body with printf (not a heredoc) so the literal
-          # newlines don't fight YAML's block-scalar indentation rules.
-          BODY_FILE="$RUNNER_TEMP/pr-body.md"
-          printf '%s\n' \
-            "Automated sync from \`main\` into \`prod-live-patches\` (the mini" \
-            "deploy branch) hit merge conflicts and could not be fast-forwarded" \
-            "automatically." \
-            "" \
-            "This PR contains the attempted merge with conflict markers left in" \
-            "place. Please resolve the conflicts and merge into" \
-            "\`prod-live-patches\` so deploys stay current." \
-            "" \
-            "**Conflicting files:**" \
-            "$CONFLICT_FILES" \
-            "" \
-            "Generated by the \`sync-prod-live-patches\` workflow." \
-            > "$BODY_FILE"
-
-          EXISTING_PR=$(gh pr list --head "$BRANCH" --base prod-live-patches --state open --json number --jq '.[0].number' 2>/dev/null || true)
-          if [ -z "$EXISTING_PR" ]; then
-            gh pr create \
-              --head "$BRANCH" --base prod-live-patches \
-              --title "Auto-merge main into prod-live-patches (${DATE_TAG}) — conflicts need resolution" \
-              --body-file "$BODY_FILE"
-          else
-            echo "PR #$EXISTING_PR already open for $BRANCH; force-push above updated it."
-          fi
-
-          echo "::warning::main → prod-live-patches merge conflicts. See PR for $BRANCH."
+      - name: Record promotion summary
+        if: always()
+        env:
+          CERTIFIED_SHA: ${{ steps.main.outputs.sha }}
+          CHANGED: ${{ steps.prepare.outputs.changed }}
+          CERTIFICATE_ID: ${{ steps.certificate.outputs.id }}
+          RECEIPT_ID: ${{ steps.receipt.outputs.id }}
+        run: |
+          {
+            echo "## prod-live-patches promotion"
+            echo "- Certified main SHA: \`$CERTIFIED_SHA\`"
+            echo "- Changed: \`${CHANGED:-unknown}\`"
+            echo "- Certificate: \`${CERTIFICATE_ID:-not-issued}\`"
+            echo "- Receipt: \`${RECEIPT_ID:-not-issued}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
