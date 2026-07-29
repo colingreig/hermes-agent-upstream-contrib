@@ -22,7 +22,7 @@
       "src_rel": "hermes_report_build.py",
       "src_base": "mirror",
       "dest_abs": "~/.hermes/scripts/hermes_report_build.py",
-      "sha256": "2b35e527353397445240592115c0a32e8a1e04ed075c70597e96864d7a1a579c",
+      "sha256": "593b35a88cd74002e2447b429cb96e3b22310699f0e1127c01a7a603173e42d4",
       "role": "report builder (HTML+text+subject+JSON); imports hermes_report_build_v1lib + claim_store",
       "deploy_mode": "script"
     },
@@ -38,7 +38,7 @@
       "src_rel": "hermes_report_build_v2.py",
       "src_base": "mirror",
       "dest_abs": "~/.hermes/scripts/hermes_report_build_v2.py",
-      "sha256": "71e5ad4f2ef8e3cf6001d2034c7bd47c429493412689eecb8e8870eceda11762",
+      "sha256": "edcac26d42001590c01ad44bcfd4f246aa9a6cfbc1c7fa1acc9e185904297d1c",
       "role": "compat-only orphan; no live importer (survey confirmed). Ships until a follow-up PR retires it after a final cross-surface caller check",
       "deploy_mode": "script"
     },
