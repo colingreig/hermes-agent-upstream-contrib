@@ -281,6 +281,7 @@ class CiHealthWatchTests(unittest.TestCase):
                 "actor": "operator@example.com",
                 "action": "restart",
                 "reason": "managed restart",
+                "status": "succeeded",
             },
         }
         before = json.dumps(stored, sort_keys=True)
@@ -428,6 +429,66 @@ class CiHealthWatchTests(unittest.TestCase):
         self.runner.boot_id = BOOT_B
         self._poll()
         self.assertEqual(self._evidence()[-1]["initiator"], "unknown")
+
+    def test_poll_during_pending_managed_command_cannot_attribute_or_authorize_recovery(
+        self,
+    ):
+        self._poll()
+        command_started = threading.Event()
+        release_command = threading.Event()
+        outcomes: list[int] = []
+        failures: list[BaseException] = []
+
+        def blocking_runner(cmd, **kwargs):
+            if list(cmd)[:2] == ["orb", "restart"]:
+                command_started.set()
+                if not release_command.wait(timeout=5):
+                    raise TimeoutError("test did not release managed command")
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            return self.runner(cmd, **kwargs)
+
+        def invoke_lifecycle():
+            try:
+                outcomes.append(
+                    self.mod.record_managed_lifecycle(
+                        "restart",
+                        "operator@example.com",
+                        "concurrent restart",
+                        runner=blocking_runner,
+                        topology_path=TOPOLOGY,
+                        state_path=self.state_path,
+                    )
+                )
+            except BaseException as exc:
+                failures.append(exc)
+
+        thread = threading.Thread(target=invoke_lifecycle, daemon=True)
+        thread.start()
+        self.assertTrue(command_started.wait(timeout=5))
+        try:
+            pending = json.loads(self.state_path.read_text(encoding="utf-8"))
+            self.assertEqual(pending["last_managed_intent"]["status"], "pending")
+            self.assertIsNone(self.mod._latest_managed_intent(pending))
+
+            self.runner.boot_id = BOOT_B
+            report = self._poll()
+
+            transition = self._evidence()[-1]
+            self.assertEqual(transition["initiator"], "unknown")
+            self.assertFalse(transition["recovery_eligible"])
+            self.assertEqual(report["rerun_ids"], [])
+        finally:
+            release_command.set()
+            thread.join(timeout=5)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(failures, [])
+        self.assertEqual(outcomes, [0])
+        final_state = json.loads(self.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            final_state["last_managed_intent"]["status"],
+            "succeeded",
+        )
 
     def test_managed_intent_matching_is_action_specific(self):
         self.assertTrue(self.mod._transition_matches_intent("restart", BOOT_A, BOOT_B, True, True))

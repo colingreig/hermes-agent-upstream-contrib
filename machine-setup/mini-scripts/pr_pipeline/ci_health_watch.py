@@ -514,7 +514,10 @@ def _latest_managed_intent(state: dict[str, Any]) -> dict[str, Any] | None:
         return None
     if intent.get("consumed_at"):
         return None
-    if intent.get("status") in {"failed", "consumed"}:
+    # Attribution is not speculative: while the managed command is pending or
+    # running, a concurrent poll must classify any transition as unmanaged.
+    # Only a command whose rc=0 outcome has been durably persisted is eligible.
+    if intent.get("status") != "succeeded":
         return None
     created = _parse_time(intent.get("timestamp"))
     if created is None or _now() - created > timedelta(minutes=30):
@@ -1142,8 +1145,8 @@ def record_managed_lifecycle(
             completed["command_error"] = repr(command_error)
             state.setdefault("managed_intents", []).append(completed)
         elif result is not None and result.returncode == 0:
-            completed["status"] = "dispatched"
-            completed["dispatched_at"] = _now_iso()
+            completed["status"] = "succeeded"
+            completed["command_succeeded_at"] = _now_iso()
         else:
             completed["status"] = "failed"
             completed["failed_at"] = _now_iso()

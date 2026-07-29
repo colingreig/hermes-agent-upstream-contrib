@@ -339,7 +339,56 @@ def test_all_triggers_share_certificate_and_exact_sha_cas_path(workflow):
     assert '"$RECEIPT_BLOB:$RECEIPT_REF"' in push
     assert "PUSHED_SHA" in push
     assert push.index("git fetch --no-tags origin") < push.index("FRESH_MAIN=")
-    assert push.index("FRESH_MAIN=") < push.index("git push")
+    receipt_ref_check = push.index('git ls-remote origin "$RECEIPT_REF"')
+    final_freeze_read = push.rindex(
+        "actions/variables/PROD_LIVE_PATCHES_FREEZE"
+    )
+    final_freeze_validation = push.rindex(
+        "scripts/certify_prod_live_patches.py validate-freeze"
+    )
+    atomic_push = push.index("git push --atomic")
+    assert (
+        push.index("FRESH_MAIN=")
+        < receipt_ref_check
+        < final_freeze_read
+        < final_freeze_validation
+        < atomic_push
+    )
+    commands_between_guard_and_push = [
+        line.strip()
+        for line in push[final_freeze_validation:atomic_push].splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    assert commands_between_guard_and_push == [
+        "scripts/certify_prod_live_patches.py validate-freeze \\",
+        '--input "$FRESH_FREEZE_PATH"',
+    ]
+
+
+def test_frozen_final_freeze_read_fails_before_atomic_push(tmp_path, workflow):
+    freeze_path = tmp_path / "final-freeze.json"
+    freeze_path.write_text(
+        json.dumps(
+            {
+                "schema": "prod_live_patches_freeze/v1",
+                "frozen": True,
+                "actor": "incident-commander",
+                "reason": "stop promotion now",
+                "changed_at": "2026-07-29T12:01:00Z",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert (
+        certifier.main(["validate-freeze", "--input", str(freeze_path)])
+        == 2
+    )
+    push = _step(
+        workflow,
+        "Re-read freeze, CAS assert, and atomically publish branch and receipt",
+    )["run"]
+    assert push.rindex("validate-freeze") < push.index("git push --atomic")
 
 
 def test_workflow_publishes_content_addressed_receipt_in_same_git_transaction(workflow):

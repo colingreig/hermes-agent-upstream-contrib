@@ -200,13 +200,6 @@ jobs:
           FRESH_FREEZE_PATH: ${{ runner.temp }}/prod-live-patches-freeze-fresh.json
         run: |
           set -euo pipefail
-          # The repository variable is fetched again here, rather than reused
-          # from the job environment. This is the final operation before the
-          # ref transaction and makes an incident freeze fail closed.
-          gh api "repos/$REPOSITORY/actions/variables/PROD_LIVE_PATCHES_FREEZE" \
-            --jq .value > "$FRESH_FREEZE_PATH"
-          python3 scripts/certify_prod_live_patches.py validate-freeze \
-            --input "$FRESH_FREEZE_PATH"
           git fetch --no-tags origin \
             +refs/heads/main:refs/remotes/origin/main \
             +refs/heads/prod-live-patches:refs/remotes/origin/prod-live-patches
@@ -228,6 +221,13 @@ jobs:
             echo "::error::immutable receipt ref already exists"
             exit 1
           }
+          # This API read and strict parse intentionally happen after every
+          # fetch/CAS/ref preparation operation. There is no command between
+          # the final freeze decision and the atomic publication boundary.
+          gh api "repos/$REPOSITORY/actions/variables/PROD_LIVE_PATCHES_FREEZE" \
+            --jq .value > "$FRESH_FREEZE_PATH"
+          python3 scripts/certify_prod_live_patches.py validate-freeze \
+            --input "$FRESH_FREEZE_PATH"
           # Git protocol atomic push is the publication boundary: the release
           # branch and immutable receipt ref both advance, or neither does.
           git push --atomic \
