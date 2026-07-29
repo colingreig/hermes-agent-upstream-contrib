@@ -246,7 +246,7 @@ def _get(path: str) -> dict[str, Any]:
     for attempt in range(max_retries + 1):
         status, data = _req("GET", path)
         if status == 429 and attempt < max_retries:
-            delay = 2 ** (attempt + 1)
+            delay = 15 * (2 ** attempt)  # 15, 30, 60 s — long enough to outlast ClickUp's 60s rate-limit window
             print(f"WARNING: ClickUp 429 on GET {path}, retry {attempt+1}/{max_retries} in {delay}s", file=sys.stderr)
             time.sleep(delay)
             continue
@@ -262,6 +262,8 @@ def _get(path: str) -> dict[str, Any]:
         )
         raise SystemExit(4)
     if status >= 400 or data is None:
+        if status == 429:
+            _log_failure(f"rate_limit_exhausted endpoint=GET {path} retries={max_retries}")
         raise ClickUpApiError(status=status, path=path, message="request failed")
     if not isinstance(data, dict):
         raise ClickUpApiError(status=status, path=path, message="non-object response")
