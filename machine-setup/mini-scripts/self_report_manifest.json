@@ -22,7 +22,7 @@
       "src_rel": "hermes_report_build.py",
       "src_base": "mirror",
       "dest_abs": "~/.hermes/scripts/hermes_report_build.py",
-      "sha256": "2b35e527353397445240592115c0a32e8a1e04ed075c70597e96864d7a1a579c",
+      "sha256": "dfc781f98ee3e53805e5a643f435d69042072a34e393099bca454fe9f4fc60e4",
       "role": "report builder (HTML+text+subject+JSON); imports hermes_report_build_v1lib + claim_store",
       "deploy_mode": "script"
     },

@@ -12,10 +12,12 @@ that's the defect this candidate fixes. v2 restructures the SAME underlying
 data into a mobile-first single-column layout:
 
   1. Headline banner (mirrors the subject)
-  2. NEEDS YOU / ALERTS (stuck-in-flight, blocked/needs-human, health signals)
-  3. SCOREBOARD (ready/in-progress/in-review/blocked/shipped, lanes)
-  4. MODEL & SPEND (from the writer-served ledger: cost, per-provider, drift)
-  5. ROSTER (work list + queue list, moved to the bottom, as stacked cards)
+  2. ACTION REQUIRED (blocked/needs-human only)
+  3. WATCH LIST (stale in-progress only)
+  4. SYSTEM SIGNALS
+  5. SCOREBOARD (ready/in-progress/in-review/blocked/validator-completed, lanes)
+  6. MODEL & SPEND (from the writer-served ledger: cost, per-provider, drift)
+  7. ROSTER (work list + queue list, bounded and moved to the bottom)
 
 v1's collection functions (_resolve_task, build_hermes_list, build_work_list,
 _work_cron_dirs) are reused via `import hermes_report_build_v1lib as v1` — that
@@ -51,6 +53,7 @@ HERMES = os.path.expanduser("~/.hermes")
 SERVED_LEDGER_DEFAULT = os.path.join(HERMES, "logs", "writer-served.jsonl")
 
 STUCK_IN_PROGRESS_HOURS = 2.0
+MAX_SECTION_ROWS = 10
 
 
 # ---------- spend / model ledger ----------
@@ -75,11 +78,12 @@ def _local_day(dt):
 
 
 def load_served_ledger(path, window_min):
-    """Parse writer-served.jsonl. Returns (window_rows, today_rows, yesterday_rows, error)."""
+    """Parse writer-served.jsonl. Returns (window_rows, today_rows, previous_window_rows, error)."""
     if not path or not os.path.exists(path):
         return [], [], [], f"ledger not found: {path}"
     now = datetime.datetime.now(datetime.timezone.utc)
     cutoff = now - datetime.timedelta(minutes=window_min)
+    previous_cutoff = cutoff - datetime.timedelta(minutes=window_min)
     rows = []
     try:
         with open(path, encoding="utf-8", errors="replace") as f:
@@ -101,44 +105,27 @@ def load_served_ledger(path, window_min):
         return [], [], [], None
 
     window_rows = [r for r in rows if r["_dt"] is not None and r["_dt"] >= cutoff]
+    previous_window_rows = [
+        r for r in rows
+        if r["_dt"] is not None and previous_cutoff <= r["_dt"] < cutoff
+    ]
 
     today_local = _local_day(now)
-    yesterday_local = today_local - datetime.timedelta(days=1) if today_local else None
     today_rows = [r for r in rows if _local_day(r["_dt"]) == today_local]
-    yesterday_rows = [r for r in rows if _local_day(r["_dt"]) == yesterday_local]
 
-    return window_rows, today_rows, yesterday_rows, None
-
-
-def _row_cost(row):
-    """Billable USD for one served-ledger row (86e2hap1g).
-
-    Rows written after the fix already carry a subscription-routed ``cost_usd``;
-    LEGACY rows carry OpenCode's raw API-rate-card cost, which is phantom spend
-    for a Codex-OAuth-proxied run. Normalize at READ time through the SAME
-    shared resolver the spend meters use, so the digest stops reporting phantom
-    spend for rows already on disk without rewriting the append-only ledger. If
-    the helper isn't importable, fall back to the recorded cost — an unroutable
-    row must never be under-reported.
-    """
-    try:
-        from spend_opencode import served_row_cost
-
-        return float(served_row_cost(row) or 0)
-    except Exception:
-        return float(row.get("cost_usd") or 0)
+    return window_rows, today_rows, previous_window_rows, None
 
 
-def summarize_spend(window_rows, today_rows, yesterday_rows):
-    total_cost = sum(_row_cost(r) for r in window_rows)
-    today_cost = sum(_row_cost(r) for r in today_rows)
-    yesterday_cost = sum(_row_cost(r) for r in yesterday_rows)
+def summarize_spend(window_rows, today_rows, previous_window_rows):
+    total_cost = sum(float(r.get("cost_usd") or 0) for r in window_rows)
+    today_cost = sum(float(r.get("cost_usd") or 0) for r in today_rows)
+    previous_window_cost = sum(float(r.get("cost_usd") or 0) for r in previous_window_rows)
 
     by_provider = collections.defaultdict(lambda: {"n": 0, "cost": 0.0, "degraded": 0})
     for r in window_rows:
         prov = r.get("served_provider") or r.get("served_model") or "unknown"
         by_provider[prov]["n"] += 1
-        by_provider[prov]["cost"] += _row_cost(r)
+        by_provider[prov]["cost"] += float(r.get("cost_usd") or 0)
         if r.get("degraded"):
             by_provider[prov]["degraded"] += 1
     provider_rows = sorted(
@@ -157,8 +144,8 @@ def summarize_spend(window_rows, today_rows, yesterday_rows):
     return {
         "total_cost": total_cost,
         "today_cost": today_cost,
-        "yesterday_cost": yesterday_cost,
-        "cost_delta": today_cost - yesterday_cost,
+        "previous_window_cost": previous_window_cost,
+        "cost_delta": total_cost - previous_window_cost,
         "provider_rows": provider_rows,
         "providers_n": len(provider_rows),
         "runs_n": len(window_rows),
@@ -268,18 +255,6 @@ def build_alerts(hermes_rows, snap_tasks_by_id, header, now=None):
 
 # ---------- scoreboard ----------
 
-def _status_bucket(status, tags=None):
-    status = (status or "").lower()
-    tags = tags or []
-    if status == "in progress":
-        return "claimed"
-    if status in ("in review", "ready for review", "complete", "closed", "done"):
-        return "shipped"
-    if status in ("blocked", "needs human") or "needs-human" in tags:
-        return "blocked"
-    return None
-
-
 def build_scoreboard(hermes_rows, snap_tasks, hermes_meta, work_completed):
     statuses = collections.Counter((r.get("status") or "").lower() for r in hermes_rows)
     in_progress = statuses.get("in progress", 0)
@@ -294,29 +269,14 @@ def build_scoreboard(hermes_rows, snap_tasks, hermes_meta, work_completed):
             elif tag == "lane:content":
                 lanes["content"] += 1
 
-    now = datetime.datetime.now(datetime.timezone.utc)
-    today = _local_day(now)
-    yesterday = today - datetime.timedelta(days=1) if today else None
-    daily = {k: {"today": 0, "yesterday": 0} for k in ("claimed", "shipped", "blocked")}
-    for t in snap_tasks:
-        bucket = _status_bucket(t.get("status"), t.get("tags"))
-        if bucket is None:
-            continue
-        day = _local_day(_epoch_ms_to_dt(t.get("date_updated")))
-        if day == today:
-            daily[bucket]["today"] += 1
-        elif day == yesterday:
-            daily[bucket]["yesterday"] += 1
-
     return {
         "ready": hermes_meta.get("ready", 0),
         "in_progress": in_progress,
         "in_review": in_review,
         "blocked": blocked,
-        "shipped": work_completed,
+        "validator_completed_window": work_completed,
         "lane_code": lanes.get("code", 0),
         "lane_content": lanes.get("content", 0),
-        "daily": daily,
     }
 
 
@@ -325,40 +285,42 @@ def build_scoreboard(hermes_rows, snap_tasks, hermes_meta, work_completed):
 def summarize_alerts(alerts):
     counts = collections.Counter(a.get("kind") for a in alerts)
     return {
-        "stuck_tasks": counts.get("stuck", 0),
-        "blocked_tasks": counts.get("blocked", 0),
-        "health_signals": counts.get("health", 0),
+        "watch_list": counts.get("stuck", 0),
+        "action_required": counts.get("blocked", 0),
+        "system_signals": counts.get("health", 0),
         "alerts_n": len(alerts),
     }
 
 
 def _alert_count_text(alert_summary):
     return (
-        f"{alert_summary['stuck_tasks']} stuck · "
-        f"{alert_summary['blocked_tasks']} blocked · "
-        f"{alert_summary['health_signals']} health"
+        f"{alert_summary['action_required']} action required · "
+        f"{alert_summary['watch_list']} watch list · "
+        f"{alert_summary['system_signals']} system signals"
     )
 
 
 def build_subject(scoreboard, spend, alert_summary):
+    completed = scoreboard["validator_completed_window"]
     subj = (
-        f"Hermes: {scoreboard['shipped']} shipped · {_alert_count_text(alert_summary)} · "
+        f"Hermes: {completed} validator-completed · {_alert_count_text(alert_summary)} · "
         f"{_cost_display(spend)} · {scoreboard['ready']} ready"
     )
-    return subj[:78]
+    return subj
 
 
 def build_headline_emoji_text(scoreboard, spend, alert_summary):
     alerts_n = alert_summary["alerts_n"]
     dot = "🟢" if alerts_n == 0 else "⚠️"
+    completed = scoreboard["validator_completed_window"]
     return (
-        f"{dot} {scoreboard['shipped']} shipped · "
-        f"{'⚠️' if alert_summary['stuck_tasks'] else '✓'} "
-        f"{alert_summary['stuck_tasks']} stuck · "
-        f"{'⚠️' if alert_summary['blocked_tasks'] else '✓'} "
-        f"{alert_summary['blocked_tasks']} blocked · "
-        f"{'⚠️' if alert_summary['health_signals'] else '✓'} "
-        f"{alert_summary['health_signals']} health · "
+        f"{dot} {completed} validator-completed · "
+        f"{'⚠️' if alert_summary['action_required'] else '✓'} "
+        f"{alert_summary['action_required']} action required · "
+        f"{'⚠️' if alert_summary['watch_list'] else '✓'} "
+        f"{alert_summary['watch_list']} watch list · "
+        f"{'⚠️' if alert_summary['system_signals'] else '✓'} "
+        f"{alert_summary['system_signals']} system signals · "
         f"💸 {_cost_display(spend)} · {scoreboard['ready']} ready"
     )
 
@@ -378,6 +340,44 @@ def add_resolution_health(header, work_counts):
     existing = str(merged.get("needs_attention") or "").strip()
     merged["needs_attention"] = f"{existing}; {signal}".strip("; ") if existing else signal
     return merged
+
+
+def _bounded(rows):
+    rows = list(rows or [])
+    return {"rows": rows[:MAX_SECTION_ROWS], "total": len(rows), "shown": min(len(rows), MAX_SECTION_ROWS)}
+
+
+def build_report_view_model(header, scoreboard, spend, alerts, hermes_rows, hermes_meta, work_rows, window_min):
+    """Single structured report model consumed by subject, body, and JSON summary."""
+    h = header or {}
+    action_required = [a for a in alerts if a.get("kind") == "blocked"]
+    watch_list = [a for a in alerts if a.get("kind") == "stuck"]
+    system_signals = [a for a in alerts if a.get("kind") == "health"]
+    sections = {
+        "action_required": {"title": "Action required", "items": action_required},
+        "watch_list": {"title": "Watch list", "items": watch_list},
+        "system_signals": {"title": "System signals", "items": system_signals},
+        "what_hermes_did": {"title": "What Hermes did", **_bounded(work_rows)},
+        "queue": {"title": "Queue", **_bounded(hermes_rows)},
+    }
+    alert_summary = {
+        "action_required": len(action_required),
+        "watch_list": len(watch_list),
+        "system_signals": len(system_signals),
+        "alerts_n": len(action_required) + len(watch_list) + len(system_signals),
+    }
+    subject = build_subject(scoreboard, spend, alert_summary)
+    return {
+        "header": h,
+        "scoreboard": scoreboard,
+        "spend": spend,
+        "sections": sections,
+        "counts": alert_summary,
+        "hermes_meta": hermes_meta or {},
+        "window_min": window_min,
+        "subject": subject,
+        "headline": build_headline_emoji_text(scoreboard, spend, alert_summary),
+    }
 
 
 # ---------- work-stoppage verdict (deterministic; NOT delegated to the cron LLM) ----------
@@ -467,8 +467,14 @@ def _esc(x):
     return html.escape(str(x)) if x is not None else ""
 
 
-def render_html(header, scoreboard, spend, alerts, hermes_rows, hermes_meta, work_rows, window_min, subject_line):
-    h = header or {}
+def render_html_view(model):
+    h = model["header"]
+    scoreboard = model["scoreboard"]
+    spend = model["spend"]
+    sections = model["sections"]
+    hermes_meta = model["hermes_meta"]
+    window_min = model["window_min"]
+    subject_line = model["subject"]
     when = _esc(h.get("when", ""))
     window_h = window_min / 60.0
     window_h_str = f"{window_h:.0f}" if window_h == int(window_h) else f"{window_h:.1f}"
@@ -493,9 +499,9 @@ def render_html(header, scoreboard, spend, alerts, hermes_rows, hermes_meta, wor
     parts.append(f'<div style="{css_container}">')
 
     # 1. Headline banner
-    banner_color = "#e8f5e9" if not alerts else "#fff3e0"
-    border_color = "#2e7d32" if not alerts else "#e65100"
-    headline = build_headline_emoji_text(scoreboard, spend, summarize_alerts(alerts))
+    banner_color = "#e8f5e9" if model["counts"]["alerts_n"] == 0 else "#fff3e0"
+    border_color = "#2e7d32" if model["counts"]["alerts_n"] == 0 else "#e65100"
+    headline = model["headline"]
     parts.append(
         f'<div style="background:{banner_color};border-bottom:3px solid {border_color};'
         f'padding:18px 20px;">'
@@ -507,46 +513,51 @@ def render_html(header, scoreboard, spend, alerts, hermes_rows, hermes_meta, wor
 
     parts.append('<div style="padding:20px">')
 
-    # 2. Alerts
-    parts.append('<h2 style="margin:0 0 12px;font-size:16px;color:#1a1a1a">⚠️ Needs you</h2>')
-    if not alerts:
+    # 2. Action required
+    action_items = sections["action_required"]["items"]
+    parts.append('<h2 style="margin:0 0 12px;font-size:16px;color:#1a1a1a">Action required</h2>')
+    if not action_items:
         parts.append(
             '<div style="padding:14px 16px;background:#e8f5e9;border-left:4px solid #2e7d32;'
             'border-radius:4px;font-size:14px;color:#1a1a1a;margin-bottom:24px">'
-            '✓ No blockers — nothing needs you right now.</div>'
+            'No blocked or needs-human tasks right now.</div>'
         )
     else:
         parts.append('<div style="margin-bottom:24px">')
-        for a in alerts:
-            name = _esc(a.get("name") or "")
-            url = a.get("url")
-            detail = _esc(a.get("detail") or "")
-            sub = _esc(a.get("sub") or "")
-            if url:
-                title_html = (
-                    f'<a href="{_esc(url)}" style="color:#0b57d0;text-decoration:none;'
-                    f'font-weight:600;font-size:14px">{name}</a>'
-                )
-            else:
-                title_html = f'<span style="font-weight:600;font-size:14px;color:#1a1a1a">{name}</span>'
-            parts.append(
-                '<div style="padding:12px 14px;margin-bottom:8px;background:#fff6f6;'
-                'border-left:4px solid #b00020;border-radius:4px">'
-                f'{title_html}'
-                f'<div style="font-size:13px;color:#b00020;margin-top:4px;font-weight:600">{detail}</div>'
-                + (f'<div style="font-size:12px;color:#888;margin-top:2px">{sub}</div>' if sub else '')
-                + '</div>'
-            )
+        for a in action_items:
+            parts.append(render_html_alert_card(a, "#b00020"))
         parts.append('</div>')
 
-    # 3. Scoreboard
+    # 3. Watch list
+    watch_items = sections["watch_list"]["items"]
+    parts.append('<h2 style="margin:0 0 12px;font-size:16px;color:#1a1a1a">Watch list</h2>')
+    if not watch_items:
+        parts.append('<div style="font-size:13px;color:#888;margin-bottom:24px">No stale in-progress tasks.</div>')
+    else:
+        parts.append('<div style="margin-bottom:24px">')
+        for a in watch_items:
+            parts.append(render_html_alert_card(a, "#b15c00"))
+        parts.append('</div>')
+
+    # 4. System signals
+    system_items = sections["system_signals"]["items"]
+    parts.append('<h2 style="margin:0 0 12px;font-size:16px;color:#1a1a1a">System signals</h2>')
+    if not system_items:
+        parts.append('<div style="font-size:13px;color:#888;margin-bottom:24px">No system signals.</div>')
+    else:
+        parts.append('<div style="margin-bottom:24px">')
+        for a in system_items:
+            parts.append(render_html_alert_card(a, "#666"))
+        parts.append('</div>')
+
+    # 5. Scoreboard
     parts.append('<h2 style="margin:0 0 12px;font-size:16px;color:#1a1a1a">📊 Scoreboard</h2>')
     cells = [
         ("Ready", scoreboard["ready"], "#0b57d0"),
         ("In progress", scoreboard["in_progress"], "#b15c00"),
-        ("In review", scoreboard["in_review"], "#0b69c7"),
+        ("Current in review", scoreboard["in_review"], "#0b69c7"),
         ("Blocked", scoreboard["blocked"], "#b00020"),
-        ("Shipped", scoreboard["shipped"], "#0a7d33"),
+        ("Validator-completed (window)", scoreboard["validator_completed_window"], "#0a7d33"),
     ]
     parts.append(
         '<table cellpadding="0" cellspacing="0" border="0" style="width:100%;border-collapse:separate;'
@@ -570,15 +581,8 @@ def render_html(header, scoreboard, spend, alerts, hermes_rows, hermes_meta, wor
         f'<div style="font-size:13px;color:#555;margin-bottom:24px">'
         f'Lanes — Code: {scoreboard["lane_code"]} · Content: {scoreboard["lane_content"]}</div>'
     )
-    parts.append(
-        f'<div style="font-size:13px;color:#555;margin-bottom:24px">'
-        f'Today vs yesterday — claimed {scoreboard["daily"]["claimed"]["today"]}/{scoreboard["daily"]["claimed"]["yesterday"]} · '
-        f'shipped {scoreboard["daily"]["shipped"]["today"]}/{scoreboard["daily"]["shipped"]["yesterday"]} · '
-        f'blocked {scoreboard["daily"]["blocked"]["today"]}/{scoreboard["daily"]["blocked"]["yesterday"]}'
-        f'</div>'
-    )
 
-    # 4. Model & spend
+    # 6. Model & spend
     parts.append('<h2 style="margin:0 0 12px;font-size:16px;color:#1a1a1a">💸 Model &amp; spend</h2>')
     if spend.get("error"):
         parts.append(
@@ -596,12 +600,16 @@ def render_html(header, scoreboard, spend, alerts, hermes_rows, hermes_meta, wor
         cost_line = f'Total est. cost this window: <b>${spend["total_cost"]:.2f}</b>'
         delta = spend["cost_delta"]
         if delta > 0.0001:
-            cost_line += f' &nbsp; <span style="color:#b00020">▲ ${delta:.2f} vs yesterday</span>'
+            cost_line += f' &nbsp; <span style="color:#b00020">▲ ${delta:.2f} vs previous window</span>'
         elif delta < -0.0001:
-            cost_line += f' &nbsp; <span style="color:#0a7d33">▼ ${abs(delta):.2f} vs yesterday</span>'
+            cost_line += f' &nbsp; <span style="color:#0a7d33">▼ ${abs(delta):.2f} vs previous window</span>'
         else:
-            cost_line += ' &nbsp; <span style="color:#888">(flat vs yesterday)</span>'
+            cost_line += ' &nbsp; <span style="color:#888">(flat vs previous window)</span>'
         parts.append(f'<div style="font-size:14px;color:#1a1a1a;margin-bottom:10px">{cost_line}</div>')
+        parts.append(
+            f'<div style="font-size:13px;color:#555;margin-bottom:10px">'
+            f'Today so far: ${spend["today_cost"]:.2f}</div>'
+        )
 
         parts.append('<div style="margin-bottom:10px">')
         for pr in spend["provider_rows"]:
@@ -626,22 +634,28 @@ def render_html(header, scoreboard, spend, alerts, hermes_rows, hermes_meta, wor
                 '✓ All runs served on the pinned model.</div>'
             )
 
-    # 5. Roster
+    # 7. Roster
+    work_section = sections["what_hermes_did"]
     parts.append(
         f'<h2 style="margin:0 0 12px;font-size:16px;color:#1a1a1a">📋 What Hermes did '
-        f'({len(work_rows)})</h2>'
+        f'({work_section["total"]})</h2>'
     )
-    parts.append(render_html_cards(work_rows))
+    parts.append(render_html_cards(work_section["rows"]))
+    if work_section["shown"] < work_section["total"]:
+        parts.append(f'<div style="font-size:12px;color:#888;margin-bottom:16px">Showing {work_section["shown"]} of {work_section["total"]}.</div>')
 
+    queue_section = sections["queue"]
     parts.append(
         f'<h2 style="margin:24px 0 12px;font-size:16px;color:#1a1a1a">📋 Queue '
-        f'({len(hermes_rows)})</h2>'
+        f'({queue_section["total"]})</h2>'
     )
     parts.append(
         f'<div style="font-size:12px;color:#888;margin:-8px 0 12px">'
         f'{_esc(hermes_meta.get("ready"))} agent-ready · snapshot {_esc(hermes_meta.get("generated"))}</div>'
     )
-    parts.append(render_html_cards(hermes_rows))
+    parts.append(render_html_cards(queue_section["rows"]))
+    if queue_section["shown"] < queue_section["total"]:
+        parts.append(f'<div style="font-size:12px;color:#888;margin-bottom:16px">Showing {queue_section["shown"]} of {queue_section["total"]}.</div>')
 
     parts.append(
         '<p style="margin:24px 0 0;font-size:11px;color:#999">'
@@ -654,6 +668,35 @@ def render_html(header, scoreboard, spend, alerts, hermes_rows, hermes_meta, wor
     parts.append('</body>')
     parts.append('</html>')
     return "\n".join(parts)
+
+
+def render_html_alert_card(a, color):
+    name = _esc(a.get("name") or "")
+    url = a.get("url")
+    detail = _esc(a.get("detail") or "")
+    sub = _esc(a.get("sub") or "")
+    if url:
+        title_html = (
+            f'<a href="{_esc(url)}" style="color:#0b57d0;text-decoration:none;'
+            f'font-weight:600;font-size:14px">{name}</a>'
+        )
+    else:
+        title_html = f'<span style="font-weight:600;font-size:14px;color:#1a1a1a">{name}</span>'
+    return (
+        '<div style="padding:12px 14px;margin-bottom:8px;background:#fff6f6;'
+        f'border-left:4px solid {color};border-radius:4px">'
+        f'{title_html}'
+        f'<div style="font-size:13px;color:{color};margin-top:4px;font-weight:600">{detail}</div>'
+        + (f'<div style="font-size:12px;color:#888;margin-top:2px">{sub}</div>' if sub else '')
+        + '</div>'
+    )
+
+
+def render_html(header, scoreboard, spend, alerts, hermes_rows, hermes_meta, work_rows, window_min, subject_line=None):
+    model = build_report_view_model(header, scoreboard, spend, alerts, hermes_rows, hermes_meta, work_rows, window_min)
+    if subject_line:
+        model["subject"] = subject_line
+    return render_html_view(model)
 
 
 def render_html_cards(rows):
@@ -695,29 +738,42 @@ def render_text_cards(rows):
     return "\n".join(lines)
 
 
-def build_text(header, scoreboard, spend, alerts, hermes_rows, hermes_meta, work_rows, window_min):
-    h = header or {}
-    window_h = window_min / 60.0
+def render_text_alerts(alerts):
+    lines = []
+    for a in alerts:
+        lines.append(f'  - {a.get("name")}: {a.get("detail")}')
+        if a.get("sub"):
+            lines.append(f'    ({a["sub"]})')
+        if a.get("url"):
+            lines.append(f'    {a["url"]}')
+    return lines
+
+
+def build_text_view(model):
+    h = model["header"]
+    scoreboard = model["scoreboard"]
+    spend = model["spend"]
+    sections = model["sections"]
+    hermes_meta = model["hermes_meta"]
+    window_h = model["window_min"] / 60.0
     window_h_str = f"{window_h:.0f}" if window_h == int(window_h) else f"{window_h:.1f}"
-    headline = build_headline_emoji_text(scoreboard, spend, summarize_alerts(alerts))
 
     lines = [
-        headline,
+        model["headline"],
         f'Hermes status · {h.get("when","")} · trailing {window_h_str}h',
         "",
         "=" * 40,
-        "NEEDS YOU / ALERTS",
+        "ACTION REQUIRED",
         "=" * 40,
     ]
-    if not alerts:
-        lines.append("  No blockers - nothing needs you right now.")
-    else:
-        for a in alerts:
-            lines.append(f'  - {a.get("name")}: {a.get("detail")}')
-            if a.get("sub"):
-                lines.append(f'    ({a["sub"]})')
-            if a.get("url"):
-                lines.append(f'    {a["url"]}')
+    action_items = sections["action_required"]["items"]
+    lines.extend(render_text_alerts(action_items) if action_items else ["  No blocked or needs-human tasks right now."])
+    lines += ["", "=" * 40, "WATCH LIST", "=" * 40]
+    watch_items = sections["watch_list"]["items"]
+    lines.extend(render_text_alerts(watch_items) if watch_items else ["  No stale in-progress tasks."])
+    lines += ["", "=" * 40, "SYSTEM SIGNALS", "=" * 40]
+    system_items = sections["system_signals"]["items"]
+    lines.extend(render_text_alerts(system_items) if system_items else ["  No system signals."])
     lines.append("")
 
     lines += [
@@ -725,20 +781,13 @@ def build_text(header, scoreboard, spend, alerts, hermes_rows, hermes_meta, work
         "SCOREBOARD",
         "=" * 40,
         f'  Ready: {scoreboard["ready"]}   In progress: {scoreboard["in_progress"]}   '
-        f'In review: {scoreboard["in_review"]}   Blocked: {scoreboard["blocked"]}   '
-        f'Shipped (window): {scoreboard["shipped"]}',
+        f'Current in review: {scoreboard["in_review"]}   Blocked: {scoreboard["blocked"]}   '
+        f'Validator-completed (window): {scoreboard["validator_completed_window"]}',
         f'  Lanes - Code: {scoreboard["lane_code"]} · Content: {scoreboard["lane_content"]}',
-        f'  Today vs yesterday - claimed {scoreboard["daily"]["claimed"]["today"]}/{scoreboard["daily"]["claimed"]["yesterday"]} · '
-        f'shipped {scoreboard["daily"]["shipped"]["today"]}/{scoreboard["daily"]["shipped"]["yesterday"]} · '
-        f'blocked {scoreboard["daily"]["blocked"]["today"]}/{scoreboard["daily"]["blocked"]["yesterday"]}',
         "",
     ]
 
-    lines += [
-        "=" * 40,
-        "MODEL & SPEND",
-        "=" * 40,
-    ]
+    lines += ["=" * 40, "MODEL & SPEND", "=" * 40]
     if spend.get("error"):
         lines.append(f"  WARNING: served ledger UNREADABLE ({spend['error']}) — "
                       "spend this window is UNKNOWN, not $0.00.")
@@ -747,12 +796,13 @@ def build_text(header, scoreboard, spend, alerts, hermes_rows, hermes_meta, work
     else:
         delta = spend["cost_delta"]
         if delta > 0.0001:
-            delta_str = f'(up ${delta:.2f} vs yesterday)'
+            delta_str = f'(up ${delta:.2f} vs previous window)'
         elif delta < -0.0001:
-            delta_str = f'(down ${abs(delta):.2f} vs yesterday)'
+            delta_str = f'(down ${abs(delta):.2f} vs previous window)'
         else:
-            delta_str = '(flat vs yesterday)'
+            delta_str = '(flat vs previous window)'
         lines.append(f'  Total est. cost this window: ${spend["total_cost"]:.2f} {delta_str}')
+        lines.append(f'  Today so far: ${spend["today_cost"]:.2f}')
         for pr in spend["provider_rows"]:
             deg = f' · {pr["degraded"]} degraded' if pr["degraded"] else ''
             lines.append(f'    {pr["provider"]} · {pr["n"]} runs · ${pr["cost"]:.2f}{deg}')
@@ -763,21 +813,28 @@ def build_text(header, scoreboard, spend, alerts, hermes_rows, hermes_meta, work
             lines.append('  All runs served on the pinned model.')
     lines.append("")
 
+    work_section = sections["what_hermes_did"]
+    lines += ["=" * 40, f'WHAT HERMES DID ({work_section["total"]})', "=" * 40, render_text_cards(work_section["rows"])]
+    if work_section["shown"] < work_section["total"]:
+        lines.append(f'  Showing {work_section["shown"]} of {work_section["total"]}.')
+    queue_section = sections["queue"]
     lines += [
-        "=" * 40,
-        f'WHAT HERMES DID ({len(work_rows)})',
-        "=" * 40,
-        render_text_cards(work_rows),
         "",
         "=" * 40,
-        f'QUEUE ({len(hermes_rows)})',
+        f'QUEUE ({queue_section["total"]})',
         "=" * 40,
         f'  {hermes_meta.get("ready",0)} agent-ready · snapshot {hermes_meta.get("generated","")}',
-        render_text_cards(hermes_rows),
-        "",
-        "(Read-only status report. It does not fix anything - see ignite-babysit-hermes for that.)",
+        render_text_cards(queue_section["rows"]),
     ]
+    if queue_section["shown"] < queue_section["total"]:
+        lines.append(f'  Showing {queue_section["shown"]} of {queue_section["total"]}.')
+    lines += ["", "(Read-only status report. It does not fix anything - see ignite-babysit-hermes for that.)"]
     return "\n".join(lines)
+
+
+def build_text(header, scoreboard, spend, alerts, hermes_rows, hermes_meta, work_rows, window_min):
+    model = build_report_view_model(header, scoreboard, spend, alerts, hermes_rows, hermes_meta, work_rows, window_min)
+    return build_text_view(model)
 
 
 def main():
@@ -805,7 +862,7 @@ def main():
     snap_tasks = (snap or {}).get("tasks", [])
     snap_tasks_by_id = {t.get("id"): t for t in snap_tasks}
 
-    window_rows, today_rows, yesterday_rows, ledger_err = load_served_ledger(
+    window_rows, today_rows, previous_window_rows, ledger_err = load_served_ledger(
         args.served_ledger, args.window_min
     )
     if ledger_err:
@@ -816,7 +873,7 @@ def main():
         spend = {
             "empty": True,
             "error": ledger_err,
-            "total_cost": None, "today_cost": None, "yesterday_cost": None, "cost_delta": None,
+            "total_cost": None, "today_cost": None, "previous_window_cost": None, "cost_delta": None,
             "provider_rows": [], "providers_n": 0, "runs_n": 0, "drift_n": 0, "top_drift_model": None,
         }
         print(f"WARN: served ledger issue: {ledger_err}", file=sys.stderr)
@@ -828,11 +885,14 @@ def main():
         spend = {
             "empty": True,
             "error": None,
-            "total_cost": 0.0, "today_cost": 0.0, "yesterday_cost": 0.0, "cost_delta": 0.0,
+            "total_cost": 0.0,
+            "today_cost": sum(float(r.get("cost_usd") or 0) for r in today_rows),
+            "previous_window_cost": sum(float(r.get("cost_usd") or 0) for r in previous_window_rows),
+            "cost_delta": -sum(float(r.get("cost_usd") or 0) for r in previous_window_rows),
             "provider_rows": [], "providers_n": 0, "runs_n": 0, "drift_n": 0, "top_drift_model": None,
         }
     else:
-        spend = summarize_spend(window_rows, today_rows, yesterday_rows)
+        spend = summarize_spend(window_rows, today_rows, previous_window_rows)
         spend["empty"] = False
         spend["error"] = None
 
@@ -848,14 +908,13 @@ def main():
     )
 
     alerts = build_alerts(hermes_rows, snap_tasks_by_id, header)
-    alert_summary = summarize_alerts(alerts)
+    model = build_report_view_model(
+        header, scoreboard, spend, alerts, hermes_rows, hermes_meta, work_rows, args.window_min,
+    )
+    subject = model["subject"]
 
-    subject = build_subject(scoreboard, spend, alert_summary)
-
-    html_body = render_html(header, scoreboard, spend, alerts, hermes_rows, hermes_meta, work_rows,
-                             args.window_min, subject)
-    text_body = build_text(header, scoreboard, spend, alerts, hermes_rows, hermes_meta, work_rows,
-                            args.window_min)
+    html_body = render_html_view(model)
+    text_body = build_text_view(model)
 
     with open(args.out_html, "w", encoding="utf-8") as f:
         f.write(html_body)
@@ -879,11 +938,20 @@ def main():
         "unresolved_task_ids": work_counts.get("unresolved_task_ids", []),
         "snapshot_generated": hermes_meta.get("generated"),
         "suggested_subject": subject,
+        "scoreboard_terms": {
+            "ready": scoreboard["ready"],
+            "in_progress": scoreboard["in_progress"],
+            "current_in_review": scoreboard["in_review"],
+            "blocked": scoreboard["blocked"],
+            "validator_completed_window": scoreboard["validator_completed_window"],
+        },
         "total_cost_usd": (round(spend["total_cost"], 4) if spend.get("total_cost") is not None else None),
+        "today_so_far_cost_usd": (round(spend["today_cost"], 4) if spend.get("today_cost") is not None else None),
+        "previous_window_cost_usd": (round(spend["previous_window_cost"], 4) if spend.get("previous_window_cost") is not None else None),
+        "cost_delta_vs_previous_window_usd": (round(spend["cost_delta"], 4) if spend.get("cost_delta") is not None else None),
         "spend_ledger_error": spend.get("error"),
-        **alert_summary,
+        **model["counts"],
         "providers_n": spend["providers_n"],
-        "scoreboard_daily": scoreboard["daily"],
     }
     print(json.dumps(summary, indent=2))
 
