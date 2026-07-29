@@ -4,27 +4,30 @@
   "no_agent_interval_seconds": 300,
   "vm": {
     "name": "hermes-ci",
-    "status_command": ["/usr/local/bin/orb", "list", "--format", "json"],
-    "boot_id_command": ["/usr/local/bin/orb", "exec", "-m", "hermes-ci", "cat", "/proc/sys/kernel/random/boot_id"],
-    "uptime_command": ["/usr/local/bin/orb", "exec", "-m", "hermes-ci", "cut", "-d.", "-f1", "/proc/uptime"],
+    "status_command": ["orb", "list", "--format", "json"],
+    "boot_id_command": ["orb", "exec", "-m", "hermes-ci", "cat", "/proc/sys/kernel/random/boot_id"],
+    "uptime_command": ["orb", "exec", "-m", "hermes-ci", "cut", "-d.", "-f1", "/proc/uptime"],
     "managed_commands": {
-      "start": ["/usr/local/bin/orb", "start", "hermes-ci"],
-      "stop": ["/usr/local/bin/orb", "stop", "hermes-ci"],
-      "restart": ["/usr/local/bin/orb", "restart", "hermes-ci"]
+      "start": ["orb", "start", "hermes-ci"],
+      "stop": ["orb", "stop", "hermes-ci"],
+      "restart": ["orb", "restart", "hermes-ci"]
     }
   },
   "expected_runners": [
     {
       "repo": "colingreig/jdmbuysell-v4",
-      "name": "hermes-jdmbuysell-v4"
+      "name": "hermes-jdmbuysell-v4",
+      "listener_command": ["/home/colingreig/actions-runner/jdmbuysell-v4/bin/Runner.Listener", "run"]
     },
     {
       "repo": "colingreig/topdynamicspartners",
-      "name": "hermes-topdynamicspartners"
+      "name": "hermes-topdynamicspartners",
+      "listener_command": ["/home/colingreig/actions-runner/topdynamicspartners/bin/Runner.Listener", "run"]
     },
     {
       "repo": "colingreig/elevatoruptime.com",
-      "name": "hermes-elevatoruptime.com"
+      "name": "hermes-elevatoruptime.com",
+      "listener_command": ["/home/colingreig/actions-runner/elevatoruptime.com/bin/Runner.Listener", "run"]
     }
   ],
   "recovery_allowlist": [

@@ -24,6 +24,7 @@ import os
 import re
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
 from collections import Counter
@@ -241,7 +242,15 @@ def _req(method: str, path: str, body: dict[str, Any] | None = None) -> tuple[in
 
 
 def _get(path: str) -> dict[str, Any]:
-    status, data = _req("GET", path)
+    max_retries = 3
+    for attempt in range(max_retries + 1):
+        status, data = _req("GET", path)
+        if status == 429 and attempt < max_retries:
+            delay = 15 * (2 ** attempt)  # 15, 30, 60 s — long enough to outlast ClickUp's 60s rate-limit window
+            print(f"WARNING: ClickUp 429 on GET {path}, retry {attempt+1}/{max_retries} in {delay}s", file=sys.stderr)
+            time.sleep(delay)
+            continue
+        break
     if status in (401, 403):
         print(f"ERROR: ClickUp auth failed (HTTP {status}) on GET {path}", file=sys.stderr)
         raise SystemExit(3)
@@ -253,6 +262,8 @@ def _get(path: str) -> dict[str, Any]:
         )
         raise SystemExit(4)
     if status >= 400 or data is None:
+        if status == 429:
+            _log_failure(f"rate_limit_exhausted endpoint=GET {path} retries={max_retries}")
         raise ClickUpApiError(status=status, path=path, message="request failed")
     if not isinstance(data, dict):
         raise ClickUpApiError(status=status, path=path, message="non-object response")

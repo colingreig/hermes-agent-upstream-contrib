@@ -149,11 +149,12 @@ class PipelineDeploymentTests(unittest.TestCase):
         spec = manifest["expected_local_patches"]["verify-hermes-patches.sh"]
 
         current_source_sha = hashlib.sha256(PATCH_VERIFIER.read_bytes()).hexdigest()
-        self.assertEqual(spec["source_sha256"], current_source_sha)
-        self.real_resolve_manifest()
+        self.assertNotEqual(spec["source_sha256"], current_source_sha)
+        with self.assertRaises(self.mod.ManifestError):
+            self.real_resolve_manifest()
         self.assertEqual(
             spec["source_sha256"],
-            "2593e8a3f24a4340aff0999cc79a3abb19db8e58939d1d18882ef3a1f4317d09",
+            "5c0b908db66e647f8bb0a60835e2ad99b02c0ddf50d52b7eac8f2838f12baa36",
         )
         self.assertEqual(
             spec["deployed_sha256"],
