@@ -19,8 +19,9 @@ import tempfile
 from typing import Any, Iterable
 
 
-SCHEMA = "hermes-mini-release-poll-control/v1"
+SCHEMA = "hermes-mini-release-poll-control/v2"
 SHA_RE = re.compile(r"[0-9a-f]{40,64}\Z")
+RECEIPT_ID_RE = re.compile(r"[0-9a-f]{64}\Z")
 LATEST_NAME = ".mini-release-poll-control.json"
 RECEIPT_PREFIX = ".mini-release-poll-control-receipt-"
 LOCK_NAME = ".mini-release-poll-control.lock"
@@ -52,6 +53,13 @@ def _validate_sha(value: str | None) -> str:
     return normalized
 
 
+def _validate_receipt_id(value: str | None) -> str:
+    normalized = (value or "").strip()
+    if not RECEIPT_ID_RE.fullmatch(normalized):
+        raise ControlError("authority receipt ID must be a lowercase SHA-256 digest")
+    return normalized
+
+
 def _assert_private_regular(path: Path) -> None:
     if path.is_symlink() or not path.is_file():
         raise ControlError(f"control file is missing or not a regular file: {path}")
@@ -78,10 +86,12 @@ def read_state(state_dir: Path) -> dict[str, Any]:
     _validate_text(state.get("actor"), "recorded actor")
     _validate_text(state.get("reason"), "recorded reason")
     certified_sha = state.get("certified_sha")
+    authority_receipt_id = state.get("authority_receipt_id")
     if state["state"] == "unfrozen":
         _validate_sha(certified_sha)
-    elif certified_sha is not None:
-        raise ControlError("frozen poll-control state must not carry a certified SHA")
+        _validate_receipt_id(authority_receipt_id)
+    elif certified_sha is not None or authority_receipt_id is not None:
+        raise ControlError("frozen poll-control state must not carry release authority")
 
     receipt_id = _receipt_id(payload)
     receipt = state_dir / f"{RECEIPT_PREFIX}{receipt_id}.json"
@@ -122,6 +132,7 @@ def change_state(
     actor: str,
     reason: str,
     certified_sha: str | None = None,
+    authority_receipt_id: str | None = None,
 ) -> dict[str, Any]:
     """Atomically record a frozen/unfrozen state and immutable receipt."""
     state_dir = state_dir.expanduser().resolve()
@@ -131,8 +142,10 @@ def change_state(
     reason = _validate_text(reason, "reason")
     if state == "unfrozen":
         certified_sha = _validate_sha(certified_sha)
+        authority_receipt_id = _validate_receipt_id(authority_receipt_id)
     elif state == "frozen":
         certified_sha = None
+        authority_receipt_id = None
     else:
         raise ControlError(f"unsupported poll-control state: {state}")
 
@@ -153,6 +166,7 @@ def change_state(
             "actor": actor,
             "reason": reason,
             "certified_sha": certified_sha,
+            "authority_receipt_id": authority_receipt_id,
             "changed_at": datetime.now(timezone.utc).isoformat(),
             "previous_receipt_id": previous.get("receipt_id") if previous else None,
         }
@@ -190,12 +204,14 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("status")
     authorize = subparsers.add_parser("authorize")
     authorize.add_argument("--print-certified-sha", action="store_true")
+    authorize.add_argument("--print-authority-receipt-id", action="store_true")
     for action in ("freeze", "unfreeze"):
         command = subparsers.add_parser(action)
         command.add_argument("--actor", required=True)
         command.add_argument("--reason", required=True)
         if action == "unfreeze":
             command.add_argument("--certified-sha", required=True)
+            command.add_argument("--authority-receipt-id", required=True)
     return parser
 
 
@@ -214,6 +230,7 @@ def main(argv: Iterable[str] | None = None) -> int:
                 actor=args.actor,
                 reason=args.reason,
                 certified_sha=args.certified_sha,
+                authority_receipt_id=args.authority_receipt_id,
             )
         else:
             result = read_state(state_dir)
@@ -222,6 +239,9 @@ def main(argv: Iterable[str] | None = None) -> int:
                 return 3
             if args.action == "authorize" and args.print_certified_sha:
                 print(result["certified_sha"])
+                return 0
+            if args.action == "authorize" and args.print_authority_receipt_id:
+                print(result["authority_receipt_id"])
                 return 0
         print(json.dumps(result, indent=2, sort_keys=True))
         return 0

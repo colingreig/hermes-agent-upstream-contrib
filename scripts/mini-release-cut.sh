@@ -45,6 +45,7 @@ DEPLOYED_REFRESH="$HERMES_HOME/scripts/clickup_workspace_refresh.py"
 VENDORED_LAUNCHD_RECONCILER_REL="machine-setup/mini-scripts/reconcile_launchd_environment.py"
 VENDORED_SKILLS_RECONCILER_REL="machine-setup/mini-scripts/reconcile_marketplace_skills.py"
 VENDORED_PR_PIPELINE_RECONCILER_REL="machine-setup/mini-scripts/reconcile_pr_pipeline.py"
+PROMOTION_CERTIFIER_REL="scripts/certify_prod_live_patches.py"
 
 UID_NUM="$(id -u)"
 GUI_DOMAIN="gui/${UID_NUM}"
@@ -78,19 +79,23 @@ LAUNCHD_ENV_CHANGED=0
 MARKETPLACE_SKILLS_CHANGED=0
 PREFLIGHT=0
 CERTIFIED_SHA=""
+PROMOTION_RECEIPT_ID=""
 PR_PIPELINE_CHANGED=0
 PR_PIPELINE_RECEIPT_ID=""
 REVIEW_GATE_SMOKE_STATUS=""
 
 usage() {
   cat <<'EOF'
-Usage: mini-release-cut.sh [--ref <branch-or-sha>] [--certified-sha <full-sha>] [--if-advanced] [--preflight] [--rollback] [--prune] [--dry-run] [--offline]
+Usage: mini-release-cut.sh [--ref <branch-or-sha>] [--certified-sha <full-sha>] [--promotion-receipt-id <sha256>] [--if-advanced] [--preflight] [--rollback] [--prune] [--dry-run] [--offline]
 
   --ref <ref>   Branch or sha to cut (default: prod-live-patches).
   --certified-sha <sha>
                 Bind the cut/preflight to one exact certified source commit.
                 Required for every real cut and must equal the resolved target;
                 ancestor-only evidence is rejected.
+  --promotion-receipt-id <sha256>
+                Bind the cut/preflight to the immutable Git receipt published
+                atomically with prod-live-patches. Required for every real cut.
   --if-advanced Cut only when the resolved ref is a strict descendant of the
                 active runtime commit. Equal is a successful structured no-op;
                 behind or diverged refs fail closed.
@@ -119,6 +124,8 @@ while [ $# -gt 0 ]; do
     --ref=*)    REF="${1#*=}"; shift ;;
     --certified-sha) CERTIFIED_SHA="${2:-}"; shift 2 ;;
     --certified-sha=*) CERTIFIED_SHA="${1#*=}"; shift ;;
+    --promotion-receipt-id) PROMOTION_RECEIPT_ID="${2:-}"; shift 2 ;;
+    --promotion-receipt-id=*) PROMOTION_RECEIPT_ID="${1#*=}"; shift ;;
     --rollback) DO_ROLLBACK=1; shift ;;
     --prune)    DO_PRUNE=1; shift ;;
     --dry-run)  DRY_RUN=1; shift ;;
@@ -320,13 +327,15 @@ write_release_receipt() {
 
   payload="$(python3 - "$event" "$REF" "$from_sha" "$to_sha" "$runtime_dir" \
     "$source_hash" "$deployed_hash" "$detail" "$CERTIFIED_SHA" \
-    "$PR_PIPELINE_RECEIPT_ID" "$REVIEW_GATE_SMOKE_STATUS" <<'PY'
+    "$PR_PIPELINE_RECEIPT_ID" "$REVIEW_GATE_SMOKE_STATUS" \
+    "$PROMOTION_RECEIPT_ID" <<'PY'
 import json
 import sys
 
 (
     event, ref, from_sha, to_sha, runtime_dir, source_hash, deployed_hash,
     detail, certified_sha, pipeline_receipt, review_gate_smoke,
+    promotion_receipt_id,
 ) = sys.argv[1:]
 print(json.dumps({
     "schema_version": 2,
@@ -335,6 +344,7 @@ print(json.dumps({
     "from_commit": from_sha,
     "to_commit": to_sha,
     "certified_source_commit": certified_sha or None,
+    "promotion_authority_receipt_id": promotion_receipt_id or None,
     "runtime_target": runtime_dir,
     "refresh_source_sha256": source_hash,
     "refresh_deployed_sha256": deployed_hash,
@@ -570,6 +580,10 @@ reconcile_governed_pr_pipeline() {
   fi
   [ -f "$reconciler" ] && [ ! -L "$reconciler" ] \
     || { warn "PR-pipeline reconciler missing or symlinked: $reconciler"; return 1; }
+  # Arm rollback before the reconciler can write its first managed path. A
+  # partial failure is still a changed deployment and must restore the prior
+  # release snapshot.
+  PR_PIPELINE_CHANGED=1
   report="$(
     "$release_dir/venv/bin/python" "$reconciler" reconcile \
       --manifest "$manifest" \
@@ -590,7 +604,6 @@ print(report["reconciliation_receipt_id"])
   )" || return 1
   [[ "$PR_PIPELINE_RECEIPT_ID" =~ ^[0-9a-f]{64}$ ]] || return 1
   REVIEW_GATE_SMOKE_STATUS="passed"
-  PR_PIPELINE_CHANGED=1
   ok "PR pipeline reconciled at exact source $source_sha (receipt=$PR_PIPELINE_RECEIPT_ID)"
 }
 
@@ -630,6 +643,29 @@ PY
   )" || return 1
   reconcile_governed_pr_pipeline "$release_dir" "$source_sha"
   PR_PIPELINE_CHANGED=0
+}
+
+verify_promotion_authority() {
+  local head_sha="${1:-}" receipt_id="${2:-}"
+  local authority_ref local_ref receipt_path certifier
+  [[ "$head_sha" =~ ^[0-9a-f]{40,64}$ ]] || return 1
+  [[ "$receipt_id" =~ ^[0-9a-f]{64}$ ]] || return 1
+  authority_ref="refs/tags/prod-live-patches-promotion-$receipt_id"
+  local_ref="refs/hermes-promotion-authority/$receipt_id"
+  certifier="$CURRENT_LINK/$PROMOTION_CERTIFIER_REL"
+  [ -f "$certifier" ] && [ ! -L "$certifier" ] || return 1
+  git_current fetch --no-tags origin "+$authority_ref:$local_ref" || return 1
+  [ "$(git_current cat-file -t "$local_ref" 2>/dev/null)" = blob ] || return 1
+  receipt_path="$(mktemp "$RELEASES_DIR/.promotion-authority.XXXXXX")" || return 1
+  if ! git_current cat-file blob "$local_ref" > "$receipt_path" \
+    || ! "$CURRENT_LINK/venv/bin/python" "$certifier" verify-receipt \
+      --receipt "$receipt_path" \
+      --receipt-id "$receipt_id" \
+      --head-sha "$head_sha" >/dev/null; then
+    rm -f "$receipt_path"
+    return 1
+  fi
+  rm -f "$receipt_path"
 }
 
 # Install the release-owned ClickUp wrapper as a stable user command.  The
@@ -1029,6 +1065,32 @@ find_uncovered_mini_scripts_changes() {
   done <<<"$changed"
 }
 
+freeze_managed_poll_after_failure() {
+  local control="$CURRENT_LINK/scripts/mini-release-poll-control.py"
+  local python="$CURRENT_LINK/venv/bin/python"
+  [ "$IF_ADVANCED" -eq 1 ] && [ "$PREFLIGHT" -eq 0 ] && [ "$DRY_RUN" -eq 0 ] \
+    || return 0
+  if [ -x "$python" ] && [ -f "$control" ] && [ ! -L "$control" ]; then
+    if ! "$python" "$control" freeze \
+      --actor "mini-release-cut" \
+      --reason "managed release failed; operator reconciliation required" >/dev/null; then
+      # Invalidate the stable authorization pointer even when the governed
+      # lock/state update itself failed. A missing latest pointer makes every
+      # subsequent poll UNKNOWN/fail-closed until an operator reauthorizes.
+      local latest="$RELEASES_DIR/.mini-release-poll-control.json"
+      local invalidated="$RELEASES_DIR/.mini-release-poll-control.invalidated"
+      if [ -f "$latest" ] && [ ! -L "$latest" ] && [ ! -L "$invalidated" ]; then
+        mv -f "$latest" "$invalidated" || return 1
+      fi
+      warn "poll freeze persistence failed; prior authorization invalidated"
+      return 1
+    fi
+  else
+    warn "managed release failed and governed poll control is unavailable; polling wrapper will fail closed"
+    return 1
+  fi
+}
+
 # The focused shell harness sources only the helpers above. This is deliberately
 # an opt-in no-op for a production invocation: it cannot cause a release cut.
 if [ "${MINI_RELEASE_CUT_TEST_LIB:-0}" = "1" ]; then
@@ -1058,29 +1120,20 @@ fi
 if [ "$DO_ROLLBACK" -eq 0 ] && [ "$DRY_RUN" -eq 0 ]; then
   [[ "$CERTIFIED_SHA" =~ ^[0-9a-f]{40,64}$ ]] \
     || die "managed release requires --certified-sha with a full lowercase object id"
+  [[ "$PROMOTION_RECEIPT_ID" =~ ^[0-9a-f]{64}$ ]] \
+    || die "managed release requires --promotion-receipt-id with a SHA-256 digest"
 elif [ -n "$CERTIFIED_SHA" ]; then
   [[ "$CERTIFIED_SHA" =~ ^[0-9a-f]{40,64}$ ]] \
     || die "--certified-sha must be a full lowercase object id"
+fi
+if [ -n "$PROMOTION_RECEIPT_ID" ]; then
+  [[ "$PROMOTION_RECEIPT_ID" =~ ^[0-9a-f]{64}$ ]] \
+    || die "--promotion-receipt-id must be a lowercase SHA-256 digest"
 fi
 
 # This trap owns both failure cleanup and lock release. NEW_DIR remains empty
 # for an explicit rollback, so that mode only releases its lock.
 NEW_DIR=""
-freeze_managed_poll_after_failure() {
-  local control="$CURRENT_LINK/scripts/mini-release-poll-control.py"
-  local python="$CURRENT_LINK/venv/bin/python"
-  [ "$IF_ADVANCED" -eq 1 ] && [ "$PREFLIGHT" -eq 0 ] && [ "$DRY_RUN" -eq 0 ] \
-    || return 0
-  if [ -x "$python" ] && [ -f "$control" ] && [ ! -L "$control" ]; then
-    "$python" "$control" freeze \
-      --actor "mini-release-cut" \
-      --reason "managed release failed; operator reconciliation required" >/dev/null \
-      || warn "failed to persist poll freeze after release failure"
-  else
-    warn "managed release failed and governed poll control is unavailable; polling wrapper will fail closed"
-  fi
-}
-
 # shellcheck disable=SC2329 # registered as an EXIT trap immediately below
 cleanup_on_exit() {
   local status=$?
@@ -1096,7 +1149,10 @@ cleanup_on_exit() {
     fi
   fi
   if [ "$status" -ne 0 ]; then
-    freeze_managed_poll_after_failure
+    if ! freeze_managed_poll_after_failure; then
+      warn "FATAL: managed poll freeze could not be persisted; authorization was invalidated"
+      status=70
+    fi
   fi
   release_cut_lock
   trap - EXIT
@@ -1108,6 +1164,7 @@ trap cleanup_on_exit EXIT
 
 if [ "$DO_ROLLBACK" -eq 1 ]; then
   [ -L "$CURRENT_LINK" ] || die "no runtime-current symlink at $CURRENT_LINK"
+  PR_PIPELINE_CHANGED=1
   rollback_to_previous "explicit --rollback"
   exit 0
 fi
@@ -1154,6 +1211,10 @@ fi
 SHORT_SHA="${SHA:0:12}"
 if [ -n "$CERTIFIED_SHA" ] && [ "$SHA" != "$CERTIFIED_SHA" ]; then
   die "resolved target $SHA does not exactly equal certified source $CERTIFIED_SHA"
+fi
+if [ "$DRY_RUN" -eq 0 ]; then
+  verify_promotion_authority "$SHA" "$PROMOTION_RECEIPT_ID" \
+    || die "immutable promotion receipt does not authorize exact target $SHA"
 fi
 
 # Polling mode is evaluated under the same lock as the eventual cut, after the

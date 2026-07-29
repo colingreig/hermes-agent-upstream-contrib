@@ -10,6 +10,7 @@ ACTION=""
 ACTOR=""
 REASON=""
 CERTIFIED_SHA=""
+PROMOTION_RECEIPT_ID=""
 while [ $# -gt 0 ]; do
   case "${1:-}" in
     --install|--install-and-enable|--freeze|--unfreeze|--status)
@@ -20,13 +21,14 @@ while [ $# -gt 0 ]; do
     --actor) ACTOR="${2:-}"; shift 2 ;;
     --reason) REASON="${2:-}"; shift 2 ;;
     --certified-sha) CERTIFIED_SHA="${2:-}"; shift 2 ;;
+    --promotion-receipt-id) PROMOTION_RECEIPT_ID="${2:-}"; shift 2 ;;
     -h|--help|"")
       cat <<'EOF'
 Usage:
-  install-mini-release-poller.sh --install --certified-sha <full-sha>
-  install-mini-release-poller.sh --install-and-enable --actor <id> --reason <why> --certified-sha <full-sha>
+  install-mini-release-poller.sh --install --certified-sha <full-sha> --promotion-receipt-id <sha256>
+  install-mini-release-poller.sh --install-and-enable --actor <id> --reason <why> --certified-sha <full-sha> --promotion-receipt-id <sha256>
   install-mini-release-poller.sh --freeze --actor <id> --reason <why>
-  install-mini-release-poller.sh --unfreeze --actor <id> --reason <why> --certified-sha <full-sha>
+  install-mini-release-poller.sh --unfreeze --actor <id> --reason <why> --certified-sha <full-sha> --promotion-receipt-id <sha256>
   install-mini-release-poller.sh --status
 EOF
       exit 0
@@ -70,17 +72,20 @@ case "$ACTION" in
     ;;
   unfreeze)
     [ -n "$ACTOR" ] && [ -n "$REASON" ] && [ -n "$CERTIFIED_SHA" ] \
-      || { echo "ERROR: --unfreeze requires --actor, --reason, and --certified-sha" >&2; exit 2; }
+      && [ -n "$PROMOTION_RECEIPT_ID" ] \
+      || { echo "ERROR: --unfreeze requires actor, reason, certified SHA, and promotion receipt ID" >&2; exit 2; }
     exec "$PYTHON" "$CONTROL" unfreeze \
-      --actor "$ACTOR" --reason "$REASON" --certified-sha "$CERTIFIED_SHA"
+      --actor "$ACTOR" --reason "$REASON" --certified-sha "$CERTIFIED_SHA" \
+      --authority-receipt-id "$PROMOTION_RECEIPT_ID"
     ;;
   install)
-    [ -n "$CERTIFIED_SHA" ] \
-      || { echo "ERROR: --install requires --certified-sha" >&2; exit 2; }
+    [ -n "$CERTIFIED_SHA" ] && [ -n "$PROMOTION_RECEIPT_ID" ] \
+      || { echo "ERROR: --install requires certified SHA and promotion receipt ID" >&2; exit 2; }
     ;;
   install-and-enable)
     [ -n "$ACTOR" ] && [ -n "$REASON" ] && [ -n "$CERTIFIED_SHA" ] \
-      || { echo "ERROR: --install-and-enable requires --actor, --reason, and --certified-sha" >&2; exit 2; }
+      && [ -n "$PROMOTION_RECEIPT_ID" ] \
+      || { echo "ERROR: --install-and-enable requires actor, reason, certified SHA, and promotion receipt ID" >&2; exit 2; }
     ;;
 esac
 
@@ -91,7 +96,8 @@ esac
 # metadata, but exits before any build, switch, service action, or receipt
 # write. Equal and strict descendant states return 0; behind/diverged states
 # return nonzero.
-"$CUT" --ref "$CERTIFIED_SHA" --certified-sha "$CERTIFIED_SHA" --preflight >/dev/null
+"$CUT" --ref "$CERTIFIED_SHA" --certified-sha "$CERTIFIED_SHA" \
+  --promotion-receipt-id "$PROMOTION_RECEIPT_ID" --preflight >/dev/null
 
 mkdir -p "$(dirname "$TARGET_PLIST")"
 tmp="$(mktemp "$(dirname "$TARGET_PLIST")/.${LABEL}.swap.XXXXXX")"
@@ -105,7 +111,8 @@ echo "Installed $TARGET_PLIST"
 
 if [ "$ACTION" = "install-and-enable" ]; then
   "$PYTHON" "$CONTROL" unfreeze \
-    --actor "$ACTOR" --reason "$REASON" --certified-sha "$CERTIFIED_SHA" >/dev/null
+    --actor "$ACTOR" --reason "$REASON" --certified-sha "$CERTIFIED_SHA" \
+    --authority-receipt-id "$PROMOTION_RECEIPT_ID" >/dev/null
   launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
   if ! launchctl bootstrap "$DOMAIN" "$TARGET_PLIST"; then
     "$PYTHON" "$CONTROL" freeze \

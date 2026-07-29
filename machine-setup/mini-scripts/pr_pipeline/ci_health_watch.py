@@ -514,6 +514,8 @@ def _latest_managed_intent(state: dict[str, Any]) -> dict[str, Any] | None:
         return None
     if intent.get("consumed_at"):
         return None
+    if intent.get("status") in {"failed", "consumed"}:
+        return None
     created = _parse_time(intent.get("timestamp"))
     if created is None or _now() - created > timedelta(minutes=30):
         return None
@@ -665,6 +667,7 @@ def _unknown_probe_report(
     reason: str,
     evidence: dict[str, Any] | None = None,
     blockers: list[str] | None = None,
+    send: Callable[[str], bool] | None = None,
 ) -> dict[str, Any]:
     observed_at = _now_iso()
     fingerprint_payload = {
@@ -694,12 +697,19 @@ def _unknown_probe_report(
         "recovery_eligible": False,
     }
     _append_jsonl(EVIDENCE_LOG_PATH, record)
+    alerted = False
+    if send is not None:
+        alerted = send(
+            "🔴 *hermes-ci lifecycle health UNKNOWN*\n"
+            f"reason=`{reason}`; blockers=`{','.join(blockers or []) or 'none'}`; "
+            "state was preserved and recovery is blocked."
+        )
     return {
         "checked": 0,
         "red": None,
         "newly_red": 0,
         "recovered": 0,
-        "vm_alerted": False,
+        "vm_alerted": alerted,
         "runner_alerted": 0,
         "runner_recovered": 0,
         "rerun_ids": [],
@@ -954,6 +964,7 @@ def poll_once(*, runner: CommandRunner = subprocess.run, topology_path: Path = T
                 previous,
                 reason="vm-probe-invalid",
                 evidence={"error": str(exc)},
+                send=send,
             )
 
         canonical_current_boot = _canonical_boot_uuid(vm.boot_id)
@@ -966,6 +977,7 @@ def poll_once(*, runner: CommandRunner = subprocess.run, topology_path: Path = T
                     **vm.orbstack_evidence,
                     "raw_boot_id": vm.boot_id,
                 },
+                send=send,
             )
         if canonical_current_boot != vm.boot_id:
             vm = VmStatus(
@@ -992,6 +1004,7 @@ def poll_once(*, runner: CommandRunner = subprocess.run, topology_path: Path = T
                     reason="baseline-reset-blocked",
                     evidence=vm.orbstack_evidence,
                     blockers=blockers,
+                    send=send,
                 )
             classification = "baseline-reset"
         else:
@@ -1019,9 +1032,18 @@ def poll_once(*, runner: CommandRunner = subprocess.run, topology_path: Path = T
         statuses = _runner_statuses_with_fallback(topology, runner=runner)
         runner_summary = "unknown" if statuses is None else ",".join(f"{key}={value.status}" for key, value in sorted(statuses.items()))
         if classification == "baseline-reset":
-            _record_baseline_reset(previous, vm, state, runner_summary, observation)
+            reset = _record_baseline_reset(
+                previous, vm, state, runner_summary, observation
+            )
+            baseline_reset_alerted = send(
+                "🟠 *hermes-ci lifecycle baseline repaired (DEGRADED)*\n"
+                f"invalid persisted boot `{reset.get('prior_boot_id')}` was replaced "
+                f"with canonical probe `{reset.get('canonical_boot_uuid')}`; "
+                "no restart or recovery authority was inferred."
+            )
             transition = None
         else:
+            baseline_reset_alerted = False
             transition = _record_transition(previous, vm, state, runner_summary, observation)
         vm_alerted = _maybe_alert_vm_transition(state, transition, send=send)
         runner_alerted, runner_recovered = _update_runner_alerts(state, statuses, send=send)
@@ -1049,11 +1071,11 @@ def poll_once(*, runner: CommandRunner = subprocess.run, topology_path: Path = T
             "red": len(current) if current is not None else None,
             "newly_red": newly_red,
             "recovered": ci_recovered,
-            "vm_alerted": vm_alerted,
+            "vm_alerted": vm_alerted or baseline_reset_alerted,
             "runner_alerted": len(runner_alerted),
             "runner_recovered": len(runner_recovered),
             "rerun_ids": rerun_ids,
-            "health": "OK",
+            "health": "DEGRADED" if classification == "baseline-reset" else "OK",
             "classification": classification,
             "probe_fingerprint": observation["probe_fingerprint"],
             "canonical_boot_uuid": canonical_current_boot,
@@ -1082,13 +1104,56 @@ def record_managed_lifecycle(
     command = commands[action]
     if not isinstance(command, list) or not all(isinstance(part, str) for part in command):
         raise MonitorError("managed command must be a string array")
-    record = {"timestamp": _now_iso(), "actor": actor, "action": action, "reason": reason, "vm": topology["vm"]["name"]}
+    record = {
+        "intent_id": str(uuid.uuid4()),
+        "timestamp": _now_iso(),
+        "actor": actor,
+        "action": action,
+        "reason": reason,
+        "vm": topology["vm"]["name"],
+        "status": "pending",
+    }
     with _state_lock(state_path):
         _append_jsonl(INTENT_LOG_PATH, record)
         state = _load_state(state_path)
         state["last_managed_intent"] = record
         _save_state(state, state_path)
-    result = runner(command, capture_output=True, text=True, timeout=120)
+    result: subprocess.CompletedProcess[str] | None = None
+    command_error: Exception | None = None
+    try:
+        result = runner(command, capture_output=True, text=True, timeout=120)
+    except Exception as exc:
+        command_error = exc
+    with _state_lock(state_path):
+        state = _load_state(state_path)
+        current = state.get("last_managed_intent")
+        if (
+            not isinstance(current, dict)
+            or current.get("intent_id") != record["intent_id"]
+        ):
+            raise MonitorError("managed lifecycle intent changed while action was running")
+        completed = dict(current)
+        completed["command_returncode"] = (
+            result.returncode if result is not None else None
+        )
+        if command_error is not None:
+            completed["status"] = "failed"
+            completed["failed_at"] = _now_iso()
+            completed["command_error"] = repr(command_error)
+            state.setdefault("managed_intents", []).append(completed)
+        elif result is not None and result.returncode == 0:
+            completed["status"] = "dispatched"
+            completed["dispatched_at"] = _now_iso()
+        else:
+            completed["status"] = "failed"
+            completed["failed_at"] = _now_iso()
+            state.setdefault("managed_intents", []).append(completed)
+        state["last_managed_intent"] = completed
+        _append_jsonl(INTENT_LOG_PATH, completed)
+        _save_state(state, state_path)
+    if command_error is not None:
+        raise MonitorError(f"managed lifecycle command failed to execute: {command_error}")
+    assert result is not None
     return result.returncode
 
 
@@ -1112,7 +1177,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             return record_managed_lifecycle(args.action, args.actor, args.reason, topology_path=args.topology)
         report = poll_once(topology_path=getattr(args, "topology", TOPOLOGY_PATH))
         print(json.dumps(report), file=sys.stderr)
-        return 0
+        return 0 if report.get("health") == "OK" else 1
     except MonitorError as exc:
         print(f"[ci-health] {exc}", file=sys.stderr)
         return 2

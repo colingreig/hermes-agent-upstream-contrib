@@ -251,8 +251,11 @@ class CiHealthWatchTests(unittest.TestCase):
 
         state = json.loads(self.state_path.read_text(encoding="utf-8"))
         reset = state["last_baseline_reset"]
-        self.assertEqual(report["health"], "OK")
+        self.assertEqual(report["health"], "DEGRADED")
         self.assertEqual(report["classification"], "baseline-reset")
+        self.assertTrue(
+            any("baseline repaired (DEGRADED)" in msg for msg in self.runner.sent)
+        )
         self.assertEqual(report["rerun_ids"], [])
         self.assertEqual(self.runner.reruns, [])
         self.assertEqual(state["schema_version"], 2)
@@ -397,6 +400,34 @@ class CiHealthWatchTests(unittest.TestCase):
         self._poll()
         self.assertEqual(self._evidence()[-1]["initiator"], "unknown")
         self.assertNotIn("interruption_started_at", self._evidence()[-1])
+
+    def test_failed_managed_action_is_terminal_and_cannot_authorize_transition(self):
+        def failed_runner(cmd, **kwargs):
+            if list(cmd)[:2] == ["orb", "restart"]:
+                return subprocess.CompletedProcess(cmd, 17, "", "restart failed")
+            return self.runner(cmd, **kwargs)
+
+        rc = self.mod.record_managed_lifecycle(
+            "restart",
+            "operator@example.com",
+            "controlled restart",
+            runner=failed_runner,
+            topology_path=TOPOLOGY,
+            state_path=self.state_path,
+        )
+
+        self.assertEqual(rc, 17)
+        state = json.loads(self.state_path.read_text(encoding="utf-8"))
+        intent = state["last_managed_intent"]
+        self.assertEqual(intent["status"], "failed")
+        self.assertEqual(intent["command_returncode"], 17)
+        self.assertIn("failed_at", intent)
+        self.assertIsNone(self.mod._latest_managed_intent(state))
+
+        self._poll()
+        self.runner.boot_id = BOOT_B
+        self._poll()
+        self.assertEqual(self._evidence()[-1]["initiator"], "unknown")
 
     def test_managed_intent_matching_is_action_specific(self):
         self.assertTrue(self.mod._transition_matches_intent("restart", BOOT_A, BOOT_B, True, True))
@@ -564,6 +595,17 @@ class CiHealthWatchTests(unittest.TestCase):
         self.assertEqual(report["rerun_ids"], [])
         self.assertEqual(after, before)
         self.assertEqual(self.runner.reruns, [])
+        self.assertTrue(
+            any("lifecycle health UNKNOWN" in msg for msg in self.runner.sent)
+        )
+
+    def test_main_exits_nonzero_for_unknown_and_degraded_health(self):
+        for health in ("UNKNOWN", "DEGRADED"):
+            self.mod.poll_once = lambda **_kwargs: {"health": health}
+            self.assertEqual(
+                self.mod.main(["poll", "--topology", str(TOPOLOGY)]),
+                1,
+            )
 
     def test_boot_id_probe_failure_fails_closed_without_state_overwrite_or_rerun(self):
         self._poll()

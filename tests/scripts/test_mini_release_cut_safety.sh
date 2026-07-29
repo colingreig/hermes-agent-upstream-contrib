@@ -405,6 +405,57 @@ fi
   || fail "receipt symlink failure modified the symlink target"
 rm "$LAST_RECEIPT_FILE"
 
+# A reconciler can fail after its first managed write. Rollback must already be
+# armed before that subprocess begins, not only after its JSON report parses.
+PARTIAL_PR_RELEASE="$RELEASES_DIR/v1.2.5-partial-pr"
+mkdir -p "$PARTIAL_PR_RELEASE/$(dirname "$VENDORED_PR_PIPELINE_RECONCILER_REL")" \
+  "$PARTIAL_PR_RELEASE/machine-setup/mini-scripts/pr_pipeline" \
+  "$PARTIAL_PR_RELEASE/venv/bin"
+printf '# placeholder\n' > "$PARTIAL_PR_RELEASE/$VENDORED_PR_PIPELINE_RECONCILER_REL"
+printf '{}\n' > "$PARTIAL_PR_RELEASE/machine-setup/mini-scripts/pr_pipeline/manifest.json"
+cat > "$PARTIAL_PR_RELEASE/venv/bin/python" <<'SH'
+#!/usr/bin/env bash
+printf 'partial\n' > "$HERMES_HOME/partial-pr-pipeline-write"
+exit 42
+SH
+chmod 0755 "$PARTIAL_PR_RELEASE/venv/bin/python"
+PR_PIPELINE_CHANGED=0
+if reconcile_governed_pr_pipeline \
+  "$PARTIAL_PR_RELEASE" aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; then
+  fail "partially failed PR-pipeline reconciliation reported success"
+fi
+[ "$PR_PIPELINE_CHANGED" -eq 1 ] \
+  || fail "partial PR-pipeline failure did not arm rollback"
+[ -f "$HERMES_HOME/partial-pr-pipeline-write" ] \
+  || fail "partial PR-pipeline fixture did not reach its first write"
+PR_PIPELINE_CHANGED=0
+
+# If governed freeze persistence fails, the prior stable authorization pointer
+# is removed so a subsequent poll cannot reuse the old unfrozen SHA.
+FREEZE_RELEASE="$RELEASES_DIR/v1.2.6-freeze-failure"
+mkdir -p "$FREEZE_RELEASE/scripts" "$FREEZE_RELEASE/venv/bin"
+printf '# placeholder\n' > "$FREEZE_RELEASE/scripts/mini-release-poll-control.py"
+cat > "$FREEZE_RELEASE/venv/bin/python" <<'SH'
+#!/usr/bin/env bash
+exit 42
+SH
+chmod 0755 "$FREEZE_RELEASE/venv/bin/python"
+repoint_symlink "$FREEZE_RELEASE" >/dev/null
+printf 'old authorization\n' > "$RELEASES_DIR/.mini-release-poll-control.json"
+rm -f "$RELEASES_DIR/.mini-release-poll-control.invalidated"
+IF_ADVANCED=1
+PREFLIGHT=0
+DRY_RUN=0
+if freeze_managed_poll_after_failure; then
+  fail "failed governed freeze was reported as successful"
+fi
+[ ! -e "$RELEASES_DIR/.mini-release-poll-control.json" ] \
+  || fail "freeze failure left prior authorization active"
+[ -f "$RELEASES_DIR/.mini-release-poll-control.invalidated" ] \
+  || fail "freeze failure did not preserve invalidation evidence"
+repoint_symlink "$PREVIOUS_RELEASE" >/dev/null
+IF_ADVANCED=0
+
 # End-to-end dry cuts validate governed sources from the immutable target tree,
 # never create the planned release directory, and leave the active runtime,
 # deployed refresh, receipts, reloads, and reconcilers untouched. The target
@@ -529,6 +580,8 @@ POLL_INSTALLER="$SCRIPT_DIR/../../scripts/install-mini-release-poller.sh"
 POLL_PLIST="$SCRIPT_DIR/../../scripts/launchd/com.colingreig.hermes.release-poll.plist"
 grep -Fq -- '--if-advanced' "$POLL_WRAPPER" || fail "poll wrapper does not require conditional mode"
 grep -Fq -- '--certified-sha' "$POLL_WRAPPER" || fail "poll wrapper does not bind an exact certified SHA"
+grep -Fq -- '--promotion-receipt-id' "$POLL_WRAPPER" \
+  || fail "poll wrapper does not bind immutable promotion authority"
 grep -Fq -- '--preflight' "$POLL_INSTALLER" || fail "poll installer has no fail-closed preflight"
 python3 - "$POLL_PLIST" <<'PY' || fail "release poll plist is not parseable"
 import plistlib
@@ -614,7 +667,9 @@ if HOME="$PREFLIGHT_HOME" HERMES_HOME="$PREFLIGHT_HERMES" \
   FAKE_ACTIVE_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
   FAKE_REMOTE_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
   "$POLL_INSTALLER" --install \
-    --certified-sha aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa >/dev/null 2>&1; then
+    --certified-sha aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+    --promotion-receipt-id cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc \
+    >/dev/null 2>&1; then
   fail "installer accepted stale local equality after current remote diverged"
 fi
 [ -f "$PREFLIGHT_MARKER" ] \

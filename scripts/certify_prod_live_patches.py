@@ -24,6 +24,24 @@ AUTHORITY = ".github/workflows/sync-prod-live-patches.yml"
 GOVERNING_WORKFLOW = "CI"
 GOVERNING_WORKFLOW_PATH = ".github/workflows/ci.yml"
 REQUIRED_AGGREGATE_JOB = "All required checks pass"
+PROMOTION_RECEIPT_REF_PREFIX = "refs/tags/prod-live-patches-promotion-"
+REQUIRED_JOB_PREFIXES = (
+    "Detect affected areas",
+    "Python tests",
+    "Python lints",
+    "JS & TS checks",
+    "Docs Site",
+    "Check contributors",
+    "Check uv.lock",
+    "Lint Docker scripts",
+    "OSV scan",
+)
+# These jobs are intentionally conditional inside otherwise-required reusable
+# workflows.  Every other member of a required group must be terminal success.
+ALLOWED_SKIPPED_REQUIRED_JOBS = {
+    "Python lints / ruff + ty diff",
+    "Python lints / CI-sensitive file review",
+}
 
 
 class CertificationError(ValueError):
@@ -167,6 +185,44 @@ def certify(evidence: dict[str, Any]) -> dict[str, Any]:
 
     jobs_payload = _mapping(evidence.get("jobs"))
     jobs = _mappings(jobs_payload.get("jobs"))
+    required_jobs: list[dict[str, Any]] = []
+    missing_groups: list[str] = []
+    for prefix in REQUIRED_JOB_PREFIXES:
+        matches = [
+            job
+            for job in jobs
+            if job.get("name") == prefix
+            or (
+                isinstance(job.get("name"), str)
+                and job["name"].startswith(f"{prefix} / ")
+            )
+        ]
+        if not matches:
+            missing_groups.append(prefix)
+        required_jobs.extend(matches)
+    if missing_groups:
+        raise CertificationError(
+            f"required CI job groups are missing: {', '.join(missing_groups)}"
+        )
+    rejected_jobs = [
+        str(job.get("name"))
+        for job in required_jobs
+        if not (
+            job.get("status") == "completed"
+            and (
+                job.get("conclusion") == "success"
+                or (
+                    job.get("conclusion") == "skipped"
+                    and job.get("name") in ALLOWED_SKIPPED_REQUIRED_JOBS
+                )
+            )
+        )
+    ]
+    if rejected_jobs:
+        raise CertificationError(
+            "required CI jobs are not terminal success: "
+            + ", ".join(sorted(rejected_jobs))
+        )
     aggregate_jobs = [job for job in jobs if job.get("name") == REQUIRED_AGGREGATE_JOB]
     if len(aggregate_jobs) != 1:
         raise CertificationError(
@@ -208,6 +264,15 @@ def certify(evidence: dict[str, Any]) -> dict[str, Any]:
                 "status": aggregate.get("status"),
                 "conclusion": aggregate.get("conclusion"),
             },
+            "required_jobs": [
+                {
+                    "id": _required_text(job.get("id"), f"job[{job.get('name')}].id"),
+                    "name": job.get("name"),
+                    "status": job.get("status"),
+                    "conclusion": job.get("conclusion"),
+                }
+                for job in sorted(required_jobs, key=lambda item: str(item.get("name")))
+            ],
         },
     }
 
@@ -240,6 +305,21 @@ def validate_certificate(certificate: object) -> dict[str, Any]:
     ):
         raise CertificationError("certificate aggregate job is not successful")
     _required_text(aggregate.get("id"), "certificate.aggregate_job.id")
+    required_jobs = _mappings(ci.get("required_jobs"))
+    if not required_jobs:
+        raise CertificationError("certificate required jobs are missing")
+    if any(
+        job.get("status") != "completed"
+        or (
+            job.get("conclusion") != "success"
+            and not (
+                job.get("conclusion") == "skipped"
+                and job.get("name") in ALLOWED_SKIPPED_REQUIRED_JOBS
+            )
+        )
+        for job in required_jobs
+    ):
+        raise CertificationError("certificate contains a non-success required job")
     return value
 
 
@@ -260,12 +340,44 @@ def promotion_receipt(
         ),
         "repository": _required_text(certificate.get("repository"), "repository"),
         "ref": "refs/heads/prod-live-patches",
+        "receipt_ref_prefix": PROMOTION_RECEIPT_REF_PREFIX,
         "from_sha": _full_sha(from_sha, "from_sha"),
         "head_sha": _full_sha(certificate.get("head_sha"), "head_sha"),
         "certificate_id": _content_id(certificate),
         "ci": certificate["ci"],
         "freeze": certificate["freeze"],
     }
+
+
+def validate_promotion_receipt(
+    receipt: object,
+    *,
+    receipt_id: str,
+    head_sha: str,
+) -> dict[str, Any]:
+    value = _mapping(receipt)
+    if value.get("schema") != RECEIPT_SCHEMA:
+        raise CertificationError(f"receipt.schema must equal {RECEIPT_SCHEMA}")
+    if value.get("authority") != AUTHORITY:
+        raise CertificationError("receipt authority is not the promotion workflow")
+    if value.get("ref") != "refs/heads/prod-live-patches":
+        raise CertificationError("receipt does not authorize prod-live-patches")
+    if value.get("receipt_ref_prefix") != PROMOTION_RECEIPT_REF_PREFIX:
+        raise CertificationError("receipt ref authority prefix is invalid")
+    normalized_id = _full_sha(receipt_id, "receipt_id")
+    if len(normalized_id) != 64:
+        raise CertificationError("receipt_id must be a SHA-256 digest")
+    expected_head = _full_sha(head_sha, "head_sha")
+    if value.get("head_sha") != expected_head:
+        raise CertificationError("receipt head does not match exact requested SHA")
+    if _content_id(value) != normalized_id:
+        raise CertificationError("receipt content does not match receipt_id")
+    _full_sha(value.get("from_sha"), "receipt.from_sha")
+    _required_text(value.get("authority_run_id"), "receipt.authority_run_id")
+    _required_text(value.get("authority_run_attempt"), "receipt.authority_run_attempt")
+    _required_text(value.get("certificate_id"), "receipt.certificate_id")
+    validate_freeze(value.get("freeze"))
+    return value
 
 
 def write_certificate(evidence_path: Path, output_path: Path) -> str:
@@ -310,6 +422,12 @@ def _parser() -> argparse.ArgumentParser:
     receipt_parser.add_argument("--from-sha", required=True)
     receipt_parser.add_argument("--authority-run-id", required=True)
     receipt_parser.add_argument("--authority-run-attempt", required=True)
+    verify_receipt_parser = subparsers.add_parser("verify-receipt")
+    verify_receipt_parser.add_argument("--receipt", type=Path, required=True)
+    verify_receipt_parser.add_argument("--receipt-id", required=True)
+    verify_receipt_parser.add_argument("--head-sha", required=True)
+    freeze_parser = subparsers.add_parser("validate-freeze")
+    freeze_parser.add_argument("--input", type=Path, required=True)
     return parser
 
 
@@ -319,7 +437,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         if args.command == "certify":
             content_id = write_certificate(args.evidence, args.output)
             print(json.dumps({"certificate_id": content_id, "path": str(args.output)}))
-        else:
+        elif args.command == "receipt":
             path = write_receipt(
                 args.certificate,
                 args.output_dir,
@@ -328,6 +446,17 @@ def main(argv: Iterable[str] | None = None) -> int:
                 authority_run_attempt=args.authority_run_attempt,
             )
             print(str(path))
+        elif args.command == "verify-receipt":
+            receipt = json.loads(args.receipt.read_text(encoding="utf-8"))
+            value = validate_promotion_receipt(
+                receipt,
+                receipt_id=args.receipt_id,
+                head_sha=args.head_sha,
+            )
+            print(json.dumps({"head_sha": value["head_sha"], "receipt_id": args.receipt_id}))
+        else:
+            freeze = json.loads(args.input.read_text(encoding="utf-8"))
+            print(json.dumps(validate_freeze(freeze), sort_keys=True))
     except (CertificationError, OSError, json.JSONDecodeError) as exc:
         print(f"certification failed: {exc}", file=os.sys.stderr)
         return 2

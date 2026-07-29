@@ -70,6 +70,13 @@ def _job(
     }
 
 
+def _required_jobs() -> list[dict]:
+    return [
+        _job(name=name) | {"id": 9100 + index}
+        for index, name in enumerate(certifier.REQUIRED_JOB_PREFIXES)
+    ]
+
+
 def _evidence() -> dict:
     return {
         "repository": "owner/hermes-agent",
@@ -83,7 +90,7 @@ def _evidence() -> dict:
             "changed_at": "2026-07-29T12:00:00Z",
         },
         "workflow_runs": {"workflow_runs": [_run()]},
-        "jobs": {"jobs": [_job()]},
+        "jobs": {"jobs": [*_required_jobs(), _job()]},
     }
 
 
@@ -129,7 +136,7 @@ def test_missing_pending_failed_cancelled_or_skipped_ci_is_rejected(status, conc
 )
 def test_non_success_aggregate_job_is_rejected(status, conclusion):
     evidence = _evidence()
-    evidence["jobs"]["jobs"] = [_job(status=status, conclusion=conclusion)]
+    evidence["jobs"]["jobs"][-1] = _job(status=status, conclusion=conclusion)
 
     with pytest.raises(certifier.CertificationError):
         certifier.certify(evidence)
@@ -166,7 +173,7 @@ def test_workflow_run_trigger_must_be_latest_exact_run():
 
 def test_missing_aggregate_job_is_rejected():
     evidence = _evidence()
-    evidence["jobs"] = {"jobs": [_job(name="advisory")]}
+    evidence["jobs"]["jobs"][-1] = _job(name="advisory")
 
     with pytest.raises(certifier.CertificationError, match="exactly one"):
         certifier.certify(evidence)
@@ -174,9 +181,31 @@ def test_missing_aggregate_job_is_rejected():
 
 def test_aggregate_job_must_join_the_exact_workflow_run():
     evidence = _evidence()
-    evidence["jobs"]["jobs"][0].pop("run_id")
+    evidence["jobs"]["jobs"][-1].pop("run_id")
 
     with pytest.raises(certifier.CertificationError, match="aggregate_job.run_id"):
+        certifier.certify(evidence)
+
+
+@pytest.mark.parametrize("conclusion", ["failure", "cancelled", "skipped", "timed_out"])
+def test_non_success_required_job_cannot_hide_behind_green_aggregate(conclusion):
+    evidence = _evidence()
+    python_job = next(
+        job for job in evidence["jobs"]["jobs"] if job["name"] == "Python tests"
+    )
+    python_job["conclusion"] = conclusion
+
+    with pytest.raises(certifier.CertificationError, match="required CI jobs"):
+        certifier.certify(evidence)
+
+
+def test_missing_required_job_group_is_rejected():
+    evidence = _evidence()
+    evidence["jobs"]["jobs"] = [
+        job for job in evidence["jobs"]["jobs"] if job["name"] != "Docs Site"
+    ]
+
+    with pytest.raises(certifier.CertificationError, match="groups are missing"):
         certifier.certify(evidence)
 
 
@@ -233,6 +262,31 @@ def test_receipt_filename_is_content_sha_and_records_authorities(tmp_path):
     assert receipt["from_sha"] == PROD_HEAD
     assert receipt["freeze"]["reason"] == "normal governed promotion"
     assert receipt["ci"]["run_id"] == "501"
+    assert certifier.validate_promotion_receipt(
+        receipt,
+        receipt_id=hashlib.sha256(content).hexdigest(),
+        head_sha=HEAD,
+    ) == receipt
+
+
+def test_receipt_verification_rejects_wrong_id_and_wrong_head(tmp_path):
+    certificate = certifier.certify(_evidence())
+    receipt = certifier.promotion_receipt(
+        certificate,
+        from_sha=PROD_HEAD,
+        authority_run_id="700",
+        authority_run_attempt="1",
+    )
+    receipt_id = hashlib.sha256(certifier._canonical_bytes(receipt)).hexdigest()
+
+    with pytest.raises(certifier.CertificationError, match="content"):
+        certifier.validate_promotion_receipt(
+            receipt, receipt_id="d" * 64, head_sha=HEAD
+        )
+    with pytest.raises(certifier.CertificationError, match="exact requested"):
+        certifier.validate_promotion_receipt(
+            receipt, receipt_id=receipt_id, head_sha=OLDER_HEAD
+        )
 
 
 @pytest.fixture(scope="module")
@@ -265,30 +319,43 @@ def test_workflow_waits_for_completed_ci_and_has_no_push_bypass(workflow):
 def test_all_triggers_share_certificate_and_exact_sha_cas_path(workflow):
     assert list(workflow["jobs"]) == ["promote"]
     job = workflow["jobs"]["promote"]
-    assert job["env"]["FREEZE_STATE"] == "${{ vars.PROD_LIVE_PATCHES_FREEZE }}"
 
     collect = _step(workflow, "Collect governing CI evidence")["run"]
     certify = _step(workflow, "Certify exact SHA, aggregate job, and freeze state")["run"]
-    push = _step(workflow, "Re-fetch, CAS assert, and push certified SHA")["run"]
+    push = _step(
+        workflow,
+        "Re-read freeze, CAS assert, and atomically publish branch and receipt",
+    )["run"]
 
     assert "event=push" in collect
     assert "scripts/certify_prod_live_patches.py certify" in certify
+    assert "actions/variables/PROD_LIVE_PATCHES_FREEZE" in push
+    assert "validate-freeze" in push
     assert "git fetch --no-tags origin" in push
     assert '[ "$FRESH_MAIN" = "$CERTIFIED_SHA" ]' in push
     assert '[ "$FRESH_PROD" = "$EXPECTED_PROD_SHA" ]' in push
     assert "--force-with-lease=" in push
+    assert "git push --atomic" in push
+    assert '"$RECEIPT_BLOB:$RECEIPT_REF"' in push
     assert "PUSHED_SHA" in push
     assert push.index("git fetch --no-tags origin") < push.index("FRESH_MAIN=")
     assert push.index("FRESH_MAIN=") < push.index("git push")
 
 
-def test_workflow_publishes_content_addressed_receipt_artifact(workflow):
+def test_workflow_publishes_content_addressed_receipt_in_same_git_transaction(workflow):
     receipt = _step(workflow, "Create content-addressed promotion receipt")
-    publish = _step(workflow, "Publish immutable promotion receipt")
+    publish = _step(
+        workflow,
+        "Re-read freeze, CAS assert, and atomically publish branch and receipt",
+    )
 
     assert "scripts/certify_prod_live_patches.py receipt" in receipt["run"]
+    assert "git hash-object -w" in receipt["run"]
     assert publish["if"] == "steps.prepare.outputs.changed == 'true'"
-    assert publish["with"]["name"] == (
-        "prod-live-patches-promotion-${{ steps.receipt.outputs.id }}"
+    assert "git push --atomic" in publish["run"]
+    assert "refs/heads/prod-live-patches" in publish["run"]
+    assert "RECEIPT_BLOB:$RECEIPT_REF" in publish["run"]
+    assert not any(
+        step.get("uses", "").startswith("actions/upload-artifact")
+        for step in workflow["jobs"]["promote"]["steps"]
     )
-    assert publish["with"]["if-no-files-found"] == "error"
