@@ -8,7 +8,7 @@ in a row and Slack got an identical payload every 15 minutes (confirmed
 byte-identical across six consecutive runs, 257 total runs since 2026-07-22,
 for the same 6 stale PRs).
 
-pr_staleness_alert.py now owns its own dedupe: fingerprint on
+pr_pipeline/pr_staleness_alert.py now owns its own dedupe: fingerprint on
 (repo, PR number) -> a COARSE age bucket, persisted at a JSON state path, and
 post only on a fingerprint change or a digest-interval heartbeat. Every
 dedupe entry point is documented FAIL-OPEN: a bug reading state must never
@@ -35,7 +35,7 @@ from pathlib import Path
 from unittest import mock
 
 MINI_SCRIPTS_DIR = Path(__file__).resolve().parent.parent
-MODULE_PATH = MINI_SCRIPTS_DIR / "pr_staleness_alert.py"
+MODULE_PATH = MINI_SCRIPTS_DIR / "pr_pipeline" / "pr_staleness_alert.py"
 
 _COUNTER = 0
 
@@ -100,7 +100,7 @@ def _pr_state(repo: str, number: int, age_hours: float, now: datetime):
 
 
 def _alert_pr(repo: str, number: int, age_hours: float) -> dict[str, object]:
-    return {"repo": repo, "pr": number, "age_hours": age_hours}
+    return {"repo": repo, "pr": number, "age_hours": age_hours, "merge_state": "clean"}
 
 
 class AgeBucketAndFingerprintTests(unittest.TestCase):
@@ -126,31 +126,6 @@ class AgeBucketAndFingerprintTests(unittest.TestCase):
             self.mod.build_fingerprint(run1, thresholds),
             self.mod.build_fingerprint(run2, thresholds),
         )
-
-
-class MinAgeHoursTests(unittest.TestCase):
-    def setUp(self):
-        self.mod, self.ppi = _load_module()
-
-    def _set_min_age_env(self, raw: str):
-        patcher = mock.patch.dict("os.environ", {"PR_STALENESS_MIN_AGE_HOURS": raw})
-        patcher.start()
-        self.addCleanup(patcher.stop)
-
-    def test_default_is_48_hours_when_unset(self):
-        self._set_min_age_env("")
-        self.assertEqual(self.mod._min_age_hours(), 48.0)
-
-    def test_valid_override_is_honoured(self):
-        self._set_min_age_env("12")
-        self.assertEqual(self.mod._min_age_hours(), 12.0)
-
-    def test_invalid_overrides_fall_back_to_48_hours(self):
-        for raw in ("garbage", "", "0", "-1"):
-            with self.subTest(raw=raw):
-                self._set_min_age_env(raw)
-                self.assertEqual(self.mod._min_age_hours(), 48.0)
-
 
 class DecideTests(unittest.TestCase):
     """decide() is the pure dedupe/heartbeat decision — no I/O."""
@@ -289,20 +264,19 @@ class RunEndToEndTests(unittest.TestCase):
         self.ppi.notify.assert_not_called()
         self.assertFalse(self.state_path.exists())
 
-    def test_pr_selection_is_age_only_at_the_48_hour_default(self):
-        self.ppi.stale_without_verdict = mock.Mock(side_effect=AssertionError("must not be called"))
-        self._set_states([_pr_state("org/repo", 1, age_hours=47, now=self.now)])
+    def test_run_delegates_staleness_selection_to_pipeline_primitive(self):
+        self.ppi.stale_without_verdict = mock.Mock(return_value=False)
+        state = _pr_state("org/repo", 1, age_hours=49, now=self.now)
+        self._set_states([state])
         self.mod.run(["org/repo"])
         self.ppi.notify.assert_not_called()
+        self.ppi.stale_without_verdict.assert_called_once_with(
+            state.created_at, state.latest_verdict_at, self.now
+        )
 
-        self._set_states([_pr_state("org/repo", 1, age_hours=49, now=self.now)])
+        self.ppi.stale_without_verdict = mock.Mock(return_value=True)
+        self._set_states([state])
         self.mod.run(["org/repo"])
-        self.ppi.notify.assert_called_once()
-
-    def test_ambient_min_age_override_changes_pr_selection(self):
-        with mock.patch.dict("os.environ", {"PR_STALENESS_MIN_AGE_HOURS": "12"}):
-            self._set_states([_pr_state("org/repo", 1, age_hours=13, now=self.now)])
-            self.mod.run(["org/repo"])
         self.ppi.notify.assert_called_once()
 
 
@@ -313,18 +287,14 @@ class DigestMessageTests(unittest.TestCase):
     def test_zero_repos_keeps_the_resolved_message(self):
         self.assertIn("Previously stale PR", self.mod._build_message([], "stale set changed"))
 
-    def test_one_repo_digest_and_zero_ledger_footer(self):
-        self.mod.finalization_count = lambda: 0
+    def test_one_repo_digest(self):
         message = self.mod._build_message(
             [_alert_pr("org/repo", 7, age_hours=60)], "heartbeat"
         )
-        self.assertIn("1 PR(s) at least 48h old", message)
-        self.assertIn("org/repo — 1 PR(s), oldest 60.0h", message)
-        self.assertIn("org/repo#7 — 60.0h", message)
-        self.assertIn("Verdict ledger: 0 finalizations", message)
+        self.assertIn("1 PR(s) stale without a fresh verdict (heartbeat).", message)
+        self.assertIn("org/repo#7 — age 60.0h, merge_state clean", message)
 
-    def test_many_repos_cap_individual_prs_at_three(self):
-        self.mod.finalization_count = lambda: 5
+    def test_many_repos_include_each_stale_pr(self):
         message = self.mod._build_message(
             [
                 _alert_pr("org/a", 1, age_hours=50),
@@ -334,23 +304,11 @@ class DigestMessageTests(unittest.TestCase):
             ],
             "stale set changed",
         )
-        self.assertIn("org/a — 2 PR(s), oldest 80.0h", message)
-        self.assertIn("org/b — 1 PR(s), oldest 70.0h", message)
-        self.assertIn("org/c — 1 PR(s), oldest 60.0h", message)
-        self.assertIn("org/a#2 — 80.0h", message)
-        self.assertIn("org/b#3 — 70.0h", message)
-        self.assertIn("org/c#4 — 60.0h", message)
-        self.assertNotIn("org/a#1 — 50.0h", message)
-        self.assertIn("Verdict ledger: 5 finalizations.", message)
-
-    def test_unreadable_ledger_footer_does_not_change_digest_shape(self):
-        self.mod.finalization_count = lambda: None
-        message = self.mod._build_message(
-            [_alert_pr("org/repo", 7, age_hours=60)], "heartbeat"
-        )
-        self.assertIn("org/repo — 1 PR(s), oldest 60.0h", message)
-        self.assertIn("org/repo#7 — 60.0h", message)
-        self.assertIn("Verdict ledger: could not read the ledger.", message)
+        self.assertIn("4 PR(s) stale without a fresh verdict (stale set changed).", message)
+        self.assertIn("org/a#1 — age 50.0h, merge_state clean", message)
+        self.assertIn("org/a#2 — age 80.0h, merge_state clean", message)
+        self.assertIn("org/b#3 — age 70.0h, merge_state clean", message)
+        self.assertIn("org/c#4 — age 60.0h, merge_state clean", message)
 
 
 if __name__ == "__main__":

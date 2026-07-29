@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import fnmatch
 import hashlib
 import json
@@ -22,10 +23,16 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - the governed Mini is POSIX
+    fcntl = None
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -36,9 +43,26 @@ CI_HEALTH_CRON_NAME = "ci-health-watch"
 CI_HEALTH_CRON_SCHEDULE = {"kind": "cron", "expr": "*/5 * * * *", "display": "*/5 * * * *"}
 CI_HEALTH_CRON_SCHEDULE_DISPLAY = "*/5 * * * *"
 CI_HEALTH_CRON_MAX_SECONDS = 300
-SOURCE_COMMIT_RE = re.compile(r"[0-9a-f]{7,64}\Z")
+CRON_JOBS_LOCK_TIMEOUT_SECONDS = 30.0
+SOURCE_COMMIT_RE = re.compile(r"[0-9a-f]{40,64}\Z")
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 REMOTE_HOST_RE = re.compile(r"[A-Za-z0-9_.@:-]+\Z")
+REVIEW_GATE_ROOT_SHIM = Path("review_poll_gate.py")
+REVIEW_GATE_PACKAGE_CLOSURE = (
+    Path("pr_pipeline/__init__.py"),
+    Path("pr_pipeline/autonomous_merge.py"),
+    Path("pr_pipeline/pr_pipeline_event_driven.py"),
+    Path("pr_pipeline/pr_pipeline_improvements.py"),
+    Path("pr_pipeline/review_poll_gate.py"),
+    Path("pr_pipeline/validator_verdict.py"),
+)
+RETIRED_REVIEW_GATE_FLAT_IMPLEMENTATIONS = frozenset(
+    {
+        "pr_pipeline_event_driven.py",
+        "pr_pipeline_improvements.py",
+        "review_poll_gate.py",
+    }
+)
 RUNNER_ASSET_DESTINATIONS = {
     "/etc/systemd/system/hermes-runner@.service",
     "/home/colingreig/.hermes-ci/hooks/acquire.sh",
@@ -222,17 +246,27 @@ def resolve_manifest(path: Path = DEFAULT_MANIFEST) -> ResolvedManifest:
     )
     if tuple(sorted(source_root_entrypoints)) != source_root_entrypoints or len(set(source_root_entrypoints)) != len(source_root_entrypoints):
         raise ManifestError("source_root_entrypoints must be unique and sorted")
+    if REVIEW_GATE_ROOT_SHIM.name not in source_root_entrypoints:
+        raise ManifestError("source_root_entrypoints must include the review-poll compatibility shim")
     raw_flat = data.get("legacy_flat_entrypoints")
     if not isinstance(raw_flat, list) or not raw_flat:
         raise ManifestError("legacy_flat_entrypoints must be a non-empty list")
     flat = tuple(_safe_filename(name, field="legacy_flat_entrypoints item") for name in raw_flat)
     if tuple(sorted(flat)) != flat or len(set(flat)) != len(flat):
         raise ManifestError("legacy_flat_entrypoints must be unique and sorted")
+    retired_flat = RETIRED_REVIEW_GATE_FLAT_IMPLEMENTATIONS.intersection(flat)
+    if retired_flat:
+        raise ManifestError(
+            "review-poll implementation modules must be package-only, not legacy flat entrypoints: "
+            + ", ".join(sorted(retired_flat))
+        )
 
     package_glob = data.get("package_glob")
     if package_glob != "*.py":
         raise ManifestError("package_glob must be the fixed '*.py' source set")
     package_destination = _safe_directory(data.get("package_destination"), field="package_destination")
+    if package_destination != "pr_pipeline":
+        raise ManifestError("package_destination must be the canonical 'pr_pipeline' package")
     root_patterns_raw = data.get("managed_root_patterns")
     if not isinstance(root_patterns_raw, list) or not all(isinstance(item, str) and item for item in root_patterns_raw):
         raise ManifestError("managed_root_patterns must be a non-empty string list")
@@ -279,6 +313,18 @@ def resolve_manifest(path: Path = DEFAULT_MANIFEST) -> ResolvedManifest:
         raise ManifestError("pr_pipeline package must contain __init__.py and at least one Python file")
     for source in package_sources:
         add(source, Path(package_destination) / source.name)
+
+    required_review_gate_paths = (REVIEW_GATE_ROOT_SHIM, *REVIEW_GATE_PACKAGE_CLOSURE)
+    missing_review_gate_sources = [
+        relative.as_posix()
+        for relative in required_review_gate_paths
+        if relative not in destination_names
+    ]
+    if missing_review_gate_sources:
+        raise ManifestError(
+            "review-poll runtime closure is incomplete: "
+            + ", ".join(missing_review_gate_sources)
+        )
 
     indexes = {item.destination.as_posix(): index for index, item in enumerate(resolved)}
     unmanaged_patches = sorted(set(expected_local_patches).difference(indexes))
@@ -387,6 +433,31 @@ def _cron_jobs_path(destination: Path) -> Path:
     return destination.parent / "cron" / "jobs.json"
 
 
+@contextlib.contextmanager
+def _cron_jobs_lock(jobs_path: Path):
+    """Hold the scheduler's cross-process lock for one jobs.json transaction."""
+    if fcntl is None:
+        raise ManifestError("cron jobs reconciliation requires POSIX fcntl locking")
+    lock_path = jobs_path.parent / ".jobs.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+", encoding="utf-8") as handle:
+        deadline = time.monotonic() + CRON_JOBS_LOCK_TIMEOUT_SECONDS
+        while True:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except (OSError, IOError) as exc:
+                if time.monotonic() >= deadline:
+                    raise ManifestError(
+                        f"timed out waiting for cron jobs lock {lock_path}"
+                    ) from exc
+                time.sleep(0.1)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 def _managed_ci_health_script(destination: Path) -> str:
     return "ci_health_watch.py"
 
@@ -464,29 +535,148 @@ def _next_ci_health_run_at() -> str:
 
 def _repair_ci_health_schedule(destination: Path) -> None:
     jobs_path = _cron_jobs_path(destination)
-    document = _load_cron_jobs_document(jobs_path)
-    jobs = document["jobs"]
-    index = _ci_health_job_index(jobs)
-    repaired = dict(jobs[index])
-    repaired.update({
-        "name": CI_HEALTH_CRON_NAME,
-        "schedule": CI_HEALTH_CRON_SCHEDULE,
-        "script": _managed_ci_health_script(destination),
-        "schedule_display": CI_HEALTH_CRON_SCHEDULE_DISPLAY,
-        "enabled": True,
-        "no_agent": True,
-        "state": "scheduled",
-        "next_run_at": _next_ci_health_run_at(),
-    })
-    jobs[index] = repaired
-    document["jobs"] = jobs
-    _atomic_json(jobs_path, document)
+    with _cron_jobs_lock(jobs_path):
+        # Re-read only after acquiring the same .jobs.lock used by cron.jobs;
+        # an earlier snapshot may have been superseded by a scheduler tick.
+        document = _load_cron_jobs_document(jobs_path)
+        jobs = document["jobs"]
+        index = _ci_health_job_index(jobs)
+        repaired = dict(jobs[index])
+        repaired.update({
+            "name": CI_HEALTH_CRON_NAME,
+            "schedule": CI_HEALTH_CRON_SCHEDULE,
+            "script": _managed_ci_health_script(destination),
+            "schedule_display": CI_HEALTH_CRON_SCHEDULE_DISPLAY,
+            "enabled": True,
+            "no_agent": True,
+            "state": "scheduled",
+            "next_run_at": _next_ci_health_run_at(),
+        })
+        jobs[index] = repaired
+        document["jobs"] = jobs
+        _atomic_json(jobs_path, document)
 
 
 def _validate_source_commit(value: str | None) -> str:
     if not isinstance(value, str) or not SOURCE_COMMIT_RE.fullmatch(value):
-        raise ManifestError("--source-commit must be a lowercase git object id (7-64 hex characters)")
+        raise ManifestError("--source-commit must be a full lowercase git object id (40-64 hex characters)")
     return value
+
+
+def _absolute_runtime_python(runtime_python: Path | None) -> Path:
+    if runtime_python is None:
+        raise ManifestError(
+            "--runtime-python is required for install/reconcile and must name "
+            "the exact active release Python"
+        )
+    expanded = runtime_python.expanduser()
+    if not expanded.is_absolute():
+        raise ManifestError("--runtime-python must be an absolute path")
+    # Normalize spelling without dereferencing the venv's Python symlink.
+    absolute = Path(os.path.normpath(os.fspath(expanded)))
+    if not absolute.is_file():
+        raise ManifestError(f"runtime Python is missing: {absolute}")
+    return absolute
+
+
+def _runtime_python_identity(runtime_python: Path, env: dict[str, str]) -> dict[str, Any]:
+    probe = (
+        "import json,sys;"
+        "print(json.dumps({"
+        "'sys_executable':sys.executable,"
+        "'sys_prefix':sys.prefix,"
+        "'base_prefix':sys.base_prefix"
+        "},sort_keys=True))"
+    )
+    result = subprocess.run(
+        [str(runtime_python), "-c", probe],
+        cwd="/",
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    try:
+        identity = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise ManifestError(
+            "runtime Python identity probe returned invalid JSON "
+            f"(exit={result.returncode}, stderr={result.stderr.strip()!r})"
+        ) from exc
+    expected_executable = str(runtime_python)
+    reported_executable = identity.get("sys_executable") if isinstance(identity, dict) else None
+    try:
+        executable_samefile = (
+            isinstance(reported_executable, str)
+            and os.path.samefile(reported_executable, runtime_python)
+        )
+    except OSError:
+        executable_samefile = False
+    if (
+        result.returncode != 0
+        or not isinstance(identity, dict)
+        or not executable_samefile
+        or not isinstance(identity.get("sys_prefix"), str)
+        or not Path(identity["sys_prefix"]).is_absolute()
+        or not isinstance(identity.get("base_prefix"), str)
+        or not Path(identity["base_prefix"]).is_absolute()
+    ):
+        raise ManifestError(
+            "runtime Python identity did not match the supplied executable "
+            f"(expected={expected_executable!r}, identity={identity!r}, "
+            f"exit={result.returncode}, stderr={result.stderr.strip()!r})"
+        )
+    identity["is_venv"] = identity["sys_prefix"] != identity["base_prefix"]
+    identity["executable_samefile"] = True
+    return identity
+
+
+def _smoke_review_gate(destination: Path, runtime_python: Path | None) -> dict[str, Any]:
+    """Import the actual deployed root command from `/` with a minimal env."""
+    runtime_python = _absolute_runtime_python(runtime_python)
+    entrypoint = destination / REVIEW_GATE_ROOT_SHIM
+    env = {
+        "HOME": str(destination.parent.parent),
+        "HERMES_HOME": str(destination.parent),
+        "PATH": "/usr/bin:/bin",
+        "PYTHONNOUSERSITE": "1",
+        "HERMES_REVIEW_POLL_GATE_IMPORT_SMOKE": "1",
+    }
+    identity = _runtime_python_identity(runtime_python, env)
+    result = subprocess.run(
+        [str(runtime_python), str(entrypoint)],
+        cwd="/",
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    output = result.stdout.strip()
+    if result.returncode != 0 or output != "review-poll-gate-import-smoke: ok":
+        raise ManifestError(
+            "deployed review-poll root command smoke failed "
+            f"(exit={result.returncode}, stdout={output!r}, stderr={result.stderr.strip()!r})"
+        )
+    return {
+        "ok": True,
+        "runtime_python": str(runtime_python),
+        "runtime_sys_executable": identity["sys_executable"],
+        "runtime_executable_samefile": identity["executable_samefile"],
+        "runtime_sys_prefix": identity["sys_prefix"],
+        "runtime_base_prefix": identity["base_prefix"],
+        "runtime_is_venv": identity["is_venv"],
+        "entrypoint": str(entrypoint),
+        "cwd": "/",
+        "environment_keys": sorted(env),
+        "output": output,
+    }
+
+
+def _marker_receipt_id(marker: dict[str, Any]) -> str:
+    canonical = json.dumps(marker, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(canonical).hexdigest()
 
 
 def _topology_for_manifest(manifest: ResolvedManifest) -> dict[str, Any]:
@@ -611,9 +801,16 @@ def _verify_runner_vm(
     return errors
 
 
-def install(destination: Path, *, source_commit: str, manifest_path: Path = DEFAULT_MANIFEST) -> dict[str, Any]:
+def install(
+    destination: Path,
+    *,
+    source_commit: str,
+    manifest_path: Path = DEFAULT_MANIFEST,
+    runtime_python: Path | None = None,
+) -> dict[str, Any]:
     """Atomically write only manifest paths and the deployment marker."""
     source_commit = _validate_source_commit(source_commit)
+    runtime_python = _absolute_runtime_python(runtime_python)
     manifest = resolve_manifest(manifest_path)
     destination = destination.expanduser().resolve()
     destination.mkdir(parents=True, exist_ok=True)
@@ -625,21 +822,28 @@ def install(destination: Path, *, source_commit: str, manifest_path: Path = DEFA
         if item.install:
             _atomic_copy(item.source, destination / item.destination, item.mode)
     _repair_ci_health_schedule(destination)
+    smoke = _smoke_review_gate(destination, runtime_python)
     topology = _topology_for_manifest(manifest)
     if _vm_managed(destination):
         _apply_runner_vm_assets(destination, manifest, topology)
 
     marker = {
-        "schema_version": 1,
+        "schema_version": 2,
         "deployment_mode": "shadow",
         "source_commit": source_commit,
         "manifest_sha256": manifest.sha256,
         "files": _expected_hashes(manifest),
         "expected_local_patches": _expected_local_patches(manifest),
+        "review_gate_smoke": smoke,
         "runner_vm_assets": _expected_runner_vm_assets(manifest),
     }
+    marker["reconciliation_receipt_id"] = _marker_receipt_id(marker)
     _atomic_json(destination / MARKER_NAME, marker)
-    return verify(destination, manifest_path=manifest_path, expected_source_commit=source_commit)
+    return verify(
+        destination,
+        manifest_path=manifest_path,
+        expected_source_commit=source_commit,
+    )
 
 
 def _read_marker(path: Path) -> tuple[dict[str, Any] | None, list[str]]:
@@ -700,11 +904,21 @@ def verify(
         if actual != expected_hash:
             mismatches[relative] = {"expected": expected_hash, "actual": actual}
 
+    review_gate_errors: list[str] = []
+    for required in (REVIEW_GATE_ROOT_SHIM, *REVIEW_GATE_PACKAGE_CLOSURE):
+        relative = required.as_posix()
+        if relative not in expected_hashes:
+            review_gate_errors.append(f"review-gate-manifest-missing:{relative}")
+        elif relative in missing:
+            review_gate_errors.append(f"review-gate-runtime-missing:{relative}")
+        elif relative in mismatches:
+            review_gate_errors.append(f"review-gate-hash-mismatch:{relative}")
+
     marker, marker_errors = _read_marker(destination / MARKER_NAME)
     recorded_commit: str | None = None
     if marker is not None:
         recorded_commit = marker.get("source_commit") if isinstance(marker.get("source_commit"), str) else None
-        if marker.get("schema_version") != 1:
+        if marker.get("schema_version") != 2:
             marker_errors.append("deployment-marker-schema-mismatch")
         if marker.get("deployment_mode") != "shadow":
             marker_errors.append("deployment-mode-not-shadow")
@@ -712,6 +926,43 @@ def verify(
             marker_errors.append("deployment-marker-manifest-mismatch")
         if marker.get("files") != expected_hashes:
             marker_errors.append("deployment-marker-file-list-mismatch")
+        marker_without_receipt = dict(marker)
+        recorded_receipt_id = marker_without_receipt.pop("reconciliation_receipt_id", None)
+        if (
+            not isinstance(recorded_receipt_id, str)
+            or not SHA256_RE.fullmatch(recorded_receipt_id)
+            or recorded_receipt_id != _marker_receipt_id(marker_without_receipt)
+        ):
+            marker_errors.append("deployment-marker-receipt-invalid")
+        smoke = marker.get("review_gate_smoke")
+        runtime_paths_match = False
+        if isinstance(smoke, dict):
+            try:
+                runtime_paths_match = os.path.samefile(
+                    smoke.get("runtime_python", ""),
+                    smoke.get("runtime_sys_executable", ""),
+                )
+            except (OSError, TypeError, ValueError):
+                runtime_paths_match = False
+        if not isinstance(smoke, dict) or smoke.get("ok") is not True:
+            marker_errors.append("deployment-marker-review-gate-smoke-invalid")
+        elif (
+            smoke.get("cwd") != "/"
+            or smoke.get("output") != "review-poll-gate-import-smoke: ok"
+            or "HERMES_REVIEW_POLL_GATE_IMPORT_SMOKE"
+            not in (smoke.get("environment_keys") or [])
+            or not isinstance(smoke.get("runtime_python"), str)
+            or not Path(smoke["runtime_python"]).is_absolute()
+            or smoke.get("runtime_executable_samefile") is not True
+            or not runtime_paths_match
+            or not isinstance(smoke.get("runtime_sys_prefix"), str)
+            or not Path(smoke["runtime_sys_prefix"]).is_absolute()
+            or not isinstance(smoke.get("runtime_base_prefix"), str)
+            or not Path(smoke["runtime_base_prefix"]).is_absolute()
+            or smoke.get("runtime_is_venv")
+            != (smoke.get("runtime_sys_prefix") != smoke.get("runtime_base_prefix"))
+        ):
+            marker_errors.append("deployment-marker-review-gate-smoke-contract-drift")
         if marker.get("runner_vm_assets") != _expected_runner_vm_assets(manifest):
             marker_errors.append("deployment-marker-runner-assets-mismatch")
         if recorded_commit is None or not SOURCE_COMMIT_RE.fullmatch(recorded_commit):
@@ -728,7 +979,15 @@ def verify(
     topology = _topology_for_manifest(manifest)
     runner_vm_errors = _verify_runner_vm(destination, manifest, topology)
     report = {
-        "ok": not missing and not mismatches and not extras and not marker_errors and not cron_errors and not runner_vm_errors,
+        "ok": (
+            not missing
+            and not mismatches
+            and not extras
+            and not marker_errors
+            and not cron_errors
+            and not review_gate_errors
+            and not runner_vm_errors
+        ),
         "deployment": str(destination),
         "manifest": str(manifest.path),
         "manifest_sha256": manifest.sha256,
@@ -739,6 +998,7 @@ def verify(
         "extra": extras,
         "marker_errors": marker_errors,
         "cron_errors": cron_errors,
+        "review_gate_errors": review_gate_errors,
         "runner_vm_assets": _expected_runner_vm_assets(manifest),
         "runner_vm_errors": runner_vm_errors,
         "runner_vm_managed": _vm_managed(destination),
@@ -749,6 +1009,12 @@ def verify(
         },
         "recorded_source_commit": recorded_commit,
         "expected_source_commit": expected_source_commit,
+        "reconciliation_receipt_id": (
+            marker.get("reconciliation_receipt_id") if marker is not None else None
+        ),
+        "review_gate_smoke": (
+            marker.get("review_gate_smoke") if marker is not None else None
+        ),
     }
     return report
 
@@ -801,6 +1067,8 @@ def _remote_run(args: argparse.Namespace) -> int:
     ]
     if source_commit:
         command.extend(["--source-commit", source_commit])
+    if args.runtime_python:
+        command.extend(["--runtime-python", str(args.runtime_python)])
     try:
         result = subprocess.run(["ssh", "-o", "BatchMode=yes", args.host, *command], check=False)
         return result.returncode
@@ -819,6 +1087,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
     parser.add_argument("--destination", type=Path, default=DEFAULT_DESTINATION)
     parser.add_argument("--source-commit", help="required for install/reconcile; recorded on the Mini")
+    parser.add_argument(
+        "--runtime-python",
+        type=Path,
+        help="exact release Python used for the sanitized deployed root-command smoke",
+    )
     parser.add_argument("--host", help="SSH host alias; stage and run the same verifier on that host")
     return parser
 
@@ -826,10 +1099,17 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Iterable[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
+        if args.action in {"install", "reconcile"}:
+            _absolute_runtime_python(args.runtime_python)
         if args.host:
             return _remote_run(args)
         if args.action in {"install", "reconcile"}:
-            report = install(args.destination, source_commit=args.source_commit, manifest_path=args.manifest)
+            report = install(
+                args.destination,
+                source_commit=args.source_commit,
+                manifest_path=args.manifest,
+                runtime_python=args.runtime_python,
+            )
             return _print_report(report)
         return _print_report(verify(args.destination, manifest_path=args.manifest, expected_source_commit=args.source_commit))
     except (ManifestError, OSError, subprocess.SubprocessError) as exc:

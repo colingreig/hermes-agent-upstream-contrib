@@ -160,14 +160,16 @@ jobs:
 
   # ─────────────────────────────────────────────────────────────────────
   # Gate: runs after everything. ``if: always()`` ensures it reports a
-  # status even when some deps were skipped. Only actual ``failure``
-  # results cause it to fail; ``skipped`` is treated as success.
+  # status even when some deps were skipped. A dependency is allowed to skip
+  # only when the classifier says that lane is not required for this event.
+  # Every required dependency must be terminal ``success``.
   #
   # Branch protection should require ONLY this check.
   # ─────────────────────────────────────────────────────────────────────
   all-checks-pass:
     name: All required checks pass
     needs:
+      - detect
       - tests
       - lint
       - js-tests
@@ -193,15 +195,41 @@ jobs:
           echo "$NEEDS" | python3 -c "
           import json, sys
           needs = json.load(sys.stdin)
-          failed = [name for name, info in needs.items() if info['result'] == 'failure']
+          outputs = needs['detect']['outputs']
+          event = outputs['event_name']
+          required = {
+              'detect': True,
+              'tests': outputs['python'] == 'true',
+              'lint': outputs['python'] == 'true' or outputs['ci_review'] == 'true',
+              'js-tests': outputs['frontend'] == 'true',
+              'docs-site': outputs['site'] == 'true',
+              'history-check': event == 'pull_request',
+              'pr-safety-gate': event == 'pull_request',
+              'contributor-check': outputs['python'] == 'true',
+              'uv-lockfile': True,
+              'lockfile-diff': event == 'pull_request' and outputs['npm_lock'] == 'true',
+              'docker-lint': outputs['docker_meta'] == 'true',
+              'supply-chain': event == 'pull_request' and (
+                  outputs['scan'] == 'true'
+                  or outputs['deps'] == 'true'
+                  or outputs['mcp_catalog'] == 'true'
+              ),
+              'osv-scanner': True,
+          }
+          failed = [
+              name for name, is_required in required.items()
+              if is_required and needs[name]['result'] != 'success'
+          ]
           for name, info in sorted(needs.items()):
               result = info['result']
-              icon = '✅' if result in ('success', 'skipped') else '❌'
-              print(f'{icon} {name}: {result}')
+              is_required = required[name]
+              icon = '✅' if (is_required and result == 'success') or not is_required else '❌'
+              requirement = 'required' if is_required else 'not-required'
+              print(f'{icon} {name}: {result} ({requirement})')
           if failed:
-              print(f'::error::{len(failed)} job(s) failed: {\", \".join(failed)}')
+              print(f'::error::{len(failed)} required job(s) did not succeed: {\", \".join(failed)}')
               sys.exit(1)
-          print('All checks passed (or were skipped)')
+          print('All required checks succeeded')
           "
 
   # ─────────────────────────────────────────────────────────────────────
@@ -259,9 +287,11 @@ jobs:
         env:
           REPORT_URL: ${{ steps.ci-timings-artifact.outputs.artifact-url}}
         run: |
-          echo "# CI Timing report" >> "$GITHUB_STEP_SUMMARY"
-          echo "[View the full interactive report]($REPORT_URL)" >> "$GITHUB_STEP_SUMMARY"
-          cat ci-timings-summary.md >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "# CI Timing report"
+            echo "[View the full interactive report]($REPORT_URL)"
+            cat ci-timings-summary.md
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Save baseline cache (main only)
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'

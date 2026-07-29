@@ -52,25 +52,28 @@ which is not on a non-interactive ssh PATH — the script extends PATH itself.
 
 ```bash
 # Standard cut of prod-live-patches:
-~/.hermes/runtime-current/scripts/mini-release-cut.sh --ref prod-live-patches
+~/.hermes/runtime-current/scripts/mini-release-cut.sh --ref <certified-full-sha> --certified-sha <certified-full-sha>
 
 # Preview every mutating action, change nothing:
 ~/.hermes/runtime-current/scripts/mini-release-cut.sh --ref prod-live-patches --dry-run
 
 # Polling-safe mode: equal is a successful no-op; only a strict descendant cuts:
-~/.hermes/runtime-current/scripts/mini-release-cut.sh --ref prod-live-patches --if-advanced
+~/.hermes/runtime-current/scripts/mini-release-cut.sh --ref prod-live-patches --certified-sha <certified-full-sha> --if-advanced
 
 # Cut a specific sha or branch:
-~/.hermes/runtime-current/scripts/mini-release-cut.sh --ref <sha-or-branch>
+~/.hermes/runtime-current/scripts/mini-release-cut.sh --ref <sha-or-branch> --certified-sha <same-full-sha>
 
 # Roll back to the previous release (no build):
 ~/.hermes/runtime-current/scripts/mini-release-cut.sh --rollback
 
 # Cut, then prune releases older than the newest 3:
-~/.hermes/runtime-current/scripts/mini-release-cut.sh --ref prod-live-patches --prune
+~/.hermes/runtime-current/scripts/mini-release-cut.sh --ref <certified-full-sha> --certified-sha <certified-full-sha> --prune
 ```
 
 `--ref` defaults to `prod-live-patches`.
+Every real cut and preflight requires `--certified-sha`. The resolved target
+must equal it exactly; ancestry is not accepted as certification. Dry-runs and
+explicit rollback are the only exceptions.
 
 ## Optional local polling job
 
@@ -78,15 +81,30 @@ The poller is local-only and does not expose a webhook. Its wrapper delegates
 all decisions to the locked cutter:
 
 ```bash
-~/.hermes/runtime-current/scripts/install-mini-release-poller.sh --install
+~/.hermes/runtime-current/scripts/install-mini-release-poller.sh --install \
+  --certified-sha <full-sha>
 # Review the installed plist, then explicitly load it:
-~/.hermes/runtime-current/scripts/install-mini-release-poller.sh --install-and-enable
+~/.hermes/runtime-current/scripts/install-mini-release-poller.sh --install-and-enable \
+  --actor "<operator-id>" --reason "<exact-SHA CI evidence>" \
+  --certified-sha <full-sha>
+
+# Governed controls used during rollout:
+~/.hermes/runtime-current/scripts/install-mini-release-poller.sh --freeze \
+  --actor "<operator-id>" --reason "<why>"
+~/.hermes/runtime-current/scripts/install-mini-release-poller.sh --unfreeze \
+  --actor "<operator-id>" --reason "<exact-SHA CI evidence>" \
+  --certified-sha <full-sha>
+~/.hermes/runtime-current/scripts/install-mini-release-poller.sh --status
 ```
 
 The installer first runs the cutter's dedicated `--preflight` mode. Preflight
 acquires the real release lock, fetches current origin metadata, and refuses a
 behind or diverged branch without building, switching, restarting services, or
 writing a receipt. The LaunchAgent runs every 15 minutes and is not `RunAtLoad`.
+Poll-control changes are content-addressed, persist under `releases/`, and
+require an explicit actor and reason. Missing, corrupt, locked, or
+unsafe-permission control state prevents polling. A failed managed cut records
+a frozen receipt, or remains fail-closed if the control itself is unavailable.
 Do not enable it until `prod-live-patches` contains the active runtime commit:
 on 2026-07-26 the Mini's active `231607384a1d` and branch `9a48716a786d` were
 diverged, so bootstrap is intentionally blocked until the branch is reconciled.
@@ -116,15 +134,20 @@ diverged, so bootstrap is intentionally blocked until the branch is reconciled.
 8. Transactionally reconcile both LaunchAgents and their canonical wrappers,
    then reload with `bootout` + `bootstrap`. Plists point only to wrappers;
    permanent auth parks cleanly while transient exhaustion remains retryable.
-9. **Verify (up to 240s)**: gateway process running through the new release,
+9. Reconcile the PR-pipeline manifest from the newly selected release at the
+   exact certified SHA. The reconciler records a composite receipt and runs the
+   deployed root `review_poll_gate.py` command using the release Python from
+   `/` under a sanitized environment.
+10. **Verify (up to 240s)**: gateway process running through the new release,
    `Gateway running with N platform(s)` with N ≥ 2 in `gateway.log`, and
    `:8642` listening; then verify the dashboard (`:9119` → HTTP 200).
-10. Atomically install and hash-verify the governed refresh source at
+11. Atomically install and hash-verify the governed refresh source at
    `~/.hermes/scripts/clickup_workspace_refresh.py`, then install (or repair)
    the executable `~/.local/bin/cu-clickup` wrapper and PATH link.
-11. Record a deterministic receipt with old/new commits, runtime target, source
-    hash, deployed hash, ref, event, and result detail.
-12. On **any** verification, governed install, CLI install, hash, or receipt
+12. Record a deterministic receipt with old/new commits, certified SHA,
+    runtime target, reconciliation receipt, review-gate smoke, source hash,
+    deployed hash, ref, event, and result detail.
+13. On **any** verification, governed install, CLI install, hash, or receipt
     failure: **automatic rollback** of the runtime target, launchd snapshot, and
     governed refresh bytes, restart, re-verify, and exit non-zero.
 

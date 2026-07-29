@@ -62,6 +62,15 @@ def identity(head: str = "b" * 40) -> TrustedMergeIdentity:
 
 
 class RuntimeWiringTests(unittest.TestCase):
+    def test_retired_flat_pipeline_duplicates_are_absent_from_repo_and_manifest(self) -> None:
+        retired = {"pr_pipeline_improvements.py", "pr_staleness_alert.py"}
+        manifest = json.loads((PIPELINE / "manifest.json").read_text(encoding="utf-8"))
+
+        for name in retired:
+            self.assertFalse((SCRIPTS / name).exists(), name)
+            self.assertTrue((PIPELINE / name).is_file(), name)
+        self.assertFalse(retired.intersection(manifest["legacy_flat_entrypoints"]))
+
     def test_finalization_count_is_read_only_and_distinguishes_unreadable_from_zero(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             missing = Path(directory) / "missing.sqlite3"

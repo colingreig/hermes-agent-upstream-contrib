@@ -38,6 +38,31 @@ class PipelineVerifierTests(unittest.TestCase):
         self.destination = Path(self.temporary.name) / "scripts"
         self.local_patch_bytes = b"pipeline-verifier local patch fixture\n"
         self.destination.mkdir(parents=True, exist_ok=True)
+        jobs_path = self.destination.parent / "cron" / "jobs.json"
+        jobs_path.parent.mkdir(parents=True, exist_ok=True)
+        jobs_path.write_text(
+            json.dumps(
+                {
+                    "jobs": [
+                        {
+                            "id": "ci-health-fixture",
+                            "name": "ci-health-watch",
+                            "schedule": {
+                                "kind": "cron",
+                                "expr": "*/5 * * * *",
+                                "display": "*/5 * * * *",
+                            },
+                            "schedule_display": "*/5 * * * *",
+                            "script": "ci_health_watch.py",
+                            "no_agent": True,
+                            "enabled": True,
+                            "state": "scheduled",
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
         self._install_fixture()
 
     def _fixture_manifest_for_local_patch(self, payload: bytes):
@@ -94,7 +119,11 @@ class PipelineVerifierTests(unittest.TestCase):
         )
         manifest = self._fixture_manifest_for_local_patch(self.local_patch_bytes)
         with mock.patch.object(self.reconciler, "resolve_manifest", return_value=manifest):
-            return self.reconciler.install(self.destination, source_commit="a" * 40)
+            return self.reconciler.install(
+                self.destination,
+                source_commit="a" * 40,
+                runtime_python=Path(sys.executable),
+            )
 
     def test_deployed_pipeline_verifier_proves_the_shadow_boundary(self):
         report = self.verifier.verify(self.destination)
@@ -126,6 +155,15 @@ class PipelineVerifierTests(unittest.TestCase):
 
         self._install_fixture()
         (self.destination / "pr_pipeline" / "unmanaged.py").write_text("# unsafe\n", encoding="utf-8")
+        with self.assertRaises(self.verifier.VerificationError):
+            self.verifier.verify(self.destination)
+
+    def test_deployed_pipeline_verifier_rejects_tampered_smoke_receipt(self):
+        marker_path = self.destination / self.reconciler.MARKER_NAME
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        marker["review_gate_smoke"]["runtime_python"] = "/usr/bin/python3"
+        marker_path.write_text(json.dumps(marker), encoding="utf-8")
+
         with self.assertRaises(self.verifier.VerificationError):
             self.verifier.verify(self.destination)
 

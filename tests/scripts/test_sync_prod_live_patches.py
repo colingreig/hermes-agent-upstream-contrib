@@ -1,252 +1,410 @@
-"""Tests for the sync-prod-live-patches GitHub Actions workflow.
+"""Deterministic certification tests for prod-live-patches promotion."""
+from __future__ import annotations
 
-The mini's deploy branch (prod-live-patches, tracked by release-poll)
-historically required a manual forward-merge from main, and when nobody
-did it, merged fixes silently never deployed (task 86e2hw6fp — on
-2026-07-28 prod-live-patches was 6 commits behind main).
-
-This test module covers two things:
-
-1. The workflow YAML has the triggers/safety properties the fix requires
-   (push to main, daily schedule, manual dispatch, full-history checkout,
-   a concurrency group, and a bot git identity).
-2. The core merge decision — clean merge vs. conflicting merge — behaves
-   as the workflow's shell steps assume, exercised against real local git
-   repos in a tmp dir (no network, no GitHub API).
-"""
-
-import subprocess
+import hashlib
+import importlib.util
+import json
 import sys
 from pathlib import Path
 
 import pytest
 import yaml
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-WORKFLOW_PATH = (
-    REPO_ROOT / ".github" / "workflows" / "sync-prod-live-patches.yml"
+
+ROOT = Path(__file__).resolve().parents[2]
+HELPER = ROOT / "scripts" / "certify_prod_live_patches.py"
+WORKFLOW = ROOT / ".github" / "workflows" / "sync-prod-live-patches.yml"
+HEAD = "a" * 40
+OLDER_HEAD = "b" * 40
+PROD_HEAD = "c" * 40
+
+
+def _load_helper():
+    spec = importlib.util.spec_from_file_location("certify_prod_live_patches_test", HELPER)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+certifier = _load_helper()
+
+
+def _run(
+    *,
+    run_id: int = 501,
+    head_sha: str = HEAD,
+    status: str = "completed",
+    conclusion: str | None = "success",
+    run_number: int = 50,
+    run_attempt: int = 1,
+) -> dict:
+    return {
+        "id": run_id,
+        "name": "CI",
+        "path": ".github/workflows/ci.yml",
+        "event": "push",
+        "head_branch": "main",
+        "head_sha": head_sha,
+        "status": status,
+        "conclusion": conclusion,
+        "run_number": run_number,
+        "run_attempt": run_attempt,
+    }
+
+
+def _job(
+    *,
+    run_id: int = 501,
+    status: str = "completed",
+    conclusion: str | None = "success",
+    name: str = "All required checks pass",
+) -> dict:
+    return {
+        "id": 9001,
+        "run_id": run_id,
+        "name": name,
+        "status": status,
+        "conclusion": conclusion,
+    }
+
+
+def _required_jobs() -> list[dict]:
+    return [
+        _job(name=name) | {"id": 9100 + index}
+        for index, name in enumerate(certifier.REQUIRED_JOB_PREFIXES)
+    ]
+
+
+def _evidence() -> dict:
+    return {
+        "repository": "owner/hermes-agent",
+        "current_main_sha": HEAD,
+        "trigger_run_id": 501,
+        "freeze": {
+            "schema": "prod_live_patches_freeze/v1",
+            "frozen": False,
+            "actor": "release-owner@example.com",
+            "reason": "normal governed promotion",
+            "changed_at": "2026-07-29T12:00:00Z",
+        },
+        "workflow_runs": {"workflow_runs": [_run()]},
+        "jobs": {"jobs": [*_required_jobs(), _job()]},
+    }
+
+
+def test_exact_current_main_push_ci_and_aggregate_issue_certificate():
+    certificate = certifier.certify(_evidence())
+
+    assert certificate["schema"] == "prod_live_patches_certificate/v1"
+    assert certificate["head_sha"] == HEAD
+    assert certificate["ci"]["run_id"] == "501"
+    assert certificate["ci"]["aggregate_job"]["conclusion"] == "success"
+    assert certificate["freeze"]["actor"] == "release-owner@example.com"
+
+
+@pytest.mark.parametrize(
+    ("status", "conclusion"),
+    [
+        ("queued", None),
+        ("in_progress", None),
+        ("completed", "failure"),
+        ("completed", "cancelled"),
+        ("completed", "skipped"),
+    ],
 )
+def test_missing_pending_failed_cancelled_or_skipped_ci_is_rejected(status, conclusion):
+    evidence = _evidence()
+    evidence["workflow_runs"]["workflow_runs"] = [
+        _run(status=status, conclusion=conclusion)
+    ]
+
+    with pytest.raises(certifier.CertificationError):
+        certifier.certify(evidence)
 
 
-def run_git(repo: Path, *args: str) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        ["git", *args],
-        cwd=repo,
-        capture_output=True,
-        text=True,
+@pytest.mark.parametrize(
+    ("status", "conclusion"),
+    [
+        ("queued", None),
+        ("in_progress", None),
+        ("completed", "failure"),
+        ("completed", "cancelled"),
+        ("completed", "skipped"),
+    ],
+)
+def test_non_success_aggregate_job_is_rejected(status, conclusion):
+    evidence = _evidence()
+    evidence["jobs"]["jobs"][-1] = _job(status=status, conclusion=conclusion)
+
+    with pytest.raises(certifier.CertificationError):
+        certifier.certify(evidence)
+
+
+def test_wrong_sha_and_ancestor_only_evidence_are_rejected():
+    evidence = _evidence()
+    evidence["workflow_runs"]["workflow_runs"] = [_run(head_sha=OLDER_HEAD)]
+
+    with pytest.raises(certifier.CertificationError, match="no exact current-main"):
+        certifier.certify(evidence)
+
+
+def test_older_success_cannot_mask_newer_failed_exact_sha_run():
+    evidence = _evidence()
+    evidence["trigger_run_id"] = None
+    evidence["workflow_runs"]["workflow_runs"] = [
+        _run(run_id=500, run_number=49, conclusion="success"),
+        _run(run_id=501, run_number=50, conclusion="failure"),
+    ]
+    evidence["jobs"]["jobs"] = [_job(run_id=501)]
+
+    with pytest.raises(certifier.CertificationError, match="not success"):
+        certifier.certify(evidence)
+
+
+def test_workflow_run_trigger_must_be_latest_exact_run():
+    evidence = _evidence()
+    evidence["trigger_run_id"] = 499
+
+    with pytest.raises(certifier.CertificationError, match="stale"):
+        certifier.certify(evidence)
+
+
+def test_missing_aggregate_job_is_rejected():
+    evidence = _evidence()
+    evidence["jobs"]["jobs"][-1] = _job(name="advisory")
+
+    with pytest.raises(certifier.CertificationError, match="exactly one"):
+        certifier.certify(evidence)
+
+
+def test_aggregate_job_must_join_the_exact_workflow_run():
+    evidence = _evidence()
+    evidence["jobs"]["jobs"][-1].pop("run_id")
+
+    with pytest.raises(certifier.CertificationError, match="aggregate_job.run_id"):
+        certifier.certify(evidence)
+
+
+@pytest.mark.parametrize("conclusion", ["failure", "cancelled", "skipped", "timed_out"])
+def test_non_success_required_job_cannot_hide_behind_green_aggregate(conclusion):
+    evidence = _evidence()
+    python_job = next(
+        job for job in evidence["jobs"]["jobs"] if job["name"] == "Python tests"
+    )
+    python_job["conclusion"] = conclusion
+
+    with pytest.raises(certifier.CertificationError, match="required CI jobs"):
+        certifier.certify(evidence)
+
+
+def test_missing_required_job_group_is_rejected():
+    evidence = _evidence()
+    evidence["jobs"]["jobs"] = [
+        job for job in evidence["jobs"]["jobs"] if job["name"] != "Docs Site"
+    ]
+
+    with pytest.raises(certifier.CertificationError, match="groups are missing"):
+        certifier.certify(evidence)
+
+
+@pytest.mark.parametrize(
+    "freeze",
+    [
+        {},
+        {
+            "schema": "prod_live_patches_freeze/v1",
+            "frozen": True,
+            "actor": "operator",
+            "reason": "incident",
+            "changed_at": "2026-07-29T12:00:00Z",
+        },
+        {
+            "schema": "prod_live_patches_freeze/v1",
+            "frozen": False,
+            "actor": "",
+            "reason": "",
+            "changed_at": "not-a-time",
+        },
+    ],
+)
+def test_freeze_gate_is_structured_audited_and_fail_closed(freeze):
+    evidence = _evidence()
+    evidence["freeze"] = freeze
+
+    with pytest.raises(certifier.CertificationError):
+        certifier.certify(evidence)
+
+
+def test_receipt_filename_is_content_sha_and_records_authorities(tmp_path):
+    certificate = certifier.certify(_evidence())
+    certificate_path = tmp_path / "certificate.json"
+    certificate_path.write_text(
+        json.dumps(certificate, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
     )
 
-
-def init_repo(repo: Path) -> None:
-    repo.mkdir(parents=True, exist_ok=True)
-    run_git(repo, "init", "-q", "-b", "main")
-    run_git(repo, "config", "user.name", "test")
-    run_git(repo, "config", "user.email", "test@example.com")
-
-
-def commit_file(repo: Path, name: str, content: str, message: str) -> None:
-    (repo / name).write_text(content)
-    assert run_git(repo, "add", name).returncode == 0
-    assert (
-        run_git(repo, "commit", "-q", "-m", message).returncode == 0
-    ), run_git(repo, "commit", "-q", "-m", message).stderr
-
-
-def attempt_merge(repo: Path, ref_to_merge: str) -> dict:
-    """Mirror the workflow's merge step: attempt a merge, and on conflict
-    record the conflicting files and leave the working tree clean by
-    aborting. Returns a dict matching the shape of the workflow's step
-    outputs (conflict / changed), plus the conflicting file list.
-    """
-    is_ancestor = run_git(
-        repo, "merge-base", "--is-ancestor", ref_to_merge, "HEAD"
+    receipt_path = certifier.write_receipt(
+        certificate_path,
+        tmp_path / "receipts",
+        from_sha=PROD_HEAD,
+        authority_run_id="700",
+        authority_run_attempt="2",
     )
-    if is_ancestor.returncode == 0:
-        return {"conflict": False, "changed": False, "conflicts": []}
+    content = receipt_path.read_bytes()
+    receipt = json.loads(content)
 
-    merge = run_git(repo, "merge", "--no-edit", ref_to_merge)
-    if merge.returncode == 0:
-        return {"conflict": False, "changed": True, "conflicts": []}
+    assert receipt_path.name == f"promotion-receipt-{hashlib.sha256(content).hexdigest()}.json"
+    assert receipt["authority"] == ".github/workflows/sync-prod-live-patches.yml"
+    assert receipt["authority_run_id"] == "700"
+    assert receipt["head_sha"] == HEAD
+    assert receipt["from_sha"] == PROD_HEAD
+    assert receipt["freeze"]["reason"] == "normal governed promotion"
+    assert receipt["ci"]["run_id"] == "501"
+    assert certifier.validate_promotion_receipt(
+        receipt,
+        receipt_id=hashlib.sha256(content).hexdigest(),
+        head_sha=HEAD,
+    ) == receipt
 
-    conflicts = run_git(
-        repo, "diff", "--name-only", "--diff-filter=U"
-    ).stdout.splitlines()
-    abort = run_git(repo, "merge", "--abort")
-    assert abort.returncode == 0, abort.stderr
-    return {"conflict": True, "changed": False, "conflicts": conflicts}
 
+def test_receipt_verification_rejects_wrong_id_and_wrong_head(tmp_path):
+    certificate = certifier.certify(_evidence())
+    receipt = certifier.promotion_receipt(
+        certificate,
+        from_sha=PROD_HEAD,
+        authority_run_id="700",
+        authority_run_attempt="1",
+    )
+    receipt_id = hashlib.sha256(certifier._canonical_bytes(receipt)).hexdigest()
 
-# ── workflow YAML structure ───────────────────────────────────────────
+    with pytest.raises(certifier.CertificationError, match="content"):
+        certifier.validate_promotion_receipt(
+            receipt, receipt_id="d" * 64, head_sha=HEAD
+        )
+    with pytest.raises(certifier.CertificationError, match="exact requested"):
+        certifier.validate_promotion_receipt(
+            receipt, receipt_id=receipt_id, head_sha=OLDER_HEAD
+        )
 
 
 @pytest.fixture(scope="module")
 def workflow() -> dict:
-    assert WORKFLOW_PATH.is_file(), f"missing workflow file: {WORKFLOW_PATH}"
-    with WORKFLOW_PATH.open() as f:
-        return yaml.safe_load(f)
-
-
-def test_workflow_parses_as_yaml(workflow):
-    assert isinstance(workflow, dict)
+    value = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+    assert isinstance(value, dict)
+    return value
 
 
 def _triggers(workflow: dict) -> dict:
-    # PyYAML parses the bare `on:` key as the boolean True in YAML 1.1.
     return workflow.get("on") or workflow.get(True)
 
 
-def test_triggers_on_push_to_main(workflow):
-    triggers = _triggers(workflow)
-    assert "push" in triggers
-    assert "main" in triggers["push"]["branches"]
+def _step(workflow: dict, name: str) -> dict:
+    steps = workflow["jobs"]["promote"]["steps"]
+    return next(step for step in steps if step.get("name") == name)
 
 
-def test_triggers_on_daily_schedule(workflow):
+def test_workflow_waits_for_completed_ci_and_has_no_push_bypass(workflow):
     triggers = _triggers(workflow)
+
+    assert "push" not in triggers
+    assert triggers["workflow_run"]["workflows"] == ["CI"]
+    assert triggers["workflow_run"]["branches"] == ["main"]
+    assert triggers["workflow_run"]["types"] == ["completed"]
     assert "schedule" in triggers
-    crons = [entry["cron"] for entry in triggers["schedule"]]
-    assert "0 6 * * *" in crons
-
-
-def test_triggers_on_workflow_dispatch(workflow):
-    triggers = _triggers(workflow)
     assert "workflow_dispatch" in triggers
 
 
-def test_has_concurrency_group(workflow):
-    assert "concurrency" in workflow
-    assert workflow["concurrency"]["group"]
+def test_all_triggers_share_certificate_and_exact_sha_cas_path(workflow):
+    assert list(workflow["jobs"]) == ["promote"]
+    job = workflow["jobs"]["promote"]
+
+    collect = _step(workflow, "Collect governing CI evidence")["run"]
+    certify = _step(workflow, "Certify exact SHA, aggregate job, and freeze state")["run"]
+    push = _step(
+        workflow,
+        "Re-read freeze, CAS assert, and atomically publish branch and receipt",
+    )["run"]
+
+    assert "event=push" in collect
+    assert "scripts/certify_prod_live_patches.py certify" in certify
+    assert "actions/variables/PROD_LIVE_PATCHES_FREEZE" in push
+    assert "validate-freeze" in push
+    assert "git fetch --no-tags origin" in push
+    assert '[ "$FRESH_MAIN" = "$CERTIFIED_SHA" ]' in push
+    assert '[ "$FRESH_PROD" = "$EXPECTED_PROD_SHA" ]' in push
+    assert "--force-with-lease=" in push
+    assert "git push --atomic" in push
+    assert '"$RECEIPT_BLOB:$RECEIPT_REF"' in push
+    assert "PUSHED_SHA" in push
+    assert push.index("git fetch --no-tags origin") < push.index("FRESH_MAIN=")
+    receipt_ref_check = push.index('git ls-remote origin "$RECEIPT_REF"')
+    final_freeze_read = push.rindex(
+        "actions/variables/PROD_LIVE_PATCHES_FREEZE"
+    )
+    final_freeze_validation = push.rindex(
+        "scripts/certify_prod_live_patches.py validate-freeze"
+    )
+    atomic_push = push.index("git push --atomic")
+    assert (
+        push.index("FRESH_MAIN=")
+        < receipt_ref_check
+        < final_freeze_read
+        < final_freeze_validation
+        < atomic_push
+    )
+    commands_between_guard_and_push = [
+        line.strip()
+        for line in push[final_freeze_validation:atomic_push].splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    assert commands_between_guard_and_push == [
+        "scripts/certify_prod_live_patches.py validate-freeze \\",
+        '--input "$FRESH_FREEZE_PATH"',
+    ]
 
 
-def test_checkout_uses_full_history(workflow):
-    raw = WORKFLOW_PATH.read_text()
-    assert "fetch-depth: 0" in raw
-
-
-def test_configures_bot_git_identity(workflow):
-    raw = WORKFLOW_PATH.read_text()
-    assert "github-actions[bot]" in raw
-
-
-def test_uses_github_token_for_auth(workflow):
-    raw = WORKFLOW_PATH.read_text()
-    assert "secrets.GITHUB_TOKEN" in raw
-
-
-def test_no_hardcoded_secrets_outside_github_token(workflow):
-    raw = WORKFLOW_PATH.read_text()
-    # Guard against accidentally wiring in a PAT/custom secret for a
-    # workflow that's meant to run with default permissions only.
-    assert "secrets." in raw  # sanity: something references secrets
-    for line in raw.splitlines():
-        if "secrets." in line:
-            assert "secrets.GITHUB_TOKEN" in line
-
-
-# ── merge logic: clean vs. conflicting ────────────────────────────────
-
-
-def test_clean_merge_fast_forwards_without_conflict(tmp_path):
-    repo = tmp_path / "repo"
-    init_repo(repo)
-    commit_file(repo, "a.txt", "base\n", "base commit")
-
-    run_git(repo, "branch", "prod-live-patches")
-
-    # Advance main only.
-    commit_file(repo, "b.txt", "new file on main\n", "add b.txt on main")
-
-    run_git(repo, "checkout", "-q", "prod-live-patches")
-    result = attempt_merge(repo, "main")
-
-    assert result == {"conflict": False, "changed": True, "conflicts": []}
-    assert (repo / "b.txt").exists()
-    # Working tree is clean, no leftover merge state.
-    status = run_git(repo, "status", "--porcelain")
-    assert status.stdout.strip() == ""
-
-
-def test_already_up_to_date_is_a_noop(tmp_path):
-    repo = tmp_path / "repo"
-    init_repo(repo)
-    commit_file(repo, "a.txt", "base\n", "base commit")
-    run_git(repo, "branch", "prod-live-patches")
-
-    run_git(repo, "checkout", "-q", "prod-live-patches")
-    result = attempt_merge(repo, "main")
-
-    assert result == {"conflict": False, "changed": False, "conflicts": []}
-
-
-def test_conflicting_merge_is_detected_and_aborted(tmp_path):
-    repo = tmp_path / "repo"
-    init_repo(repo)
-    commit_file(repo, "a.txt", "base\n", "base commit")
-    run_git(repo, "branch", "prod-live-patches")
-
-    # Diverge: main and prod-live-patches both edit a.txt differently.
-    commit_file(repo, "a.txt", "changed on main\n", "edit a.txt on main")
-
-    run_git(repo, "checkout", "-q", "prod-live-patches")
-    commit_file(
-        repo, "a.txt", "changed on prod-live-patches\n", "edit a.txt on prod"
+def test_frozen_final_freeze_read_fails_before_atomic_push(tmp_path, workflow):
+    freeze_path = tmp_path / "final-freeze.json"
+    freeze_path.write_text(
+        json.dumps(
+            {
+                "schema": "prod_live_patches_freeze/v1",
+                "frozen": True,
+                "actor": "incident-commander",
+                "reason": "stop promotion now",
+                "changed_at": "2026-07-29T12:01:00Z",
+            }
+        ),
+        encoding="utf-8",
     )
 
-    result = attempt_merge(repo, "main")
+    assert (
+        certifier.main(["validate-freeze", "--input", str(freeze_path)])
+        == 2
+    )
+    push = _step(
+        workflow,
+        "Re-read freeze, CAS assert, and atomically publish branch and receipt",
+    )["run"]
+    assert push.rindex("validate-freeze") < push.index("git push --atomic")
 
-    assert result["conflict"] is True
-    assert result["changed"] is False
-    assert result["conflicts"] == ["a.txt"]
 
-    # merge --abort must have left the tree clean and mid-merge state gone.
-    status = run_git(repo, "status", "--porcelain")
-    assert status.stdout.strip() == ""
-    assert not (repo / ".git" / "MERGE_HEAD").exists()
-
-
-def test_conflicting_merge_leaves_original_branch_content_intact(tmp_path):
-    repo = tmp_path / "repo"
-    init_repo(repo)
-    commit_file(repo, "a.txt", "base\n", "base commit")
-    run_git(repo, "branch", "prod-live-patches")
-
-    commit_file(repo, "a.txt", "changed on main\n", "edit a.txt on main")
-
-    run_git(repo, "checkout", "-q", "prod-live-patches")
-    commit_file(
-        repo, "a.txt", "changed on prod-live-patches\n", "edit a.txt on prod"
+def test_workflow_publishes_content_addressed_receipt_in_same_git_transaction(workflow):
+    receipt = _step(workflow, "Create content-addressed promotion receipt")
+    publish = _step(
+        workflow,
+        "Re-read freeze, CAS assert, and atomically publish branch and receipt",
     )
 
-    attempt_merge(repo, "main")
-
-    # After an aborted conflicting merge, prod-live-patches must still show
-    # its own content — we never want to push a half-resolved merge.
-    assert (repo / "a.txt").read_text() == "changed on prod-live-patches\n"
-
-
-def test_multiple_conflicting_files_all_reported(tmp_path):
-    repo = tmp_path / "repo"
-    init_repo(repo)
-    commit_file(repo, "a.txt", "base a\n", "base a")
-    commit_file(repo, "b.txt", "base b\n", "base b")
-    run_git(repo, "branch", "prod-live-patches")
-
-    (repo / "a.txt").write_text("main a\n")
-    (repo / "b.txt").write_text("main b\n")
-    run_git(repo, "add", "a.txt", "b.txt")
-    run_git(repo, "commit", "-q", "-m", "edit both on main")
-
-    run_git(repo, "checkout", "-q", "prod-live-patches")
-    (repo / "a.txt").write_text("prod a\n")
-    (repo / "b.txt").write_text("prod b\n")
-    run_git(repo, "add", "a.txt", "b.txt")
-    run_git(repo, "commit", "-q", "-m", "edit both on prod")
-
-    result = attempt_merge(repo, "main")
-
-    assert result["conflict"] is True
-    assert sorted(result["conflicts"]) == ["a.txt", "b.txt"]
-
-
-if __name__ == "__main__":
-    sys.exit(pytest.main([__file__, "-v"]))
+    assert "scripts/certify_prod_live_patches.py receipt" in receipt["run"]
+    assert "git hash-object -w" in receipt["run"]
+    assert publish["if"] == "steps.prepare.outputs.changed == 'true'"
+    assert "git push --atomic" in publish["run"]
+    assert "refs/heads/prod-live-patches" in publish["run"]
+    assert "RECEIPT_BLOB:$RECEIPT_REF" in publish["run"]
+    assert not any(
+        step.get("uses", "").startswith("actions/upload-artifact")
+        for step in workflow["jobs"]["promote"]["steps"]
+    )

@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.colingreig.hermes.delivery-watch</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>__HERMES_DELIVERY_SNAPSHOT_SCRIPT__</string>
+        <string>--once</string>
+        <string>--config</string>
+        <string>__HERMES_DELIVERY_WATCH_CONFIG__</string>
+        <string>--output</string>
+        <string>__HERMES_DELIVERY_SNAPSHOT_OUTPUT__</string>
+        <string>--run-watcher</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <key>HERMES_HOME</key>
+        <string>__HERMES_HOME__</string>
+        <key>PATH</key>
+        <string>__HOME__/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StartInterval</key>
+    <integer>300</integer>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>StandardErrorPath</key>
+    <string>__HERMES_HOME__/logs/delivery-watch.err.log</string>
+    <key>StandardOutPath</key>
+    <string>__HERMES_HOME__/logs/delivery-watch.log</string>
+</dict>
+</plist>

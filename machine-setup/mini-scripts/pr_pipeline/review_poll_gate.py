@@ -9,19 +9,13 @@ Token: CLICKUP_API_TOKEN. Wake target resolved by NAME from ~/.hermes/cron/jobs.
 import json, os, re, subprocess, sys, time, urllib.parse, urllib.request
 from datetime import datetime, timezone
 
-# PR pipeline improvements (no-PR-left-behind) and the merge actor use the
-# same canonical sibling modules whether this is the flat Mini entrypoint or a
-# package import in tests/tools.
-if __package__:
-    from . import autonomous_merge
-    from . import pr_pipeline_event_driven
-    from . import pr_pipeline_improvements
-    from . import validator_verdict
-else:
-    import autonomous_merge
-    import pr_pipeline_event_driven
-    import pr_pipeline_improvements
-    import validator_verdict
+# This module is the implementation. The runtime-root review_poll_gate.py is
+# intentionally only a compatibility shim, so implementation dependencies stay
+# inside the package and can never fall back to retired flat helper modules.
+from . import autonomous_merge
+from . import pr_pipeline_event_driven
+from . import pr_pipeline_improvements
+from . import validator_verdict
 
 TEAM_ID = "9017245888"
 # The `needs-validation` TAG is the SOLE discriminator for a daemon handoff.
@@ -483,8 +477,16 @@ def main():
     state["last_poll"] = _now_iso(); _save(STATE_PATH, state)
     print(json.dumps({"wakeAgent": bool(woke), "pending": len(pending)})); return 0
 
-if __name__ == "__main__":
-    try: sys.exit(main())
+
+def safe_main():
+    """Run the gate without letting an operational failure break cron delivery."""
+    try:
+        return main()
     except Exception as e:
         print(f"[review-gate] unexpected: {e!r}", file=sys.stderr)
-        print(json.dumps({"wakeAgent": False})); sys.exit(0)
+        print(json.dumps({"wakeAgent": False}))
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(safe_main())

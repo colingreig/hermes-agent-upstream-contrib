@@ -56,6 +56,43 @@ class TestPersistentPool:
         assert sched._parallel_pool_max_workers is None
 
 
+def test_explicit_zero_uses_exact_due_set_capacity(monkeypatch):
+    """Zero is deterministic unbounded-for-this-tick, not stdlib ``None``."""
+    import cron.scheduler as sched
+
+    jobs = [
+        {
+            "id": f"due-{index}",
+            "name": f"Due {index}",
+            "deliver": "local",
+        }
+        for index in range(7)
+    ]
+    observed_workers = []
+    real_get_pool = sched._get_parallel_pool
+
+    def capture_pool(max_workers):
+        observed_workers.append(max_workers)
+        return real_get_pool(max_workers)
+
+    monkeypatch.delenv("HERMES_CRON_MAX_PARALLEL", raising=False)
+    monkeypatch.setattr(sched, "get_due_jobs", lambda: jobs)
+    monkeypatch.setattr(sched, "advance_next_run", lambda *_args: None)
+    monkeypatch.setattr(sched, "load_config", lambda: {"cron": {"max_parallel_jobs": 0}})
+    monkeypatch.setattr(sched, "_get_parallel_pool", capture_pool)
+    monkeypatch.setattr(
+        sched,
+        "run_one_job",
+        lambda *_args, **_kwargs: True,
+    )
+
+    try:
+        assert sched.tick(verbose=False) == len(jobs)
+        assert observed_workers == [len(jobs)]
+    finally:
+        sched._shutdown_parallel_pool()
+
+
 class TestRunningJobGuard:
     """_running_job_ids prevents double-dispatch of active jobs."""
 
