@@ -11,7 +11,7 @@ from pathlib import Path
 from unittest import mock
 
 SCRIPTS = Path(__file__).resolve().parent.parent
-MODULE = SCRIPTS / "pr_pipeline_improvements.py"
+MODULE = SCRIPTS / "pr_pipeline" / "pr_pipeline_improvements.py"
 _COUNTER = 0
 
 

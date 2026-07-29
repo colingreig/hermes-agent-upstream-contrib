@@ -369,7 +369,7 @@ proof packet:
   layered on top in the next commit.
 - `tests/test_claim_history.py` — covers the per-task attempt-cap logic added
   on top of the vendored claim chain (see "Claim retry cap" below).
-- `pr_staleness_alert.py` — Slack-delivered cron wrapper (mini job
+- `pr_pipeline/pr_staleness_alert.py` — Slack-delivered cron wrapper (mini job
   `pr-staleness-alert`, id `3043a00e6df8`) for open PRs stuck without a fresh
   validator verdict. Vendored 2026-07-24 (byte-identical, commit 1) then
   fixed (commit 2) for the 15-minute repost bug — see "PR staleness dedupe"
@@ -380,7 +380,7 @@ proof packet:
 - `pr_pipeline/` — canonical Mini PR-review, validation, tripwire, CI, risk,
   Slack, and merge-guard closure. `manifest.json` resolves its source hashes
   at deployment time, including every `pr_pipeline/*.py` trust-boundary
-  component. The legacy flat entry points and the package namespace are both
+  component. Remaining legacy flat entry points and the package namespace are
   generated Mini artifacts from these sources.
 - `reconcile_pr_pipeline.py` — the only deploy/verify path for that closure.
   It installs only manifest paths, records the supplying source commit plus
@@ -578,7 +578,7 @@ consecutive runs (20:02-21:16 on 2026-07-23), 257 runs since 2026-07-22, for
 the same 6 unresolved stale PRs. The signal was real; the dedupe granularity
 was the defect.
 
-Fix: `pr_staleness_alert.py` no longer calls that function at all. It calls
+Fix: `pr_pipeline/pr_staleness_alert.py` no longer calls that function at all. It calls
 the lower-level scan/staleness primitives (`GitHubClient`, `scan_repos`,
 `stale_without_verdict`, `utcnow`, `notify` — all re-exported by
 `pr_pipeline_improvements`) directly, then owns its own dedupe:
@@ -604,9 +604,9 @@ Deploy (run from the repo root; `mac-mini-h.tail51ec1b.ts.net` is the
 mini's Tailscale name):
 
 ```bash
-scp machine-setup/mini-scripts/pr_staleness_alert.py \
-    mac-mini-h.tail51ec1b.ts.net:~/.hermes/scripts/pr_staleness_alert.py
-mini-run -- 'python3 -m py_compile ~/.hermes/scripts/pr_staleness_alert.py'  # sanity check
+scp machine-setup/mini-scripts/pr_pipeline/pr_staleness_alert.py \
+    mac-mini-h.tail51ec1b.ts.net:~/.hermes/scripts/pr_pipeline/pr_staleness_alert.py
+mini-run -- 'python3 -m py_compile ~/.hermes/scripts/pr_pipeline/pr_staleness_alert.py'  # sanity check
 ```
 
 ## PR-pipeline source and deployment integrity
@@ -614,9 +614,9 @@ mini-run -- 'python3 -m py_compile ~/.hermes/scripts/pr_staleness_alert.py'  # s
 `machine-setup/mini-scripts/pr_pipeline/` is now the only authoritative
 source for the Mini PR-review/merge closure. The Mini copies at
 `~/.hermes/scripts/` and `~/.hermes/scripts/pr_pipeline/` are generated
-artifacts. The manifest includes the legacy flat entry points and every Python
-file in the package, so a newly added trust-boundary module cannot silently
-remain Mini-only.
+artifacts. The manifest includes the remaining legacy flat entry points and
+every Python file in the package, so a newly added trust-boundary module cannot
+silently remain Mini-only.
 
 The focused verifier/reconciler is deliberately separate from the legacy
 patch checker: it stages the manifest sources to the Mini, writes only the
@@ -643,7 +643,7 @@ hand-maintained on the mini and holds ~203 live-only scripts with no git
 backing (see the top of this file). Only ever `scp` the exact file(s) named
 in the deploy command for the section you're working from (e.g. just
 `claim_store.py`, `opencode_exec.py`, and `clickup-queue-poller-claim_next.py`
-for "Claim retry cap" above, or just `pr_staleness_alert.py` for "PR
+for "Claim retry cap" above, or just `pr_pipeline/pr_staleness_alert.py` for "PR
 staleness dedupe" above) — never the directory. The same caution applies to
 `~/.hermes/skills/clickup-queue-poller/scripts/` — copy only `claim_next.py`,
 never the directory.
