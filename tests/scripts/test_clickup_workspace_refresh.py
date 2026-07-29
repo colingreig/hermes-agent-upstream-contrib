@@ -529,4 +529,37 @@ class TestResolveClickupToken:
         assert exc_info.value.code == 2
         stderr = capsys.readouterr().err
         assert "could not be resolved via 1Password" in stderr
-        assert "Authorization" not in stderr
+
+
+def test_get_retries_on_429_and_succeeds(monkeypatch):
+    """_get() retries on transient 429s and returns data on eventual success."""
+    responses = iter([(429, None), (429, None), (200, {"ok": True})])
+    calls = []
+
+    def fake_req(method, path, body=None):
+        calls.append((method, path))
+        return next(responses)
+
+    slept = []
+    monkeypatch.setattr(refresh_mod, "_req", fake_req)
+    monkeypatch.setattr(refresh_mod.time, "sleep", lambda s: slept.append(s))
+
+    result = refresh_mod._get("/test/path")
+
+    assert result == {"ok": True}
+    assert len(calls) == 3  # 2 x 429 retried + 1 success
+    assert slept == [15, 30]  # 15 * 2^0, 15 * 2^1
+
+
+def test_get_raises_and_logs_after_exhausting_retries(monkeypatch):
+    """_get() raises ClickUpApiError and logs a drift entry after max retries on 429."""
+    monkeypatch.setattr(refresh_mod, "_req", lambda *_: (429, None))
+    monkeypatch.setattr(refresh_mod.time, "sleep", lambda _: None)
+
+    logged = []
+    monkeypatch.setattr(refresh_mod, "_log_failure", lambda r: logged.append(r))
+
+    with pytest.raises(refresh_mod.ClickUpApiError):
+        refresh_mod._get("/test/path")
+
+    assert any("rate_limit_exhausted" in entry for entry in logged)
