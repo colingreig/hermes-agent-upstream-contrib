@@ -390,7 +390,7 @@ class LiveBackend:
     def mini_runtime(self) -> dict[str, Any]:
         link = "/Users/colingreig/.hermes/runtime-current"
         target = self._ssh(
-            ["/bin/readlink", link], timeout=15, source="mini:runtime-target"
+            ["/usr/bin/readlink", link], timeout=15, source="mini:runtime-target"
         ).decode("utf-8", errors="strict").strip()
         head = self._ssh(
             ["/usr/bin/git", "-C", link, "rev-parse", "HEAD^{commit}"],

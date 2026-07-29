@@ -221,6 +221,34 @@ def test_admission_reads_active_singleton_and_bounded_recent_history(monkeypatch
     assert "LIMIT 100" in history_query
 
 
+def test_mini_runtime_uses_fixed_macos_readlink_argv(monkeypatch):
+    calls: list[list[str]] = []
+    backend = producer.LiveBackend(mini_host="mini")
+
+    def fake_ssh(remote_argv, **_kwargs):
+        calls.append(remote_argv)
+        if remote_argv[0] == "/usr/bin/readlink":
+            return b"/Users/colingreig/.hermes/releases/v0.18.2-aaaaaaaaaaaa\n"
+        return (b"a" * 40) + b"\n"
+
+    monkeypatch.setattr(backend, "_ssh", fake_ssh)
+
+    assert backend.mini_runtime() == {
+        "target": "/Users/colingreig/.hermes/releases/v0.18.2-aaaaaaaaaaaa",
+        "head_sha": "a" * 40,
+    }
+    assert calls == [
+        ["/usr/bin/readlink", "/Users/colingreig/.hermes/runtime-current"],
+        [
+            "/usr/bin/git",
+            "-C",
+            "/Users/colingreig/.hermes/runtime-current",
+            "rev-parse",
+            "HEAD^{commit}",
+        ],
+    ]
+
+
 def test_clickup_reads_disable_the_cli_cache(monkeypatch, tmp_path):
     calls: list[tuple[list[str], dict]] = []
 
