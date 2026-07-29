@@ -11,6 +11,7 @@ calls a PR merge command.
 from __future__ import annotations
 
 import argparse
+import base64
 import fnmatch
 import hashlib
 import json
@@ -29,6 +30,7 @@ from typing import Any, Iterable
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_MANIFEST = SCRIPT_DIR / "pr_pipeline" / "manifest.json"
+DEFAULT_DESTINATION = Path.home() / ".hermes" / "scripts"
 MARKER_NAME = ".pr_pipeline_deployment.json"
 CI_HEALTH_CRON_NAME = "ci-health-watch"
 CI_HEALTH_CRON_SCHEDULE = {"kind": "cron", "expr": "*/5 * * * *", "display": "*/5 * * * *"}
@@ -37,6 +39,14 @@ CI_HEALTH_CRON_MAX_SECONDS = 300
 SOURCE_COMMIT_RE = re.compile(r"[0-9a-f]{7,64}\Z")
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 REMOTE_HOST_RE = re.compile(r"[A-Za-z0-9_.@:-]+\Z")
+RUNNER_ASSET_DESTINATIONS = {
+    "/etc/systemd/system/hermes-runner@.service",
+    "/home/colingreig/.hermes-ci/hooks/acquire.sh",
+    "/home/colingreig/.hermes-ci/hooks/release.sh",
+    "/home/colingreig/.hermes-ci/run-runner-loop.sh",
+    "/home/colingreig/.hermes-ci/runner-config.json",
+}
+RUNNER_ASSET_OWNERS = {"root", "colingreig"}
 
 
 class ManifestError(ValueError):
@@ -55,6 +65,16 @@ class ResolvedFile:
 
 
 @dataclass(frozen=True)
+class RunnerVmAsset:
+    source_destination: Path
+    destination: str
+    sha256: str
+    mode: int
+    owner: str
+    group: str
+
+
+@dataclass(frozen=True)
 class ResolvedManifest:
     path: Path
     sha256: str
@@ -62,6 +82,7 @@ class ResolvedManifest:
     root_patterns: tuple[str, ...]
     unmanaged_root_exclusions: tuple[str, ...]
     package_destination: str
+    runner_vm_assets: tuple[RunnerVmAsset, ...]
 
 
 def _sha256_path(path: Path) -> str:
@@ -107,6 +128,50 @@ def _safe_sha256(value: object, *, field: str) -> str:
     if not isinstance(value, str) or not SHA256_RE.fullmatch(value):
         raise ManifestError(f"{field} must be a lowercase SHA-256 digest")
     return value
+
+
+def _runner_vm_assets(data: dict[str, Any], resolved: list[ResolvedFile]) -> tuple[RunnerVmAsset, ...]:
+    raw = data.get("runner_vm_assets")
+    if not isinstance(raw, list) or not raw:
+        raise ManifestError("runner_vm_assets must be a non-empty list")
+    sources = {item.destination.as_posix(): item for item in resolved}
+    assets: list[RunnerVmAsset] = []
+    seen_sources: set[str] = set()
+    seen_destinations: set[str] = set()
+    for index, item in enumerate(raw):
+        if not isinstance(item, dict):
+            raise ManifestError(f"runner_vm_assets[{index}] must be an object")
+        source_name = _safe_filename(item.get("source"), field=f"runner_vm_assets[{index}].source")
+        destination = item.get("destination")
+        if destination not in RUNNER_ASSET_DESTINATIONS:
+            raise ManifestError(f"runner_vm_assets[{index}].destination is not governed")
+        mode_text = item.get("mode")
+        if not isinstance(mode_text, str) or not re.fullmatch(r"0[0-7]{3}", mode_text):
+            raise ManifestError(f"runner_vm_assets[{index}].mode must be a four-digit octal string")
+        owner = item.get("owner")
+        group = item.get("group")
+        if owner not in RUNNER_ASSET_OWNERS or group not in RUNNER_ASSET_OWNERS:
+            raise ManifestError(f"runner_vm_assets[{index}] owner/group is not governed")
+        if source_name in seen_sources or destination in seen_destinations:
+            raise ManifestError("runner_vm_assets sources and destinations must be unique")
+        source = sources.get(source_name)
+        if source is None or not source.install:
+            raise ManifestError(f"runner_vm_assets source is not a managed flat entrypoint: {source_name}")
+        seen_sources.add(source_name)
+        seen_destinations.add(destination)
+        assets.append(
+            RunnerVmAsset(
+                source_destination=source.destination,
+                destination=destination,
+                sha256=source.sha256,
+                mode=int(mode_text, 8),
+                owner=str(owner),
+                group=str(group),
+            )
+        )
+    if seen_destinations != RUNNER_ASSET_DESTINATIONS:
+        raise ManifestError("runner_vm_assets must declare the exact governed runner asset set")
+    return tuple(sorted(assets, key=lambda asset: asset.destination))
 
 
 def _expected_local_patch_specs(data: dict[str, Any]) -> dict[str, dict[str, str]]:
@@ -244,6 +309,7 @@ def resolve_manifest(path: Path = DEFAULT_MANIFEST) -> ResolvedManifest:
         root_patterns=root_patterns,
         unmanaged_root_exclusions=unmanaged_root_exclusions,
         package_destination=package_destination,
+        runner_vm_assets=_runner_vm_assets(data, resolved),
     )
 
 
@@ -261,6 +327,19 @@ def _expected_local_patches(manifest: ResolvedManifest) -> dict[str, dict[str, s
         }
         for item in manifest.files
         if not item.install
+    }
+
+
+def _expected_runner_vm_assets(manifest: ResolvedManifest) -> dict[str, dict[str, Any]]:
+    return {
+        item.destination: {
+            "group": item.group,
+            "mode": f"{item.mode:04o}",
+            "owner": item.owner,
+            "sha256": item.sha256,
+            "source": item.source_destination.as_posix(),
+        }
+        for item in manifest.runner_vm_assets
     }
 
 
@@ -410,6 +489,128 @@ def _validate_source_commit(value: str | None) -> str:
     return value
 
 
+def _topology_for_manifest(manifest: ResolvedManifest) -> dict[str, Any]:
+    source = next(
+        (item.source for item in manifest.files if item.destination.as_posix() == "ci_health_topology.json"),
+        None,
+    )
+    if source is None:
+        raise ManifestError("manifest does not contain ci_health_topology.json")
+    try:
+        topology = json.loads(source.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ManifestError(f"cannot read runner topology: {exc}") from exc
+    desired = topology.get("desired_resources") if isinstance(topology, dict) else None
+    if not isinstance(desired, dict):
+        raise ManifestError("topology.desired_resources is required")
+    if desired.get("cpu_limit") != 4 or desired.get("memory_limit_mib") != 6144:
+        raise ManifestError("runner VM resources must be exactly 4 CPU and 6144 MiB")
+    if desired.get("concurrency_slots") != 1:
+        raise ManifestError("runner concurrency must be exactly one slot")
+    return topology
+
+
+def _vm_managed(destination: Path) -> bool:
+    return destination == DEFAULT_DESTINATION.expanduser().resolve()
+
+
+def _run_checked(command: list[str], *, input_bytes: bytes | None = None) -> subprocess.CompletedProcess:
+    result = subprocess.run(command, input=input_bytes, capture_output=True, check=False)
+    if result.returncode != 0:
+        stderr = result.stderr.decode("utf-8", "replace") if isinstance(result.stderr, bytes) else str(result.stderr)
+        raise ManifestError(f"managed runner command failed ({result.returncode}): {' '.join(command)}: {stderr[:300]}")
+    return result
+
+
+def _apply_runner_vm_assets(destination: Path, manifest: ResolvedManifest, topology: dict[str, Any]) -> None:
+    vm_name = topology["vm"]["name"]
+    orb = topology["vm"]["status_command"][0]
+    desired = topology["desired_resources"]
+    for key, value in (
+        (f"machine.{vm_name}.cpu", desired["cpu_limit"]),
+        (f"machine.{vm_name}.memory_mib", desired["memory_limit_mib"]),
+    ):
+        _run_checked([orb, "config", "set", key, str(value)])
+    for asset in manifest.runner_vm_assets:
+        source = destination / asset.source_destination
+        _run_checked(
+            [
+                orb,
+                "exec",
+                "-m",
+                vm_name,
+                "sudo",
+                "sh",
+                "-c",
+                (
+                    'set -eu; target="$1"; raw="$(mktemp)"; staged="${target}.new.$$"; '
+                    'trap \'rm -f "$raw" "$staged"\' EXIT; '
+                    'base64 -d > "$raw"; '
+                    'install -D -m "$2" -o "$3" -g "$4" "$raw" "$staged"; '
+                    'mv -f "$staged" "$target"'
+                ),
+                "runner-asset-install",
+                asset.destination,
+                f"{asset.mode:04o}",
+                asset.owner,
+                asset.group,
+            ],
+            input_bytes=base64.b64encode(source.read_bytes()),
+        )
+    _run_checked([orb, "exec", "-m", vm_name, "sudo", "systemctl", "daemon-reload"])
+
+
+def _verify_runner_vm(
+    destination: Path,
+    manifest: ResolvedManifest,
+    topology: dict[str, Any],
+) -> list[str]:
+    if not _vm_managed(destination):
+        return []
+    vm_name = topology["vm"]["name"]
+    orb = topology["vm"]["status_command"][0]
+    errors: list[str] = []
+    status = _run_checked([orb, "list", "--format", "json"])
+    raw_status = status.stdout.decode("utf-8", "replace") if isinstance(status.stdout, bytes) else status.stdout
+    try:
+        payload = json.loads(raw_status or "[]")
+    except json.JSONDecodeError as exc:
+        raise ManifestError(f"managed runner VM status is malformed: {exc}") from exc
+    matches = [item for item in payload if isinstance(item, dict) and item.get("name") == vm_name] if isinstance(payload, list) else []
+    if len(matches) != 1:
+        return ["runner-vm-missing-or-ambiguous"]
+    config = matches[0].get("config") if isinstance(matches[0].get("config"), dict) else {}
+    desired = topology["desired_resources"]
+    if config.get("cpu_limit") != desired["cpu_limit"]:
+        errors.append("runner-vm-cpu-drift")
+    if config.get("memory_limit_mib") != desired["memory_limit_mib"]:
+        errors.append("runner-vm-memory-drift")
+    for asset in manifest.runner_vm_assets:
+        result = _run_checked(
+            [
+                orb,
+                "exec",
+                "-m",
+                vm_name,
+                "sudo",
+                "sh",
+                "-c",
+                'sha256sum "$1"; stat -c "%a %U %G" "$1"',
+                "runner-asset-verify",
+                asset.destination,
+            ]
+        )
+        stdout = result.stdout.decode("utf-8", "replace") if isinstance(result.stdout, bytes) else result.stdout
+        lines = stdout.splitlines()
+        if len(lines) < 2 or lines[0].split(maxsplit=1)[0] != asset.sha256:
+            errors.append(f"runner-asset-hash-drift:{asset.destination}")
+            continue
+        expected_stat = f"{asset.mode:o} {asset.owner} {asset.group}"
+        if lines[1].strip() != expected_stat:
+            errors.append(f"runner-asset-mode-owner-drift:{asset.destination}")
+    return errors
+
+
 def install(destination: Path, *, source_commit: str, manifest_path: Path = DEFAULT_MANIFEST) -> dict[str, Any]:
     """Atomically write only manifest paths and the deployment marker."""
     source_commit = _validate_source_commit(source_commit)
@@ -424,6 +625,9 @@ def install(destination: Path, *, source_commit: str, manifest_path: Path = DEFA
         if item.install:
             _atomic_copy(item.source, destination / item.destination, item.mode)
     _repair_ci_health_schedule(destination)
+    topology = _topology_for_manifest(manifest)
+    if _vm_managed(destination):
+        _apply_runner_vm_assets(destination, manifest, topology)
 
     marker = {
         "schema_version": 1,
@@ -432,6 +636,7 @@ def install(destination: Path, *, source_commit: str, manifest_path: Path = DEFA
         "manifest_sha256": manifest.sha256,
         "files": _expected_hashes(manifest),
         "expected_local_patches": _expected_local_patches(manifest),
+        "runner_vm_assets": _expected_runner_vm_assets(manifest),
     }
     _atomic_json(destination / MARKER_NAME, marker)
     return verify(destination, manifest_path=manifest_path, expected_source_commit=source_commit)
@@ -507,6 +712,8 @@ def verify(
             marker_errors.append("deployment-marker-manifest-mismatch")
         if marker.get("files") != expected_hashes:
             marker_errors.append("deployment-marker-file-list-mismatch")
+        if marker.get("runner_vm_assets") != _expected_runner_vm_assets(manifest):
+            marker_errors.append("deployment-marker-runner-assets-mismatch")
         if recorded_commit is None or not SOURCE_COMMIT_RE.fullmatch(recorded_commit):
             marker_errors.append("deployment-marker-source-commit-invalid")
         elif expected_source_commit is not None and recorded_commit != expected_source_commit:
@@ -518,8 +725,10 @@ def verify(
         cron_errors = _ci_health_schedule_errors(destination, _load_cron_jobs(_cron_jobs_path(destination)))
     except ManifestError as exc:
         cron_errors = [f"ci-health-cron-invalid:{exc}"]
+    topology = _topology_for_manifest(manifest)
+    runner_vm_errors = _verify_runner_vm(destination, manifest, topology)
     report = {
-        "ok": not missing and not mismatches and not extras and not marker_errors and not cron_errors,
+        "ok": not missing and not mismatches and not extras and not marker_errors and not cron_errors and not runner_vm_errors,
         "deployment": str(destination),
         "manifest": str(manifest.path),
         "manifest_sha256": manifest.sha256,
@@ -530,6 +739,9 @@ def verify(
         "extra": extras,
         "marker_errors": marker_errors,
         "cron_errors": cron_errors,
+        "runner_vm_assets": _expected_runner_vm_assets(manifest),
+        "runner_vm_errors": runner_vm_errors,
+        "runner_vm_managed": _vm_managed(destination),
         "managed_cron": {
             "name": CI_HEALTH_CRON_NAME,
             "max_interval_seconds": CI_HEALTH_CRON_MAX_SECONDS,
@@ -605,7 +817,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=("install", "verify", "reconcile"))
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
-    parser.add_argument("--destination", type=Path, default=Path.home() / ".hermes" / "scripts")
+    parser.add_argument("--destination", type=Path, default=DEFAULT_DESTINATION)
     parser.add_argument("--source-commit", help="required for install/reconcile; recorded on the Mini")
     parser.add_argument("--host", help="SSH host alias; stage and run the same verifier on that host")
     return parser

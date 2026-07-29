@@ -4,14 +4,23 @@
   "no_agent_interval_seconds": 300,
   "vm": {
     "name": "hermes-ci",
-    "status_command": ["orb", "list", "--format", "json"],
-    "boot_id_command": ["orb", "exec", "-m", "hermes-ci", "cat", "/proc/sys/kernel/random/boot_id"],
-    "uptime_command": ["orb", "exec", "-m", "hermes-ci", "cut", "-d.", "-f1", "/proc/uptime"],
+    "status_command": ["/usr/local/bin/orb", "list", "--format", "json"],
+    "boot_id_command": ["/usr/local/bin/orb", "exec", "-m", "hermes-ci", "cat", "/proc/sys/kernel/random/boot_id"],
+    "uptime_command": ["/usr/local/bin/orb", "exec", "-m", "hermes-ci", "cut", "-d.", "-f1", "/proc/uptime"],
+    "runner_config_command": ["/usr/local/bin/orb", "exec", "-m", "hermes-ci", "cat", "/home/colingreig/.hermes-ci/runner-config.json"],
     "managed_commands": {
-      "start": ["orb", "start", "hermes-ci"],
-      "stop": ["orb", "stop", "hermes-ci"],
-      "restart": ["orb", "restart", "hermes-ci"]
+      "start": ["/usr/local/bin/orb", "start", "hermes-ci"],
+      "stop": ["/usr/local/bin/orb", "stop", "hermes-ci"],
+      "restart": ["/usr/local/bin/orb", "restart", "hermes-ci"]
     }
+  },
+  "desired_resources": {
+    "cpu_limit": 4,
+    "memory_limit_mib": 6144,
+    "concurrency_slots": 1,
+    "semaphore_timeout_seconds": 1800,
+    "diagnostic_retention_days": 7,
+    "diagnostic_max_jobs_per_repo": 20
   },
   "expected_runners": [
     {
@@ -28,6 +37,11 @@
       "repo": "colingreig/elevatoruptime.com",
       "name": "hermes-elevatoruptime.com",
       "listener_command": ["/home/colingreig/actions-runner/elevatoruptime.com/bin/Runner.Listener", "run"]
+    },
+    {
+      "repo": "colingreig/thermal",
+      "name": "hermes-thermal",
+      "listener_command": ["/home/colingreig/actions-runner/thermal/bin/Runner.Listener", "run"]
     }
   ],
   "recovery_allowlist": [
@@ -35,6 +49,16 @@
       "repo": "colingreig/jdmbuysell-v4",
       "workflow": "Dead-image monitor",
       "event": "schedule",
+      "max_reruns": 1
+    },
+    {
+      "repo": "colingreig/thermal",
+      "workflow": "E2E Functional",
+      "event": "schedule",
+      "job": "e2e functional suite (advisory)",
+      "expected_runner": "hermes-thermal",
+      "mode": "job-interruption",
+      "max_age_seconds": 86400,
       "max_reruns": 1
     }
   ]

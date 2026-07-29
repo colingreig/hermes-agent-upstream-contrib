@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import importlib.util
 import hashlib
+import json
 import sys
 import tempfile
 import unittest
@@ -65,10 +66,32 @@ class PipelineVerifierTests(unittest.TestCase):
             root_patterns=manifest.root_patterns,
             unmanaged_root_exclusions=manifest.unmanaged_root_exclusions,
             package_destination=manifest.package_destination,
+            runner_vm_assets=manifest.runner_vm_assets,
         )
 
     def _install_fixture(self):
         (self.destination / "verify-hermes-patches.sh").write_bytes(self.local_patch_bytes)
+        jobs_path = self.destination.parent / "cron" / "jobs.json"
+        jobs_path.parent.mkdir(parents=True, exist_ok=True)
+        jobs_path.write_text(
+            json.dumps(
+                {
+                    "jobs": [
+                        {
+                            "id": "pipeline-verifier-ci-health",
+                            "name": "ci-health-watch",
+                            "script": "ci_health_watch.py",
+                            "schedule": {"kind": "cron", "expr": "*/5 * * * *"},
+                            "schedule_display": "*/5 * * * *",
+                            "enabled": True,
+                            "no_agent": True,
+                            "state": "scheduled",
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
         manifest = self._fixture_manifest_for_local_patch(self.local_patch_bytes)
         with mock.patch.object(self.reconciler, "resolve_manifest", return_value=manifest):
             return self.reconciler.install(self.destination, source_commit="a" * 40)
