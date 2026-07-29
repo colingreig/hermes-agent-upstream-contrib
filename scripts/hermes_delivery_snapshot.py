@@ -21,7 +21,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Optional, Union
 
 from delivery_watch_safety import redact_sensitive
 
@@ -29,7 +29,7 @@ from delivery_watch_safety import redact_sensitive
 SCHEMA = "hermes_delivery_snapshot/v1"
 DEFAULT_LIST_ID = "901714465284"  # AI Dev Assistant
 DEFAULT_HERMES_HOME = Path(os.path.expanduser(os.environ.get("HERMES_HOME", "~/.hermes")))
-DEFAULT_CONFIG = DEFAULT_HERMES_HOME / "config.delivery-watch.yaml"
+DEFAULT_CONFIG = DEFAULT_HERMES_HOME / "config.delivery-watch.json"
 DEFAULT_OUTPUT = DEFAULT_HERMES_HOME / "state" / "delivery-input" / "macbook.json"
 UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
@@ -117,12 +117,8 @@ def _load_config(path: Path) -> dict[str, Any]:
         raise SnapshotError(f"cannot read snapshot config {path}: {exc}") from exc
     try:
         parsed = json.loads(raw)
-    except json.JSONDecodeError:
-        try:
-            import yaml  # type: ignore[import-untyped]
-        except ImportError as exc:
-            raise SnapshotError("snapshot config requires JSON or PyYAML") from exc
-        parsed = yaml.safe_load(raw)
+    except json.JSONDecodeError as exc:
+        raise SnapshotError("snapshot config must be valid JSON") from exc
     if not isinstance(parsed, dict):
         raise SnapshotError("snapshot config must be an object")
     config = parsed.get("delivery_snapshot", {})
@@ -187,7 +183,7 @@ def _load_config(path: Path) -> dict[str, Any]:
 class LiveBackend:
     """Bounded adapters for the three live read-only authorities."""
 
-    def __init__(self, *, mini_host: str, deadline: float | None = None):
+    def __init__(self, *, mini_host: str, deadline: Optional[float] = None):
         self.mini_host = mini_host
         self.deadline = deadline
         self.node = shutil.which("node")
@@ -205,9 +201,9 @@ class LiveBackend:
         *,
         timeout: int,
         source: str,
-        input_bytes: bytes | None = None,
-        env: dict[str, str] | None = None,
-        deadline: float | None = None,
+        input_bytes: Optional[bytes] = None,
+        env: Optional[dict[str, str]] = None,
+        deadline: Optional[float] = None,
     ) -> bytes:
         if deadline is not None:
             remaining = deadline - time.monotonic()
@@ -320,7 +316,7 @@ class LiveBackend:
         *,
         timeout: int,
         source: str,
-        input_bytes: bytes | None = None,
+        input_bytes: Optional[bytes] = None,
     ) -> bytes:
         if self.ssh is None:
             raise SnapshotError("ssh is unavailable")
@@ -534,7 +530,7 @@ def _status_name(task: dict[str, Any]) -> str:
     return str(_mapping(value).get("status") or value or "").strip().lower()
 
 
-def _timestamp_ms(value: object) -> datetime | None:
+def _timestamp_ms(value: object) -> Optional[datetime]:
     try:
         return datetime.fromtimestamp(int(str(value)) / 1000, tz=timezone.utc)
     except (TypeError, ValueError, OverflowError):
@@ -576,7 +572,7 @@ def _combined_text(task: dict[str, Any], comments: list[dict[str, Any]]) -> str:
     return "\n".join(piece for piece in pieces if piece)
 
 
-def _sha_near_marker(text: str, marker: re.Pattern[str]) -> str | None:
+def _sha_near_marker(text: str, marker: re.Pattern[str]) -> Optional[str]:
     matches = list(marker.finditer(text))
     if not matches:
         return None
@@ -585,7 +581,7 @@ def _sha_near_marker(text: str, marker: re.Pattern[str]) -> str | None:
     return sha.group(0).lower() if sha else None
 
 
-def _field(text: str, names: Iterable[str]) -> str | None:
+def _field(text: str, names: Iterable[str]) -> Optional[str]:
     joined = "|".join(re.escape(name) for name in names)
     match = re.search(
         rf"(?im)^\s*(?:{joined})\s*[:=]\s*[`\"]?([A-Za-z0-9_.:/-]+)",
@@ -628,10 +624,10 @@ def _authorized_run(
 def _github_identity(
     task: dict[str, Any],
     comments: list[dict[str, Any]],
-    backend: LiveBackend | FixtureBackend,
+    backend: Union[LiveBackend, FixtureBackend],
     collection: dict[str, Any],
     governing_ci: list[dict[str, Any]],
-) -> tuple[str | None, list[dict[str, Any]], list[dict[str, Any]], list[str]]:
+) -> tuple[Optional[str], list[dict[str, Any]], list[dict[str, Any]], list[str]]:
     text = _combined_text(task, comments)
     memberships: list[tuple[str, int]] = []
     for owner, repo, number in PR_URL_RE.findall(text):
@@ -727,7 +723,7 @@ def _handoff_and_validator(
 
 
 def _mini_sources(
-    backend: LiveBackend | FixtureBackend, collection: dict[str, Any]
+    backend: Union[LiveBackend, FixtureBackend], collection: dict[str, Any]
 ) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for name in MINI_JSON_PATHS:
@@ -975,7 +971,7 @@ def _task_lane(text: str) -> str:
 def _normalize_task(
     raw: dict[str, Any],
     comments: list[dict[str, Any]],
-    backend: LiveBackend | FixtureBackend,
+    backend: Union[LiveBackend, FixtureBackend],
     mini: dict[str, Any],
     collection: dict[str, Any],
     governing_ci: list[dict[str, Any]],
@@ -1176,10 +1172,10 @@ def _normalize_task(
 
 
 def build_snapshot(
-    backend: LiveBackend | FixtureBackend,
+    backend: Union[LiveBackend, FixtureBackend],
     config: dict[str, Any],
     *,
-    now: datetime | None = None,
+    now: Optional[datetime] = None,
 ) -> dict[str, Any]:
     observed = now or _now()
     poll_deadline = time.monotonic() + config.get("poll_timeout_seconds", 240)
@@ -1291,11 +1287,11 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: Iterable[str] | None = None) -> int:
+def main(argv: Optional[Iterable[str]] = None) -> int:
     args = _parser().parse_args(list(argv) if argv is not None else None)
     try:
         config = _load_config(args.config)
-        backend: LiveBackend | FixtureBackend
+        backend: Union[LiveBackend, FixtureBackend]
         backend = FixtureBackend(args.fixture) if args.fixture else LiveBackend(
             mini_host=config["mini_host"]
         )

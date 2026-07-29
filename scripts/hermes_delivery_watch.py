@@ -23,7 +23,7 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Optional
 
 from task_delivery import CorrelationError, correlate
 from delivery_watch_safety import redact_sensitive
@@ -37,7 +37,7 @@ DEFAULT_STATE_DIR = Path(
 ) / "state" / "task-delivery-watch"
 DEFAULT_CONFIG = Path(
     os.path.expanduser(os.environ.get("HERMES_HOME", "~/.hermes"))
-) / "config.yaml"
+) / "config.delivery-watch.json"
 HERMES_BIN = Path(os.path.expanduser("~/.local/bin/hermes"))
 ALERT_THRESHOLDS = {
     "eligible_unowned": timedelta(minutes=40),
@@ -60,7 +60,7 @@ def _iso(value: datetime) -> str:
     return value.astimezone(timezone.utc).isoformat()
 
 
-def _parse_time(value: object) -> datetime | None:
+def _parse_time(value: object) -> Optional[datetime]:
     if not isinstance(value, str) or not value:
         return None
     try:
@@ -135,15 +135,8 @@ def _load_config(path: Path) -> dict[str, Any]:
         raise WatchError(f"cannot read watcher config {path}: {exc}") from exc
     try:
         parsed = json.loads(raw)
-    except json.JSONDecodeError:
-        try:
-            import yaml  # type: ignore[import-untyped]
-        except ImportError as exc:
-            raise WatchError(
-                "config.yaml is not JSON and PyYAML is unavailable; install PyYAML "
-                "or pass a JSON config with --config"
-            ) from exc
-        parsed = yaml.safe_load(raw)
+    except json.JSONDecodeError as exc:
+        raise WatchError("watcher config must be valid JSON") from exc
     if not isinstance(parsed, dict):
         raise WatchError("watcher config must be an object")
     config = parsed.get("delivery_watch", parsed)
@@ -284,7 +277,7 @@ def _merge_payload(target: dict[str, Any], payload: dict[str, Any]) -> None:
 
 
 def collect_snapshot(
-    config: dict[str, Any], *, now: datetime | None = None
+    config: dict[str, Any], *, now: Optional[datetime] = None
 ) -> dict[str, Any]:
     """Collect a normalized snapshot using read-only transports only."""
     observed = now or _now()
@@ -534,8 +527,8 @@ def run_once(
     config: dict[str, Any],
     state_dir: Path,
     *,
-    snapshot: dict[str, Any] | None = None,
-    now: datetime | None = None,
+    snapshot: Optional[dict[str, Any]] = None,
+    now: Optional[datetime] = None,
     alert: bool = True,
     ping_deadman: bool = True,
 ) -> dict[str, Any]:
@@ -660,7 +653,9 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     return records
 
 
-def final_evidence(state_dir: Path, *, now: datetime | None = None) -> dict[str, Any]:
+def final_evidence(
+    state_dir: Path, *, now: Optional[datetime] = None
+) -> dict[str, Any]:
     """Evaluate the 24-72 hour acceptance window from durable watcher evidence."""
     current = now or _now()
     events = _read_jsonl(state_dir / "events.jsonl")
@@ -782,7 +777,7 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: Iterable[str] | None = None) -> int:
+def main(argv: Optional[Iterable[str]] = None) -> int:
     args = _parser().parse_args(list(argv) if argv is not None else None)
     try:
         if args.status:

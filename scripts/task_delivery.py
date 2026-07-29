@@ -13,7 +13,7 @@ watcher; callers pass one normalized task snapshot to :func:`correlate`.
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, Iterable
+from typing import Any, Iterable, Optional
 
 
 SCHEMA = "task_delivery/v1"
@@ -95,7 +95,9 @@ def _append_missing(missing: list[str], condition: bool, name: str) -> None:
         missing.append(name)
 
 
-def correlate(snapshot: dict[str, Any], *, generated_at: str | None = None) -> dict[str, Any]:
+def correlate(
+    snapshot: dict[str, Any], *, generated_at: Optional[str] = None
+) -> dict[str, Any]:
     """Return one canonical ``task_delivery/v1`` correlation.
 
     Supported forms are:

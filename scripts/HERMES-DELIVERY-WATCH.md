@@ -49,26 +49,38 @@ and enforces a 240-second whole-poll deadline so one run cannot consume the
 
 ## Configuration
 
-The installer creates a dedicated, mode-0600 configuration at
-`~/.hermes/config.delivery-watch.yaml`. It never rewrites the main Hermes
-configuration. JSON is accepted as YAML-compatible configuration. The generated
-minimum is:
+The installer creates a dedicated, mode-0600, stdlib-readable JSON
+configuration at `~/.hermes/config.delivery-watch.json`. It never reads or
+rewrites the main Hermes configuration and does not require PyYAML. If the
+former `config.delivery-watch.yaml` contains the JSON emitted by an older
+installer, it is copied byte-for-byte to the new path and the legacy file is
+left untouched. The generated minimum is:
 
-```yaml
-delivery_snapshot:
-  clickup_list_id: "901714465284"
-  mini_host: mini
-  lookback_hours: 72
-  max_tasks: 25
-  poll_timeout_seconds: 240
-  governing_ci:
-    - path: ".github/workflows/ci.yml"
-      events: ["pull_request", "push"]
-delivery_watch:
-  collectors:
-    - name: live-delivery-snapshot
-      kind: file
-      path: "/Users/colingreig/.hermes/state/delivery-input/macbook.json"
+```json
+{
+  "delivery_snapshot": {
+    "clickup_list_id": "901714465284",
+    "mini_host": "mini",
+    "lookback_hours": 72,
+    "max_tasks": 25,
+    "poll_timeout_seconds": 240,
+    "governing_ci": [
+      {
+        "path": ".github/workflows/ci.yml",
+        "events": ["pull_request", "push"]
+      }
+    ]
+  },
+  "delivery_watch": {
+    "collectors": [
+      {
+        "name": "live-delivery-snapshot",
+        "kind": "file",
+        "path": "/Users/colingreig/.hermes/state/delivery-input/macbook.json"
+      }
+    ]
+  }
+}
 ```
 
 After installation, optionally add `slack_target` and `deadman_url` beneath
@@ -136,9 +148,12 @@ scripts/install-hermes-delivery-watcher.sh --install
 ```
 
 This installs the producer, watcher, correlator, dedicated configuration, and
-plist without loading the job. After reviewing the generated configuration,
-use `--install-and-enable`. The launchd job runs the following cycle every 300
-seconds:
+plist without loading the job. The plist always invokes Apple's fixed,
+Apple-signature-verified `/usr/bin/python3`; the installer rejects interpreter
+overrides and never selects a workspace virtualenv. This avoids depending on a
+quarantined workspace or package-manager interpreter. After reviewing the
+generated configuration, use `--install-and-enable`. The launchd job runs the
+following cycle every 300 seconds:
 
 ```text
 hermes_delivery_snapshot.py --once --run-watcher
@@ -150,12 +165,12 @@ hermes_delivery_snapshot.py --once --run-watcher
 Useful read-only commands are:
 
 ```bash
-python3 scripts/hermes_delivery_watch.py --status \
-  --config ~/.hermes/config.delivery-watch.yaml
-python3 scripts/hermes_delivery_watch.py --final-evidence \
-  --config ~/.hermes/config.delivery-watch.yaml
-python3 scripts/hermes_delivery_snapshot.py --once \
-  --config ~/.hermes/config.delivery-watch.yaml
+/usr/bin/python3 scripts/hermes_delivery_watch.py --status \
+  --config ~/.hermes/config.delivery-watch.json
+/usr/bin/python3 scripts/hermes_delivery_watch.py --final-evidence \
+  --config ~/.hermes/config.delivery-watch.json
+/usr/bin/python3 scripts/hermes_delivery_snapshot.py --once \
+  --config ~/.hermes/config.delivery-watch.json
 python3 scripts/hermes_delivery_watch.py --once --no-alert --no-deadman \
   --snapshot /absolute/path/to/offline-snapshot.json
 python3 scripts/hermes_delivery_snapshot.py --once \

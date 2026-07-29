@@ -6,7 +6,7 @@
     <string>com.colingreig.hermes.delivery-watch</string>
     <key>ProgramArguments</key>
     <array>
-        <string>__HERMES_DELIVERY_WATCH_PYTHON__</string>
+        <string>/usr/bin/python3</string>
         <string>__HERMES_DELIVERY_SNAPSHOT_SCRIPT__</string>
         <string>--once</string>
         <string>--config</string>

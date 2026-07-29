@@ -23,7 +23,6 @@ esac
 
 HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 WATCHER_SOURCE="$SCRIPT_DIR/hermes_delivery_watch.py"
 CORRELATOR_SOURCE="$SCRIPT_DIR/task_delivery.py"
 PRODUCER_SOURCE="$SCRIPT_DIR/hermes_delivery_snapshot.py"
@@ -34,7 +33,8 @@ WATCHER="$TARGET_DIR/hermes_delivery_watch.py"
 CORRELATOR="$TARGET_DIR/task_delivery.py"
 PRODUCER="$TARGET_DIR/hermes_delivery_snapshot.py"
 SAFETY="$TARGET_DIR/delivery_watch_safety.py"
-WATCH_CONFIG="$HERMES_HOME/config.delivery-watch.yaml"
+WATCH_CONFIG="$HERMES_HOME/config.delivery-watch.json"
+LEGACY_WATCH_CONFIG="$HERMES_HOME/config.delivery-watch.yaml"
 SNAPSHOT="$HERMES_HOME/state/delivery-input/macbook.json"
 TARGET_PLIST="$HOME/Library/LaunchAgents/com.colingreig.hermes.delivery-watch.plist"
 LABEL="com.colingreig.hermes.delivery-watch"
@@ -51,29 +51,32 @@ DOMAIN="gui/$(id -u)"
 [ -f "$SOURCE_PLIST" ] && [ ! -L "$SOURCE_PLIST" ] \
   || { echo "ERROR: missing or symlinked source plist: $SOURCE_PLIST" >&2; exit 1; }
 
-PYTHON=""
-python_candidates=()
-[ -n "${HERMES_DELIVERY_WATCH_PYTHON:-}" ] \
-  && python_candidates+=("$HERMES_DELIVERY_WATCH_PYTHON")
-python_candidates+=(
-  "$REPO_ROOT/.venv/bin/python"
-  "$REPO_ROOT/venv/bin/python"
-)
-command -v python3 >/dev/null 2>&1 \
-  && python_candidates+=("$(command -v python3)")
-python_candidates+=("/opt/homebrew/bin/python3" "/usr/local/bin/python3" "/usr/bin/python3")
-for candidate in "${python_candidates[@]}"; do
-  [ -x "$candidate" ] || continue
-  if PYTHONPATH="$SCRIPT_DIR" "$candidate" -c \
-    'import yaml, task_delivery, hermes_delivery_watch, hermes_delivery_snapshot' >/dev/null 2>&1; then
-    PYTHON="$(CDPATH= cd -- "$(dirname -- "$candidate")" && pwd -P)/$(basename "$candidate")"
-    break
-  fi
-done
-[ -n "$PYTHON" ] || {
-  echo "ERROR: no Python can import the watcher and required PyYAML dependency" >&2
+PYTHON="/usr/bin/python3"
+if [ -n "${HERMES_DELIVERY_WATCH_PYTHON:-}" ] \
+  && [ "$HERMES_DELIVERY_WATCH_PYTHON" != "$PYTHON" ]; then
+  echo "ERROR: watcher interpreter override is not trusted; required path is $PYTHON" >&2
+  exit 1
+fi
+[ -x "$PYTHON" ] && [ ! -L "$PYTHON" ] || {
+  echo "ERROR: required Apple Python is missing or symlinked: $PYTHON" >&2
   exit 1
 }
+/usr/bin/codesign --verify --strict -R='anchor apple' "$PYTHON" >/dev/null 2>&1 || {
+  echo "ERROR: required Python does not satisfy the Apple code-signing requirement" >&2
+  exit 1
+}
+"$PYTHON" -c \
+  'import sys; raise SystemExit(0 if (3, 9) <= sys.version_info < (4, 0) else 1)' \
+  || {
+    echo "ERROR: $PYTHON must be supported Python 3.9 or newer" >&2
+    exit 1
+  }
+PYTHONPATH="$SCRIPT_DIR" "$PYTHON" -c \
+  'import task_delivery, hermes_delivery_watch, hermes_delivery_snapshot' >/dev/null \
+  || {
+    echo "ERROR: watcher sources do not load under the trusted Apple Python" >&2
+    exit 1
+  }
 
 mkdir -p "$HERMES_HOME/logs" "$HERMES_HOME/state/task-delivery-watch" \
   "$HERMES_HOME/state/delivery-input" "$TARGET_DIR"
@@ -97,14 +100,36 @@ install_source "$SAFETY_SOURCE" "$SAFETY" 0644
 # Prove the exact installed files load under the interpreter written into the
 # LaunchAgent.
 PYTHONPATH="$TARGET_DIR" "$PYTHON" -c \
-  'import yaml, task_delivery, hermes_delivery_watch, hermes_delivery_snapshot' >/dev/null
+  'import task_delivery, hermes_delivery_watch, hermes_delivery_snapshot' >/dev/null
 "$PYTHON" "$WATCHER" --status >/dev/null
 
 # Use a dedicated watcher config so installing the observer never rewrites the
-# user's main Hermes behavioral config.  Existing configuration is preserved
-# byte-for-byte for review and optional Slack/dead-man additions.
+# user's main Hermes behavioral config. Existing JSON configuration is
+# preserved byte-for-byte. The installer's former JSON-in-YAML file is migrated
+# once without modifying or deleting the legacy copy.
 if [ ! -e "$WATCH_CONFIG" ]; then
-  "$PYTHON" - "$WATCH_CONFIG" "$SNAPSHOT" <<'PY'
+  if [ -e "$LEGACY_WATCH_CONFIG" ]; then
+    [ -f "$LEGACY_WATCH_CONFIG" ] && [ ! -L "$LEGACY_WATCH_CONFIG" ] \
+      || { echo "ERROR: legacy watcher config must be a regular non-symlink: $LEGACY_WATCH_CONFIG" >&2; exit 1; }
+    "$PYTHON" - "$LEGACY_WATCH_CONFIG" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+try:
+    value = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+except (OSError, json.JSONDecodeError) as exc:
+    raise SystemExit(f"ERROR: legacy watcher config must contain valid JSON: {exc}")
+if not isinstance(value, dict):
+    raise SystemExit("ERROR: legacy watcher config must contain a JSON object")
+PY
+    swap="$(mktemp "$HERMES_HOME/.config.delivery-watch.json.swap.XXXXXX")"
+    cp "$LEGACY_WATCH_CONFIG" "$swap"
+    chmod 0600 "$swap"
+    mv -f "$swap" "$WATCH_CONFIG"
+    echo "Migrated legacy JSON watcher config to $WATCH_CONFIG; preserved $LEGACY_WATCH_CONFIG"
+  else
+    "$PYTHON" - "$WATCH_CONFIG" "$SNAPSHOT" <<'PY'
 import json
 import os
 import sys
@@ -154,7 +179,8 @@ except BaseException:
         pass
     raise
 PY
-  echo "Created reviewable watcher config $WATCH_CONFIG"
+    echo "Created reviewable watcher config $WATCH_CONFIG"
+  fi
 else
   [ -f "$WATCH_CONFIG" ] && [ ! -L "$WATCH_CONFIG" ] \
     || { echo "ERROR: watcher config must be a regular non-symlink: $WATCH_CONFIG" >&2; exit 1; }
@@ -175,15 +201,14 @@ PY
 mkdir -p "$(dirname "$TARGET_PLIST")"
 tmp="$(mktemp "$(dirname "$TARGET_PLIST")/.${LABEL}.swap.XXXXXX")"
 trap 'rm -f "$tmp"' EXIT
-"$PYTHON" - "$SOURCE_PLIST" "$tmp" "$PYTHON" "$PRODUCER" "$WATCH_CONFIG" \
+"$PYTHON" - "$SOURCE_PLIST" "$tmp" "$PRODUCER" "$WATCH_CONFIG" \
   "$SNAPSHOT" "$HOME" "$HERMES_HOME" <<'PY'
 import sys
 from pathlib import Path
 
-source, target, python, producer, config, snapshot, home, hermes_home = sys.argv[1:]
+source, target, producer, config, snapshot, home, hermes_home = sys.argv[1:]
 payload = Path(source).read_text(encoding="utf-8")
 for marker, value in (
-    ("__HERMES_DELIVERY_WATCH_PYTHON__", python),
     ("__HERMES_DELIVERY_SNAPSHOT_SCRIPT__", producer),
     ("__HERMES_DELIVERY_WATCH_CONFIG__", config),
     ("__HERMES_DELIVERY_SNAPSHOT_OUTPUT__", snapshot),
