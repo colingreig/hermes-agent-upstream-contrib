@@ -44,6 +44,7 @@ VENDORED_REFRESH_REL="machine-setup/mini-scripts/clickup_workspace_refresh.py"
 DEPLOYED_REFRESH="$HERMES_HOME/scripts/clickup_workspace_refresh.py"
 VENDORED_LAUNCHD_RECONCILER_REL="machine-setup/mini-scripts/reconcile_launchd_environment.py"
 VENDORED_SKILLS_RECONCILER_REL="machine-setup/mini-scripts/reconcile_marketplace_skills.py"
+VENDORED_PR_PIPELINE_RECONCILER_REL="machine-setup/mini-scripts/reconcile_pr_pipeline.py"
 
 UID_NUM="$(id -u)"
 GUI_DOMAIN="gui/${UID_NUM}"
@@ -76,12 +77,20 @@ IF_ADVANCED=0
 LAUNCHD_ENV_CHANGED=0
 MARKETPLACE_SKILLS_CHANGED=0
 PREFLIGHT=0
+CERTIFIED_SHA=""
+PR_PIPELINE_CHANGED=0
+PR_PIPELINE_RECEIPT_ID=""
+REVIEW_GATE_SMOKE_STATUS=""
 
 usage() {
   cat <<'EOF'
-Usage: mini-release-cut.sh [--ref <branch-or-sha>] [--if-advanced] [--preflight] [--rollback] [--prune] [--dry-run] [--offline]
+Usage: mini-release-cut.sh [--ref <branch-or-sha>] [--certified-sha <full-sha>] [--if-advanced] [--preflight] [--rollback] [--prune] [--dry-run] [--offline]
 
   --ref <ref>   Branch or sha to cut (default: prod-live-patches).
+  --certified-sha <sha>
+                Bind the cut/preflight to one exact certified source commit.
+                Required for every real cut and must equal the resolved target;
+                ancestor-only evidence is rejected.
   --if-advanced Cut only when the resolved ref is a strict descendant of the
                 active runtime commit. Equal is a successful structured no-op;
                 behind or diverged refs fail closed.
@@ -108,6 +117,8 @@ while [ $# -gt 0 ]; do
   case "${1:-}" in
     --ref)      REF="${2:-}"; shift 2 ;;
     --ref=*)    REF="${1#*=}"; shift ;;
+    --certified-sha) CERTIFIED_SHA="${2:-}"; shift 2 ;;
+    --certified-sha=*) CERTIFIED_SHA="${1#*=}"; shift ;;
     --rollback) DO_ROLLBACK=1; shift ;;
     --prune)    DO_PRUNE=1; shift ;;
     --dry-run)  DRY_RUN=1; shift ;;
@@ -308,20 +319,27 @@ write_release_receipt() {
   fi
 
   payload="$(python3 - "$event" "$REF" "$from_sha" "$to_sha" "$runtime_dir" \
-    "$source_hash" "$deployed_hash" "$detail" <<'PY'
+    "$source_hash" "$deployed_hash" "$detail" "$CERTIFIED_SHA" \
+    "$PR_PIPELINE_RECEIPT_ID" "$REVIEW_GATE_SMOKE_STATUS" <<'PY'
 import json
 import sys
 
-event, ref, from_sha, to_sha, runtime_dir, source_hash, deployed_hash, detail = sys.argv[1:]
+(
+    event, ref, from_sha, to_sha, runtime_dir, source_hash, deployed_hash,
+    detail, certified_sha, pipeline_receipt, review_gate_smoke,
+) = sys.argv[1:]
 print(json.dumps({
-    "schema_version": 1,
+    "schema_version": 2,
     "event": event,
     "ref": ref,
     "from_commit": from_sha,
     "to_commit": to_sha,
+    "certified_source_commit": certified_sha or None,
     "runtime_target": runtime_dir,
     "refresh_source_sha256": source_hash,
     "refresh_deployed_sha256": deployed_hash,
+    "pr_pipeline_reconciliation_receipt_id": pipeline_receipt or None,
+    "review_poll_gate_smoke": review_gate_smoke or None,
     "detail": detail,
 }, sort_keys=True, separators=(",", ":")))
 PY
@@ -530,6 +548,88 @@ rollback_governed_marketplace_skills() {
   "$CURRENT_LINK/venv/bin/python" "$reconciler" rollback \
     --home "$HOME" --hermes-home "$HERMES_HOME" --reload
   MARKETPLACE_SKILLS_CHANGED=0
+}
+
+# Reconcile the canonical PR-pipeline package from the exact release being
+# activated. The reconciler copies and hash-verifies the manifest closure,
+# records the exact source commit, and smokes the deployed root entrypoint with
+# this release's Python from `/` under a sanitized environment.
+reconcile_governed_pr_pipeline() {
+  local release_dir="${1:-}" source_sha="${2:-}"
+  local reconciler="$release_dir/$VENDORED_PR_PIPELINE_RECONCILER_REL"
+  local manifest="$release_dir/machine-setup/mini-scripts/pr_pipeline/manifest.json"
+  local report
+  if [ "$DRY_RUN" -eq 1 ]; then
+    dry_run_target_regular_file_metadata "$VENDORED_PR_PIPELINE_RECONCILER_REL" || return 1
+    printf '\033[35m[DRY-RUN]\033[0m %s %s reconcile --manifest %s --destination %s --source-commit %s --runtime-python %s\n' \
+      "$release_dir/venv/bin/python" "$reconciler" "$manifest" \
+      "$HERMES_HOME/scripts" "$source_sha" "$release_dir/venv/bin/python"
+    PR_PIPELINE_RECEIPT_ID=""
+    REVIEW_GATE_SMOKE_STATUS="planned"
+    return 0
+  fi
+  [ -f "$reconciler" ] && [ ! -L "$reconciler" ] \
+    || { warn "PR-pipeline reconciler missing or symlinked: $reconciler"; return 1; }
+  report="$(
+    "$release_dir/venv/bin/python" "$reconciler" reconcile \
+      --manifest "$manifest" \
+      --destination "$HERMES_HOME/scripts" \
+      --source-commit "$source_sha" \
+      --runtime-python "$release_dir/venv/bin/python"
+  )" || return 1
+  PR_PIPELINE_RECEIPT_ID="$(
+    printf '%s' "$report" | "$release_dir/venv/bin/python" -c '
+import json, sys
+report = json.load(sys.stdin)
+assert report["ok"] is True
+assert report["recorded_source_commit"] == sys.argv[1]
+assert report["expected_source_commit"] == sys.argv[1]
+assert report["review_gate_smoke"]["ok"] is True
+print(report["reconciliation_receipt_id"])
+' "$source_sha"
+  )" || return 1
+  [[ "$PR_PIPELINE_RECEIPT_ID" =~ ^[0-9a-f]{64}$ ]] || return 1
+  REVIEW_GATE_SMOKE_STATUS="passed"
+  PR_PIPELINE_CHANGED=1
+  ok "PR pipeline reconciled at exact source $source_sha (receipt=$PR_PIPELINE_RECEIPT_ID)"
+}
+
+smoke_live_review_poll_gate() {
+  local release_dir="${1:-}"
+  local output
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '\033[35m[DRY-RUN]\033[0m (cd / && env -i HOME=%s HERMES_HOME=%s PATH=/usr/bin:/bin PYTHONNOUSERSITE=1 HERMES_REVIEW_POLL_GATE_IMPORT_SMOKE=1 %s %s)\n' \
+      "$HOME" "$HERMES_HOME" "$release_dir/venv/bin/python" \
+      "$HERMES_HOME/scripts/review_poll_gate.py"
+    REVIEW_GATE_SMOKE_STATUS="planned"
+    return 0
+  fi
+  output="$(
+    cd /
+    env -i \
+      HOME="$HOME" \
+      HERMES_HOME="$HERMES_HOME" \
+      PATH="/usr/bin:/bin" \
+      PYTHONNOUSERSITE=1 \
+      HERMES_REVIEW_POLL_GATE_IMPORT_SMOKE=1 \
+      "$release_dir/venv/bin/python" "$HERMES_HOME/scripts/review_poll_gate.py"
+  )" || return 1
+  [ "$output" = "review-poll-gate-import-smoke: ok" ] || return 1
+  REVIEW_GATE_SMOKE_STATUS="passed"
+  ok "live root review_poll_gate command import-smoked with sanitized cwd/env"
+}
+
+restore_governed_pr_pipeline_for_release() {
+  local release_dir="${1:-}" source_sha
+  [ "$PR_PIPELINE_CHANGED" -eq 1 ] || return 0
+  source_sha="$("$release_dir/venv/bin/python" - "$release_dir" <<'PY'
+import subprocess
+import sys
+print(subprocess.check_output(["git", "-C", sys.argv[1], "rev-parse", "HEAD^{commit}"], text=True).strip())
+PY
+  )" || return 1
+  reconcile_governed_pr_pipeline "$release_dir" "$source_sha"
+  PR_PIPELINE_CHANGED=0
 }
 
 # Install the release-owned ClickUp wrapper as a stable user command.  The
@@ -779,6 +879,8 @@ rollback_to_previous() {
     || die "rollback could not restore governed ClickUp refresh — MANUAL INTERVENTION REQUIRED"
   install_clickup_cli "$prev" \
     || die "rollback could not restore managed ClickUp CLI — MANUAL INTERVENTION REQUIRED"
+  restore_governed_pr_pipeline_for_release "$prev" \
+    || die "rollback could not restore governed PR pipeline — MANUAL INTERVENTION REQUIRED"
   rollback_governed_marketplace_skills "$reason" \
     || die "rollback could not restore governed marketplace skills — MANUAL INTERVENTION REQUIRED"
   rollback_governed_launchd_environment "$reason" \
@@ -911,7 +1013,8 @@ find_uncovered_mini_scripts_changes() {
       printf '%s\n' \
         "$VENDORED_REFRESH_REL" \
         "$VENDORED_LAUNCHD_RECONCILER_REL" \
-        "$VENDORED_SKILLS_RECONCILER_REL"
+        "$VENDORED_SKILLS_RECONCILER_REL" \
+        "$VENDORED_PR_PIPELINE_RECONCILER_REL"
     } 2>/dev/null
   )"
 
@@ -952,10 +1055,32 @@ if [ "$PREFLIGHT" -eq 1 ] && {
 }; then
   die "--preflight cannot be combined with --dry-run, --rollback, --prune, or --offline"
 fi
+if [ "$DO_ROLLBACK" -eq 0 ] && [ "$DRY_RUN" -eq 0 ]; then
+  [[ "$CERTIFIED_SHA" =~ ^[0-9a-f]{40,64}$ ]] \
+    || die "managed release requires --certified-sha with a full lowercase object id"
+elif [ -n "$CERTIFIED_SHA" ]; then
+  [[ "$CERTIFIED_SHA" =~ ^[0-9a-f]{40,64}$ ]] \
+    || die "--certified-sha must be a full lowercase object id"
+fi
 
 # This trap owns both failure cleanup and lock release. NEW_DIR remains empty
 # for an explicit rollback, so that mode only releases its lock.
 NEW_DIR=""
+freeze_managed_poll_after_failure() {
+  local control="$CURRENT_LINK/scripts/mini-release-poll-control.py"
+  local python="$CURRENT_LINK/venv/bin/python"
+  [ "$IF_ADVANCED" -eq 1 ] && [ "$PREFLIGHT" -eq 0 ] && [ "$DRY_RUN" -eq 0 ] \
+    || return 0
+  if [ -x "$python" ] && [ -f "$control" ] && [ ! -L "$control" ]; then
+    "$python" "$control" freeze \
+      --actor "mini-release-cut" \
+      --reason "managed release failed; operator reconciliation required" >/dev/null \
+      || warn "failed to persist poll freeze after release failure"
+  else
+    warn "managed release failed and governed poll control is unavailable; polling wrapper will fail closed"
+  fi
+}
+
 # shellcheck disable=SC2329 # registered as an EXIT trap immediately below
 cleanup_on_exit() {
   local status=$?
@@ -969,6 +1094,9 @@ cleanup_on_exit() {
       warn "cleanup: removing partially-built release dir: $NEW_DIR"
       rm -rf "$NEW_DIR"
     fi
+  fi
+  if [ "$status" -ne 0 ]; then
+    freeze_managed_poll_after_failure
   fi
   release_cut_lock
   trap - EXIT
@@ -1024,6 +1152,9 @@ else
   die "could not resolve ref '$REF' to a commit (tried origin/$REF and $REF)"
 fi
 SHORT_SHA="${SHA:0:12}"
+if [ -n "$CERTIFIED_SHA" ] && [ "$SHA" != "$CERTIFIED_SHA" ]; then
+  die "resolved target $SHA does not exactly equal certified source $CERTIFIED_SHA"
+fi
 
 # Polling mode is evaluated under the same lock as the eventual cut, after the
 # fetch and immutable commit resolution. This closes the check-then-cut race.
@@ -1044,6 +1175,10 @@ if [ "$IF_ADVANCED" -eq 1 ]; then
         ok "release preflight passed: $REF already active at $SHA"
         exit 0
       fi
+      reconcile_governed_pr_pipeline "$CURRENT_LINK" "$SHA" \
+        || die "active runtime PR pipeline could not reconcile to exact source $SHA"
+      smoke_live_review_poll_gate "$CURRENT_LINK" \
+        || die "active runtime root review_poll_gate smoke failed"
       write_release_receipt "noop" "$ACTIVE_SHA" "$SHA" "$ACTIVE_TARGET" \
         "$ACTIVE_REFRESH_SOURCE_HASH" "$ACTIVE_REFRESH_DEPLOYED_HASH" \
         "resolved ref already active" \
@@ -1268,6 +1403,8 @@ PY
   "$NEW_DIR/venv/bin/python" -m py_compile \
     "$LAUNCHD_SOURCE_ROOT/reconcile_launchd_environment.py" \
     "$LAUNCHD_SOURCE_ROOT/reconcile_marketplace_skills.py" \
+    "$LAUNCHD_SOURCE_ROOT/reconcile_pr_pipeline.py" \
+    "$LAUNCHD_SOURCE_ROOT/review_poll_gate.py" \
     "$LAUNCHD_SOURCE_ROOT/mini_health_attestation.py" \
     "$LAUNCHD_SOURCE_ROOT/record_skill_pull_success.py" \
     "$LAUNCHD_SOURCE_ROOT/skill_pull_guard.py" \
@@ -1325,6 +1462,16 @@ if ! install_governed_marketplace_skills "$NEW_DIR"; then
   rollback_to_previous "governed marketplace skills install failed"
   die "cut aborted and rolled back to previous release"
 fi
+if ! reconcile_governed_pr_pipeline "$NEW_DIR" "$SHA"; then
+  warn "governed PR-pipeline reconciliation failed — rolling back"
+  rollback_to_previous "governed PR-pipeline reconciliation failed"
+  die "cut aborted and rolled back to previous release"
+fi
+if ! smoke_live_review_poll_gate "$NEW_DIR"; then
+  warn "live review_poll_gate root-command smoke failed — rolling back"
+  rollback_to_previous "review_poll_gate smoke failed"
+  die "cut aborted and rolled back to previous release"
+fi
 if ! verify_gateway "$NEW_DIR" "$LAUNCHD_GW_OFFSET" || ! verify_dashboard; then
   warn "services did not verify through governed launchd environment — rolling back"
   rollback_to_previous "governed launchd environment verify failed"
@@ -1365,7 +1512,7 @@ fi
 # pr_pipeline/manifest.json, or the three files vendored above). This is a
 # report-only check — it never blocks or rolls back the cut.
 UNCOVERED_MINI_SCRIPTS="$(find_uncovered_mini_scripts_changes)"
-RECEIPT_DETAIL="release cut and governed script deployment verified"
+RECEIPT_DETAIL="release cut, exact-source PR-pipeline reconciliation, and governed script deployment verified"
 if [ -n "$UNCOVERED_MINI_SCRIPTS" ]; then
   UNCOVERED_COUNT="$(printf '%s\n' "$UNCOVERED_MINI_SCRIPTS" | grep -c .)"
   warn "release changed machine-setup/mini-scripts/ file(s) outside every deploy manifest — NOT deployed to the mini by this cut:"

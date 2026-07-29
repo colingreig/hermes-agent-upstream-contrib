@@ -385,8 +385,12 @@ proof packet:
 - `reconcile_pr_pipeline.py` — the only deploy/verify path for that closure.
   It installs only manifest paths, records the supplying source commit plus
   every deployed SHA-256 in `.pr_pipeline_deployment.json`, and reports
-  missing, extra, or drifted pipeline files. The snapshot is hard-shadowed:
-  this deployment surface never enables or invokes a live merge.
+  missing, extra, or drifted pipeline files. Source identity is exact (a full
+  SHA equal to the active release), never ancestor-only. Reconciliation also
+  runs the deployed root `review_poll_gate.py` command from `/` with the
+  release Python and a sanitized environment, then records the smoke and a
+  composite reconciliation receipt. The snapshot is hard-shadowed: this
+  deployment surface never enables or invokes a live merge.
 - `github_app_cred.sh` — git credential helper for the Hermes Dev Assistant
   GitHub App, wired up by `~/.hermes/gitconfig` (`GIT_CONFIG_GLOBAL`). Mints a
   short-lived installation token per request via `op-run` +

@@ -34,7 +34,7 @@ CI_HEALTH_CRON_NAME = "ci-health-watch"
 CI_HEALTH_CRON_SCHEDULE = {"kind": "cron", "expr": "*/5 * * * *", "display": "*/5 * * * *"}
 CI_HEALTH_CRON_SCHEDULE_DISPLAY = "*/5 * * * *"
 CI_HEALTH_CRON_MAX_SECONDS = 300
-SOURCE_COMMIT_RE = re.compile(r"[0-9a-f]{7,64}\Z")
+SOURCE_COMMIT_RE = re.compile(r"[0-9a-f]{40,64}\Z")
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 REMOTE_HOST_RE = re.compile(r"[A-Za-z0-9_.@:-]+\Z")
 REVIEW_GATE_ROOT_SHIM = Path("review_poll_gate.py")
@@ -444,11 +444,60 @@ def _repair_ci_health_schedule(destination: Path) -> None:
 
 def _validate_source_commit(value: str | None) -> str:
     if not isinstance(value, str) or not SOURCE_COMMIT_RE.fullmatch(value):
-        raise ManifestError("--source-commit must be a lowercase git object id (7-64 hex characters)")
+        raise ManifestError("--source-commit must be a full lowercase git object id (40-64 hex characters)")
     return value
 
 
-def install(destination: Path, *, source_commit: str, manifest_path: Path = DEFAULT_MANIFEST) -> dict[str, Any]:
+def _smoke_review_gate(destination: Path, runtime_python: Path) -> dict[str, Any]:
+    """Import the actual deployed root command from `/` with a minimal env."""
+    runtime_python = runtime_python.expanduser().resolve()
+    if not runtime_python.is_file() or runtime_python.is_symlink():
+        raise ManifestError(f"runtime Python is missing or symlinked: {runtime_python}")
+    entrypoint = destination / REVIEW_GATE_ROOT_SHIM
+    env = {
+        "HOME": str(destination.parent.parent),
+        "HERMES_HOME": str(destination.parent),
+        "PATH": "/usr/bin:/bin",
+        "PYTHONNOUSERSITE": "1",
+        "HERMES_REVIEW_POLL_GATE_IMPORT_SMOKE": "1",
+    }
+    result = subprocess.run(
+        [str(runtime_python), str(entrypoint)],
+        cwd="/",
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    output = result.stdout.strip()
+    if result.returncode != 0 or output != "review-poll-gate-import-smoke: ok":
+        raise ManifestError(
+            "deployed review-poll root command smoke failed "
+            f"(exit={result.returncode}, stdout={output!r}, stderr={result.stderr.strip()!r})"
+        )
+    return {
+        "ok": True,
+        "runtime_python": str(runtime_python),
+        "entrypoint": str(entrypoint),
+        "cwd": "/",
+        "environment_keys": sorted(env),
+        "output": output,
+    }
+
+
+def _marker_receipt_id(marker: dict[str, Any]) -> str:
+    canonical = json.dumps(marker, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def install(
+    destination: Path,
+    *,
+    source_commit: str,
+    manifest_path: Path = DEFAULT_MANIFEST,
+    runtime_python: Path | None = None,
+) -> dict[str, Any]:
     """Atomically write only manifest paths and the deployment marker."""
     source_commit = _validate_source_commit(source_commit)
     manifest = resolve_manifest(manifest_path)
@@ -462,17 +511,24 @@ def install(destination: Path, *, source_commit: str, manifest_path: Path = DEFA
         if item.install:
             _atomic_copy(item.source, destination / item.destination, item.mode)
     _repair_ci_health_schedule(destination)
+    smoke = _smoke_review_gate(destination, runtime_python or Path(sys.executable))
 
     marker = {
-        "schema_version": 1,
+        "schema_version": 2,
         "deployment_mode": "shadow",
         "source_commit": source_commit,
         "manifest_sha256": manifest.sha256,
         "files": _expected_hashes(manifest),
         "expected_local_patches": _expected_local_patches(manifest),
+        "review_gate_smoke": smoke,
     }
+    marker["reconciliation_receipt_id"] = _marker_receipt_id(marker)
     _atomic_json(destination / MARKER_NAME, marker)
-    return verify(destination, manifest_path=manifest_path, expected_source_commit=source_commit)
+    return verify(
+        destination,
+        manifest_path=manifest_path,
+        expected_source_commit=source_commit,
+    )
 
 
 def _read_marker(path: Path) -> tuple[dict[str, Any] | None, list[str]]:
@@ -547,7 +603,7 @@ def verify(
     recorded_commit: str | None = None
     if marker is not None:
         recorded_commit = marker.get("source_commit") if isinstance(marker.get("source_commit"), str) else None
-        if marker.get("schema_version") != 1:
+        if marker.get("schema_version") != 2:
             marker_errors.append("deployment-marker-schema-mismatch")
         if marker.get("deployment_mode") != "shadow":
             marker_errors.append("deployment-mode-not-shadow")
@@ -555,6 +611,24 @@ def verify(
             marker_errors.append("deployment-marker-manifest-mismatch")
         if marker.get("files") != expected_hashes:
             marker_errors.append("deployment-marker-file-list-mismatch")
+        marker_without_receipt = dict(marker)
+        recorded_receipt_id = marker_without_receipt.pop("reconciliation_receipt_id", None)
+        if (
+            not isinstance(recorded_receipt_id, str)
+            or not SHA256_RE.fullmatch(recorded_receipt_id)
+            or recorded_receipt_id != _marker_receipt_id(marker_without_receipt)
+        ):
+            marker_errors.append("deployment-marker-receipt-invalid")
+        smoke = marker.get("review_gate_smoke")
+        if not isinstance(smoke, dict) or smoke.get("ok") is not True:
+            marker_errors.append("deployment-marker-review-gate-smoke-invalid")
+        elif (
+            smoke.get("cwd") != "/"
+            or smoke.get("output") != "review-poll-gate-import-smoke: ok"
+            or "HERMES_REVIEW_POLL_GATE_IMPORT_SMOKE"
+            not in (smoke.get("environment_keys") or [])
+        ):
+            marker_errors.append("deployment-marker-review-gate-smoke-contract-drift")
         if recorded_commit is None or not SOURCE_COMMIT_RE.fullmatch(recorded_commit):
             marker_errors.append("deployment-marker-source-commit-invalid")
         elif expected_source_commit is not None and recorded_commit != expected_source_commit:
@@ -593,6 +667,12 @@ def verify(
         },
         "recorded_source_commit": recorded_commit,
         "expected_source_commit": expected_source_commit,
+        "reconciliation_receipt_id": (
+            marker.get("reconciliation_receipt_id") if marker is not None else None
+        ),
+        "review_gate_smoke": (
+            marker.get("review_gate_smoke") if marker is not None else None
+        ),
     }
     return report
 
@@ -645,6 +725,8 @@ def _remote_run(args: argparse.Namespace) -> int:
     ]
     if source_commit:
         command.extend(["--source-commit", source_commit])
+    if args.runtime_python:
+        command.extend(["--runtime-python", str(args.runtime_python)])
     try:
         result = subprocess.run(["ssh", "-o", "BatchMode=yes", args.host, *command], check=False)
         return result.returncode
@@ -663,6 +745,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
     parser.add_argument("--destination", type=Path, default=Path.home() / ".hermes" / "scripts")
     parser.add_argument("--source-commit", help="required for install/reconcile; recorded on the Mini")
+    parser.add_argument(
+        "--runtime-python",
+        type=Path,
+        help="exact release Python used for the sanitized deployed root-command smoke",
+    )
     parser.add_argument("--host", help="SSH host alias; stage and run the same verifier on that host")
     return parser
 
@@ -673,7 +760,12 @@ def main(argv: Iterable[str] | None = None) -> int:
         if args.host:
             return _remote_run(args)
         if args.action in {"install", "reconcile"}:
-            report = install(args.destination, source_commit=args.source_commit, manifest_path=args.manifest)
+            report = install(
+                args.destination,
+                source_commit=args.source_commit,
+                manifest_path=args.manifest,
+                runtime_python=args.runtime_python,
+            )
             return _print_report(report)
         return _print_report(verify(args.destination, manifest_path=args.manifest, expected_source_commit=args.source_commit))
     except (ManifestError, OSError, subprocess.SubprocessError) as exc:

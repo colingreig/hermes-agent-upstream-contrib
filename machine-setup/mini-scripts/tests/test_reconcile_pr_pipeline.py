@@ -150,12 +150,11 @@ class PipelineDeploymentTests(unittest.TestCase):
         spec = manifest["expected_local_patches"]["verify-hermes-patches.sh"]
 
         current_source_sha = hashlib.sha256(PATCH_VERIFIER.read_bytes()).hexdigest()
-        self.assertNotEqual(spec["source_sha256"], current_source_sha)
-        with self.assertRaises(self.mod.ManifestError):
-            self.real_resolve_manifest()
+        self.assertEqual(spec["source_sha256"], current_source_sha)
+        self.real_resolve_manifest()
         self.assertEqual(
             spec["source_sha256"],
-            "5c0b908db66e647f8bb0a60835e2ad99b02c0ddf50d52b7eac8f2838f12baa36",
+            "2593e8a3f24a4340aff0999cc79a3abb19db8e58939d1d18882ef3a1f4317d09",
         )
         self.assertEqual(
             spec["deployed_sha256"],
@@ -168,6 +167,13 @@ class PipelineDeploymentTests(unittest.TestCase):
 
         self.assertTrue(report["ok"])
         self.assertEqual(report["recorded_source_commit"], self.source_commit)
+        self.assertRegex(report["reconciliation_receipt_id"], r"^[0-9a-f]{64}$")
+        self.assertTrue(report["review_gate_smoke"]["ok"])
+        self.assertEqual(
+            report["review_gate_smoke"]["output"],
+            "review-poll-gate-import-smoke: ok",
+        )
+        self.assertEqual(report["review_gate_smoke"]["cwd"], "/")
         self.assertFalse(report["missing"])
         self.assertFalse(report["hash_mismatches"])
         self.assertFalse(report["extra"])
@@ -197,6 +203,44 @@ class PipelineDeploymentTests(unittest.TestCase):
         self.assertEqual(managed[0]["state"], "scheduled")
         self.assertEqual(managed[0]["custom"], "preserved")
         self.assertFalse(report["cron_errors"])
+
+    def test_short_or_wrong_source_commit_is_rejected_exactly(self):
+        self.destination.mkdir(parents=True, exist_ok=True)
+        (self.destination / "verify-hermes-patches.sh").write_bytes(self.local_patch_bytes)
+        self._write_jobs([self._stable_ci_health_job()])
+
+        with self.assertRaisesRegex(self.mod.ManifestError, "full lowercase"):
+            self.mod.install(self.destination, source_commit="a" * 12)
+
+        self.mod.install(self.destination, source_commit=self.source_commit)
+        report = self.mod.verify(
+            self.destination,
+            expected_source_commit="b" * 40,
+        )
+        self.assertFalse(report["ok"])
+        self.assertIn(
+            "deployment-marker-source-commit-mismatch",
+            report["marker_errors"],
+        )
+
+    def test_smoke_receipt_tampering_fails_verification(self):
+        self._install()
+        marker_path = self.destination / self.mod.MARKER_NAME
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        marker["review_gate_smoke"]["cwd"] = str(self.destination)
+        marker_path.write_text(json.dumps(marker), encoding="utf-8")
+
+        report = self.mod.verify(
+            self.destination,
+            expected_source_commit=self.source_commit,
+        )
+
+        self.assertFalse(report["ok"])
+        self.assertIn(
+            "deployment-marker-review-gate-smoke-contract-drift",
+            report["marker_errors"],
+        )
+        self.assertIn("deployment-marker-receipt-invalid", report["marker_errors"])
 
     def test_verify_accepts_correct_managed_ci_health_schedule(self):
         self._install()

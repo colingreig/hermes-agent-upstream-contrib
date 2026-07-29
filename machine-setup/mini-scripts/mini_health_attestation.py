@@ -206,10 +206,21 @@ def evaluate_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
             last_good.get("valid")
             and last_good.get("to_commit")
             and last_good.get("to_commit") == actual_sha
+            and last_good.get("certified_source_commit") == actual_sha
+            and re.fullmatch(
+                r"[0-9a-f]{64}",
+                str(last_good.get("pr_pipeline_reconciliation_receipt_id") or ""),
+            )
+            and last_good.get("review_poll_gate_smoke") == "passed"
         ),
         {
             "event": last_good.get("event"),
             "to_commit": last_good.get("to_commit"),
+            "certified_source_commit": last_good.get("certified_source_commit"),
+            "pr_pipeline_reconciliation_receipt_id": last_good.get(
+                "pr_pipeline_reconciliation_receipt_id"
+            ),
+            "review_poll_gate_smoke": last_good.get("review_poll_gate_smoke"),
             "receipt_hash": last_good.get("receipt_hash"),
         },
     )
@@ -448,6 +459,11 @@ def _collect_release(releases_dir: Path, runtime: Path, runtime_sha: str) -> dic
                 "valid": True,
                 "event": data.get("event"),
                 "to_commit": data.get("to_commit"),
+                "certified_source_commit": data.get("certified_source_commit"),
+                "pr_pipeline_reconciliation_receipt_id": data.get(
+                    "pr_pipeline_reconciliation_receipt_id"
+                ),
+                "review_poll_gate_smoke": data.get("review_poll_gate_smoke"),
                 "receipt_hash": digest,
             }
             break
@@ -718,10 +734,17 @@ def collect_live(home: Path, hermes_home: Path) -> dict[str, Any]:
         recorded = report.get("recorded_source_commit")
         if not recorded:
             raise RuntimeError("PR pipeline source commit missing")
-        ancestor = _run(["git", "-C", str(runtime), "merge-base", "--is-ancestor", recorded, actual_sha])
-        if ancestor.returncode != 0:
-            raise RuntimeError("PR pipeline source commit is not in the active runtime")
-        return "manifest hashes match and recorded source commit is an ancestor"
+        if recorded != actual_sha:
+            raise RuntimeError(
+                "PR pipeline source commit does not exactly equal the active runtime"
+            )
+        receipt_id = report.get("reconciliation_receipt_id")
+        if not isinstance(receipt_id, str) or not re.fullmatch(r"[0-9a-f]{64}", receipt_id):
+            raise RuntimeError("PR pipeline reconciliation receipt is invalid")
+        smoke = report.get("review_gate_smoke") or {}
+        if smoke.get("ok") is not True:
+            raise RuntimeError("PR pipeline review-gate smoke receipt is invalid")
+        return "manifest hashes, exact source commit, reconciliation receipt, and root smoke match"
 
     governed["launchd-environment"] = _safe_probe(verify_launchd)
     governed["marketplace-skills"] = _safe_probe(verify_marketplace)

@@ -460,7 +460,8 @@ case "${1:-}" in
     case "$target_path" in
       machine-setup/mini-scripts/clickup_workspace_refresh.py|\
       machine-setup/mini-scripts/reconcile_launchd_environment.py|\
-      machine-setup/mini-scripts/reconcile_marketplace_skills.py)
+      machine-setup/mini-scripts/reconcile_marketplace_skills.py|\
+      machine-setup/mini-scripts/reconcile_pr_pipeline.py)
         printf '100755 blob %s\t%s\n' "$DRY_TARGET_BLOB" "$target_path"
         ;;
       *) exit 3 ;;
@@ -508,6 +509,8 @@ grep -Fq "ls-tree $DRY_TARGET_SHA -- $VENDORED_LAUNCHD_RECONCILER_REL" "$DRY_GIT
   || fail "dry cut did not validate launchd reconciler metadata from the target tree"
 grep -Fq "ls-tree $DRY_TARGET_SHA -- $VENDORED_SKILLS_RECONCILER_REL" "$DRY_GIT_LOG" \
   || fail "dry cut did not validate marketplace reconciler metadata from the target tree"
+grep -Fq "ls-tree $DRY_TARGET_SHA -- $VENDORED_PR_PIPELINE_RECONCILER_REL" "$DRY_GIT_LOG" \
+  || fail "dry cut did not validate PR-pipeline reconciler metadata from the target tree"
 if grep -Eq ' (show|cat-file) ' "$DRY_GIT_LOG"; then
   fail "dry cut materialized a target blob"
 fi
@@ -525,6 +528,7 @@ POLL_WRAPPER="$SCRIPT_DIR/../../scripts/mini-release-poll.sh"
 POLL_INSTALLER="$SCRIPT_DIR/../../scripts/install-mini-release-poller.sh"
 POLL_PLIST="$SCRIPT_DIR/../../scripts/launchd/com.colingreig.hermes.release-poll.plist"
 grep -Fq -- '--if-advanced' "$POLL_WRAPPER" || fail "poll wrapper does not require conditional mode"
+grep -Fq -- '--certified-sha' "$POLL_WRAPPER" || fail "poll wrapper does not bind an exact certified SHA"
 grep -Fq -- '--preflight' "$POLL_INSTALLER" || fail "poll installer has no fail-closed preflight"
 python3 - "$POLL_PLIST" <<'PY' || fail "release poll plist is not parseable"
 import plistlib
@@ -550,11 +554,14 @@ PREFLIGHT_BIN="$PREFLIGHT_ROOT/bin"
 PREFLIGHT_STATE="$PREFLIGHT_ROOT/origin-state"
 PREFLIGHT_MARKER="$PREFLIGHT_ROOT/fetch-held-lock"
 PREFLIGHT_LOG="$PREFLIGHT_ROOT/git.log"
-mkdir -p "$PREFLIGHT_RELEASE/scripts/launchd" "$PREFLIGHT_BIN"
+mkdir -p "$PREFLIGHT_RELEASE/scripts/launchd" "$PREFLIGHT_RELEASE/venv/bin" "$PREFLIGHT_BIN"
 cp "$SCRIPT" "$PREFLIGHT_RELEASE/scripts/mini-release-cut.sh"
+cp "$SCRIPT_DIR/../../scripts/mini-release-poll-control.py" \
+  "$PREFLIGHT_RELEASE/scripts/mini-release-poll-control.py"
 cp "$POLL_PLIST" \
   "$PREFLIGHT_RELEASE/scripts/launchd/com.colingreig.hermes.release-poll.plist"
 chmod 0755 "$PREFLIGHT_RELEASE/scripts/mini-release-cut.sh"
+ln -s "$(command -v python3)" "$PREFLIGHT_RELEASE/venv/bin/python"
 ln -s "$PREFLIGHT_RELEASE" "$PREFLIGHT_HERMES/runtime-current"
 printf '%s\n' aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa > "$PREFLIGHT_STATE"
 cat > "$PREFLIGHT_BIN/git" <<'SH'
@@ -606,7 +613,8 @@ if HOME="$PREFLIGHT_HOME" HERMES_HOME="$PREFLIGHT_HERMES" \
   FAKE_FETCH_MARKER="$PREFLIGHT_MARKER" \
   FAKE_ACTIVE_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
   FAKE_REMOTE_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
-  "$POLL_INSTALLER" --install >/dev/null 2>&1; then
+  "$POLL_INSTALLER" --install \
+    --certified-sha aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa >/dev/null 2>&1; then
   fail "installer accepted stale local equality after current remote diverged"
 fi
 [ -f "$PREFLIGHT_MARKER" ] \

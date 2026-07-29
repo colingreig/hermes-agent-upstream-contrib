@@ -76,6 +76,9 @@ def healthy_snapshot() -> dict:
                 "valid": True,
                 "event": "cut",
                 "to_commit": commit,
+                "certified_source_commit": commit,
+                "pr_pipeline_reconciliation_receipt_id": "e" * 64,
+                "review_poll_gate_smoke": "passed",
                 "receipt_hash": "c" * 64,
             },
         },
@@ -156,6 +159,17 @@ def test_dirty_or_stale_release_fails_closed() -> None:
     snapshot = healthy_snapshot()
     snapshot["runtime"]["dirty_paths"] = ["package-lock.json"]
     assert_fails(snapshot, "runtime.clean")
+
+
+def test_release_receipt_requires_exact_certification_reconciliation_and_smoke() -> None:
+    for field, value in (
+        ("certified_source_commit", "b" * 40),
+        ("pr_pipeline_reconciliation_receipt_id", None),
+        ("review_poll_gate_smoke", "planned"),
+    ):
+        snapshot = healthy_snapshot()
+        snapshot["release"]["last_good"][field] = value
+        assert_fails(snapshot, "release.last-good")
 
     snapshot = healthy_snapshot()
     snapshot["runtime"]["actual_sha"] = "e" * 40
