@@ -127,14 +127,53 @@ python3 machine-setup/mini-scripts/reconcile_pr_pipeline.py verify  --host mini 
 ```
 
 The topology is deliberately declarative and fail-closed. It declares the VM
-probe commands, managed start/stop/restart commands, expected runners, the
-no-agent cadence (`300` seconds, not the older two-hour interval), and the only
-automatic recovery allowlist: `colingreig/jdmbuysell-v4` workflow `Dead-image
-monitor`, event `schedule`, `max_reruns=1`. Any missing or malformed topology,
-ambiguous workflow identity, GitHub/API failure, non-schedule run, mutating or
-non-allowlisted workflow, missing restart correlation, or runner still offline
-prevents automatic rerun. Refused non-allowlisted failures are reported to
-Slack but never dispatched.
+probe commands, managed start/stop/restart commands, the exact four-runner
+fleet (including `colingreig/thermal` / `hermes-thermal`), the no-agent cadence
+(`300` seconds), and desired resources: 4 CPU, 6144 MiB, and one shared job
+slot. Duplicate, missing, or unknown runners are rejected.
+
+Two scheduled recoveries are governed and capped at one rerun:
+
+- `colingreig/jdmbuysell-v4` / `Dead-image monitor` retains managed-restart
+  overlap recovery.
+- `colingreig/thermal` / `E2E Functional` inspects the exact `e2e functional
+  suite (advisory)` job, even when job-level `continue-on-error` made the
+  workflow look green. It reruns only a completed failed job on
+  `hermes-thermal` when every completed step is `success` or `skipped` and at
+  least one step is truly `pending`/`in_progress` with no conclusion. Any
+  completed null, failure, cancellation, timeout, or action-required result
+  fails closed.
+
+For Thermal job-interruption recovery, only the newest matching scheduled run
+is considered, it must be no older than 24 hours, and its head SHA is compared
+with a freshly queried default-branch SHA both at classification and
+immediately before dispatch. JDM retains its legacy managed-restart overlap
+semantics and is not subjected to Thermal's current-main filter. At most one
+rerun command is sent per poll. Later polls reconcile the new attempt and
+persist its final job/run conclusion and observation time without ever
+authorizing another dispatch.
+
+Every recovery record is written before dispatch and includes run ID, job ID
+when applicable, runner, classification, timestamps, dispatch result, and the
+single attempt number.
+
+The same manifest governs the Linux VM runner loop, systemd template, hook
+scripts, and runner config. Installation configures OrbStack's desired 4
+CPU/6144 MiB limits but does not restart the VM; apply them with the managed
+idle-window lifecycle command below. Before an ephemeral runner work tree is
+removed, the loop writes a mode-0700 archive containing `_diag`, available
+run/job identifiers, a bounded unit journal excerpt, and cgroup/PSI resource
+evidence. Archives retain seven days and at most twenty jobs per repository.
+The acquire hook has one shared slot and fails closed after 30 minutes. Slot
+files are private leases containing boot, systemd invocation, worker PID, and
+timestamp evidence. A new runner cycle may remove only its own lease, and only
+when a changed boot/invocation or dead worker proves it stale. The shared
+acquire path may also remove another runner's lease when changed-boot or
+dead-worker evidence proves that owner stale, but never from invocation
+difference alone and never while its worker PID is live. Empty
+registration-only churn creates no archive. A failed registration with
+nonempty `_diag` is preserved in a separate private, seven-day/twenty-entry
+failure bucket, so it cannot evict real job archives.
 
 Use the managed lifecycle wrapper for any planned VM operation so the monitor
 can distinguish planned maintenance from unknown-cause restarts:
@@ -142,12 +181,18 @@ can distinguish planned maintenance from unknown-cause restarts:
 ```bash
 python3 ~/.hermes/scripts/ci_health_watch.py lifecycle restart \
   --actor "colin" \
-  --reason "controlled idle-window verification before next Dead-image monitor schedule"
+  --reason "apply governed 4 CPU / 6144 MiB Hermes CI resources in an idle window"
 ```
 
 The wrapper appends intent evidence before it acts. Unmanaged restarts are not
 guessed: lifecycle transition records keep `initiator=unknown` and
 `reason=unknown` unless a recent managed intent exists.
+
+On the first poll after this release, a legacy live state file containing both
+known synthetic `boot-a` and run `111` test fixtures is copied mode 0600 into
+`~/.hermes/state/ci-health/quarantine/`, then reinitialized. Lifecycle JSONL
+evidence is preserved and receives a quarantine event. Unit tests always pass
+an isolated state path and cannot trigger this production migration.
 
 State and evidence locations on the Mini:
 

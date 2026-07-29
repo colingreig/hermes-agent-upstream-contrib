@@ -1,0 +1,18 @@
+[Unit]
+Description=Hermes ephemeral GitHub Actions runner (%i)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=colingreig
+WorkingDirectory=/home/colingreig/actions-runner/%i
+Environment=ACTIONS_RUNNER_HOOK_JOB_STARTED=/home/colingreig/.hermes-ci/hooks/acquire.sh
+Environment=ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/home/colingreig/.hermes-ci/hooks/release.sh
+ExecStart=/home/colingreig/.hermes-ci/run-runner-loop.sh %i
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
