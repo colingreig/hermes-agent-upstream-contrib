@@ -5,6 +5,7 @@ import importlib.util
 import hashlib
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -142,6 +143,7 @@ class PipelineDeploymentTests(unittest.TestCase):
             root_patterns=tuple(manifest_data["managed_root_patterns"]),
             unmanaged_root_exclusions=tuple(manifest_data["unmanaged_root_exclusions"]),
             package_destination=manifest_data["package_destination"],
+            runner_vm_assets=self.mod._runner_vm_assets(manifest_data, files),
         )
 
     def test_default_manifest_declares_verify_patches_as_expected_local_patch(self):
@@ -149,12 +151,11 @@ class PipelineDeploymentTests(unittest.TestCase):
         spec = manifest["expected_local_patches"]["verify-hermes-patches.sh"]
 
         current_source_sha = hashlib.sha256(PATCH_VERIFIER.read_bytes()).hexdigest()
-        self.assertNotEqual(spec["source_sha256"], current_source_sha)
-        with self.assertRaises(self.mod.ManifestError):
-            self.real_resolve_manifest()
+        self.assertEqual(spec["source_sha256"], current_source_sha)
+        self.assertTrue(self.real_resolve_manifest().files)
         self.assertEqual(
             spec["source_sha256"],
-            "5c0b908db66e647f8bb0a60835e2ad99b02c0ddf50d52b7eac8f2838f12baa36",
+            "2593e8a3f24a4340aff0999cc79a3abb19db8e58939d1d18882ef3a1f4317d09",
         )
         self.assertEqual(
             spec["deployed_sha256"],
@@ -193,6 +194,12 @@ class PipelineDeploymentTests(unittest.TestCase):
         self.assertEqual(managed[0]["state"], "scheduled")
         self.assertEqual(managed[0]["custom"], "preserved")
         self.assertFalse(report["cron_errors"])
+        self.assertFalse(report["runner_vm_managed"])
+        self.assertFalse(report["runner_vm_errors"])
+        self.assertEqual(
+            set(report["runner_vm_assets"]),
+            self.mod.RUNNER_ASSET_DESTINATIONS,
+        )
 
     def test_verify_accepts_correct_managed_ci_health_schedule(self):
         self._install()
@@ -290,6 +297,276 @@ class PipelineDeploymentTests(unittest.TestCase):
         self.assertIn("validator_repo_guard.py", destinations)
         self.assertIn("pr_pipeline/validator_repo_guard.py", destinations)
         self.assertIn("validator_repo_guard.py", self.mod._expected_hashes(manifest))
+
+    def test_manifest_governs_runner_assets_modes_and_exact_vm_destinations(self):
+        manifest = self.real_resolve_manifest()
+        assets = {item.destination: item for item in manifest.runner_vm_assets}
+
+        self.assertEqual(set(assets), self.mod.RUNNER_ASSET_DESTINATIONS)
+        self.assertEqual(assets["/etc/systemd/system/hermes-runner@.service"].mode, 0o644)
+        self.assertEqual(assets["/etc/systemd/system/hermes-runner@.service"].owner, "root")
+        self.assertEqual(assets["/home/colingreig/.hermes-ci/runner-config.json"].mode, 0o600)
+        for destination in (
+            "/home/colingreig/.hermes-ci/hooks/acquire.sh",
+            "/home/colingreig/.hermes-ci/hooks/release.sh",
+            "/home/colingreig/.hermes-ci/run-runner-loop.sh",
+        ):
+            self.assertEqual(assets[destination].mode, 0o755)
+            self.assertEqual(assets[destination].owner, "colingreig")
+
+    def test_runner_assets_encode_single_slot_bounded_private_diagnostics(self):
+        acquire = (PIPELINE / "hermes-runner-acquire.sh").read_text(encoding="utf-8")
+        loop = (PIPELINE / "hermes-runner-loop.sh").read_text(encoding="utf-8")
+        unit = (PIPELINE / "hermes-runner@.service").read_text(encoding="utf-8")
+        config = json.loads((PIPELINE / "hermes-runner-config.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(config["concurrency_slots"], 1)
+        self.assertEqual(config["semaphore_timeout_seconds"], 1800)
+        self.assertEqual(config["diagnostic_retention_days"], 7)
+        self.assertEqual(config["diagnostic_max_jobs_per_repo"], 20)
+        self.assertIn('select(type == "number" and . == 1)', acquire)
+        self.assertIn('select(type == "number" and . == 1800)', acquire)
+        self.assertIn("chmod 0700", loop)
+        self.assertIn('cp -a "$DIR/_diag"', loop)
+        self.assertIn("journalctl -u", loop)
+        self.assertIn("memory.events", loop)
+        self.assertIn("diagnostic_retention_days", loop)
+        self.assertIn("diagnostic_max_jobs_per_repo", loop)
+        self.assertIn("ACTIONS_RUNNER_HOOK_JOB_STARTED", unit)
+        self.assertIn("ACTIONS_RUNNER_HOOK_JOB_COMPLETED", unit)
+
+    def test_runner_vm_installer_applies_resources_assets_and_daemon_reload(self):
+        self._install()
+        topology = self.mod._topology_for_manifest(self.fixture_manifest)
+        calls = []
+
+        def fake_run(command, **kwargs):
+            calls.append((list(command), kwargs.get("input")))
+            return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+        with mock.patch.object(self.mod.subprocess, "run", side_effect=fake_run):
+            self.mod._apply_runner_vm_assets(self.destination, self.fixture_manifest, topology)
+
+        commands = [command for command, _payload in calls]
+        self.assertIn(
+            ["/usr/local/bin/orb", "config", "set", "machine.hermes-ci.cpu", "4"],
+            commands,
+        )
+        self.assertIn(
+            ["/usr/local/bin/orb", "config", "set", "machine.hermes-ci.memory_mib", "6144"],
+            commands,
+        )
+        installs = [command for command in commands if "runner-asset-install" in command]
+        self.assertEqual(len(installs), 5)
+        self.assertTrue(any("0600" in command and any(part.endswith("runner-config.json") for part in command) for command in installs))
+        self.assertTrue(any("0644" in command and any(part.endswith("hermes-runner@.service") for part in command) for command in installs))
+        self.assertTrue(all(payload for command, payload in calls if "runner-asset-install" in command))
+        self.assertEqual(
+            commands[-1],
+            ["/usr/local/bin/orb", "exec", "-m", "hermes-ci", "sudo", "systemctl", "daemon-reload"],
+        )
+
+    def _runner_test_tree(self):
+        root = Path(self.tmp.name) / "hermes-ci"
+        home = Path(self.tmp.name) / "home"
+        runner_dir = home / "actions-runner" / "thermal"
+        (root / "sem" / "slots").mkdir(parents=True, exist_ok=True)
+        (root / "runtime").mkdir(parents=True, exist_ok=True)
+        runner_dir.mkdir(parents=True, exist_ok=True)
+        (root / "runner-config.json").write_text(
+            (PIPELINE / "hermes-runner-config.json").read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        fake_bin = Path(self.tmp.name) / "bin"
+        fake_bin.mkdir(exist_ok=True)
+        flock = fake_bin / "flock"
+        flock.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        flock.chmod(0o755)
+        env = {
+            **os.environ,
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "HERMES_RUNNER_TEST_MODE": "1",
+            "HERMES_RUNNER_TEST_ROOT": str(root),
+            "HERMES_RUNNER_TEST_HOME": str(home),
+            "RUNNER_NAME": "hermes-thermal",
+            "INVOCATION_ID": "invocation-current",
+        }
+        return root, home, runner_dir, env
+
+    def test_acquire_and_release_execute_with_a_single_private_lease(self):
+        root, _home, _runner_dir, env = self._runner_test_tree()
+        env.update(
+            {
+                "GITHUB_REPOSITORY": "colingreig/thermal",
+                "GITHUB_WORKFLOW": "E2E Functional",
+                "GITHUB_RUN_ID": "12345",
+                "GITHUB_RUN_ATTEMPT": "1",
+                "GITHUB_JOB": "e2e-functional",
+            }
+        )
+        acquire = subprocess.run(
+            [str(PIPELINE / "hermes-runner-acquire.sh")],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        self.assertEqual(acquire.returncode, 0, acquire.stderr)
+        lease = root / "sem" / "slots" / "hermes-thermal"
+        self.assertTrue(lease.is_file())
+        self.assertIn("invocation_id=invocation-current", lease.read_text(encoding="utf-8"))
+        self.assertEqual(lease.stat().st_mode & 0o777, 0o600)
+
+        release = subprocess.run(
+            [str(PIPELINE / "hermes-runner-release.sh")],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        self.assertEqual(release.returncode, 0, release.stderr)
+        self.assertFalse(lease.exists())
+        metadata = (root / "runtime" / "hermes-thermal.env").read_text(encoding="utf-8")
+        self.assertIn("run_id=12345", metadata)
+        self.assertIn("job_completed_at=", metadata)
+
+    def test_runner_startup_reclaims_only_proven_stale_own_lease(self):
+        root, _home, _runner_dir, env = self._runner_test_tree()
+        slots = root / "sem" / "slots"
+        own = slots / "hermes-thermal"
+        other = slots / "hermes-jdmbuysell-v4"
+        own.write_text("boot_id=old\ninvocation_id=invocation-old\nworker_pid=999999\n", encoding="utf-8")
+        other.write_text("boot_id=current\ninvocation_id=active-other\nworker_pid=1\n", encoding="utf-8")
+        env["HERMES_RUNNER_TEST_ACTION"] = "reconcile-lease"
+
+        result = subprocess.run(
+            [str(PIPELINE / "hermes-runner-loop.sh"), "thermal"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(own.exists())
+        self.assertTrue(other.exists())
+
+    def test_shared_slot_reclaims_dead_other_runner_but_preserves_live_owner(self):
+        root, _home, _runner_dir, env = self._runner_test_tree()
+        slots = root / "sem" / "slots"
+        dead = slots / "hermes-dead-repo"
+        live = slots / "hermes-live-repo"
+        dead.write_text(
+            "boot_id=\ninvocation_id=other-dead\nworker_pid=999999\n",
+            encoding="utf-8",
+        )
+        live.write_text(
+            f"boot_id=\ninvocation_id=other-live\nworker_pid={os.getpid()}\n",
+            encoding="utf-8",
+        )
+        env["HERMES_RUNNER_TEST_ACTION"] = "reconcile-leases"
+
+        result = subprocess.run(
+            [str(PIPELINE / "hermes-runner-acquire.sh")],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(dead.exists())
+        self.assertTrue(live.exists())
+
+    def test_empty_restart_cycles_do_not_archive_or_prune_real_job_evidence(self):
+        root, _home, runner_dir, env = self._runner_test_tree()
+        archives = root / "diagnostics" / "thermal"
+        for index in range(20):
+            evidence = archives / f"20260701T0000{index:02d}Z-real"
+            evidence.mkdir(parents=True)
+            (evidence / "job.env").write_text(f"run_id={index}\njob=e2e\n", encoding="utf-8")
+        before = sorted(path.name for path in archives.iterdir())
+        env["HERMES_RUNNER_TEST_ACTION"] = "cleanup"
+        for _ in range(5):
+            (runner_dir / "_diag").mkdir(exist_ok=True)
+            result = subprocess.run(
+                [str(PIPELINE / "hermes-runner-loop.sh"), "thermal"],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+        self.assertEqual(sorted(path.name for path in archives.iterdir()), before)
+        self.assertFalse((root / "diagnostics-failures").exists())
+
+    def test_job_cleanup_archives_evidence_privately_and_enforces_retention(self):
+        root, _home, runner_dir, env = self._runner_test_tree()
+        archives = root / "diagnostics" / "thermal"
+        for index in range(20):
+            (archives / f"20260701T0000{index:02d}Z-real").mkdir(parents=True)
+        diag = runner_dir / "_diag"
+        diag.mkdir()
+        (diag / "Runner.log").write_text("diagnostic\n", encoding="utf-8")
+        work = runner_dir / "_work"
+        work.mkdir()
+        metadata = root / "runtime" / "hermes-thermal.env"
+        metadata.write_text("run_id=999\njob=e2e-functional\n", encoding="utf-8")
+        env["HERMES_RUNNER_TEST_ACTION"] = "cleanup"
+
+        result = subprocess.run(
+            [str(PIPELINE / "hermes-runner-loop.sh"), "thermal"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        remaining = sorted(path for path in archives.iterdir() if path.is_dir())
+        self.assertEqual(len(remaining), 20)
+        self.assertFalse((archives / "20260701T000000Z-real").exists())
+        newest = remaining[-1]
+        self.assertTrue((newest / "_diag" / "Runner.log").is_file())
+        self.assertTrue((newest / "job.env").is_file())
+        self.assertEqual(newest.stat().st_mode & 0o777, 0o700)
+        self.assertFalse(work.exists())
+        self.assertFalse(diag.exists())
+
+    def test_nonempty_registration_diagnostics_use_separate_bounded_archive(self):
+        root, _home, runner_dir, env = self._runner_test_tree()
+        job_archives = root / "diagnostics" / "thermal"
+        real_job = job_archives / "20260701T000000Z-real-job"
+        real_job.mkdir(parents=True)
+        (real_job / "job.env").write_text("run_id=1\njob=e2e\n", encoding="utf-8")
+        failure_archives = root / "diagnostics-failures" / "thermal"
+        for index in range(20):
+            (failure_archives / f"20260701T0000{index:02d}Z-failure").mkdir(parents=True)
+        diag = runner_dir / "_diag"
+        diag.mkdir()
+        (diag / "Runner.log").write_text("registration failed\n", encoding="utf-8")
+        env["HERMES_RUNNER_TEST_ACTION"] = "cleanup"
+
+        result = subprocess.run(
+            [str(PIPELINE / "hermes-runner-loop.sh"), "thermal"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(real_job.is_dir())
+        self.assertEqual(len([path for path in failure_archives.iterdir() if path.is_dir()]), 20)
+        self.assertFalse((failure_archives / "20260701T000000Z-failure").exists())
+        newest = sorted(path for path in failure_archives.iterdir() if path.is_dir())[-1]
+        self.assertTrue((newest / "_diag" / "Runner.log").is_file())
+        self.assertIn(
+            "archive_kind=registration-failure",
+            (newest / "runner.env").read_text(encoding="utf-8"),
+        )
+        self.assertFalse(diag.exists())
 
     def test_installed_merge_surface_loads_as_a_standalone_entrypoint(self):
         self._install()
