@@ -10,13 +10,16 @@ Mini deployment reconciler can prove the canonical assets are present.
 from __future__ import annotations
 
 import argparse
+import copy
 import contextlib
 import fcntl
+import hashlib
 import json
 import os
 import subprocess
 import sys
 import tempfile
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -35,6 +38,8 @@ RUNS_PER_REPO = 40
 GH_TIMEOUT = 45
 POLL_DEBOUNCE_COUNT = 2
 GATING_EVENTS = {"push", "merge_group", "pull_request"}
+STATE_SCHEMA_VERSION = 2
+LIFECYCLE_SCHEMA_VERSION = 1
 
 
 class MonitorError(RuntimeError):
@@ -124,18 +129,155 @@ def _state_lock(path: Path):
 
 def _load_state(path: Path = STATE_PATH) -> dict[str, Any]:
     if not path.exists():
-        return {}
+        return {"schema_version": STATE_SCHEMA_VERSION}
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise MonitorError(f"cannot read persisted recovery state {path}: {exc}") from exc
     if not isinstance(data, dict):
         raise MonitorError(f"persisted recovery state {path} must be a JSON object")
+    schema_version = data.get("schema_version")
+    if schema_version is None:
+        # Schema-less v1 state is migrated in memory and only committed after a
+        # complete, trustworthy poll. Existing alert/recovery fields survive.
+        data["schema_version"] = STATE_SCHEMA_VERSION
+    elif (
+        not isinstance(schema_version, int)
+        or isinstance(schema_version, bool)
+        or schema_version != STATE_SCHEMA_VERSION
+    ):
+        raise MonitorError(
+            f"persisted recovery state {path} has unsupported schema_version={schema_version!r}"
+        )
+    vm = data.get("vm")
+    if vm is not None and not isinstance(vm, dict):
+        raise MonitorError(f"persisted recovery state {path}.vm must be an object")
+    if isinstance(vm, dict):
+        if "available" in vm and not isinstance(vm.get("available"), bool):
+            raise MonitorError(f"persisted recovery state {path}.vm.available must be boolean")
+        if "boot_id" in vm and vm.get("boot_id") is not None and not isinstance(vm.get("boot_id"), str):
+            raise MonitorError(f"persisted recovery state {path}.vm.boot_id must be a string or null")
+    lifecycle = data.get("lifecycle")
+    if lifecycle is not None:
+        if not isinstance(lifecycle, dict):
+            raise MonitorError(f"persisted recovery state {path}.lifecycle must be an object")
+        lifecycle_schema = lifecycle.get("schema_version")
+        if (
+            not isinstance(lifecycle_schema, int)
+            or isinstance(lifecycle_schema, bool)
+            or lifecycle_schema != LIFECYCLE_SCHEMA_VERSION
+        ):
+            raise MonitorError(
+                f"persisted recovery state {path}.lifecycle has unsupported schema_version"
+            )
+        if lifecycle.get("classification") not in {
+            "baseline",
+            "baseline-reset",
+            "stable",
+            "transition",
+            "unavailable",
+        }:
+            raise MonitorError(
+                f"persisted recovery state {path}.lifecycle classification is invalid"
+            )
+        if _parse_time(lifecycle.get("observed_at")) is None:
+            raise MonitorError(
+                f"persisted recovery state {path}.lifecycle observed_at is invalid"
+            )
+        fingerprint = lifecycle.get("probe_fingerprint")
+        digest = (
+            fingerprint.removeprefix("sha256:")
+            if isinstance(fingerprint, str) and fingerprint.startswith("sha256:")
+            else ""
+        )
+        if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+            raise MonitorError(
+                f"persisted recovery state {path}.lifecycle probe_fingerprint is invalid"
+            )
+        lifecycle_boot = lifecycle.get("canonical_boot_uuid")
+        if lifecycle_boot is not None and _canonical_boot_uuid(lifecycle_boot) != lifecycle_boot:
+            raise MonitorError(
+                f"persisted recovery state {path}.lifecycle canonical_boot_uuid is invalid"
+            )
+        stored_boot = vm.get("boot_id") if isinstance(vm, dict) else None
+        canonical_stored_boot = _canonical_boot_uuid(stored_boot)
+        if (
+            lifecycle_boot is not None
+            and canonical_stored_boot is not None
+            and lifecycle_boot != canonical_stored_boot
+        ):
+            raise MonitorError(
+                f"persisted recovery state {path} lifecycle and vm boot IDs disagree"
+            )
     return data
 
 
 def _save_state(obj: dict[str, Any], path: Path = STATE_PATH) -> None:
+    obj["schema_version"] = STATE_SCHEMA_VERSION
     _atomic_json(path, obj)
+
+
+def _canonical_boot_uuid(value: object) -> str | None:
+    """Return the canonical UUID form of a kernel boot ID, else ``None``."""
+    if not isinstance(value, str):
+        return None
+    candidate = value.strip()
+    if not candidate:
+        return None
+    try:
+        parsed = uuid.UUID(candidate)
+    except (ValueError, AttributeError):
+        return None
+    canonical = str(parsed)
+    # UUID() accepts compact/braced/URN inputs. The kernel contract is the
+    # canonical 36-character hyphenated form; rejecting aliases prevents a
+    # formatting change from masquerading as a lifecycle transition.
+    return canonical if candidate.lower() == canonical else None
+
+
+def _probe_fingerprint(
+    topology: dict[str, Any],
+    vm: VmStatus,
+    canonical_boot_uuid: str | None,
+) -> str:
+    payload = {
+        "topology_vm": topology["vm"]["name"],
+        "status_command": topology["vm"].get("status_command"),
+        "boot_id_command": topology["vm"].get("boot_id_command"),
+        "status_matches": vm.orbstack_evidence.get("status_matches"),
+        "vm_state": vm.orbstack_evidence.get("vm_state"),
+        "available": vm.available,
+        "canonical_boot_uuid": canonical_boot_uuid,
+        "uptime_seconds": vm.uptime_seconds,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def _lifecycle_observation(
+    topology: dict[str, Any],
+    vm: VmStatus,
+    *,
+    canonical_boot_uuid: str | None,
+    observed_at: str,
+    classification: str,
+) -> dict[str, Any]:
+    return {
+        "schema_version": LIFECYCLE_SCHEMA_VERSION,
+        "probe_fingerprint": _probe_fingerprint(topology, vm, canonical_boot_uuid),
+        "canonical_boot_uuid": canonical_boot_uuid,
+        "observed_at": observed_at,
+        "classification": classification,
+    }
+
+
+def _active_baseline_reset_blockers(state: dict[str, Any]) -> list[str]:
+    blockers: list[str] = []
+    if isinstance(state.get("vm_outage"), dict):
+        blockers.append("outage-active")
+    if _latest_managed_intent(state) is not None:
+        blockers.append("managed-intent-active")
+    return blockers
 
 
 def _load_topology(path: Path = TOPOLOGY_PATH) -> dict[str, Any]:
@@ -408,7 +550,13 @@ def _consume_managed_intent(
     return intent
 
 
-def _record_transition(previous: dict[str, Any], vm: VmStatus, state: dict[str, Any], runner_status: str) -> dict[str, Any] | None:
+def _record_transition(
+    previous: dict[str, Any],
+    vm: VmStatus,
+    state: dict[str, Any],
+    runner_status: str,
+    observation: dict[str, Any],
+) -> dict[str, Any] | None:
     old = previous.get("vm") if isinstance(previous.get("vm"), dict) else {}
     prior_boot = old.get("boot_id")
     prior_available = old.get("available")
@@ -445,7 +593,11 @@ def _record_transition(previous: dict[str, Any], vm: VmStatus, state: dict[str, 
     recovery_eligible = interruption_started_at is not None and interruption_ended_at is not None
     record = {
         "timestamp": timestamp,
+        "observed_at": observation["observed_at"],
         "event": "hermes-ci-lifecycle-transition",
+        "classification": observation["classification"],
+        "probe_fingerprint": observation["probe_fingerprint"],
+        "canonical_boot_uuid": observation["canonical_boot_uuid"],
         "prior_boot_id": prior_boot,
         "current_boot_id": vm.boot_id,
         "prior_available": prior_available,
@@ -470,6 +622,96 @@ def _record_transition(previous: dict[str, Any], vm: VmStatus, state: dict[str, 
         record["recovery_notification_eligible"] = vm.available is True
     _append_jsonl(EVIDENCE_LOG_PATH, record)
     return record
+
+
+def _record_baseline_reset(
+    previous: dict[str, Any],
+    vm: VmStatus,
+    state: dict[str, Any],
+    runner_status: str,
+    observation: dict[str, Any],
+) -> dict[str, Any]:
+    old_vm = previous.get("vm") if isinstance(previous.get("vm"), dict) else {}
+    record = {
+        "timestamp": observation["observed_at"],
+        "observed_at": observation["observed_at"],
+        "event": "hermes-ci-lifecycle-baseline-reset",
+        "classification": "baseline-reset",
+        "probe_fingerprint": observation["probe_fingerprint"],
+        "canonical_boot_uuid": observation["canonical_boot_uuid"],
+        "prior_boot_id": old_vm.get("boot_id"),
+        "current_boot_id": observation["canonical_boot_uuid"],
+        "prior_available": old_vm.get("available"),
+        "current_available": vm.available,
+        "host_uptime_seconds": vm.uptime_seconds,
+        "runner_status": runner_status,
+        "orbstack_evidence": vm.orbstack_evidence,
+        "initiator": "unknown",
+        "reason": "invalid-persisted-boot-id",
+        "recovery_eligible": False,
+    }
+    # Resetting an untrusted baseline also retires stale lifecycle evidence;
+    # otherwise a later stable poll could reuse it to authorize a rerun.
+    state.pop("last_transition", None)
+    state["last_baseline_reset"] = record
+    _append_jsonl(EVIDENCE_LOG_PATH, record)
+    return record
+
+
+def _unknown_probe_report(
+    topology: dict[str, Any],
+    previous: dict[str, Any],
+    *,
+    reason: str,
+    evidence: dict[str, Any] | None = None,
+    blockers: list[str] | None = None,
+) -> dict[str, Any]:
+    observed_at = _now_iso()
+    fingerprint_payload = {
+        "topology_vm": topology["vm"]["name"],
+        "reason": reason,
+        "evidence": evidence or {},
+        "blockers": blockers or [],
+    }
+    fingerprint = "sha256:" + hashlib.sha256(
+        json.dumps(fingerprint_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    previous_vm = previous.get("vm") if isinstance(previous.get("vm"), dict) else {}
+    record = {
+        "timestamp": observed_at,
+        "observed_at": observed_at,
+        "event": "hermes-ci-lifecycle-health",
+        "classification": "unknown",
+        "health": "UNKNOWN",
+        "reason": reason,
+        "blockers": blockers or [],
+        "probe_fingerprint": fingerprint,
+        "canonical_boot_uuid": None,
+        "prior_boot_id": previous_vm.get("boot_id"),
+        "current_boot_id": None,
+        "orbstack_evidence": evidence or {},
+        "state_preserved": True,
+        "recovery_eligible": False,
+    }
+    _append_jsonl(EVIDENCE_LOG_PATH, record)
+    return {
+        "checked": 0,
+        "red": None,
+        "newly_red": 0,
+        "recovered": 0,
+        "vm_alerted": False,
+        "runner_alerted": 0,
+        "runner_recovered": 0,
+        "rerun_ids": [],
+        "health": "UNKNOWN",
+        "classification": "unknown",
+        "reason": reason,
+        "probe_fingerprint": fingerprint,
+        "canonical_boot_uuid": None,
+        "observed_at": observed_at,
+        "state_preserved": True,
+        "blockers": blockers or [],
+    }
 
 
 def _update_runner_alerts(
@@ -701,17 +943,93 @@ def poll_once(*, runner: CommandRunner = subprocess.run, topology_path: Path = T
     topology = _load_topology(topology_path)
     with _state_lock(state_path):
         state = _load_state(state_path)
-        previous = dict(state)
+        previous = copy.deepcopy(state)
         send = lambda msg: _send_slack(msg, runner=runner)
 
-        vm = _probe_vm(topology, runner=runner)
+        try:
+            vm = _probe_vm(topology, runner=runner)
+        except MonitorError as exc:
+            return _unknown_probe_report(
+                topology,
+                previous,
+                reason="vm-probe-invalid",
+                evidence={"error": str(exc)},
+            )
+
+        canonical_current_boot = _canonical_boot_uuid(vm.boot_id)
+        if vm.available and canonical_current_boot is None:
+            return _unknown_probe_report(
+                topology,
+                previous,
+                reason="current-boot-id-invalid",
+                evidence={
+                    **vm.orbstack_evidence,
+                    "raw_boot_id": vm.boot_id,
+                },
+            )
+        if canonical_current_boot != vm.boot_id:
+            vm = VmStatus(
+                available=vm.available,
+                boot_id=canonical_current_boot,
+                uptime_seconds=vm.uptime_seconds,
+                runner_status=vm.runner_status,
+                orbstack_evidence=vm.orbstack_evidence,
+            )
+
+        old_vm = previous.get("vm") if isinstance(previous.get("vm"), dict) else {}
+        raw_stored_boot = old_vm.get("boot_id")
+        canonical_stored_boot = _canonical_boot_uuid(raw_stored_boot)
+        if raw_stored_boot is not None and canonical_stored_boot is None:
+            blockers = _active_baseline_reset_blockers(state)
+            if old_vm.get("available") is False and "outage-active" not in blockers:
+                blockers.insert(0, "outage-active")
+            if not vm.available or canonical_current_boot is None:
+                blockers.append("current-valid-boot-required")
+            if blockers:
+                return _unknown_probe_report(
+                    topology,
+                    previous,
+                    reason="baseline-reset-blocked",
+                    evidence=vm.orbstack_evidence,
+                    blockers=blockers,
+                )
+            classification = "baseline-reset"
+        else:
+            classification = (
+                "unavailable"
+                if not vm.available
+                else "baseline"
+                if not old_vm
+                else "stable"
+                if canonical_stored_boot == canonical_current_boot
+                and old_vm.get("available") == vm.available
+                else "transition"
+            )
+            if canonical_stored_boot is not None and canonical_stored_boot != raw_stored_boot:
+                previous["vm"]["boot_id"] = canonical_stored_boot
+
+        observed_at = _now_iso()
+        observation = _lifecycle_observation(
+            topology,
+            vm,
+            canonical_boot_uuid=canonical_current_boot,
+            observed_at=observed_at,
+            classification=classification,
+        )
         statuses = _runner_statuses_with_fallback(topology, runner=runner)
         runner_summary = "unknown" if statuses is None else ",".join(f"{key}={value.status}" for key, value in sorted(statuses.items()))
-        transition = _record_transition(previous, vm, state, runner_summary)
+        if classification == "baseline-reset":
+            _record_baseline_reset(previous, vm, state, runner_summary, observation)
+            transition = None
+        else:
+            transition = _record_transition(previous, vm, state, runner_summary, observation)
         vm_alerted = _maybe_alert_vm_transition(state, transition, send=send)
         runner_alerted, runner_recovered = _update_runner_alerts(state, statuses, send=send)
         saved_transition = state.get("last_transition") if isinstance(state.get("last_transition"), dict) else None
-        correlation_transition = transition or saved_transition
+        # A baseline reset repairs untrusted persisted identity; it is not
+        # evidence of an interruption and must never reuse a stale transition
+        # to authorize recovery.
+        correlation_transition = None if classification == "baseline-reset" else transition or saved_transition
         rerun_ids = _maybe_recover(topology, state, statuses, correlation_transition, runner=runner, send=send)
 
         repos = _repos()
@@ -722,6 +1040,7 @@ def poll_once(*, runner: CommandRunner = subprocess.run, topology_path: Path = T
             newly_red, ci_recovered = _ci_red_alerts(state, current, send=send)
         state["generated_at"] = _now_iso()
         state["vm"] = {"available": vm.available, "boot_id": vm.boot_id, "uptime_seconds": vm.uptime_seconds}
+        state["lifecycle"] = observation
         if transition is not None:
             state["last_transition"] = transition
         _save_state(state, state_path)
@@ -734,6 +1053,12 @@ def poll_once(*, runner: CommandRunner = subprocess.run, topology_path: Path = T
             "runner_alerted": len(runner_alerted),
             "runner_recovered": len(runner_recovered),
             "rerun_ids": rerun_ids,
+            "health": "OK",
+            "classification": classification,
+            "probe_fingerprint": observation["probe_fingerprint"],
+            "canonical_boot_uuid": canonical_current_boot,
+            "observed_at": observed_at,
+            "state_preserved": False,
         }
 
 
