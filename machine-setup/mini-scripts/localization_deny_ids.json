@@ -1,0 +1,4 @@
+{
+  "_comment": "Operator-curated deny-list of ClickUp task ids that must never be agent-claimed. Format: JSON list under `ids`. Add task ids here without code change. Read at the start of every poll-gate cycle. If this file is malformed or missing, the in-code defaults apply (verified 2026-06-20: 86e1yxn5e, 86e1yq89q, 86e1z13vv). See ~/.hermes/scripts/clickup_poll_gate.py LOCALIZATION_DENY_IDS_DEFAULT.",
+  "ids": []
+}

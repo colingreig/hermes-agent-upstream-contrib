@@ -1,0 +1,112 @@
+{
+  "_note": "Ignite Marketing ClickUp ID map. Used by clickup.mjs to resolve friendly names → IDs (e.g. --list fieldboss:seo, --assignee colin). Captured live 2026-05-30. Re-derive with: node clickup.mjs teams|spaces|folders|lists.",
+  "workspace": { "id": "9017245888", "name": "Ignite Marketing PM" },
+
+  "people": {
+    "colin":    { "id": 168143285, "name": "Colin Greig",     "email": "colin@ignitemarketing.com" },
+    "nawid":    { "id": 89379372,  "name": "Nawid Niazi",      "email": "nawid@ignitemarketing.com" },
+    "digvijay": { "id": 89379371,  "name": "Digvijay Rathod",  "email": "digvijay@ignitemarketing.com" },
+    "kenny":    { "id": 95132105,  "name": "Kenny Grant",      "email": "kennywgrant@gmail.com" }
+  },
+
+  "spaces": {
+    "delivery":   "90171361707",
+    "operations": "90171361718",
+    "growth":     "90171361693",
+    "crm":        "90171348025"
+  },
+
+  "clients": {
+    "abcfitness": {
+      "folder": "90177349884",
+      "lists": { "ppc": "901711808264", "seo": "901711808271", "content": "901711808277", "cro": "901711808285", "reporting": "901711808294", "strategy": "901711808309", "glofox_ppc": "901713087539", "trainerize_ppc": "901713087548" }
+    },
+    "advantive": {
+      "folder": "90172903544",
+      "lists": { "main": "901705837419", "ppc": "901711769862", "seo": "901711769863", "content": "901711769864", "reporting": "901711769865", "strategy": "901711769866", "cro": "901711769867" }
+    },
+    "allyourducks": {
+      "folder": "90176695653",
+      "lists": { "seo": "901711769914", "reporting": "901711769915", "cro": "901711769919" }
+    },
+    "bigfiber": {
+      "folder": "90177467419",
+      "lists": { "ppc": "901711961513", "seo": "901711961516", "reporting": "901711961519" }
+    },
+    "fieldboss": {
+      "folder": "90172903678",
+      "lists": { "ppc": "901705875039", "seo": "901705875373", "content": "901711769869", "reporting": "901711769870", "cro": "901711769871", "elevatoruptime": "901712951127" }
+    },
+    "lsretail": {
+      "folder": "90172903977",
+      "lists": { "ppc": "901705838161", "reporting": "901711769877", "cro": "901711769878" }
+    },
+    "tigunia": {
+      "folder": "90172903987",
+      "lists": { "ppc": "901705875500", "seo": "901711036294", "content": "901711769872", "reporting": "901711769873", "cro": "901711769875" }
+    },
+    "qixas": {
+      "folder": "90172903980",
+      "lists": { "main": "901705838171", "seo": "901711877576", "reporting": "901711769879", "cro": "901711769880" }
+    },
+    "randgroup": {
+      "folder": "90172903981",
+      "lists": { "main": "901705838173", "consulting": "901705845444" }
+    },
+    "resco": {
+      "folder": "90174194032",
+      "lists": { "main": "901707744079", "ppc": "901711769891", "seo": "901711769894", "content": "901711769895", "reporting": "901711769896", "cro": "901711769898" }
+    },
+    "standardaero": {
+      "folder": "90173610201",
+      "lists": { "main": "901706950713", "ppc": "901711769900", "seo": "901711769901", "reporting": "901711769902", "cro": "901711769903" }
+    },
+    "thesharpdesign": {
+      "folder": "90175906176",
+      "lists": { "main": "901710100207", "ppc": "901711769904", "seo": "901711769907", "reporting": "901711769909", "cro": "901711769910" }
+    },
+    "topdynamicspartners": {
+      "folder": "90172903993",
+      "lists": { "seo": "901711877588", "content": "901712059917", "cro": "901711903258", "sales": "901712061924", "social": "901712155181", "old": "901705838218" }
+    },
+    "jdmbuysell": {
+      "folder": "90172903743",
+      "lists": { "seo": "901713991975", "ppc": "901713996695", "marketing": "901705838013", "dev": "901705837749", "v4": "901708886398", "scraper_dev": "901705838106", "scraper_sources": "901713977276", "sentry": "901714054795" }
+    },
+    "fieldservicesoftware": {
+      "folder": "90172903699",
+      "lists": { "main": "901705837679", "seo": "901711877578" }
+    },
+    "excel": {
+      "folder": "90172903654",
+      "lists": { "main": "901705837595" }
+    },
+    "ignitemarketing": {
+      "folder": "90172903704",
+      "lists": { "main": "901705837689" }
+    },
+    "oec": {
+      "folder": "90179095888",
+      "lists": { "web": "901714167048", "infrastructure": "901714262159", "partstech": "901714482608" }
+    }
+  },
+
+  "lists": {
+    "workbench:active":        "901711777622",
+    "workbench:ppc-audits":    "901711813532",
+    "workbench:ad-copy":       "901711875767",
+    "workbench:megaaudits":    "901711888890",
+    "workbench:vertex":        "901711893572",
+    "workbench:bugs":          "901711948214",
+    "agencyos:presswizz":      "901713970419",
+    "multisite":               "901712247739",
+    "finance:expenses":        "901711769927",
+    "growth:marketing":        "901705825962",
+    "growth:sales":            "901705825971",
+    "growth:backlog":          "901705825715",
+    "growth:ideation":         "901711995297",
+    "crm:deals":               "901705826058",
+    "crm:companies":           "901705826060",
+    "crm:contacts":            "901705826063"
+  }
+}

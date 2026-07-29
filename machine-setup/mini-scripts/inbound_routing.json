@@ -1,0 +1,39 @@
+{
+  "_comment": "Routing table for the postmark-inbound-filer agent. Maps the ORIGINAL sender's client domain (parsed from the forwarded email body, NOT the colin@ignitemarketing.com forwarding envelope) to a ClickUp List. Seeded 2026-06-14 from the live workspace + brain note 'ClickUp workspace map (2026-06-13)'. Update as clients change. team_id is the ClickUp workspace/team id.",
+  "team_id": "9017245888",
+  "default_list_id": "901705837391",
+  "default_list_name": "Ad Hoc",
+  "allowed_sender_domains": ["colingreig.com", "colingreig.ca", "ignitemarketing.com", "vercel.com", "github.com", "jdmbuysell.com"],
+  "_sentry_note": "Sentry is intentionally NOT whitelisted for email→ClickUp: the jdmbuysell-sentry-triage Worker already files richer, AI-diagnosed, deduped tasks for jdmbuysell-v4-web. Future plan: centralize Sentry→ClickUp as an org-wide API/webhook service (replacing the in-repo worker) rather than via email.",
+  "_from_domain_routing_note": "The CF Worker (inbound-worker/) NOW ALSO routes a DIRECT send (no forwarded original sender in body) by its From-header domain when that domain is a known client in domain_to_list AND not a forwarder domain (colingreig.com/.ca, ignitemarketing.com). e.g. info@jdmbuysell.com digests -> jdm list. SOURCE OF TRUTH for the Worker's routing.js copy.",
+  "_allowed_sender_note": "Security gate enforced by postmark_inbound_gate.py: an inbound email is only processed if its From-header domain (the forwarder/sender that hit hermes@) is one of these, or a subdomain of one. Everything else is marked ignored and never wakes the filer agent. This is defense-in-depth on top of the M365 distribution list's 'require authenticated senders' (which already blocks external mail to hermes@).",
+  "domain_to_list": {
+    "advantive.com":          {"list_id": "901705837419", "name": "advantive.com"},
+    "fieldboss.com":          {"list_id": "901705875373", "name": "fieldboss.com SEO", "ppc_list_id": "901705875039"},
+    "elevatoruptime.com":     {"list_id": "901712951127", "name": "elevatoruptime.com"},
+    "fieldservicesoftware.io":{"list_id": "901705837679", "name": "fieldservicesoftware.io"},
+    "hvacservicebellevue.com":{"list_id": "901705837684", "name": "hvacservicebellevue.com"},
+    "lsretail.com":           {"list_id": "901705838161", "name": "lsretail.com PPC"},
+    "tigunia.com":            {"list_id": "901705875500", "name": "tigunia.com PPC"},
+    "qixas.com":              {"list_id": "901705838171", "name": "qixas.com"},
+    "resco.net":              {"list_id": "901707744079", "name": "resco.net"},
+    "oeconnection.com":       {"list_id": "901714167048", "name": "oeconnection.com"},
+    "partstech.com":          {"list_id": "901714482608", "name": "partstech.com"},
+    "thesharpdesign.ca":      {"list_id": "901710100207", "name": "thesharpdesign.ca"},
+    "allyourducks.com":       {"list_id": "901711769914", "name": "allyourducks.com"},
+    "jdmbuysell.com":         {"list_id": "901708886398", "name": "jdm.com v4", "sentry_list_id": "901714054795"},
+    "ignitemarketing.com":    {"list_id": "901705837689", "name": "ignitemarketing.com"},
+    "carcollection.ca":       {"list_id": "901705837561", "name": "carcollection.ca"},
+    "dynamics365group.com":   {"list_id": "901705837580", "name": "dynamics365group.com"},
+    "excel.tv":               {"list_id": "901705837595", "name": "excel.tv"},
+    "islandwellservice.ca":   {"list_id": "901705837707", "name": "islandwellservice.ca"},
+    "luxuryexoticrental.com": {"list_id": "901705838164", "name": "luxuryexoticrental.com"},
+    "software-shootout.com":  {"list_id": "901705838181", "name": "software-shootout.com"},
+    "randgroup.com":          {"list_id": "901705838173", "name": "randgroup.com"},
+    "standardaero.com":       {"list_id": "901706950713", "name": "standardaero.com"}
+  },
+  "keyword_rules": [
+    {"match_any": ["ignite workbench", "workbench", "stack trace", "sentry", "deploy failed", "deployment failed", "500 error", "dashboard error"], "list_id": "901711948214", "name": "App - Bug List"},
+    {"match_any": ["hermes", "dev assistant", "ai assistant", "the agent", "cron job", "kanban"], "list_id": "901714465284", "name": "AI Dev Assistant"}
+  ]
+}
