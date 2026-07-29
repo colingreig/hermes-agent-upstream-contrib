@@ -34,8 +34,9 @@ _TIRITH_PATCH = "tools.tirith_security.check_command_security"
 
 
 @pytest.fixture(autouse=True)
-def _clean_state():
+def _clean_state(monkeypatch):
     """Clear approval state and relevant env vars between tests."""
+    monkeypatch.setattr(approval_module, "_get_approval_mode", lambda: "manual")
     approval_module._session_approved.clear()
     approval_module._pending.clear()
     approval_module._permanent_approved.clear()
