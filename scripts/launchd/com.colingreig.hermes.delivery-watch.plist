@@ -7,8 +7,13 @@
     <key>ProgramArguments</key>
     <array>
         <string>__HERMES_DELIVERY_WATCH_PYTHON__</string>
-        <string>__HERMES_DELIVERY_WATCH_SCRIPT__</string>
+        <string>__HERMES_DELIVERY_SNAPSHOT_SCRIPT__</string>
         <string>--once</string>
+        <string>--config</string>
+        <string>__HERMES_DELIVERY_WATCH_CONFIG__</string>
+        <string>--output</string>
+        <string>__HERMES_DELIVERY_SNAPSHOT_OUTPUT__</string>
+        <string>--run-watcher</string>
     </array>
     <key>EnvironmentVariables</key>
     <dict>

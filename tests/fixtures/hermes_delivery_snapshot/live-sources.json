@@ -1,0 +1,247 @@
+{
+  "clickup_comments": {
+    "MINI-1": [
+      {
+        "comment_text": "ignite- HANDOFF: v1\nhead_sha: dddddddddddddddddddddddddddddddddddddddd\njob_id: executor-job\nowner_run_id: mini-run-1\nfencing_token: 17\nledger_execution_id: ledger-mini-1",
+        "id": "handoff-mini"
+      },
+      {
+        "comment_text": "ignite-validate: PASS\nhead_sha: dddddddddddddddddddddddddddddddddddddddd",
+        "id": "validator-mini"
+      }
+    ],
+    "NOPR-1": [
+      {
+        "comment_text": "ignite- HANDOFF: v1\nhead_sha: cccccccccccccccccccccccccccccccccccccccc",
+        "id": "handoff-nopr"
+      },
+      {
+        "comment_text": "ignite-validate: PASS\nhead_sha: cccccccccccccccccccccccccccccccccccccccc",
+        "id": "validator-nopr"
+      }
+    ],
+    "REPO-1": [
+      {
+        "comment_text": "ignite- HANDOFF: v1\nhead_sha: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\njob_id: repo-job\nrun_id: repo-run\nfencing_token: repo-fence\nledger_execution_id: repo-execution",
+        "id": "handoff-repo"
+      },
+      {
+        "comment_text": "ignite-validate: PASS\nhead_sha: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "id": "validator-repo"
+      }
+    ],
+    "STACK-1": [
+      {
+        "comment_text": "ignite- HANDOFF: v1\nhead_sha: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\njob_id: stack-job\nrun_id: stack-run\nfencing_token: stack-fence\nledger_execution_id: stack-execution",
+        "id": "handoff-stack"
+      },
+      {
+        "comment_text": "ignite-validate: PASS\nhead_sha: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "id": "validator-stack"
+      }
+    ]
+  },
+  "clickup_tasks": [
+    {
+      "date_updated": "1785340000000",
+      "description": "Target repo: owner/repo\nhttps://github.com/owner/repo/pull/1",
+      "id": "REPO-1",
+      "name": "Repository-only delivery",
+      "status": "complete"
+    },
+    {
+      "date_updated": "1785340001000",
+      "description": "Target repo: owner/stack\nhttps://github.com/owner/stack/pull/10\nhttps://github.com/owner/stack/pull/11",
+      "id": "STACK-1",
+      "name": "Stacked delivery",
+      "status": "in review"
+    },
+    {
+      "date_updated": "1785340002000",
+      "description": "Target repo: owner/no-pr\nallow_no_pr: true\nno_pr_authority: governed-repository-receipt\nno_pr_receipt_id: no-pr-receipt-1\nno_pr_head_sha: cccccccccccccccccccccccccccccccccccccccc\ngoverning_workflow: no-pr-ci\nci_run_id: 303\nci_head_sha: cccccccccccccccccccccccccccccccccccccccc\nci_status: completed\nci_conclusion: success\njob_id: no-pr-job\nrun_id: no-pr-run\nfencing_token: no-pr-fence\nledger_execution_id: no-pr-execution",
+      "id": "NOPR-1",
+      "name": "Explicit no-PR delivery",
+      "status": "complete"
+    },
+    {
+      "date_updated": "1785340003000",
+      "description": "Target repo: owner/hermes-agent\nlane: mini\nhttps://github.com/owner/hermes-agent/pull/20",
+      "id": "MINI-1",
+      "name": "Mini runtime delivery",
+      "status": "in progress"
+    }
+  ],
+  "github_prs": {
+    "owner/hermes-agent#20": {
+      "headRefOid": "dddddddddddddddddddddddddddddddddddddddd",
+      "number": 20,
+      "statusCheckRollup": [
+        {
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/owner/hermes-agent/actions/runs/204",
+          "status": "COMPLETED",
+          "workflowName": "governing-ci"
+        }
+      ]
+    },
+    "owner/repo#1": {
+      "headRefOid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "number": 1,
+      "statusCheckRollup": [
+        {
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/owner/repo/actions/runs/201",
+          "status": "COMPLETED",
+          "workflowName": "governing-ci"
+        }
+      ]
+    },
+    "owner/stack#10": {
+      "headRefOid": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "number": 10,
+      "statusCheckRollup": [
+        {
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/owner/stack/actions/runs/202",
+          "status": "COMPLETED",
+          "workflowName": "governing-ci"
+        }
+      ]
+    },
+    "owner/stack#11": {
+      "headRefOid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "number": 11,
+      "statusCheckRollup": [
+        {
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/owner/stack/actions/runs/203",
+          "status": "COMPLETED",
+          "workflowName": "governing-ci"
+        }
+      ]
+    }
+  },
+  "github_runs": {
+    "owner/hermes-agent#204": {
+      "conclusion": "success",
+      "databaseId": 204,
+      "headSha": "dddddddddddddddddddddddddddddddddddddddd",
+      "status": "completed",
+      "workflowName": "governing-ci"
+    },
+    "owner/no-pr#303": {
+      "conclusion": "success",
+      "databaseId": 303,
+      "headSha": "cccccccccccccccccccccccccccccccccccccccc",
+      "status": "completed",
+      "workflowName": "no-pr-ci"
+    },
+    "owner/repo#201": {
+      "conclusion": "success",
+      "databaseId": 201,
+      "headSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "status": "completed",
+      "workflowName": "governing-ci"
+    },
+    "owner/stack#202": {
+      "conclusion": "success",
+      "databaseId": 202,
+      "headSha": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "status": "completed",
+      "workflowName": "governing-ci"
+    },
+    "owner/stack#203": {
+      "conclusion": "success",
+      "databaseId": 203,
+      "headSha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "status": "completed",
+      "workflowName": "governing-ci"
+    }
+  },
+  "mini_json": {
+    "ci_health": {
+      "vm": {
+        "available": true
+      }
+    },
+    "deployment": {
+      "source_commit": "dddddddddddddddddddddddddddddddddddddddd"
+    },
+    "jobs": {
+      "jobs": [
+        {
+          "id": "review-job",
+          "name": "review poll gate"
+        }
+      ]
+    },
+    "release": {
+      "_content_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "certified_source_commit": "dddddddddddddddddddddddddddddddddddddddd",
+      "promotion_authority_receipt_id": "1111111111111111111111111111111111111111111111111111111111111111",
+      "to_commit": "dddddddddddddddddddddddddddddddddddddddd"
+    },
+    "review_gate": {
+      "last_poll": "2026-07-29T16:30:00Z"
+    }
+  },
+  "mini_lifecycle": [
+    {
+      "classification": "transition",
+      "current_boot_id": "6167727e-4b7c-4440-8d76-fad239060239",
+      "fingerprint": "life-1",
+      "prior_boot_id": "5d5bdeaa-a5b6-4950-a9a5-37844161720f",
+      "timestamp": "2026-07-29T15:50:36Z"
+    }
+  ],
+  "mini_sqlite": {
+    "admission": [
+      {
+        "acquired_at": "2026-07-29T16:00:00Z",
+        "expires_at": "2026-07-29T17:00:00Z",
+        "fencing_token": 17,
+        "heartbeat_at": "2026-07-29T16:29:30Z",
+        "job_id": "executor-job",
+        "ledger_execution_id": "ledger-mini-1",
+        "owner_run_id": "mini-run-1",
+        "state": "active",
+        "task_id": "MINI-1"
+      }
+    ],
+    "ledger": [
+      {
+        "claimed_at": "2026-07-29T16:00:00Z",
+        "heartbeat_at": "2026-07-29T16:29:30Z",
+        "id": "ledger-mini-1",
+        "job_id": "executor-job",
+        "lease_expires_at": "2026-07-29T17:00:00Z",
+        "started_at": "2026-07-29T16:00:01Z",
+        "status": "running"
+      },
+      {
+        "claimed_at": "2026-07-29T16:25:00Z",
+        "finished_at": "2026-07-29T16:25:05Z",
+        "id": "review-run-3",
+        "job_id": "review-job",
+        "status": "completed",
+        "terminal_at": "2026-07-29T16:25:05Z"
+      },
+      {
+        "claimed_at": "2026-07-29T16:20:00Z",
+        "finished_at": "2026-07-29T16:20:05Z",
+        "id": "review-run-2",
+        "job_id": "review-job",
+        "status": "completed",
+        "terminal_at": "2026-07-29T16:20:05Z"
+      },
+      {
+        "claimed_at": "2026-07-29T16:15:00Z",
+        "finished_at": "2026-07-29T16:15:05Z",
+        "id": "review-run-1",
+        "job_id": "review-job",
+        "status": "completed",
+        "terminal_at": "2026-07-29T16:15:05Z"
+      }
+    ]
+  }
+}

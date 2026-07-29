@@ -230,6 +230,36 @@ def test_failed_collector_makes_delivery_unknown(tmp_path):
     }
 
 
+def test_collector_payload_propagates_underlying_source_unknown(tmp_path):
+    payload = _snapshot()
+    payload["collection"]["mini:ledger"] = {
+        "status": "UNKNOWN",
+        "error": "read failed",
+    }
+    source = tmp_path / "snapshot.json"
+    source.write_text(json.dumps(payload), encoding="utf-8")
+
+    merged = watch.collect_snapshot(
+        {"collectors": [{"name": "producer", "kind": "file", "path": str(source)}]}
+    )
+
+    assert merged["collection"]["producer"] == {"status": "OK"}
+    assert merged["collection"]["mini:ledger"] == {
+        "status": "UNKNOWN",
+        "error": "read failed",
+    }
+    result = watch.run_once(
+        {"collectors": [{"name": "producer", "kind": "file", "path": str(source)}]},
+        tmp_path / "state",
+        snapshot=merged,
+        now=NOW,
+        alert=False,
+        ping_deadman=False,
+    )
+    assert result["status"] == "UNKNOWN"
+    assert result["correlations"][0]["delivery_status"] == "UNKNOWN"
+
+
 def test_executor_overlap_is_global_across_different_tasks():
     snapshot = _snapshot()
     snapshot["watch"]["owners"] = [

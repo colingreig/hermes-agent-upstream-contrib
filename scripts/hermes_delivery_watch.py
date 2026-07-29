@@ -236,6 +236,19 @@ def _merge_payload(target: dict[str, Any], payload: dict[str, Any]) -> None:
                 merged_watch.setdefault(key, []).extend(value)
             else:
                 merged_watch[key] = value
+    collection = payload.get("collection")
+    if isinstance(collection, dict):
+        merged_collection = target.setdefault("collection", {})
+        for name, value in collection.items():
+            source_name = str(name)
+            state = _mapping(value)
+            if state.get("status") != "OK":
+                merged_collection[source_name] = {
+                    "status": "UNKNOWN",
+                    **({"error": state.get("error")} if state.get("error") else {}),
+                }
+            elif _mapping(merged_collection.get(source_name)).get("status") != "UNKNOWN":
+                merged_collection[source_name] = {"status": "OK"}
 
 
 def collect_snapshot(config: dict[str, Any]) -> dict[str, Any]:

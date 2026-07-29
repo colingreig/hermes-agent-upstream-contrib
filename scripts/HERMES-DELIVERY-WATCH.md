@@ -1,8 +1,9 @@
 # Hermes delivery watcher
 
-`hermes_delivery_watch.py` is an independent, zero-agent MacBook observer. Every
-five minutes it reads normalized evidence, joins it through `task_delivery/v1`,
-evaluates delivery and ownership invariants, and records evidence under:
+`hermes_delivery_watch.py` is an independent, zero-agent MacBook observer.
+`hermes_delivery_snapshot.py` is its read-only live evidence producer. Every
+five minutes launchd runs the producer first, then evaluates that exact
+snapshot through `task_delivery/v1` and records evidence under:
 
 ```text
 ~/.hermes/state/task-delivery-watch/
@@ -18,34 +19,47 @@ reads, HTTPS `GET`, and `ssh HOST cat -- /absolute/path`. It cannot claim a
 task, update ClickUp, restart Hermes, merge a PR, release a lease, or promote a
 release. Slack is notification-only and is deduplicated by incident transition.
 
-## Configuration
+The producer reads the AI Dev Assistant list through the existing ClickUp CLI,
+PR and exact-head workflow evidence through authenticated `gh` read commands,
+and Mini state through fixed `ssh mini` `cat`, `tail`, and read-only SQLite
+queries. All subprocess argument vectors and remote paths are bounded in source;
+there is no shell command from configuration and no agent invocation. It writes
+only one atomic local snapshot:
 
-Add a `delivery_watch` object to `~/.hermes/config.yaml`. JSON is also accepted
-as a YAML-compatible operational config. Each collector returns an object with
-`tasks` and/or `watch`.
-
-```yaml
-delivery_watch:
-  slack_target: "slack:hermes"
-  deadman_url: "https://hc-ping.com/REDACTED"
-  collectors:
-    - name: macbook-snapshot
-      kind: file
-      path: "/Users/colingreig/.hermes/state/delivery-input/macbook.json"
-    - name: mini-snapshot
-      kind: ssh-json
-      host: mini
-      path: "/Users/colingreig/.hermes/state/delivery-input/mini.json"
-    - name: governed-read-api
-      kind: http-json
-      url: "https://example.invalid/task-delivery-snapshot"
-      header_env:
-        Authorization: DELIVERY_WATCH_AUTHORIZATION
+```text
+~/.hermes/state/delivery-input/macbook.json
 ```
 
-An HTTPS collector uses only `GET`. Header values are resolved from launchd's
-environment; do not put tokens in the config. A failed collector is
-`UNKNOWN` and prevents a delivery result from becoming `DELIVERED`.
+Each upstream failure is retained as `collection.<source>.status=UNKNOWN`.
+The watcher imports those nested source states, so a successful local file read
+cannot mask a failed ClickUp, GitHub, SSH, ledger, lifecycle, or receipt read.
+
+## Configuration
+
+The installer creates a dedicated, mode-0600 configuration at
+`~/.hermes/config.delivery-watch.yaml`. It never rewrites the main Hermes
+configuration. JSON is accepted as YAML-compatible configuration. The generated
+minimum is:
+
+```yaml
+delivery_snapshot:
+  clickup_list_id: "901714465284"
+  mini_host: mini
+  lookback_hours: 72
+  max_tasks: 40
+delivery_watch:
+  collectors:
+    - name: live-delivery-snapshot
+      kind: file
+      path: "/Users/colingreig/.hermes/state/delivery-input/macbook.json"
+```
+
+After installation, optionally add `slack_target` and `deadman_url` beneath
+`delivery_watch`. Do not put ClickUp, GitHub, Slack, or dead-man secrets in the
+file. ClickUp uses the existing CLI token resolution, `gh` uses its existing
+authentication, and an HTTPS collector resolves header values from launchd's
+environment. A failed source is `UNKNOWN` and prevents a delivery result from
+becoming `DELIVERED`.
 
 Each task snapshot has this normalized shape:
 
@@ -104,15 +118,38 @@ Install but do not load:
 scripts/install-hermes-delivery-watcher.sh --install
 ```
 
-After reviewing the config, use `--install-and-enable`. The launchd job runs
-`--once` every 300 seconds. Useful read-only commands are:
+This installs the producer, watcher, correlator, dedicated configuration, and
+plist without loading the job. After reviewing the generated configuration,
+use `--install-and-enable`. The launchd job runs the following cycle every 300
+seconds:
+
+```text
+hermes_delivery_snapshot.py --once --run-watcher
+  -> atomic live snapshot
+  -> hermes_delivery_watch.run_once()
+  -> append-only watcher evidence and heartbeat
+```
+
+Useful read-only commands are:
 
 ```bash
-python3 scripts/hermes_delivery_watch.py --status
-python3 scripts/hermes_delivery_watch.py --final-evidence
+python3 scripts/hermes_delivery_watch.py --status \
+  --config ~/.hermes/config.delivery-watch.yaml
+python3 scripts/hermes_delivery_watch.py --final-evidence \
+  --config ~/.hermes/config.delivery-watch.yaml
+python3 scripts/hermes_delivery_snapshot.py --once \
+  --config ~/.hermes/config.delivery-watch.yaml
 python3 scripts/hermes_delivery_watch.py --once --no-alert --no-deadman \
   --snapshot /absolute/path/to/offline-snapshot.json
+python3 scripts/hermes_delivery_snapshot.py --once \
+  --config /absolute/path/to/offline-config.json \
+  --fixture /absolute/path/to/source-fixture.json \
+  --output /absolute/path/to/offline-snapshot.json
 ```
+
+`--fixture` disables every live command and is the supported offline test and
+incident-reproduction mode. It exercises repo-only, stacked-PR, explicit
+no-PR, and Mini delivery shapes without secrets.
 
 Final evidence passes only after 24-72 hours with at least three distinct
 delivered task chains, distinct executor runs/fences and PR/CI identities, no

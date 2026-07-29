@@ -26,10 +26,14 @@ SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 WATCHER_SOURCE="$SCRIPT_DIR/hermes_delivery_watch.py"
 CORRELATOR_SOURCE="$SCRIPT_DIR/task_delivery.py"
+PRODUCER_SOURCE="$SCRIPT_DIR/hermes_delivery_snapshot.py"
 SOURCE_PLIST="$SCRIPT_DIR/launchd/com.colingreig.hermes.delivery-watch.plist"
 TARGET_DIR="$HERMES_HOME/libexec/delivery-watch"
 WATCHER="$TARGET_DIR/hermes_delivery_watch.py"
 CORRELATOR="$TARGET_DIR/task_delivery.py"
+PRODUCER="$TARGET_DIR/hermes_delivery_snapshot.py"
+WATCH_CONFIG="$HERMES_HOME/config.delivery-watch.yaml"
+SNAPSHOT="$HERMES_HOME/state/delivery-input/macbook.json"
 TARGET_PLIST="$HOME/Library/LaunchAgents/com.colingreig.hermes.delivery-watch.plist"
 LABEL="com.colingreig.hermes.delivery-watch"
 DOMAIN="gui/$(id -u)"
@@ -38,6 +42,8 @@ DOMAIN="gui/$(id -u)"
   || { echo "ERROR: missing or symlinked watcher source: $WATCHER_SOURCE" >&2; exit 1; }
 [ -f "$CORRELATOR_SOURCE" ] && [ ! -L "$CORRELATOR_SOURCE" ] \
   || { echo "ERROR: missing or symlinked correlator source: $CORRELATOR_SOURCE" >&2; exit 1; }
+[ -f "$PRODUCER_SOURCE" ] && [ ! -L "$PRODUCER_SOURCE" ] \
+  || { echo "ERROR: missing or symlinked producer source: $PRODUCER_SOURCE" >&2; exit 1; }
 [ -f "$SOURCE_PLIST" ] && [ ! -L "$SOURCE_PLIST" ] \
   || { echo "ERROR: missing or symlinked source plist: $SOURCE_PLIST" >&2; exit 1; }
 
@@ -55,7 +61,7 @@ python_candidates+=("/opt/homebrew/bin/python3" "/usr/local/bin/python3" "/usr/b
 for candidate in "${python_candidates[@]}"; do
   [ -x "$candidate" ] || continue
   if PYTHONPATH="$SCRIPT_DIR" "$candidate" -c \
-    'import yaml, task_delivery, hermes_delivery_watch' >/dev/null 2>&1; then
+    'import yaml, task_delivery, hermes_delivery_watch, hermes_delivery_snapshot' >/dev/null 2>&1; then
     PYTHON="$(CDPATH= cd -- "$(dirname -- "$candidate")" && pwd -P)/$(basename "$candidate")"
     break
   fi
@@ -65,7 +71,8 @@ done
   exit 1
 }
 
-mkdir -p "$HERMES_HOME/logs" "$HERMES_HOME/state/task-delivery-watch" "$TARGET_DIR"
+mkdir -p "$HERMES_HOME/logs" "$HERMES_HOME/state/task-delivery-watch" \
+  "$HERMES_HOME/state/delivery-input" "$TARGET_DIR"
 chmod 0700 "$TARGET_DIR"
 
 install_source() {
@@ -80,25 +87,94 @@ install_source() {
 }
 install_source "$WATCHER_SOURCE" "$WATCHER" 0755
 install_source "$CORRELATOR_SOURCE" "$CORRELATOR" 0644
+install_source "$PRODUCER_SOURCE" "$PRODUCER" 0755
 
 # Prove the exact installed files load under the interpreter written into the
-# LaunchAgent. Installation never manufactures behavioral configuration.
+# LaunchAgent.
 PYTHONPATH="$TARGET_DIR" "$PYTHON" -c \
-  'import yaml, task_delivery, hermes_delivery_watch' >/dev/null
+  'import yaml, task_delivery, hermes_delivery_watch, hermes_delivery_snapshot' >/dev/null
 "$PYTHON" "$WATCHER" --status >/dev/null
+
+# Use a dedicated watcher config so installing the observer never rewrites the
+# user's main Hermes behavioral config.  Existing configuration is preserved
+# byte-for-byte for review and optional Slack/dead-man additions.
+if [ ! -e "$WATCH_CONFIG" ]; then
+  "$PYTHON" - "$WATCH_CONFIG" "$SNAPSHOT" <<'PY'
+import json
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+target = Path(sys.argv[1])
+snapshot = str(Path(sys.argv[2]))
+payload = {
+    "delivery_snapshot": {
+        "clickup_list_id": "901714465284",
+        "lookback_hours": 72,
+        "max_tasks": 40,
+        "mini_host": "mini",
+    },
+    "delivery_watch": {
+        "collectors": [
+            {
+                "kind": "file",
+                "name": "live-delivery-snapshot",
+                "path": snapshot,
+            }
+        ]
+    },
+}
+target.parent.mkdir(parents=True, exist_ok=True)
+fd, temporary = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, target)
+except BaseException:
+    try:
+        os.unlink(temporary)
+    except FileNotFoundError:
+        pass
+    raise
+PY
+  echo "Created reviewable watcher config $WATCH_CONFIG"
+else
+  [ -f "$WATCH_CONFIG" ] && [ ! -L "$WATCH_CONFIG" ] \
+    || { echo "ERROR: watcher config must be a regular non-symlink: $WATCH_CONFIG" >&2; exit 1; }
+  echo "Preserved existing watcher config $WATCH_CONFIG"
+fi
+chmod 0600 "$WATCH_CONFIG"
+PYTHONPATH="$TARGET_DIR" "$PYTHON" - "$WATCH_CONFIG" <<'PY'
+import sys
+from pathlib import Path
+from hermes_delivery_snapshot import _load_config as load_snapshot_config
+from hermes_delivery_watch import _load_config as load_watch_config
+
+path = Path(sys.argv[1])
+load_snapshot_config(path)
+load_watch_config(path)
+PY
 
 mkdir -p "$(dirname "$TARGET_PLIST")"
 tmp="$(mktemp "$(dirname "$TARGET_PLIST")/.${LABEL}.swap.XXXXXX")"
 trap 'rm -f "$tmp"' EXIT
-"$PYTHON" - "$SOURCE_PLIST" "$tmp" "$PYTHON" "$WATCHER" "$HOME" "$HERMES_HOME" <<'PY'
+"$PYTHON" - "$SOURCE_PLIST" "$tmp" "$PYTHON" "$PRODUCER" "$WATCH_CONFIG" \
+  "$SNAPSHOT" "$HOME" "$HERMES_HOME" <<'PY'
 import sys
 from pathlib import Path
 
-source, target, python, watcher, home, hermes_home = sys.argv[1:]
+source, target, python, producer, config, snapshot, home, hermes_home = sys.argv[1:]
 payload = Path(source).read_text(encoding="utf-8")
 for marker, value in (
     ("__HERMES_DELIVERY_WATCH_PYTHON__", python),
-    ("__HERMES_DELIVERY_WATCH_SCRIPT__", watcher),
+    ("__HERMES_DELIVERY_SNAPSHOT_SCRIPT__", producer),
+    ("__HERMES_DELIVERY_WATCH_CONFIG__", config),
+    ("__HERMES_DELIVERY_SNAPSHOT_OUTPUT__", snapshot),
     ("__HOME__", home),
     ("__HERMES_HOME__", hermes_home),
 ):
@@ -112,20 +188,19 @@ trap - EXIT
 echo "Installed $TARGET_PLIST"
 
 if [ "$ENABLE" -eq 1 ]; then
-  [ -f "$HERMES_HOME/config.yaml" ] || {
-    echo "ERROR: configure delivery_watch in $HERMES_HOME/config.yaml before enabling" >&2
-    exit 1
-  }
-  PYTHONPATH="$TARGET_DIR" "$PYTHON" - "$HERMES_HOME/config.yaml" <<'PY'
+  PYTHONPATH="$TARGET_DIR" "$PYTHON" - "$WATCH_CONFIG" <<'PY'
 import sys
 from pathlib import Path
-from hermes_delivery_watch import _load_config
+from hermes_delivery_snapshot import _load_config as load_snapshot_config
+from hermes_delivery_watch import _load_config as load_watch_config
 
-_load_config(Path(sys.argv[1]))
+path = Path(sys.argv[1])
+load_snapshot_config(path)
+load_watch_config(path)
 PY
   launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
   launchctl bootstrap "$DOMAIN" "$TARGET_PLIST"
   echo "Enabled $DOMAIN/$LABEL"
 else
-  echo "Not loaded. Review delivery_watch config, then re-run with --install-and-enable."
+  echo "Not loaded. Review $WATCH_CONFIG, then re-run with --install-and-enable."
 fi

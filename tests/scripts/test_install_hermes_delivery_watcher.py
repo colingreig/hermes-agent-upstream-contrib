@@ -42,6 +42,20 @@ def test_installer_copies_repo_sources_and_pins_a_proven_python(tmp_path):
     assert (installed_dir / "task_delivery.py").read_bytes() == (
         ROOT / "scripts" / "task_delivery.py"
     ).read_bytes()
+    assert (installed_dir / "hermes_delivery_snapshot.py").read_bytes() == (
+        ROOT / "scripts" / "hermes_delivery_snapshot.py"
+    ).read_bytes()
+    config_path = hermes_home / "config.delivery-watch.yaml"
+    config = __import__("json").loads(config_path.read_text(encoding="utf-8"))
+    assert config["delivery_snapshot"]["clickup_list_id"] == "901714465284"
+    assert config["delivery_watch"]["collectors"] == [
+        {
+            "kind": "file",
+            "name": "live-delivery-snapshot",
+            "path": str(hermes_home / "state" / "delivery-input" / "macbook.json"),
+        }
+    ]
+    assert config_path.stat().st_mode & 0o777 == 0o600
     plist_path = (
         home
         / "Library"
@@ -58,6 +72,14 @@ def test_installer_copies_repo_sources_and_pins_a_proven_python(tmp_path):
         text=True,
     )
     assert payload["ProgramArguments"][1] == str(
-        installed_dir / "hermes_delivery_watch.py"
+        installed_dir / "hermes_delivery_snapshot.py"
     )
+    assert payload["ProgramArguments"][2:] == [
+        "--once",
+        "--config",
+        str(config_path),
+        "--output",
+        str(hermes_home / "state" / "delivery-input" / "macbook.json"),
+        "--run-watcher",
+    ]
     assert "runtime-current" not in plist_path.read_text(encoding="utf-8")
