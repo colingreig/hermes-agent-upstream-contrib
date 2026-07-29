@@ -43,11 +43,38 @@ lease_is_proven_stale() {
     && [ "$lease_invocation" != "$INVOCATION_ID" ]
 }
 
+legacy_empty_lease_is_proven_stale() {
+  local lease="${1:?lease required}"
+  local owner repo modified now cmdline
+  [ ! -s "$lease" ] || return 1
+  owner="$(basename "$lease")"
+  repo="${owner#hermes-}"
+  [ "$repo" != "$owner" ] || return 1
+
+  modified="$(stat -c %Y "$lease" 2>/dev/null || stat -f %m "$lease" 2>/dev/null || true)"
+  [[ "$modified" =~ ^[0-9]+$ ]] || return 1
+  now="$(date +%s)"
+  [ $((now - modified)) -ge "$TIMEOUT" ] || return 1
+
+  # Pre-managed hooks wrote empty marker files. An aged marker is safe to
+  # reclaim only when its owning runner has no live Worker process; the
+  # listener service itself is intentionally long-lived and is not ownership
+  # evidence for a job lease.
+  for cmdline in /proc/[0-9]*/cmdline; do
+    [ -r "$cmdline" ] || continue
+    if tr '\0' ' ' < "$cmdline" 2>/dev/null \
+      | grep -Fq "/actions-runner/$repo/bin/Runner.Worker"; then
+      return 1
+    fi
+  done
+  return 0
+}
+
 reconcile_stale_leases() {
   local lease
   for lease in "$SLOTS_DIR"/*; do
     [ -f "$lease" ] || continue
-    if lease_is_proven_stale "$lease"; then
+    if lease_is_proven_stale "$lease" || legacy_empty_lease_is_proven_stale "$lease"; then
       rm -f -- "$lease"
     fi
   done
