@@ -7,7 +7,7 @@
     {
       "src_rel": "config-overlay.yaml",
       "dest_abs": "~/.hermes/config.yaml",
-      "sha256": "8d2920058f8dbfb86ec5598d780443f24c285703e430bd3f9ac21e21489dc130",
+      "sha256": "58d38ecdaee885fc057f69803a48a941f26167d5adc96508fff9081a7e710659",
       "role": "governed overlay deep-merged into the live config.yaml (model/fallback_providers/delegation/kanban dispatch)",
       "deploy_mode": "config_overlay"
     },

@@ -35,6 +35,56 @@ cleared. **Never** re-introduce `delegation.base_url` + a named provider.
 `openai-api` (billed OpenAI) anywhere in this bundle; `openai-codex` (Codex
 OAuth, subscription-covered) is the only sanctioned OpenAI surface.
 
+## Fallback chain
+
+```
+primary   openai-codex / gpt-5.5            (Codex OAuth, subscription-covered)
+tier 2    zai / glm-4.7                     (GLM_API_KEY/ZAI_API_KEY, already live)
+tier 3    nous / moonshotai/kimi-k2.6       (Nous Research Portal, key PENDING)
+```
+
+- **google/gemini-2.5-flash is removed** from the chain (2026-07-29). Its
+  history on this fleet is repeated false credential alarms (`.env`
+  `${GEMINI_API_KEY}` interpolation poison + sticky exhausted-pool cache),
+  and it added a third billing surface for no capability the other tiers
+  lack.
+- **Tier 3 = Nous Research Portal** (https://portal.nousresearch.com),
+  OpenAI-compatible inference at `https://inference-api.nousresearch.com/v1`
+  (public `/v1/models` verified 2026-07-29; 323 models). `nous` is a
+  first-class Hermes provider — the base URL is baked into
+  `PROVIDER_REGISTRY`, so the fallback entry needs no `base_url` (and per
+  the delegation credential-leak lesson we don't set one next to a named
+  provider). Model choice, from live catalog pricing:
+  - **`moonshotai/kimi-k2.6`** (chosen, in-chain): $0.5168/M in, $2.176/M
+    out, 262k ctx, tool-calling supported — the cheapest current-gen Kimi
+    that can actually run the agent loop (k2.5 is $0.456/$2.28 but older
+    gen; kimi-k3 is $2.40/$12.00).
+  - **`nousresearch/hermes-4-70b`** (recorded secondary, NOT in-chain):
+    $0.05/M in, $0.20/M out — cheapest on the Portal, but it does not
+    support tool-calling and Nous' own docs say Hermes-4 is not
+    recommended for agent work, so it must not sit in an agent fallback
+    chain.
+- **PENDING: `NOUS_PORTAL_API_KEY` is not yet provisioned.** The fallback
+  entry sources its key via `key_env: NOUS_PORTAL_API_KEY`
+  (`hermes_cli/fallback_config.py::resolve_entry_api_key` → passed as
+  `explicit_api_key`; no OAuth needed). NEVER hardcode the key, and never
+  write it as a `${VAR}` reference inside a `.env`-style value —
+  `load_env` does not interpolate and a literal `${...}` poisons the
+  credential pool (the gemini-400 incident). Until the key lands in the
+  gateway secret env (1Password → launchd wrap), tier 3 falls through to
+  the (also unprovisioned) nous OAuth store and the chain effectively
+  ends after zai — same coverage as before this change, minus the gemini
+  false-alarm surface.
+- Do **not** add a `providers:`/`custom_providers:` entry named `nous`:
+  `runtime_provider.py::_get_named_custom_provider` defers canonical
+  built-in names to the built-in provider, so such an entry is dead
+  config. (The installer's deep-merge would handle a nested `providers:`
+  map correctly — non-empty dicts merge key-by-key, preserving live
+  sibling providers — it's the runtime that would ignore a custom `nous`.)
+- The **content profile is exempt by design**: `profiles/content/config.yaml`
+  stays `anthropic/claude-sonnet-5` with `fallback_providers: []`
+  (fail-closed; model substitution on content is a defect).
+
 ## Jobs curation
 
 Starting point: the pre-freeze snapshot at

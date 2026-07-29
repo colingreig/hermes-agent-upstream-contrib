@@ -23,6 +23,20 @@
 # `openai-codex` (Codex OAuth, subscription-covered) is the only sanctioned
 # OpenAI surface for fleet work.
 
+# NOTE on the Nous tier: `nous` is a FIRST-CLASS provider (PROVIDER_REGISTRY
+# in hermes_cli/auth.py; base_url https://inference-api.nousresearch.com/v1,
+# an OpenAI-compatible endpoint). Do NOT add a `providers:`/`custom_providers:`
+# map entry named "nous" — runtime_provider.py::_get_named_custom_provider
+# deliberately defers canonical built-in provider names to the built-in, so a
+# custom entry keyed "nous" is dead config. The fallback entry's `key_env`
+# below is the sanctioned key-injection path: the fallback runtime resolves
+# it (hermes_cli/fallback_config.py::resolve_entry_api_key) and passes it as
+# explicit_api_key to resolve_runtime_provider, bypassing the Portal OAuth
+# flow. NOUS_PORTAL_API_KEY is NOT yet provisioned — until it lands in the
+# gateway env, tier 3 falls through to normal nous credential resolution
+# (OAuth store; also unprovisioned on the mini), so the chain effectively
+# ends after zai. See README "Fallback chain".
+
 model:
   provider: openai-codex
   default: gpt-5.5
@@ -30,8 +44,9 @@ model:
 fallback_providers:
   - provider: zai
     model: glm-4.7
-  - provider: google
-    model: gemini-2.5-flash
+  - provider: nous
+    model: moonshotai/kimi-k2.6
+    key_env: NOUS_PORTAL_API_KEY
 
 # Cleared — profile-based kanban routing (profiles/) replaces delegation-based
 # subagent routing. See the merge-rule note above: this empty dict REPLACES
