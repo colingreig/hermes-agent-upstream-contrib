@@ -35,8 +35,10 @@ cleanly. This mirrors the redundant, conservative, fail-closed posture of
 Usage:
   python3 mcp_serve_reaper.py [--dry-run] [--min-age-minutes 45] [--grace-seconds 10]
 
-Exit code is always 0 (a sweep with nothing to do, or a per-process error, is not a fleet
-failure) — errors are logged, never raised past main().
+Exit code is 0 only when the process snapshot was readable and every selected
+reap completed.  Snapshot and per-process failures are non-zero so the
+independent fleet outcome probe can distinguish "nothing to reap" from "the
+reaper could not inspect or enforce its policy."
 """
 import argparse
 import os
@@ -71,7 +73,7 @@ def _ps_snapshot():
         ).stdout
     except Exception as exc:
         _log(f"ERROR_PS_SNAPSHOT: {exc}")
-        return {}
+        return None
 
     snapshot = {}
     for line in out.splitlines():
@@ -182,6 +184,8 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
 
     snapshot = _ps_snapshot()
+    if snapshot is None:
+        return 2
     if not snapshot:
         _log("sweep-finish reaped=0 skipped_young=0 skipped_live=0 (empty ps snapshot)")
         return 0
@@ -190,6 +194,7 @@ def main(argv=None) -> int:
     reaped = 0
     skipped_young = 0
     skipped_live = 0
+    failed = 0
     min_age_seconds = args.min_age_minutes * 60
 
     for pid in sorted(candidates):
@@ -205,13 +210,15 @@ def main(argv=None) -> int:
             continue
         if _reap(pid, info["command"], args.grace_seconds, args.dry_run):
             reaped += 1
+        else:
+            failed += 1
 
     _log(
         f"sweep-finish candidates={len(candidates)} reaped={reaped} "
         f"skipped_young={skipped_young} skipped_live={skipped_live} "
-        f"dry_run={args.dry_run}"
+        f"failed={failed} dry_run={args.dry_run}"
     )
-    return 0
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":

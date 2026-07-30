@@ -31,9 +31,20 @@ def _completed(cmd, returncode=0, stdout="", stderr=""):
     return subprocess.CompletedProcess(cmd, returncode, stdout, stderr)
 
 
+def _isolate_watchdog(module, tmp_path, *, checked_at=None):
+    module.FLEET_PROBE_RECEIPT = tmp_path / "fleet-receipt.json"
+    module.FLEET_WATCHDOG_STATE = tmp_path / "fleet-watchdog.json"
+    observed = checked_at or module._now()
+    module.FLEET_PROBE_RECEIPT.write_text(
+        json.dumps({"checked_at": observed.isoformat(), "status": "clean"}),
+        encoding="utf-8",
+    )
+
+
 def test_ci_health_always_runs_and_propagates_streams_and_exit(tmp_path):
     module = _load_module()
     module.DAILY_STATE_PATH = tmp_path / "daily.json"
+    _isolate_watchdog(module, tmp_path)
     calls = []
 
     def run(cmd, **_kwargs):
@@ -60,6 +71,7 @@ def test_ci_health_always_runs_and_propagates_streams_and_exit(tmp_path):
 def test_daily_scan_is_skipped_inside_rolling_24_hours(tmp_path):
     module = _load_module()
     module.DAILY_STATE_PATH = tmp_path / "daily.json"
+    _isolate_watchdog(module, tmp_path, checked_at=NOW)
     module.DAILY_STATE_PATH.write_text(
         json.dumps({"last_attempt_at": (NOW - timedelta(hours=23)).isoformat()}),
         encoding="utf-8",
@@ -96,6 +108,7 @@ def test_due_stale_result_is_sent_to_ci_health_slack_channel(tmp_path):
     module = _load_module()
     module.DAILY_STATE_PATH = tmp_path / "daily.json"
     module.HERMES_BIN = tmp_path / "hermes"
+    _isolate_watchdog(module, tmp_path, checked_at=NOW)
     calls = []
     alert = "⏰ 1 PR(s) stale without a fresh verdict."
 
@@ -130,6 +143,7 @@ def test_due_stale_result_is_sent_to_ci_health_slack_channel(tmp_path):
 def test_due_clean_result_stays_silent(tmp_path):
     module = _load_module()
     module.DAILY_STATE_PATH = tmp_path / "daily.json"
+    _isolate_watchdog(module, tmp_path, checked_at=NOW)
     calls = []
     clean = "✅ Previously stale PR(s) are no longer stale."
 
@@ -149,3 +163,52 @@ def test_due_clean_result_stays_silent(tmp_path):
         "ci_health_watch.py",
         "pr_staleness_alert.py",
     ]
+
+
+def test_stale_fleet_probe_alert_is_delivery_aware_and_deduped(tmp_path):
+    module = _load_module()
+    module.FLEET_PROBE_RECEIPT = tmp_path / "fleet-receipt.json"
+    module.FLEET_WATCHDOG_STATE = tmp_path / "fleet-watchdog.json"
+    module.FLEET_PROBE_RECEIPT.write_text(
+        json.dumps({"checked_at": (NOW - timedelta(hours=1)).isoformat()}),
+        encoding="utf-8",
+    )
+    problem = module._fleet_probe_problem(now=NOW)
+    assert problem and "stale" in problem
+
+    failed = _completed(["hermes"], returncode=1, stderr="offline")
+    with mock.patch.object(module, "_now", return_value=NOW):
+        with mock.patch.object(module, "_send_slack", return_value=failed):
+            module._route_fleet_probe_watchdog(problem)
+    assert not module.FLEET_WATCHDOG_STATE.exists()
+
+    sent = _completed(["hermes"])
+    sender = mock.Mock(return_value=sent)
+    with mock.patch.object(module, "_now", return_value=NOW):
+        with mock.patch.object(module, "_send_slack", sender):
+            module._route_fleet_probe_watchdog(problem)
+            module._route_fleet_probe_watchdog(problem)
+    assert sender.call_count == 1
+    state = json.loads(module.FLEET_WATCHDOG_STATE.read_text(encoding="utf-8"))
+    assert state["active"] is True
+
+
+def test_fleet_probe_recovery_clears_only_after_confirmed_delivery(tmp_path):
+    module = _load_module()
+    module.FLEET_WATCHDOG_STATE = tmp_path / "fleet-watchdog.json"
+    module.FLEET_WATCHDOG_STATE.write_text(
+        json.dumps({"active": True, "delivered_signature": "abc"}),
+        encoding="utf-8",
+    )
+
+    with mock.patch.object(module, "_now", return_value=NOW):
+        with mock.patch.object(
+            module, "_send_slack", return_value=_completed(["hermes"], returncode=2)
+        ):
+            module._route_fleet_probe_watchdog(None)
+    assert json.loads(module.FLEET_WATCHDOG_STATE.read_text())["active"] is True
+
+    with mock.patch.object(module, "_now", return_value=NOW):
+        with mock.patch.object(module, "_send_slack", return_value=_completed(["hermes"])):
+            module._route_fleet_probe_watchdog(None)
+    assert json.loads(module.FLEET_WATCHDOG_STATE.read_text())["active"] is False

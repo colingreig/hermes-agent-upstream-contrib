@@ -369,10 +369,22 @@ def main():
             slack_msg = "\n".join([SLACK_MENTION, *msg_lines])
             slack_ok = _send_slack(slack_msg)
             cu_ok = _post_clickup_comment(ESCALATION_TASK_ID, msg)
-            state["last_alert_signature"] = sig
-            state["last_alert_at"] = now.isoformat()
-            _save_state(state)
-            print(f"[degraded-secrets-monitor] alerted (slack={slack_ok} clickup={cu_ok})")
+            # Delivery-aware dedupe: do not silence the next five-minute tick
+            # unless both declared alarm surfaces confirmed delivery.  The old
+            # behavior recorded the signature even when Slack and/or ClickUp
+            # returned False, converting a delivery outage into permanent
+            # silence until the underlying degradation changed.
+            if slack_ok and cu_ok:
+                state["last_alert_signature"] = sig
+                state["last_alert_at"] = now.isoformat()
+                _save_state(state)
+                print(f"[degraded-secrets-monitor] alerted (slack={slack_ok} clickup={cu_ok})")
+            else:
+                print(
+                    f"[degraded-secrets-monitor] alert delivery incomplete "
+                    f"(slack={slack_ok} clickup={cu_ok}); dedupe state NOT advanced",
+                    file=sys.stderr,
+                )
         elif not degraded and last_sig is not None:
             state["last_alert_signature"] = None
             state["recovered_at"] = now.isoformat()

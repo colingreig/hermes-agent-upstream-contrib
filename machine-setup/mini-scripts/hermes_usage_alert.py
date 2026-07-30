@@ -38,6 +38,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 from typing import Any
@@ -55,6 +56,8 @@ JOBS_PATH = os.environ.get("HERMES_USAGE_ALERT_JOBS_PATH") or os.path.join(HOME,
 STATE_PATH = os.environ.get("HERMES_USAGE_ALERT_STATE_PATH") or os.path.join(
     HOME, ".hermes/scripts/.usage_alert_state.json"
 )
+HERMES_BIN = os.path.join(HOME, ".local/bin/hermes")
+SLACK_TARGET = "slack:hermes"
 
 # Separate cooldowns by signal class so a cron error is not hidden by a recent
 # usage alert.
@@ -302,6 +305,15 @@ def _cooldown_key(kind: str) -> str:
     return f"last_alert_ts:{kind}"
 
 
+def _send_slack(message: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [HERMES_BIN, "send", "--to", SLACK_TARGET, message],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+
 def main():
     if os.environ.get("HERMES_USAGE_ALERT_DISABLE") == "1":
         return 0
@@ -351,6 +363,26 @@ def main():
         printed.append(kind)
 
     if printed:
+        # This script owns its Slack alarm.  Relying on an enclosing LLM
+        # digest to notice stdout made the zero-LLM alarm both delayed and
+        # unsatisfiable when the digest itself stopped.  Persist offsets,
+        # cooldowns, and red-job re-alert timestamps only after Slack confirms
+        # delivery; a failed send therefore remains eligible next tick.
+        try:
+            delivery = _send_slack("\n\n".join(
+                _build_alert(kind, events_by_kind[kind], now)
+                for kind in printed
+            ))
+        except (OSError, subprocess.SubprocessError) as exc:
+            print(f"[hermes_usage_alert] Slack delivery failed: {exc}", file=sys.stderr)
+            return 2
+        if delivery.returncode != 0:
+            detail = (delivery.stderr or delivery.stdout or "unknown failure").strip()
+            print(
+                f"[hermes_usage_alert] Slack delivery exited {delivery.returncode}: {detail}",
+                file=sys.stderr,
+            )
+            return 2
         _save_state(state)
     else:
         # We still updated offsets / job status caches above, so this run stays

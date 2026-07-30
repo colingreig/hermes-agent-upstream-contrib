@@ -356,7 +356,7 @@
       "key_env": null,
       "fire_claim": null,
       "base_url": null,
-      "script": "ci_health_watch.py",
+      "script": "ci-health-watch-cron.py",
       "prompt": "",
       "created_at": "2026-07-29T00:00:00-07:00",
       "last_run_at": null,

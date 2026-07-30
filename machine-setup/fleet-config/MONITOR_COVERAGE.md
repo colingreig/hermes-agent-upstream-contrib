@@ -1,0 +1,87 @@
+# Hermes Mini monitor coverage
+
+Task: ClickUp `86e2jbbhx`
+
+Contract: `machine-setup/mini-scripts/fleet_outcome_contracts.json`
+
+Probe: `machine-setup/mini-scripts/fleet_outcome_probe.py`
+
+## What “covered” means
+
+An enabled job is covered only when the independent probe can verify all of:
+
+1. the exact declared job/LaunchAgent is present in the expected enabled,
+   loaded, disabled, or retired state;
+2. its last run is inside a cadence-specific freshness budget; and
+3. a semantic output, endpoint, or durable receipt proves the task reached its
+   intended outcome. A scheduler or launchd exit code by itself never passes.
+
+The probe fails closed when a new enabled cron or Hermes/Ignite LaunchAgent has
+no contract. Findings go directly to `hermes send --to slack:hermes`; alert
+signatures and recoveries are persisted only after confirmed delivery.
+
+`fleet_outcome_probe.py --drill-all --real-alert` injects one failure for every
+row below through the production formatter, Slack sender, receipt writer, and
+dedupe state. It does not change live cron or launchd state. The five-minute
+`ci-health-watch-cron.py` separately alarms if the probe receipt stops updating,
+while the probe verifies CI health's semantic `"health": "OK"` result. These
+two scheduling planes therefore cross-watch rather than self-monitor.
+
+## Cron fleet: 16/16 declared
+
+| ID | Job | Expected | Outcome proof (not exit-only) | Alarm condition |
+|---|---|---:|---|---|
+| `62714b869845` | clickup-executor | enabled | fresh saved response; rejects empty/failed turns | missing/stale/failed response |
+| `dcab830aa41c` | content-lane-executor | enabled | fresh saved response; rejects empty/failed turns | missing/stale/failed response |
+| `9dca144ff19b` | clickup-poll-gate | enabled | fresh `wakeAgent`/semantic-silent gate document | credential, scan, stale, or failed gate |
+| `8d3b1d53470d` | review-poll-gate | enabled | fresh `wakeAgent`/semantic-silent gate document | credential, scan, stale, or failed gate |
+| `ad0ae6b717e2` | clickup-review-sla | enabled | fresh SLA/review scan document | scan, stale, or failed result |
+| `5a76e290811d` | hermes-pr-validate | disabled | disabled-state assertion | unexpected enablement |
+| `b0c4c5cc70c1` | spend-meter | enabled | fresh under-cap or spend evaluation document | unreadable spend data, stale, or failure |
+| `e835c614cfb2` | ci-health-watch | enabled | fresh parsed CI state: stable lifecycle, VM available, no resource drift | unavailable/drifted/missing/stale state |
+| `bcf275768661` | clickup-workspace-refresh | enabled | fresh parsed `clickup-map.json` topology artifact | missing/stale/invalid artifact |
+| `dd73a5e578e4` | reap-stranded-claims | enabled | fresh claim/reap result document | error, missing, or stale result |
+| `542fca8d839f` | ignite-board-sync | enabled | fresh sync/complete result document | failed/missing/stale sync |
+| `2ff001bea4b5` | clickup-closeout-actor | enabled | fresh PR and DB closeout count documents | error, failed flip, missing/stale counts |
+| `6139465f559f` | Purelymail notify-me poller | enabled | fresh poll/cursor/semantic-silent document | IMAP/SMTP failure or stale/missing poll |
+| `777876d3eb16` | clickup-lifecycle | enabled | fresh non-empty lifecycle response | empty/failed/stale lifecycle pass |
+| `f23a03e9d1b2` | fleet-health-digest | enabled | fresh parsed delivery receipt with `status=sent` | missing/stale/failed delivery |
+| `59bdd8ebc468` | repo-maintenance | enabled | fresh non-empty maintenance response | empty/failed/stale maintenance pass |
+
+## LaunchAgent fleet: 17 active + 1 retired
+
+| Label | Expected | Outcome proof (not exit-only) | Alarm condition |
+|---|---:|---|---|
+| `ai.hermes.codex-proxy` | loaded | live TCP connect to loopback `:8646` | unavailable endpoint or unloaded agent |
+| `ai.hermes.gateway` | loaded | fresh gateway activity log without fatal credential markers | stale/fatal log or unloaded agent |
+| `com.colingreig.hermes-dashboard` | loaded | semantic HTTP `:9119/health` response | endpoint failure or unloaded agent |
+| `com.colingreig.hermes.daily-spend-alert` | loaded | fresh explicit OK/alert evaluation log | stale/fatal/delivery failure |
+| `com.colingreig.hermes.degraded-secrets-monitor` | loaded | fresh healthy/alerted/recovered result; delivery-aware dedupe | stale result or incomplete alarm delivery |
+| `com.colingreig.hermes.heartbeat` | loaded | fresh `heartbeat ping delivered` record | DORMANT, failed, or stale heartbeat |
+| `com.colingreig.hermes.ignite-sentinel` | loaded | fresh monitor-start plus semantic JSON result | fatal/stale/missing monitor result |
+| `com.colingreig.hermes.ignite-sentinel-digest` | loaded | fresh digest result/delivery marker | fatal/timeout/stale/missing digest |
+| `com.colingreig.hermes.runtime-artifact-cleanup` | loaded | fresh completion summary | removal error or stale/missing summary |
+| `com.colingreig.hermes.worktree-backstop-sweep` | loaded | fresh sweep summary and prune completion | safety/removal error or stale summary |
+| `com.colingreig.ignite-marketplace-sync` | loaded | fresh `sync.sh exited 0` record | non-zero, missing, or stale sync |
+| `com.hermes.offbox-restic-backup` | loaded | fresh post-restic `backup and retention complete` marker | backup/delivery failure or stale marker |
+| `com.colingreig.hermes.mcp-serve-reaper` | loaded | fresh sweep summary; snapshot/reap errors now exit non-zero | snapshot/reap failure or stale summary |
+| `com.colingreig.ignite-skills-pull` | loaded | fresh parsed commit-pinned success receipt | stale/missing/invalid receipt |
+| `com.colingreig.pull_anthropic_skills` | loaded | fresh parsed commit-pinned success receipt | stale/missing/invalid receipt |
+| `com.colingreig.chrome-cdp` | loaded | semantic `/json/version` response with CDP WebSocket URL | endpoint failure or unloaded agent |
+| `com.colingreig.hermes.fleet-outcome-probe` | loaded | current process execution plus CI-wrapper heartbeat cross-watch | unloaded agent or stale probe receipt |
+| `com.colingreig.hermes.release-poll` | retired | plist absent and `launchctl print` fails | any plist/load resurrection |
+
+The legacy `com.ignite.skills-sync` label remains retired. If its plist
+reappears, the probe's unknown-Hermes/Ignite fail-closed inventory check alarms
+even though the label is not part of the active contract.
+
+## Alarm proof
+
+Repository tests prove semantic failures are distinguishable from scheduler
+success, unknown enabled jobs and monitored plists fail closed, a failed Slack
+send does not advance dedupe, confirmed delivery dedupes a repeat, and the
+drill emits exactly one finding per contract.
+
+The live Mini cutover receipt and Slack drill receipt are attached to ClickUp
+task `86e2jbbhx`; they are intentionally operational evidence rather than
+hard-coded into this durable source document.

@@ -168,8 +168,8 @@ Starting point: the pre-freeze snapshot at
   `content-lane-executor`'s prompt (it's already agent-driven, so adding a
   Bash step is free). `ci-health-watch-cron.py` now provides the
   `pr-staleness-alert` daily fold without changing either underlying
-  monitor; the bundled `jobs.json` remains unchanged because the live cron
-  rewire is a separate ops step — see Deviations below.
+  monitor. The bundled `jobs.json` points `ci-health-watch` at that argv-free
+  wrapper so the fold and its independent fleet-probe watchdog are live.
 
 ### Modified: clickup-executor / content-lane-executor
 
@@ -247,8 +247,17 @@ use it to find the right timestamp/paths rather than guessing.
   the existing `pr_staleness_alert.py` scan and routes emitted alerts through
   `hermes send --to slack:hermes`. This preserves the five-minute pure
   `no_agent` monitor and avoids both LLM cron cost and trust-boundary edits.
-  The fleet bundle's `jobs.json` intentionally has no change; pointing the
-  live `ci-health-watch` job at this wrapper remains a separate ops step.
+  The fleet bundle now points the live `ci-health-watch` job at this wrapper.
+  The wrapper also cross-watches the independent LaunchAgent outcome probe's
+  heartbeat; the LaunchAgent, in turn, verifies the five-minute CI job's
+  fresh parsed CI state (stable lifecycle, VM available, no resource drift).
+  This breaks the prior circular self-report
+  arrangement while preserving `ci_health_watch.py` byte-for-byte.
+- **Coverage-verified monitor plane**: task `86e2jbbhx` adds the complete
+  contract and alarm matrix in [MONITOR_COVERAGE.md](MONITOR_COVERAGE.md).
+  `fleet_outcome_probe.py` runs as an independent five-minute LaunchAgent,
+  fails closed on uncovered enabled jobs or Hermes LaunchAgents, and routes
+  delivery-aware Slack alarms without an LLM.
 - **Profile bootstrap dirs**: the task text listed 8 dirs (memories,
   sessions, skills, logs, plans, workspace, cron, home); the installer
   creates the real 9 from `hermes_cli/profiles.py::_PROFILE_DIRS`, which

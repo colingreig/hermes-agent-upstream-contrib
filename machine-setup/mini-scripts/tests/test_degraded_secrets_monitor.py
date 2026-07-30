@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 SOURCE = Path(__file__).resolve().parent.parent / "degraded_secrets_monitor.py"
@@ -339,6 +340,40 @@ class DegradedSecretsMonitorCredentialPoolTests(unittest.TestCase):
         self.assertIn("[degraded-secrets-monitor] healthy", result.stdout)
         self.assertIn("[degraded-secrets-monitor] recovered", result.stdout)
         self.assertIsNone(state["last_alert_signature"])
+
+    def test_failed_alarm_delivery_does_not_advance_dedup_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            auth_file = base / "auth.json"
+            log_file = base / "gateway.error.log"
+            state_file = base / "state.json"
+            log_file.write_text("")
+            _write_auth(
+                auth_file,
+                {"codex": [{"id": "pool-1", "last_status": "exhausted"}]},
+            )
+            argv = [
+                str(SOURCE),
+                "--alert",
+                "--log-file",
+                str(log_file),
+                "--auth-file",
+                str(auth_file),
+                "--now",
+                self.NOW,
+            ]
+            with mock.patch.object(monitor, "STATE_PATH", str(state_file)):
+                with mock.patch.object(monitor, "_send_slack", return_value=False):
+                    with mock.patch.object(
+                        monitor, "_post_clickup_comment", return_value=True
+                    ):
+                        with mock.patch.object(sys, "argv", argv):
+                            with self.assertRaises(SystemExit) as raised:
+                                monitor.main()
+            state_exists = state_file.exists()
+
+        self.assertEqual(raised.exception.code, 1)
+        self.assertFalse(state_exists)
 
 
 class DegradedSecretsMonitorLaunchdContractTests(unittest.TestCase):

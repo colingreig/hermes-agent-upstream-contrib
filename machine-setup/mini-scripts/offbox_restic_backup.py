@@ -220,6 +220,7 @@ def backup(env: dict[str, str], *, host: str) -> None:
         env=env,
         check=True,
     )
+    log("backup and retention complete")
 
 
 def snapshots(env: dict[str, str]) -> list[dict[str, object]]:
