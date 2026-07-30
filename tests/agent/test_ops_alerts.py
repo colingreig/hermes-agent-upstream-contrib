@@ -8,6 +8,8 @@ monitor's established convention).
 
 from __future__ import annotations
 
+import json
+import subprocess
 from unittest.mock import patch
 
 import agent.ops_alerts as ops_alerts
@@ -72,7 +74,9 @@ class TestSendSlackShape:
         assert cmd[1:4] == ["send", "--to", ops_alerts.OPS_ALERT_SLACK_TARGET]
         assert ops_alerts.OPS_ALERT_SLACK_MENTION in cmd[4]
         assert "vision is dead" in cmd[4]
+        assert "--json" in cmd
         assert kwargs.get("check") is True
+        assert kwargs.get("text") is True
 
     def test_subprocess_failure_returns_false_not_raise(self, monkeypatch):
         monkeypatch.delenv("DRY_RUN", raising=False)
@@ -86,3 +90,56 @@ class TestSendSlackShape:
         # channel/primitive for this alert.
         assert ops_alerts.OPS_ALERT_SLACK_TARGET == "slack:D0BA2PM9CFM"
         assert ops_alerts.OPS_ALERT_SLACK_MENTION == "<@UN4CQ1EGG>"
+
+
+class TestOpsAlertReceipts:
+    def test_successful_send_writes_non_secret_delivery_receipt(self, monkeypatch, tmp_path):
+        receipt_path = tmp_path / "ops-alert-receipts.jsonl"
+        monkeypatch.setattr(ops_alerts, "OPS_ALERT_RECEIPTS_LEDGER", str(receipt_path))
+        monkeypatch.delenv("DRY_RUN", raising=False)
+        completed = subprocess.CompletedProcess(
+            args=["hermes"],
+            returncode=0,
+            stdout=json.dumps({
+                "success": True,
+                "platform": "slack",
+                "chat_id": "D123",
+                "message_id": "1785449999.000100",
+            }),
+            stderr="",
+        )
+        with (
+            patch("agent.ops_alerts.subprocess.run", return_value=completed),
+            patch("agent.ops_alerts.shutil.which", return_value="/usr/local/bin/hermes"),
+        ):
+            ok = ops_alerts._send_slack("fallback fired", signature="fallback:test")
+
+        assert ok is True
+        entry = json.loads(receipt_path.read_text(encoding="utf-8").strip())
+        assert entry["signature"] == "fallback:test"
+        assert entry["success"] is True
+        assert entry["dry_run"] is False
+        assert entry["returncode"] == 0
+        assert entry["send_payload"]["platform"] == "slack"
+        assert entry["send_payload"]["message_id"] == "1785449999.000100"
+        assert "fallback fired" not in json.dumps(entry)
+
+    def test_failed_send_receipt_redacts_stderr(self, monkeypatch, tmp_path):
+        receipt_path = tmp_path / "ops-alert-receipts.jsonl"
+        monkeypatch.setattr(ops_alerts, "OPS_ALERT_RECEIPTS_LEDGER", str(receipt_path))
+        monkeypatch.delenv("DRY_RUN", raising=False)
+        error = subprocess.CalledProcessError(
+            1,
+            ["hermes"],
+            output="",
+            stderr="Authorization: Bearer sk-secret-token\napi_key=abc123",
+        )
+        with patch("agent.ops_alerts.subprocess.run", side_effect=error):
+            ok = ops_alerts._send_slack("fallback fired", signature="fallback:test")
+
+        assert ok is False
+        entry = json.loads(receipt_path.read_text(encoding="utf-8").strip())
+        assert entry["success"] is False
+        assert entry["returncode"] == 1
+        assert "sk-secret-token" not in entry["stderr_tail"]
+        assert "abc123" not in entry["stderr_tail"]
