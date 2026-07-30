@@ -21,6 +21,7 @@ state.
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import os
 import subprocess
@@ -34,9 +35,12 @@ from typing import Any
 CI_HEALTH_PATH = Path(__file__).resolve().parent / "pr_pipeline" / "ci_health_watch.py"
 PR_STALENESS_PATH = Path(__file__).resolve().parent / "pr_pipeline" / "pr_staleness_alert.py"
 DAILY_STATE_PATH = Path.home() / ".hermes/state/ci-health-pr-staleness-last-run.json"
+FLEET_PROBE_RECEIPT = Path.home() / ".hermes/state/fleet-outcome-probe.json"
+FLEET_WATCHDOG_STATE = Path.home() / ".hermes/state/ci-health-fleet-probe-watchdog.json"
 HERMES_BIN = Path.home() / ".local/bin/hermes"
 SLACK_TARGET = "slack:hermes"
 DAILY_INTERVAL = timedelta(hours=24)
+FLEET_PROBE_MAX_AGE = timedelta(minutes=15)
 
 
 def _now() -> datetime:
@@ -110,6 +114,15 @@ def _run_ci_health() -> subprocess.CompletedProcess[str]:
     return result
 
 
+def _send_slack(message: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [str(HERMES_BIN), "send", "--to", SLACK_TARGET, message],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+
 def _run_daily_staleness() -> None:
     if not PR_STALENESS_PATH.is_file():
         print(
@@ -142,12 +155,7 @@ def _run_daily_staleness() -> None:
     if not message or message.lstrip().startswith("✅"):
         return
     try:
-        delivery = subprocess.run(
-            [str(HERMES_BIN), "send", "--to", SLACK_TARGET, message],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
+        delivery = _send_slack(message)
     except (OSError, subprocess.SubprocessError) as exc:
         print(f"[ci-health-watch-cron] Slack delivery failed: {exc}", file=sys.stderr)
         return
@@ -160,6 +168,110 @@ def _run_daily_staleness() -> None:
         )
 
 
+def _fleet_probe_problem(*, now: datetime | None = None) -> tuple[str, str] | None:
+    current = (now or _now()).astimezone(timezone.utc)
+    try:
+        payload = json.loads(FLEET_PROBE_RECEIPT.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return (
+            "receipt-unreadable",
+            f"fleet outcome probe receipt unreadable at {FLEET_PROBE_RECEIPT}: {exc}",
+        )
+    if not isinstance(payload, dict) or payload.get("mode") != "production":
+        return ("receipt-mode-invalid", "fleet outcome probe receipt is not a production receipt")
+    checked_at = _parse_time(payload.get("checked_at") if isinstance(payload, dict) else None)
+    if checked_at is None:
+        return (
+            "receipt-timestamp-invalid",
+            f"fleet outcome probe receipt has no valid checked_at: {FLEET_PROBE_RECEIPT}",
+        )
+    age = current - checked_at
+    if age < -timedelta(minutes=1):
+        return (
+            "receipt-timestamp-future",
+            f"fleet outcome probe heartbeat is timestamped "
+            f"{int(-age.total_seconds())}s in the future",
+        )
+    if age > FLEET_PROBE_MAX_AGE:
+        return (
+            "receipt-stale",
+            f"fleet outcome probe heartbeat is stale ({int(age.total_seconds())}s; "
+            f"limit {int(FLEET_PROBE_MAX_AGE.total_seconds())}s)",
+        )
+    alarm = payload.get("alarm")
+    if not isinstance(alarm, dict):
+        return ("alarm-receipt-invalid", "fleet outcome probe receipt has no alarm result")
+    action = str(alarm.get("action") or "")
+    if action in {
+        "delivery-failed",
+        "recovery-delivery-failed",
+        "dry-run",
+        "recovery-dry-run",
+    }:
+        return (
+            "alarm-delivery-unconfirmed",
+            f"fleet outcome probe alarm delivery is unconfirmed (action={action})",
+        )
+    return None
+
+
+def _route_fleet_probe_watchdog(problem: tuple[str, str] | None) -> None:
+    state = _load_state(FLEET_WATCHDOG_STATE)
+    previous = str(state.get("delivered_signature") or "")
+    if problem is None:
+        if not state.get("active") or not previous:
+            return
+        message = (
+            "✅ Hermes fleet outcome probe heartbeat recovered\n"
+            f"Previous signature: {previous[:12]}"
+        )
+        try:
+            delivery = _send_slack(message)
+        except (OSError, subprocess.SubprocessError) as exc:
+            print(f"[ci-health-watch-cron] fleet watchdog recovery delivery failed: {exc}", file=sys.stderr)
+            return
+        if delivery.returncode != 0:
+            print(
+                "[ci-health-watch-cron] fleet watchdog recovery delivery exited "
+                f"{delivery.returncode}: {delivery.stderr.strip()}",
+                file=sys.stderr,
+            )
+            return
+        state.update({"active": False, "recovered_at": _now().isoformat()})
+        _atomic_json(FLEET_WATCHDOG_STATE, state)
+        return
+
+    problem_code, problem_detail = problem
+    signature = hashlib.sha256(problem_code.encode("utf-8")).hexdigest()
+    if state.get("active") and previous == signature:
+        return
+    message = (
+        "🚨 Hermes fleet outcome probe stopped checking in\n"
+        f"{problem_detail}\n"
+        "Next: inspect the fleet-outcome-probe LaunchAgent and its launchd error log."
+    )
+    try:
+        delivery = _send_slack(message)
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"[ci-health-watch-cron] fleet watchdog delivery failed: {exc}", file=sys.stderr)
+        return
+    if delivery.returncode != 0:
+        print(
+            f"[ci-health-watch-cron] fleet watchdog delivery exited {delivery.returncode}: "
+            f"{delivery.stderr.strip()}",
+            file=sys.stderr,
+        )
+        return
+    state.update(
+        {
+            "active": True,
+            "delivered_signature": signature,
+            "last_alert_at": _now().isoformat(),
+        }
+    )
+    _atomic_json(FLEET_WATCHDOG_STATE, state)
+
+
 def main() -> int:
     ci_result = _run_ci_health()
     try:
@@ -167,6 +279,10 @@ def main() -> int:
             _run_daily_staleness()
     except OSError as exc:
         print(f"[ci-health-watch-cron] daily gate failed: {exc}", file=sys.stderr)
+    try:
+        _route_fleet_probe_watchdog(_fleet_probe_problem())
+    except OSError as exc:
+        print(f"[ci-health-watch-cron] fleet watchdog state failed: {exc}", file=sys.stderr)
     return ci_result.returncode
 
 

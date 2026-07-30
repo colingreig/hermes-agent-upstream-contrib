@@ -367,17 +367,49 @@ def main():
                 )
             msg = "\n".join(msg_lines)
             slack_msg = "\n".join([SLACK_MENTION, *msg_lines])
-            slack_ok = _send_slack(slack_msg)
-            cu_ok = _post_clickup_comment(ESCALATION_TASK_ID, msg)
-            state["last_alert_signature"] = sig
-            state["last_alert_at"] = now.isoformat()
-            _save_state(state)
-            print(f"[degraded-secrets-monitor] alerted (slack={slack_ok} clickup={cu_ok})")
+            pending_sig = _normalize_signature(state.get("pending_alert_signature"))
+            deliveries = (
+                dict(state.get("pending_deliveries") or {})
+                if pending_sig == sig
+                else {}
+            )
+            slack_ok = bool(deliveries.get("slack"))
+            cu_ok = bool(deliveries.get("clickup"))
+            if not slack_ok:
+                slack_ok = _send_slack(slack_msg)
+            if not cu_ok:
+                cu_ok = _post_clickup_comment(ESCALATION_TASK_ID, msg)
+            # Persist success independently per destination. If Slack succeeds
+            # while ClickUp is down, the next tick retries only ClickUp instead
+            # of paging Slack every five minutes.
+            deliveries.update({"slack": slack_ok, "clickup": cu_ok})
+            if slack_ok and cu_ok:
+                state["last_alert_signature"] = sig
+                state["last_alert_at"] = now.isoformat()
+                state.pop("pending_alert_signature", None)
+                state.pop("pending_deliveries", None)
+                _save_state(state)
+                print(f"[degraded-secrets-monitor] alerted (slack={slack_ok} clickup={cu_ok})")
+            else:
+                state["pending_alert_signature"] = sig
+                state["pending_deliveries"] = deliveries
+                _save_state(state)
+                print(
+                    f"[degraded-secrets-monitor] alert delivery incomplete "
+                    f"(slack={slack_ok} clickup={cu_ok}); dedupe state NOT advanced",
+                    file=sys.stderr,
+                )
         elif not degraded and last_sig is not None:
             state["last_alert_signature"] = None
+            state.pop("pending_alert_signature", None)
+            state.pop("pending_deliveries", None)
             state["recovered_at"] = now.isoformat()
             _save_state(state)
             print("[degraded-secrets-monitor] recovered — dedup state cleared")
+        elif not degraded and state.get("pending_alert_signature") is not None:
+            state.pop("pending_alert_signature", None)
+            state.pop("pending_deliveries", None)
+            _save_state(state)
 
     sys.exit(1 if degraded else 0)
 

@@ -119,6 +119,20 @@ def test_old_live_session_is_never_reaped(monkeypatch):
     assert reaped == []
 
 
+def test_snapshot_failure_is_nonzero_not_false_green(monkeypatch):
+    monkeypatch.setattr(reaper, "_ps_snapshot", lambda: None)
+    assert reaper.main([]) == 2
+
+
+def test_per_process_reap_failure_is_nonzero(monkeypatch):
+    snapshot = {
+        950: {"ppid": 1, "etime_seconds": 999999, "command": HERMES_MCP_SERVE_CMD},
+    }
+    monkeypatch.setattr(reaper, "_ps_snapshot", lambda: snapshot)
+    monkeypatch.setattr(reaper, "_reap", lambda *_args: False)
+    assert reaper.main(["--min-age-minutes", "45"]) == 1
+
+
 def test_reap_sends_sigterm_then_confirms_exit(monkeypatch):
     calls = []
 

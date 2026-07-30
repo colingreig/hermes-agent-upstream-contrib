@@ -93,7 +93,7 @@ class PipelineDeploymentTests(unittest.TestCase):
             "name": "ci-health-watch",
             "schedule": {"kind": "cron", "expr": "17 */2 * * *", "display": "17 */2 * * *"},
             "schedule_display": "17 */2 * * *",
-            "script": "ci_health_watch.py",
+            "script": "ci-health-watch-cron.py",
             "no_agent": True,
             "enabled": True,
             "state": "scheduled",
@@ -219,7 +219,7 @@ class PipelineDeploymentTests(unittest.TestCase):
         self.assertEqual(managed[0]["id"], "stable-ci-health-id")
         self.assertEqual(managed[0]["schedule"], {"kind": "cron", "expr": "*/5 * * * *", "display": "*/5 * * * *"})
         self.assertEqual(managed[0]["schedule_display"], "*/5 * * * *")
-        self.assertEqual(managed[0]["script"], "ci_health_watch.py")
+        self.assertEqual(managed[0]["script"], "ci-health-watch-cron.py")
         self.assertTrue(managed[0]["no_agent"])
         self.assertTrue(managed[0]["enabled"])
         self.assertEqual(managed[0]["state"], "scheduled")
@@ -448,7 +448,7 @@ class PipelineDeploymentTests(unittest.TestCase):
         self.assertEqual(jobs[1]["id"], "stable-ci-health-id")
         self.assertEqual(jobs[1]["schedule"], {"kind": "cron", "expr": "*/5 * * * *", "display": "*/5 * * * *"})
         self.assertEqual(jobs[1]["schedule_display"], "*/5 * * * *")
-        self.assertEqual(jobs[1]["script"], "ci_health_watch.py")
+        self.assertEqual(jobs[1]["script"], "ci-health-watch-cron.py")
         self.assertTrue(jobs[1]["no_agent"])
         self.assertTrue(jobs[1]["enabled"])
         self.assertEqual(jobs[1]["state"], "scheduled")

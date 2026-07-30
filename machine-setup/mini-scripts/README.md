@@ -506,7 +506,38 @@ proof packet:
   `_scan_cron_errors` used to catch any `jobs.json` read/parse failure and
   return `[]` — indistinguishable from "read fine, no errors." An unreadable
   `jobs.json` now produces its own distinct `monitor_error` alert instead of
-  silently reporting all-clear.
+  silently reporting all-clear. Task `86e2jbbhx` also closes the delivery
+  loop: the script now sends its own combined alert through
+  `hermes send --to slack:hermes` and persists offsets/cooldowns only after a
+  confirmed send. It no longer depends on the six-hour LLM digest noticing
+  stdout, and a Slack outage cannot advance dedupe into silence.
+- `fleet_outcome_probe.py` + `fleet_outcome_contracts.json` (task
+  `86e2jbbhx`) — independent zero-LLM coverage plane for all 16 rebuilt cron
+  jobs and every Hermes/Ignite LaunchAgent. It requires a fresh semantic
+  output, endpoint, or durable receipt in addition to scheduler/launchd state;
+  fails closed on uncovered enabled jobs and monitored plists; and sends
+  delivery-aware alarms directly through `hermes send --to slack:hermes`.
+  LaunchAgent
+  `launchd/com.colingreig.hermes.fleet-outcome-probe.plist` runs it every five
+  minutes. `ci-health-watch-cron.py` cross-watches the probe's receipt, while
+  the probe verifies CI health's fresh parsed state (stable lifecycle, VM
+  available, no resource drift), so neither monitor depends on its own
+  scheduling plane. The full inventory and outcome mapping is in
+  `../fleet-config/MONITOR_COVERAGE.md`.
+
+  Deployment is governed by the content-addressed
+  `fleet_outcome_manifest.json` and transactional
+  `reconcile_fleet_outcomes.py`. The normal Mini release cut invokes it
+  automatically. For an explicit verification or repair from an exact release:
+
+  ```bash
+  ~/.hermes/runtime-current/venv/bin/python \
+    ~/.hermes/runtime-current/machine-setup/mini-scripts/reconcile_fleet_outcomes.py \
+    verify \
+    --source-root ~/.hermes/runtime-current/machine-setup/mini-scripts \
+    --manifest ~/.hermes/runtime-current/machine-setup/mini-scripts/fleet_outcome_manifest.json \
+    --reload
+  ```
 - `hermes_report_build.py` fix (2026-07-26): the status-email spend section
   rendered a served-ledger read failure the same as a genuine $0.00 day —
   `spend['total_cost']` stayed `None` on error but every formatter still ran
@@ -530,6 +561,9 @@ proof packet:
   `mini-release-cut.sh` (previously never pruned, so old release dirs
   accumulated unbounded — `mini-release-cut.sh` already had `--prune` wired
   and tested, it just wasn't being invoked).
+  Task `86e2jbbhx` removes its false-green exit: a failed `ps` snapshot now
+  exits 2, and any selected process that cannot be reaped makes the sweep exit
+  1. An empty readable snapshot and a clean no-op sweep remain successful.
 - `wt-new` (ClickUp 86e2evnx0) — Python3 CLI that creates a per-task worktree
   off the shared bare mirror (`git worktree add`), resolving the mirror's
   default ref from `refs/remotes/origin/HEAD` when present, falling back to

@@ -1,0 +1,87 @@
+{
+  "schema_version": 1,
+  "bundle": "hermes-mini-fleet-outcomes",
+  "source_task": "86e2jbbhx",
+  "description": "Content-addressed scripts, contracts, plists, and cron wiring for the Mini fleet outcome alarm plane.",
+  "files": [
+    {
+      "source": "reconcile_fleet_outcomes.py",
+      "destination_root": "scripts",
+      "destination": "reconcile_fleet_outcomes.py",
+      "mode": "0755",
+      "sha256": "3188f0e70d2349e24f1d4066ccf55dcfe40b68a52c5c3b7ff36da787de77350b"
+    },
+    {
+      "source": "ci-health-watch-cron.py",
+      "destination_root": "scripts",
+      "destination": "ci-health-watch-cron.py",
+      "mode": "0755",
+      "sha256": "e1d1e9a1ac709f87074099180dd858c3fe64cff1b2d0cb347cbcf86ea60d127a"
+    },
+    {
+      "source": "fleet_outcome_probe.py",
+      "destination_root": "scripts",
+      "destination": "fleet_outcome_probe.py",
+      "mode": "0755",
+      "sha256": "2dad36422a50082895b2618792519b976a1734ae05608970ce27e5b0b2a139d0"
+    },
+    {
+      "source": "fleet_outcome_contracts.json",
+      "destination_root": "scripts",
+      "destination": "fleet_outcome_contracts.json",
+      "mode": "0644",
+      "sha256": "44795d4f84cd4c809c380cea5815e0653ce59511ca9efe4e755e66741391083b"
+    },
+    {
+      "source": "hermes_usage_alert.py",
+      "destination_root": "scripts",
+      "destination": "hermes_usage_alert.py",
+      "mode": "0755",
+      "sha256": "f4adbeb2ba0263dbeec52e6a2e146a6e00a5edf8fdd5fad3f3bb84f1de8ccf42"
+    },
+    {
+      "source": "degraded_secrets_monitor.py",
+      "destination_root": "scripts",
+      "destination": "degraded_secrets_monitor.py",
+      "mode": "0755",
+      "sha256": "87edb5c4394a639eb15175c49e02bde10e0dd3e6b345f041f7e60ced057475e2"
+    },
+    {
+      "source": "mcp_serve_reaper.py",
+      "destination_root": "scripts",
+      "destination": "mcp_serve_reaper.py",
+      "mode": "0755",
+      "sha256": "cec4324853e3149a90f1c69aadb4035bb834caffd931010a24b20e3b7bf2ca67"
+    },
+    {
+      "source": "offbox_restic_backup.py",
+      "destination_root": "scripts",
+      "destination": "offbox_restic_backup.py",
+      "mode": "0755",
+      "sha256": "d7fe1526434b4dadd297d3419aabb3570626c18bac1befe1e95acc9207ba0778"
+    },
+    {
+      "source": "launchd/com.colingreig.hermes.fleet-outcome-probe.plist",
+      "destination_root": "launch_agents",
+      "destination": "com.colingreig.hermes.fleet-outcome-probe.plist",
+      "mode": "0644",
+      "sha256": "449b77c0ac184e208103f362600dd0ae128f5eaeb00bbbcb603d9fcd1d2b7799"
+    },
+    {
+      "source": "launchd/com.colingreig.hermes.usage-alert.plist",
+      "destination_root": "launch_agents",
+      "destination": "com.colingreig.hermes.usage-alert.plist",
+      "mode": "0644",
+      "sha256": "d79dd91da4de834242de7be3bff3d07800b049b9da0a641a115e5bcf75e1de4b"
+    }
+  ],
+  "cron_updates": [
+    {
+      "id": "e835c614cfb2",
+      "name": "ci-health-watch",
+      "fields": {
+        "script": "ci-health-watch-cron.py"
+      }
+    }
+  ]
+}

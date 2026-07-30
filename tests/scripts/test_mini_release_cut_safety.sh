@@ -512,8 +512,12 @@ case "${1:-}" in
       machine-setup/mini-scripts/clickup_workspace_refresh.py|\
       machine-setup/mini-scripts/reconcile_launchd_environment.py|\
       machine-setup/mini-scripts/reconcile_marketplace_skills.py|\
-      machine-setup/mini-scripts/reconcile_pr_pipeline.py)
+      machine-setup/mini-scripts/reconcile_pr_pipeline.py|\
+      machine-setup/mini-scripts/reconcile_fleet_outcomes.py)
         printf '100755 blob %s\t%s\n' "$DRY_TARGET_BLOB" "$target_path"
+        ;;
+      machine-setup/mini-scripts/fleet_outcome_manifest.json)
+        printf '100644 blob %s\t%s\n' "$DRY_TARGET_BLOB" "$target_path"
         ;;
       *) exit 3 ;;
     esac
@@ -562,6 +566,10 @@ grep -Fq "ls-tree $DRY_TARGET_SHA -- $VENDORED_SKILLS_RECONCILER_REL" "$DRY_GIT_
   || fail "dry cut did not validate marketplace reconciler metadata from the target tree"
 grep -Fq "ls-tree $DRY_TARGET_SHA -- $VENDORED_PR_PIPELINE_RECONCILER_REL" "$DRY_GIT_LOG" \
   || fail "dry cut did not validate PR-pipeline reconciler metadata from the target tree"
+grep -Fq "ls-tree $DRY_TARGET_SHA -- $VENDORED_FLEET_OUTCOMES_RECONCILER_REL" "$DRY_GIT_LOG" \
+  || fail "dry cut did not validate fleet-outcome reconciler metadata from the target tree"
+grep -Fq "ls-tree $DRY_TARGET_SHA -- $VENDORED_FLEET_OUTCOMES_MANIFEST_REL" "$DRY_GIT_LOG" \
+  || fail "dry cut did not validate fleet-outcome manifest metadata from the target tree"
 if grep -Eq ' (show|cat-file) ' "$DRY_GIT_LOG"; then
   fail "dry cut materialized a target blob"
 fi
