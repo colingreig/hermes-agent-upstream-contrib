@@ -53,6 +53,12 @@ fallback_providers:
 # whatever delegation block is live, it does not leave it untouched.
 delegation: {}
 
+# Persistent equivalent of the BROWSER_CDP_URL live override. Chrome stays
+# loopback-only on the mini; machine-setup/mini-scripts/chrome_cdp_launch.sh
+# exposes this endpoint to other tailnet hosts through Tailscale Serve.
+browser:
+  cdp_url: http://127.0.0.1:9222
+
 kanban:
   dispatch_in_gateway: true
   dispatch_interval_seconds: 60
