@@ -17,7 +17,11 @@ of ``read_note("clickup-workspace-map")``. The CLI read equivalent is
 from __future__ import annotations
 
 import argparse
+import contextvars
 import datetime as dt
+import email.utils
+import fcntl
+import hashlib
 import importlib.util
 import json
 import os
@@ -53,6 +57,9 @@ REFRESH_TTL_SECONDS = 6 * 60 * 60
 TASK_LOOKBACK_DAYS = 7
 TASK_PAGE_LIMIT = 10
 THIS_SCRIPT_NAME = "clickup_workspace_refresh.py"
+RATE_LIMIT_MAX_RETRIES = 3
+RATE_LIMIT_FALLBACK_BACKOFF_SECONDS = 15
+FIELD_DISCOVERY_MIN_INTERVAL_SECONDS = 0.25
 
 # 86e1vw79j: this note documents a specific historical incident (the
 # 2026-07-09 out-of-band rewrite that upgraded the output schema and hand-ran
@@ -80,8 +87,34 @@ DEFAULT_BRAIN_NOTE_PATH = Path.home() / "brain" / "clickup-workspace-map.md"
 
 _LIST_DETAIL_CACHE: dict[str, dict[str, Any]] = {}
 _LIST_FIELDS_CACHE: dict[str, list[dict[str, Any]]] = {}
+_LAST_FIELD_DISCOVERY_AT: float | None = None
 _HELPER_MODULE: Any | None = None
 _HELPER_MODULE_ATTEMPTED = False
+
+
+@dataclass
+class RefreshEvidence:
+    """Secret-free evidence for one refresh or cache-reuse attempt."""
+
+    started_at: str
+    request_count: int = 0
+    rate_limit_count: int = 0
+    retry_delays_seconds: list[float] | None = None
+    rate_limit_guidance: list[dict[str, str]] | None = None
+    cache_present: bool = False
+    cache_used: bool = False
+    cache_retained: bool = False
+
+    def __post_init__(self) -> None:
+        if self.retry_delays_seconds is None:
+            self.retry_delays_seconds = []
+        if self.rate_limit_guidance is None:
+            self.rate_limit_guidance = []
+
+
+_ACTIVE_REFRESH_EVIDENCE: contextvars.ContextVar[RefreshEvidence | None] = contextvars.ContextVar(
+    "clickup_workspace_refresh_evidence", default=None
+)
 
 _CLIENT_ALIAS_STOPWORDS = {
     "active",
@@ -126,6 +159,10 @@ class ClickUpApiError(RuntimeError):
 
 class WorkspaceMapNoteError(RuntimeError):
     """The canonical workspace-map brain note could not be read or written."""
+
+
+class WorkspaceMapValidationError(RuntimeError):
+    """A refresh response was incomplete and must not be published."""
 
 
 def _now_utc() -> dt.datetime:
@@ -208,7 +245,19 @@ def _resolve_clickup_token() -> str:
     return token
 
 
-def _fallback_req(method: str, path: str, body: dict[str, Any] | None = None) -> tuple[int, Any]:
+def _headers_to_dict(headers: Any) -> dict[str, str]:
+    """Normalize HTTP headers while keeping helper-backed requests compatible."""
+    if headers is None:
+        return {}
+    try:
+        return {str(key).lower(): str(value) for key, value in headers.items()}
+    except Exception:
+        return {}
+
+
+def _fallback_req(
+    method: str, path: str, body: dict[str, Any] | None = None
+) -> tuple[int, Any, dict[str, str]]:
     token = _resolve_clickup_token()
     if not token:
         print(
@@ -226,28 +275,94 @@ def _fallback_req(method: str, path: str, body: dict[str, Any] | None = None) ->
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             raw = resp.read().decode("utf-8", "replace")
-            return resp.status, (json.loads(raw) if raw.strip() else {})
+            return resp.status, (json.loads(raw) if raw.strip() else {}), _headers_to_dict(resp.headers)
     except urllib.error.HTTPError as err:
-        return err.code, None
+        return err.code, None, _headers_to_dict(err.headers)
     except Exception as err:  # pragma: no cover - exercised as exit path
         print(f"request error: {err!r}", file=sys.stderr)
-        return 0, None
+        return 0, None, {}
 
 
-def _req(method: str, path: str, body: dict[str, Any] | None = None) -> tuple[int, Any]:
+def _req(method: str, path: str, body: dict[str, Any] | None = None) -> Any:
     helper = _load_clickup_helper()
     if helper is not None and hasattr(helper, "_req"):
         return helper._req(method, path, body)
     return _fallback_req(method, path, body)
 
 
+def _split_response(response: Any) -> tuple[int, Any, dict[str, str]]:
+    """Accept legacy two-tuples from the deployed helper plus header-aware ones."""
+    if not isinstance(response, tuple) or len(response) not in (2, 3):
+        raise ClickUpApiError(status=0, path="(request)", message="invalid response tuple")
+    status, data = response[:2]
+    headers = response[2] if len(response) == 3 else {}
+    return int(status or 0), data, _headers_to_dict(headers)
+
+
+def _header_delay_seconds(headers: dict[str, str]) -> float | None:
+    """Return ClickUp's Retry-After/reset guidance when it is usable."""
+    retry_after = headers.get("retry-after")
+    if retry_after:
+        try:
+            return max(0.0, float(retry_after))
+        except ValueError:
+            try:
+                retry_at = email.utils.parsedate_to_datetime(retry_after)
+                if retry_at.tzinfo is None:
+                    retry_at = retry_at.replace(tzinfo=dt.timezone.utc)
+                return max(0.0, retry_at.timestamp() - time.time())
+            except (TypeError, ValueError, IndexError, OverflowError):
+                pass
+
+    for name in ("x-ratelimit-reset", "x-rate-limit-reset", "ratelimit-reset"):
+        raw = headers.get(name)
+        if raw is None:
+            continue
+        try:
+            reset = float(raw)
+        except ValueError:
+            continue
+        # ClickUp deployments use either an epoch reset timestamp or a
+        # remaining-seconds value. Treat clearly future epoch values as dates.
+        return max(0.0, reset - time.time()) if reset > time.time() else max(0.0, reset)
+    return None
+
+
+def _rate_limit_delay_seconds(headers: dict[str, str], attempt: int) -> float:
+    suggested = _header_delay_seconds(headers)
+    fallback = RATE_LIMIT_FALLBACK_BACKOFF_SECONDS * (2**attempt)
+    delay = fallback if suggested is None else suggested
+    # The attempt count is bounded, but server guidance is not truncated: a
+    # 429 with Retry-After: 120 must never be retried at 60 seconds.
+    return max(1.0, delay)
+
+
+def _rate_limit_guidance(headers: dict[str, str]) -> dict[str, str]:
+    """Keep only retry metadata; headers can otherwise carry sensitive data."""
+    return {
+        key: headers[key]
+        for key in ("retry-after", "x-ratelimit-reset", "x-rate-limit-reset", "ratelimit-reset")
+        if key in headers
+    }
+
+
 def _get(path: str) -> dict[str, Any]:
-    max_retries = 3
-    for attempt in range(max_retries + 1):
-        status, data = _req("GET", path)
-        if status == 429 and attempt < max_retries:
-            delay = 15 * (2 ** attempt)  # 15, 30, 60 s — long enough to outlast ClickUp's 60s rate-limit window
-            print(f"WARNING: ClickUp 429 on GET {path}, retry {attempt+1}/{max_retries} in {delay}s", file=sys.stderr)
+    for attempt in range(RATE_LIMIT_MAX_RETRIES + 1):
+        status, data, headers = _split_response(_req("GET", path))
+        evidence = _ACTIVE_REFRESH_EVIDENCE.get()
+        if evidence is not None:
+            evidence.request_count += 1
+        if status == 429 and attempt < RATE_LIMIT_MAX_RETRIES:
+            delay = _rate_limit_delay_seconds(headers, attempt)
+            if evidence is not None:
+                evidence.rate_limit_count += 1
+                evidence.retry_delays_seconds.append(delay)
+                evidence.rate_limit_guidance.append(_rate_limit_guidance(headers))
+            print(
+                f"WARNING: ClickUp 429 on GET {path}, retry "
+                f"{attempt + 1}/{RATE_LIMIT_MAX_RETRIES} in {delay:g}s",
+                file=sys.stderr,
+            )
             time.sleep(delay)
             continue
         break
@@ -263,7 +378,13 @@ def _get(path: str) -> dict[str, Any]:
         raise SystemExit(4)
     if status >= 400 or data is None:
         if status == 429:
-            _log_failure(f"rate_limit_exhausted endpoint=GET {path} retries={max_retries}")
+            evidence = _ACTIVE_REFRESH_EVIDENCE.get()
+            if evidence is not None:
+                evidence.rate_limit_count += 1
+                evidence.rate_limit_guidance.append(_rate_limit_guidance(headers))
+            _log_failure(
+                f"rate_limit_exhausted endpoint=GET {path} retries={RATE_LIMIT_MAX_RETRIES}"
+            )
         raise ClickUpApiError(status=status, path=path, message="request failed")
     if not isinstance(data, dict):
         raise ClickUpApiError(status=status, path=path, message="non-object response")
@@ -328,8 +449,14 @@ def fetch_list_detail(list_id: str) -> dict[str, Any]:
 
 
 def fetch_list_fields(list_id: str) -> list[dict[str, Any]]:
+    global _LAST_FIELD_DISCOVERY_AT
     if list_id not in _LIST_FIELDS_CACHE:
+        if _LAST_FIELD_DISCOVERY_AT is not None:
+            delay = FIELD_DISCOVERY_MIN_INTERVAL_SECONDS - (time.monotonic() - _LAST_FIELD_DISCOVERY_AT)
+            if delay > 0:
+                time.sleep(delay)
         _LIST_FIELDS_CACHE[list_id] = _get(f"/list/{list_id}/field").get("fields", [])
+        _LAST_FIELD_DISCOVERY_AT = time.monotonic()
     return _LIST_FIELDS_CACHE[list_id]
 
 
@@ -547,8 +674,10 @@ def build_clients_aliases(
 
 
 def build_workspace_map(team_id: str) -> dict[str, Any]:
+    global _LAST_FIELD_DISCOVERY_AT
     _LIST_DETAIL_CACHE.clear()
     _LIST_FIELDS_CACHE.clear()
+    _LAST_FIELD_DISCOVERY_AT = None
 
     spaces_raw = sorted(fetch_spaces(team_id), key=lambda item: (item.get("name", ""), str(item.get("id", ""))))
     task_sample = fetch_recent_task_tags(team_id)
@@ -934,14 +1063,190 @@ def cache_is_fresh(
     return now_ms - generated_at <= max_age_seconds * 1000
 
 
-def _write_json(path: Path, workspace_map: dict[str, Any]) -> None:
+def _atomic_write_text(path: Path, body: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(workspace_map, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    temp_path: Path | None = None
+    try:
+        fd, raw_temp_path = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+        temp_path = Path(raw_temp_path)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(body)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(temp_path, path)
+        temp_path = None
+    finally:
+        if temp_path is not None:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def _write_json(path: Path, workspace_map: dict[str, Any]) -> None:
+    _atomic_write_text(path, json.dumps(workspace_map, indent=2, sort_keys=True) + "\n")
 
 
 def _write_markdown(path: Path, body: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(body, encoding="utf-8")
+    _atomic_write_text(path, body)
+
+
+def _receipt_path_for(output_path: Path) -> Path:
+    return output_path.with_name(f"{output_path.stem}.receipt.json")
+
+
+def _workspace_map_bytes(workspace_map: dict[str, Any]) -> bytes:
+    return (json.dumps(workspace_map, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+
+def _validate_workspace_map(workspace_map: dict[str, Any], team_id: str) -> None:
+    """Refuse incomplete API output before replacing the last known-good map."""
+    # The topology itself is the publish boundary. Supplemental observations
+    # were added after the original schema and remain backward-compatible.
+    required_lists = ("spaces", "folders", "lists")
+    if not isinstance(workspace_map, dict):
+        raise WorkspaceMapValidationError("workspace map is not an object")
+    if workspace_map.get("schema_version") != SCHEMA_VERSION:
+        raise WorkspaceMapValidationError("workspace map has an unexpected schema version")
+    if workspace_map.get("team_id") != team_id:
+        raise WorkspaceMapValidationError("workspace map team does not match refresh request")
+    if not isinstance(workspace_map.get("generated_at"), int):
+        raise WorkspaceMapValidationError("workspace map is missing generated_at")
+    for key in required_lists:
+        if not isinstance(workspace_map.get(key), list):
+            raise WorkspaceMapValidationError(f"workspace map is missing complete {key}")
+    if not isinstance(workspace_map.get("task_tags"), dict):
+        raise WorkspaceMapValidationError("workspace map is missing task tag evidence")
+    if not isinstance(workspace_map.get("clients_aliases"), dict):
+        raise WorkspaceMapValidationError("workspace map is missing client aliases")
+
+
+def _evidence_fields(evidence: RefreshEvidence) -> dict[str, Any]:
+    return {
+        "request_count": evidence.request_count,
+        "cache_present": evidence.cache_present,
+        "cache_used": evidence.cache_used,
+        "cache_retained": evidence.cache_retained,
+        "rate_limit": {
+            "count": evidence.rate_limit_count,
+            "guidance": evidence.rate_limit_guidance,
+            "retry_delays_seconds": evidence.retry_delays_seconds,
+        },
+    }
+
+
+def _refresh_receipt(
+    workspace_map: dict[str, Any] | None,
+    evidence: RefreshEvidence,
+    *,
+    outcome: str,
+    error: str | None = None,
+) -> dict[str, Any]:
+    receipt: dict[str, Any] = {
+        "schema_version": SCHEMA_VERSION,
+        "outcome": outcome,
+        "attempted_at": evidence.started_at,
+        "written_at": _iso_utc(),
+        **_evidence_fields(evidence),
+    }
+    if workspace_map is not None:
+        receipt.update(
+            {
+                "team_id": workspace_map.get("team_id"),
+                "generated_at": workspace_map.get("generated_at"),
+                "map_sha256": hashlib.sha256(_workspace_map_bytes(workspace_map)).hexdigest(),
+            }
+        )
+    if error is not None:
+        receipt["error"] = error
+    return receipt
+
+
+def _write_refresh_receipt(
+    path: Path,
+    workspace_map: dict[str, Any] | None,
+    evidence: RefreshEvidence,
+    *,
+    outcome: str,
+    error: str | None = None,
+) -> None:
+    _atomic_write_text(
+        path,
+        json.dumps(
+            _refresh_receipt(workspace_map, evidence, outcome=outcome, error=error),
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+    )
+
+
+def _receipt_matches_workspace_map(receipt_path: Path, workspace_map: dict[str, Any]) -> bool:
+    try:
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    expected_sha = hashlib.sha256(_workspace_map_bytes(workspace_map)).hexdigest()
+    return receipt.get("outcome") == "success" and all(
+        receipt.get(key) == expected
+        for key, expected in (
+            ("schema_version", SCHEMA_VERSION),
+            ("team_id", workspace_map.get("team_id")),
+            ("generated_at", workspace_map.get("generated_at")),
+            ("map_sha256", expected_sha),
+        )
+    )
+
+
+class _WorkspaceMapLock:
+    def __init__(self, output_path: Path) -> None:
+        self.output_path = output_path
+        self.handle: Any | None = None
+        self.receipt_path: Path | None = None
+        self.evidence: RefreshEvidence | None = None
+        self.cached: dict[str, Any] | None = None
+
+    def record_failure_context(
+        self,
+        receipt_path: Path,
+        evidence: RefreshEvidence,
+        cached: dict[str, Any] | None,
+    ) -> None:
+        self.receipt_path = receipt_path
+        self.evidence = evidence
+        self.cached = cached
+
+    def __enter__(self) -> None:
+        """Serialize cache reads, refreshes, receipts, and map publication."""
+        self.output_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = self.output_path.with_name(f".{self.output_path.name}.lock")
+        self.handle = lock_path.open("a+", encoding="utf-8")
+        fcntl.flock(self.handle.fileno(), fcntl.LOCK_EX)
+
+    def __exit__(self, _exc_type: Any, _exc: Any, _traceback: Any) -> bool:
+        assert self.handle is not None
+        try:
+            if _exc_type is not None and self.receipt_path is not None and self.evidence is not None:
+                self.evidence.cache_retained = self.cached is not None
+                try:
+                    _write_refresh_receipt(
+                        self.receipt_path,
+                        self.cached,
+                        self.evidence,
+                        outcome="failed",
+                        error=f"{_exc_type.__name__}: {_exc}",
+                    )
+                except Exception as receipt_exc:
+                    _log_failure(f"refresh_failure_receipt_write_failed error={receipt_exc!r}")
+            fcntl.flock(self.handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            self.handle.close()
+        return False
+
+
+def _workspace_map_lock(output_path: Path) -> _WorkspaceMapLock:
+    """Serialize cache reads, refreshes, receipts, and map publication."""
+    return _WorkspaceMapLock(output_path)
 
 
 def write_workspace_map_note(
@@ -999,34 +1304,64 @@ def ensure_workspace_map(
     max_age_seconds: int = REFRESH_TTL_SECONDS,
     output_path: Path = DEFAULT_JSON_PATH,
     markdown_path: Path = DEFAULT_MARKDOWN_PATH,
+    receipt_path: Path | None = None,
     write_brain_note: bool = True,
     brain_note_path: Path = DEFAULT_BRAIN_NOTE_PATH,
 ) -> dict[str, Any]:
-    cached = read_cached_workspace_map(output_path)
-    if not force and cache_is_fresh(cached, max_age_seconds=max_age_seconds):
-        if write_brain_note:
-            write_workspace_map_note(
-                render_markdown_mirror(cached),
-                brain_note_path,
+    if receipt_path is None:
+        receipt_path = _receipt_path_for(output_path)
+    evidence = RefreshEvidence(started_at=_iso_utc())
+    evidence_token = _ACTIVE_REFRESH_EVIDENCE.set(evidence)
+    try:
+        # A flock covers both artifact replacement and the decision to reuse a
+        # cache, so concurrent cron/manual invocations cannot publish a map
+        # and receipt from different attempts.
+        lock = _workspace_map_lock(output_path)
+        with lock:
+            cached = read_cached_workspace_map(output_path)
+            lock.record_failure_context(receipt_path, evidence, cached)
+            evidence.cache_present = cached is not None
+            cache_receipt_valid = not receipt_path.exists() or (
+                cached is not None and _receipt_matches_workspace_map(receipt_path, cached)
             )
-        return cached
+            if receipt_path.exists() and not cache_receipt_valid:
+                _log_failure(f"cache_receipt_mismatch path={output_path}")
+            if not force and cache_receipt_valid and cache_is_fresh(cached, max_age_seconds=max_age_seconds):
+                evidence.cache_used = True
+                if write_brain_note:
+                    write_workspace_map_note(
+                        render_markdown_mirror(cached),
+                        brain_note_path,
+                    )
+                _write_refresh_receipt(receipt_path, cached, evidence, outcome="success")
+                return cached
 
-    workspace_map = build_workspace_map(team_id)
-    markdown = render_markdown_mirror(workspace_map)
-    prior_markdown = markdown_path.read_text(encoding="utf-8") if markdown_path.exists() else None
-    if prior_markdown is not None:
-        PRIOR_MARKDOWN_PATH.parent.mkdir(parents=True, exist_ok=True)
-        PRIOR_MARKDOWN_PATH.write_text(prior_markdown, encoding="utf-8")
+            workspace_map = build_workspace_map(team_id)
+            _validate_workspace_map(workspace_map, team_id)
+            markdown = render_markdown_mirror(workspace_map)
+            prior_markdown = markdown_path.read_text(encoding="utf-8") if markdown_path.exists() else None
+            if prior_markdown is not None:
+                _write_markdown(markdown_path.with_name(PRIOR_MARKDOWN_PATH.name), prior_markdown)
 
-    _write_json(output_path, workspace_map)
-    _write_markdown(markdown_path, markdown)
-    if prior_markdown is not None:
-        diff_lines = detect_markdown_drift(prior_markdown, markdown)
-        if diff_lines:
-            _log_drift(diff_lines)
-    if write_brain_note:
-        write_workspace_map_note(markdown, brain_note_path)
-    return workspace_map
+            # These are all prepared from a fully validated in-memory map.
+            # Publish receipt then map under the same lock; a process death in
+            # between creates a mismatched receipt that the next reader marks
+            # red rather than calling the retained map fresh.
+            _write_refresh_receipt(receipt_path, workspace_map, evidence, outcome="success")
+            _write_json(output_path, workspace_map)
+            _write_markdown(markdown_path, markdown)
+            if prior_markdown is not None:
+                diff_lines = detect_markdown_drift(prior_markdown, markdown)
+                if diff_lines:
+                    _log_drift(diff_lines)
+            if write_brain_note:
+                write_workspace_map_note(markdown, brain_note_path)
+            return workspace_map
+    except Exception as exc:
+        _log_failure(f"refresh_failed error={type(exc).__name__}: {exc}")
+        raise
+    finally:
+        _ACTIVE_REFRESH_EVIDENCE.reset(evidence_token)
 
 
 def main() -> int:
@@ -1064,7 +1399,7 @@ def main() -> int:
             write_brain_note=not args.local_only,
             brain_note_path=Path(args.brain_output),
         )
-    except WorkspaceMapNoteError as exc:
+    except (WorkspaceMapNoteError, WorkspaceMapValidationError, ClickUpApiError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 

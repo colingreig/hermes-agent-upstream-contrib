@@ -115,11 +115,19 @@
       "max_age_seconds": 27000,
       "outcome": {
         "kind": "json_artifact",
-        "path": "~/.hermes/state/clickup-map.json",
+        "path": "~/.hermes/state/clickup-map.receipt.json",
         "max_age_seconds": 27000,
-        "timestamp_key": "generated_at_iso",
-        "success_patterns": ["\"generated_at_iso\"", "\"lists\""],
-        "failure_patterns": []
+        "timestamp_key": "written_at",
+        "required_values": {
+          "schema_version": 3,
+          "outcome": "success"
+        },
+        "linked_artifact": {
+          "path": "~/.hermes/state/clickup-map.json",
+          "sha256_key": "map_sha256"
+        },
+        "success_patterns": ["\"outcome\"\\s*:\\s*\"success\"", "\"map_sha256\""],
+        "failure_patterns": ["\"outcome\"\\s*:\\s*\"failed\""]
       }
     },
     {

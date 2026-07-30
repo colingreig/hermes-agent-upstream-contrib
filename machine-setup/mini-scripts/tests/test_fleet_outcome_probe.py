@@ -289,6 +289,54 @@ def test_canonical_contract_inventory_covers_exact_jobs_and_semantic_outcomes():
         assert outcome.get("success_patterns") or outcome.get("required_patterns")
 
 
+def test_clickup_refresh_receipt_requires_success_and_matching_map(tmp_path):
+    module = _load_module()
+    map_path = tmp_path / "clickup-map.json"
+    map_path.write_text('{"lists": []}\n', encoding="utf-8")
+    import hashlib
+    import os
+
+    receipt_path = tmp_path / "clickup-map.receipt.json"
+    receipt_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 3,
+                "outcome": "success",
+                "written_at": NOW.isoformat(),
+                "map_sha256": hashlib.sha256(map_path.read_bytes()).hexdigest(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    os.utime(receipt_path, (NOW.timestamp(), NOW.timestamp()))
+    outcome = {
+        "kind": "json_artifact",
+        "max_age_seconds": 60,
+        "timestamp_key": "written_at",
+        "required_values": {"schema_version": 3, "outcome": "success"},
+        "linked_artifact": {"path": str(map_path), "sha256_key": "map_sha256"},
+        "success_patterns": ['"outcome"\\s*:\\s*"success"'],
+        "failure_patterns": ['"outcome"\\s*:\\s*"failed"'],
+    }
+
+    assert module._check_artifact(
+        surface="cron", identifier="clickup", outcome={**outcome, "path": str(receipt_path)}, home=tmp_path, now=NOW
+    ) == []
+
+    receipt_path.write_text(
+        json.dumps({**json.loads(receipt_path.read_text()), "outcome": "failed"}),
+        encoding="utf-8",
+    )
+    os.utime(receipt_path, (NOW.timestamp(), NOW.timestamp()))
+    codes = {
+        item["code"]
+        for item in module._check_artifact(
+            surface="cron", identifier="clickup", outcome={**outcome, "path": str(receipt_path)}, home=tmp_path, now=NOW
+        )
+    }
+    assert {"failure_marker", "success_marker_missing"} <= codes
+
+
 def test_launchctl_inventory_ignores_enabled_overrides_outside_services():
     module = _load_module()
     text = """

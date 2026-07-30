@@ -41,6 +41,9 @@
     "validator_verdict.py"
   ],
   "package_glob": "*.py",
+  "package_files": [
+    "ci_health_topology.json"
+  ],
   "package_destination": "pr_pipeline",
   "managed_root_patterns": [
     "autonomous_merge.py",
