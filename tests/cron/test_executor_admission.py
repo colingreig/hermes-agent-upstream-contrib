@@ -5,12 +5,30 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import timedelta
 import json
+import multiprocessing
 import os
 from pathlib import Path
 import sqlite3
+import threading
 import time
 
 import pytest
+
+
+def _simultaneous_acquire(start, results, database, job_id, owner, ledger):
+    import cron.executor_admission as admission
+
+    admission._database_path = lambda: Path(database)
+    start.wait()
+    try:
+        lease = admission.acquire_executor_lease(
+            job_id=job_id,
+            owner_run_id=owner,
+            ledger_execution_id=ledger,
+        )
+        results.put(("ok", None if lease is None else lease.as_dict()))
+    except BaseException as exc:
+        results.put(("error", f"{type(exc).__name__}: {exc}"))
 
 
 def _store(monkeypatch, tmp_path):
@@ -278,12 +296,16 @@ def test_expiry_never_reclaims_an_uncertain_owner(monkeypatch, tmp_path):
     assert lease is not None
     clock[0] += timedelta(seconds=2)
 
-    assert admission.acquire_executor_lease(
-        job_id="dcab830aa41c",
-        task_id="other",
-        owner_run_id="other-owner",
-        ledger_execution_id="other-ledger",
-    ) is None
+    with pytest.raises(
+        admission.ExecutorAdmissionError,
+        match="expired.*uncertain",
+    ):
+        admission.acquire_executor_lease(
+            job_id="dcab830aa41c",
+            task_id="other",
+            owner_run_id="other-owner",
+            ledger_execution_id="other-ledger",
+        )
     with pytest.raises(admission.ExecutorAdmissionError, match="heartbeat rejected"):
         admission.heartbeat_executor_lease(lease)
 
@@ -324,11 +346,15 @@ def test_expired_owner_recovery_requires_reviewed_exact_dead_owner_proof(
             reviewed_by="validator",
             reason="reviewed exact PID and start-time proof",
         )
-    assert admission.acquire_executor_lease(
-        job_id="dcab830aa41c",
-        owner_run_id="successor",
-        ledger_execution_id="successor-ledger",
-    ) is None
+    with pytest.raises(
+        admission.ExecutorAdmissionError,
+        match="expired.*uncertain",
+    ):
+        admission.acquire_executor_lease(
+            job_id="dcab830aa41c",
+            owner_run_id="successor",
+            ledger_execution_id="successor-ledger",
+        )
 
     proof = {
         "execution_id": "ledger",
@@ -520,6 +546,41 @@ def test_corrupt_store_fails_closed_without_overwrite(monkeypatch, tmp_path):
     assert database.read_bytes() == b"not a sqlite database"
 
 
+def test_bootstrap_failure_fails_closed_without_partial_schema(monkeypatch, tmp_path):
+    admission, database = _store(monkeypatch, tmp_path)
+    database.parent.mkdir(parents=True)
+    with sqlite3.connect(database) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE admission_state(singleton INTEGER PRIMARY KEY);
+            PRAGMA user_version = 1;
+            """
+        )
+    os.chmod(database, 0o600)
+
+    with pytest.raises(
+        admission.ExecutorAdmissionError,
+        match="database unavailable",
+    ):
+        admission.acquire_executor_lease(
+            job_id="62714b869845",
+            task_id="task",
+            owner_run_id="owner",
+            ledger_execution_id="ledger",
+        )
+
+    with sqlite3.connect(database) as conn:
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+    assert tables == {"admission_state"}
+    assert version == 1
+
+
 def test_gate_wake_is_consumed_by_the_admitted_run(monkeypatch, tmp_path):
     admission, _database = _store(monkeypatch, tmp_path)
     monkeypatch.setattr(
@@ -545,10 +606,148 @@ def test_gate_wake_is_consumed_by_the_admitted_run(monkeypatch, tmp_path):
     assert admission.executor_drain_status()["pending_wakes"] == []
 
 
-def test_locked_store_fails_closed(monkeypatch, tmp_path):
+def test_simultaneous_first_use_across_both_lanes_has_one_clean_loser(
+    monkeypatch, tmp_path
+):
+    _admission, database = _store(monkeypatch, tmp_path)
+    context = multiprocessing.get_context("fork")
+    start = context.Event()
+    results = context.Queue()
+    processes = [
+        context.Process(
+            target=_simultaneous_acquire,
+            args=(
+                start,
+                results,
+                str(database),
+                job_id,
+                owner,
+                ledger,
+            ),
+        )
+        for job_id, owner, ledger in (
+            ("62714b869845", "code-owner", "code-ledger"),
+            ("dcab830aa41c", "content-owner", "content-ledger"),
+        )
+    ]
+    for process in processes:
+        process.start()
+    start.set()
+    observed = [results.get(timeout=5) for _process in processes]
+    for process in processes:
+        process.join(timeout=5)
+        assert process.exitcode == 0
+
+    assert [kind for kind, _value in observed] == ["ok", "ok"]
+    leases = [value for _kind, value in observed if value is not None]
+    assert len(leases) == 1
+    with sqlite3.connect(database) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM executor_lease WHERE state='active'"
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM executor_lease_history"
+        ).fetchone()[0] == 1
+
+
+def test_locked_store_waits_within_bound_then_acquires(monkeypatch, tmp_path):
     admission, database = _store(monkeypatch, tmp_path)
     idle = admission.executor_drain_status()
     assert idle["safe_to_cutover"] is True
+
+    blocker = sqlite3.connect(database, isolation_level=None)
+    blocker.execute("BEGIN IMMEDIATE")
+    result = {}
+
+    def acquire():
+        result["lease"] = admission.acquire_executor_lease(
+            job_id="62714b869845",
+            task_id="task",
+            owner_run_id="owner",
+            ledger_execution_id="ledger",
+        )
+
+    worker = threading.Thread(target=acquire)
+    worker.start()
+    time.sleep(0.1)
+    blocker.execute("ROLLBACK")
+    blocker.close()
+    worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    assert result["lease"] is not None
+
+
+def test_reader_lock_through_commit_waits_then_acquires(monkeypatch, tmp_path):
+    admission, database = _store(monkeypatch, tmp_path)
+    assert admission.executor_drain_status()["safe_to_cutover"] is True
+    reader = sqlite3.connect(database, isolation_level=None)
+    reader.execute("BEGIN")
+    reader.execute("SELECT * FROM admission_state").fetchall()
+    result = {}
+
+    def acquire():
+        try:
+            result["lease"] = admission.acquire_executor_lease(
+                job_id="62714b869845",
+                task_id="task",
+                owner_run_id="owner",
+                ledger_execution_id="ledger",
+            )
+        except BaseException as exc:
+            result["error"] = exc
+
+    worker = threading.Thread(target=acquire)
+    worker.start()
+    time.sleep(0.15)
+    reader.execute("ROLLBACK")
+    reader.close()
+    worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    assert "error" not in result
+    assert result["lease"] is not None
+
+
+def test_reader_lock_through_cleanup_commit_waits_then_releases(
+    monkeypatch, tmp_path
+):
+    admission, database = _store(monkeypatch, tmp_path)
+    lease = admission.acquire_executor_lease(
+        job_id="62714b869845",
+        task_id="task",
+        owner_run_id="owner",
+        ledger_execution_id="ledger",
+    )
+    assert lease is not None
+    reader = sqlite3.connect(database, isolation_level=None)
+    reader.execute("BEGIN")
+    reader.execute("SELECT * FROM executor_lease").fetchall()
+    result = {}
+
+    def release():
+        try:
+            admission.release_executor_lease(lease)
+            result["released"] = True
+        except BaseException as exc:
+            result["error"] = exc
+
+    worker = threading.Thread(target=release)
+    worker.start()
+    time.sleep(0.15)
+    reader.execute("ROLLBACK")
+    reader.close()
+    worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    assert result == {"released": True}
+    assert admission.executor_drain_status()["state"] == "idle"
+
+
+def test_locked_store_past_bound_fails_closed_without_mutation(monkeypatch, tmp_path):
+    admission, database = _store(monkeypatch, tmp_path)
+    assert admission.executor_drain_status()["safe_to_cutover"] is True
+    monkeypatch.setattr(admission, "_SQLITE_BUSY_DEADLINE_SECONDS", 0.1)
 
     blocker = sqlite3.connect(database, isolation_level=None)
     blocker.execute("BEGIN IMMEDIATE")
@@ -567,8 +766,40 @@ def test_locked_store_fails_closed(monkeypatch, tmp_path):
         blocker.execute("ROLLBACK")
         blocker.close()
 
+    with sqlite3.connect(database) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM executor_lease").fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM executor_lease_history"
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT last_fencing_token FROM admission_state"
+        ).fetchone()[0] == 0
 
-def test_shared_run_body_denies_executor_before_agent_dispatch(monkeypatch):
+
+def test_genuine_connect_failure_is_not_retried(monkeypatch, tmp_path):
+    admission, _database = _store(monkeypatch, tmp_path)
+    calls = []
+
+    def unavailable(*_args, **_kwargs):
+        calls.append(True)
+        raise sqlite3.OperationalError("unable to open database file")
+
+    monkeypatch.setattr(admission.sqlite3, "connect", unavailable)
+
+    with pytest.raises(
+        admission.ExecutorAdmissionError,
+        match="database unavailable",
+    ):
+        admission.acquire_executor_lease(
+            job_id="62714b869845",
+            task_id="task",
+            owner_run_id="owner",
+            ledger_execution_id="ledger",
+        )
+    assert calls == [True]
+
+
+def test_shared_run_body_records_clean_no_claim_before_agent_dispatch(monkeypatch):
     import cron.scheduler as scheduler
 
     monkeypatch.setattr(
@@ -596,11 +827,90 @@ def test_shared_run_body_denies_executor_before_agent_dispatch(monkeypatch):
             "agent body must not run after executor admission denial"
         ),
     )
+    monkeypatch.setattr(
+        scheduler,
+        "mark_execution_running",
+        lambda *_args, **_kwargs: pytest.fail(
+            "a clean no-claim must not mark execution running"
+        ),
+    )
+    saved = {}
+    monkeypatch.setattr(
+        scheduler,
+        "save_job_output",
+        lambda job_id, output: saved.update(job_id=job_id, output=output),
+    )
     recorded = {}
 
     def record(_job, _execution_id, _owner_token, outcome, **_kwargs):
+        recorded["success"] = outcome.success
         recorded["reason"] = outcome.reason
-        return False
+        recorded["error"] = outcome.error
+        return outcome.success
+
+    monkeypatch.setattr(scheduler, "_record_cron_outcome", record)
+
+    assert scheduler.run_one_job(
+        {
+            "id": "62714b869845",
+            "name": "clickup-executor",
+            "skill": "clickup-queue-poller",
+        }
+    ) is True
+    assert recorded == {
+        "success": True,
+        "reason": "executor_admission_no_claim",
+        "error": None,
+    }
+    assert saved["job_id"] == "62714b869845"
+    assert "## Response" in saved["output"]
+    assert "Zero ClickUp claims and zero swarms" in saved["output"]
+    assert "another positively observed fenced executor owner" in saved["output"]
+
+
+def test_shared_run_body_keeps_admission_uncertainty_red_without_receipt(
+    monkeypatch,
+):
+    import cron.scheduler as scheduler
+
+    monkeypatch.setattr(
+        scheduler,
+        "create_execution",
+        lambda *_args, **_kwargs: {
+            "id": "ledger",
+            "owner_token": "ledger-token",
+        },
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "acquire_executor_lease",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            scheduler.ExecutorAdmissionError("database is corrupt")
+        ),
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "save_job_output",
+        lambda *_args, **_kwargs: pytest.fail(
+            "uncertain admission must not emit a green no-claim receipt"
+        ),
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "claim_dispatch",
+        lambda *_args, **_kwargs: pytest.fail(
+            "uncertain admission must not reach dispatch"
+        ),
+    )
+    recorded = {}
+
+    def record(_job, _execution_id, _owner_token, outcome, **_kwargs):
+        recorded.update(
+            success=outcome.success,
+            reason=outcome.reason,
+            error=outcome.error,
+        )
+        return outcome.success
 
     monkeypatch.setattr(scheduler, "_record_cron_outcome", record)
 
@@ -611,7 +921,72 @@ def test_shared_run_body_denies_executor_before_agent_dispatch(monkeypatch):
             "skill": "clickup-queue-poller",
         }
     ) is False
-    assert recorded["reason"] == "executor_admission_denied"
+    assert recorded["success"] is False
+    assert recorded["reason"] == "executor_admission_uncertain"
+    assert "database is corrupt" in recorded["error"]
+
+
+def test_expired_active_lease_is_scheduler_uncertainty_not_green_no_claim(
+    monkeypatch, tmp_path
+):
+    admission, _database = _store(monkeypatch, tmp_path)
+    import cron.scheduler as scheduler
+
+    clock = [admission._now()]
+    monkeypatch.setattr(admission, "_now", lambda: clock[0])
+    lease = admission.acquire_executor_lease(
+        job_id="62714b869845",
+        task_id="task",
+        owner_run_id="owner",
+        ledger_execution_id="existing-ledger",
+        lease_seconds=1,
+    )
+    assert lease is not None
+    clock[0] += timedelta(seconds=2)
+    monkeypatch.setattr(
+        scheduler,
+        "create_execution",
+        lambda *_args, **_kwargs: {
+            "id": "new-ledger",
+            "owner_token": "new-token",
+        },
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "save_job_output",
+        lambda *_args, **_kwargs: pytest.fail(
+            "expired ownership uncertainty must not emit a green receipt"
+        ),
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "claim_dispatch",
+        lambda *_args, **_kwargs: pytest.fail(
+            "expired ownership uncertainty must not dispatch"
+        ),
+    )
+    recorded = {}
+
+    def record(_job, _execution_id, _owner_token, outcome, **_kwargs):
+        recorded.update(
+            success=outcome.success,
+            reason=outcome.reason,
+            error=outcome.error,
+        )
+        return outcome.success
+
+    monkeypatch.setattr(scheduler, "_record_cron_outcome", record)
+
+    assert scheduler.run_one_job(
+        {
+            "id": "dcab830aa41c",
+            "name": "content-lane-executor",
+        }
+    ) is False
+    assert recorded["success"] is False
+    assert recorded["reason"] == "executor_admission_uncertain"
+    assert "expired" in recorded["error"]
+    assert admission.executor_drain_status()["state"] == "active"
 
 
 def test_heartbeat_ownership_loss_signals_running_executor_promptly(monkeypatch):
@@ -714,7 +1089,94 @@ def test_executor_run_receives_heartbeat_cancellation_event(monkeypatch):
     assert observed["elapsed"] < 0.5
 
 
-def test_env_scope_reset_runs_even_when_executor_finalize_fails(monkeypatch):
+def test_late_heartbeat_error_after_stop_forces_red_before_finalization(
+    monkeypatch,
+):
+    import cron.scheduler as scheduler
+
+    lease = scheduler.ExecutorLease(
+        task_id="task",
+        job_id="62714b869845",
+        owner_run_id="owner",
+        fencing_token=1,
+        acquired_at="2026-07-29T12:00:00+00:00",
+        heartbeat_at="2026-07-29T12:00:00+00:00",
+        expires_at="2026-07-29T12:02:00+00:00",
+        ledger_execution_id="ledger",
+    )
+
+    class RacingAdmissionHeartbeat:
+        def __init__(self, heartbeat_lease):
+            self.lease = heartbeat_lease
+            self.error = None
+            self.cancel_event = threading.Event()
+
+        def start(self):
+            pass
+
+        def stop(self):
+            self.error = scheduler.ExecutorAdmissionError(
+                "late fencing ownership loss"
+            )
+
+    class NoopExecutionHeartbeat:
+        def __init__(self, *_args):
+            pass
+
+        def start(self):
+            pass
+
+        def stop(self):
+            pass
+
+    monkeypatch.setattr(scheduler, "_ExecutorAdmissionHeartbeat", RacingAdmissionHeartbeat)
+    monkeypatch.setattr(scheduler, "_ExecutionLeaseHeartbeat", NoopExecutionHeartbeat)
+    monkeypatch.setattr(scheduler, "acquire_executor_lease", lambda **_kwargs: lease)
+    monkeypatch.setattr(scheduler, "claim_dispatch", lambda *_args: True)
+    monkeypatch.setattr(
+        scheduler, "mark_execution_running", lambda *_args, **_kwargs: {"id": "ledger"}
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "run_job",
+        lambda *_args, **_kwargs: (True, "output", "completed work", None),
+    )
+    monkeypatch.setattr(scheduler, "save_job_output", lambda *_args: "/tmp/out")
+    monkeypatch.setattr(scheduler, "_deliver_result", lambda *_args, **_kwargs: None)
+    terminal_statuses = []
+    monkeypatch.setattr(
+        scheduler,
+        "finalize_executor_lease",
+        lambda _lease, *, status: terminal_statuses.append(status),
+    )
+    monkeypatch.setattr(scheduler, "release_executor_lease", lambda _lease: None)
+    recorded = {}
+
+    def record(_job, _execution_id, _owner_token, outcome, **_kwargs):
+        recorded.update(
+            success=outcome.success,
+            reason=outcome.reason,
+            error=outcome.error,
+        )
+        return outcome.success
+
+    monkeypatch.setattr(scheduler, "_record_cron_outcome", record)
+
+    assert scheduler.run_one_job(
+        {
+            "id": "62714b869845",
+            "name": "clickup-executor",
+            "execution_id": "ledger",
+            "execution_owner_token": "ledger-token",
+        }
+    ) is False
+    assert terminal_statuses == ["failed"]
+    assert recorded["success"] is False
+    assert recorded["reason"] == "executor_admission_heartbeat_failed"
+    assert "late fencing ownership loss" in recorded["error"]
+
+
+def test_finalize_failure_still_releases_exact_lease_and_records_red(monkeypatch):
     import cron.scheduler as scheduler
     from tools import env_passthrough
 
@@ -732,11 +1194,17 @@ def test_env_scope_reset_runs_even_when_executor_finalize_fails(monkeypatch):
     monkeypatch.setattr(scheduler._ExecutorAdmissionHeartbeat, "start", lambda _self: None)
     monkeypatch.setattr(scheduler._ExecutorAdmissionHeartbeat, "stop", lambda _self: None)
     monkeypatch.setattr(scheduler, "claim_dispatch", lambda *_args: False)
-    monkeypatch.setattr(
-        scheduler,
-        "_record_cron_outcome",
-        lambda *_args, **_kwargs: False,
-    )
+    recorded = {}
+
+    def record(_job, _execution_id, _owner_token, outcome, **_kwargs):
+        recorded.update(
+            success=outcome.success,
+            reason=outcome.reason,
+            error=outcome.error,
+        )
+        return outcome.success
+
+    monkeypatch.setattr(scheduler, "_record_cron_outcome", record)
     monkeypatch.setattr(
         scheduler,
         "finalize_executor_lease",
@@ -757,14 +1225,191 @@ def test_env_scope_reset_runs_even_when_executor_finalize_fails(monkeypatch):
         lambda token: reset.append(token),
     )
 
-    with pytest.raises(scheduler.ExecutorAdmissionError, match="finalization failed"):
-        scheduler.run_one_job(
+    assert scheduler.run_one_job(
+        {
+            "id": "62714b869845",
+            "name": "clickup-executor",
+            "execution_id": "ledger",
+            "execution_owner_token": "ledger-token",
+        }
+    ) is False
+    assert reset
+    assert released == [True]
+    assert recorded["success"] is False
+    assert recorded["reason"] == "executor_admission_cleanup_failed"
+    assert "finalization failed" in recorded["error"]
+
+
+def test_failed_finalize_and_release_retry_exact_lease_in_outer_cleanup(
+    monkeypatch, tmp_path
+):
+    admission, _database = _store(monkeypatch, tmp_path)
+    import cron.scheduler as scheduler
+
+    lease = admission.acquire_executor_lease(
+        job_id="62714b869845",
+        task_id="task",
+        owner_run_id="owner",
+        ledger_execution_id="ledger",
+    )
+    assert lease is not None
+    monkeypatch.setattr(scheduler, "acquire_executor_lease", lambda **_kwargs: lease)
+    monkeypatch.setattr(scheduler._ExecutorAdmissionHeartbeat, "start", lambda _self: None)
+    monkeypatch.setattr(scheduler._ExecutorAdmissionHeartbeat, "stop", lambda _self: None)
+    monkeypatch.setattr(scheduler, "claim_dispatch", lambda *_args: False)
+    real_finalize = admission.finalize_executor_lease
+    real_release = admission.release_executor_lease
+    finalize_calls = []
+    release_calls = []
+
+    def flaky_finalize(observed_lease, *, status):
+        finalize_calls.append((observed_lease, status))
+        if len(finalize_calls) == 1:
+            raise scheduler.ExecutorAdmissionError("finalize database busy")
+        real_finalize(observed_lease, status=status)
+
+    def flaky_release(observed_lease):
+        release_calls.append(observed_lease)
+        if len(release_calls) == 1:
+            raise scheduler.ExecutorAdmissionError("release database busy")
+        real_release(observed_lease)
+
+    monkeypatch.setattr(scheduler, "finalize_executor_lease", flaky_finalize)
+    monkeypatch.setattr(scheduler, "release_executor_lease", flaky_release)
+    recorded = {}
+
+    def record(_job, _execution_id, _owner_token, outcome, **_kwargs):
+        recorded.update(
+            success=outcome.success,
+            reason=outcome.reason,
+            error=outcome.error,
+        )
+        return outcome.success
+
+    monkeypatch.setattr(scheduler, "_record_cron_outcome", record)
+
+    assert scheduler.run_one_job(
+        {
+            "id": "62714b869845",
+            "name": "clickup-executor",
+            "execution_id": "ledger",
+            "execution_owner_token": "ledger-token",
+        }
+    ) is False
+    assert finalize_calls == [(lease, "failed"), (lease, "failed")]
+    assert release_calls == [lease, lease]
+    assert recorded["success"] is False
+    assert recorded["reason"] == "executor_admission_cleanup_failed"
+    assert admission.executor_drain_status()["state"] == "idle"
+
+    successor = admission.acquire_executor_lease(
+        job_id="dcab830aa41c",
+        task_id="next",
+        owner_run_id="next-owner",
+        ledger_execution_id="next-ledger",
+    )
+    assert successor is not None
+
+
+def test_persistent_cleanup_contention_preserves_startup_recovery_proof(
+    monkeypatch, tmp_path
+):
+    admission, database = _store(monkeypatch, tmp_path)
+    import cron.executions as executions
+    import cron.scheduler as scheduler
+
+    monkeypatch.setattr(
+        executions,
+        "EXECUTIONS_FILE",
+        tmp_path / "cron" / "executions.db",
+    )
+    clock = [admission._now()]
+    monkeypatch.setattr(admission, "_now", lambda: clock[0])
+    monkeypatch.setattr(executions, "_hermes_now", lambda: clock[0])
+    execution = executions.create_execution(
+        "62714b869845",
+        source="builtin",
+        lease_seconds=1,
+    )
+    lease = admission.acquire_executor_lease(
+        job_id="62714b869845",
+        task_id="task",
+        owner_run_id="owner",
+        ledger_execution_id=execution["id"],
+        lease_seconds=1,
+    )
+    assert lease is not None
+    monkeypatch.setattr(admission, "_SQLITE_BUSY_DEADLINE_SECONDS", 0.05)
+    monkeypatch.setattr(scheduler, "acquire_executor_lease", lambda **_kwargs: lease)
+    monkeypatch.setattr(scheduler._ExecutorAdmissionHeartbeat, "start", lambda _self: None)
+    monkeypatch.setattr(scheduler._ExecutorAdmissionHeartbeat, "stop", lambda _self: None)
+    monkeypatch.setattr(scheduler, "claim_dispatch", lambda *_args: True)
+
+    class NoopExecutionHeartbeat:
+        def __init__(self, *_args):
+            pass
+
+        def start(self):
+            pass
+
+        def stop(self):
+            pass
+
+    monkeypatch.setattr(scheduler, "_ExecutionLeaseHeartbeat", NoopExecutionHeartbeat)
+    monkeypatch.setattr(
+        scheduler,
+        "run_job",
+        lambda *_args, **_kwargs: (True, "output", "completed work", None),
+    )
+    monkeypatch.setattr(scheduler, "save_job_output", lambda *_args: "/tmp/out")
+    monkeypatch.setattr(scheduler, "_deliver_result", lambda *_args, **_kwargs: None)
+    job_outcomes = []
+
+    def mark_job_run(_job_id, success, error, **_kwargs):
+        job_outcomes.append((success, error))
+
+    monkeypatch.setattr(scheduler, "mark_job_run", mark_job_run)
+    reader = sqlite3.connect(database, isolation_level=None)
+    reader.execute("BEGIN")
+    reader.execute("SELECT * FROM executor_lease").fetchall()
+    try:
+        assert scheduler.run_one_job(
             {
                 "id": "62714b869845",
                 "name": "clickup-executor",
-                "execution_id": "ledger",
-                "execution_owner_token": "ledger-token",
+                "execution_id": execution["id"],
+                "execution_owner_token": execution["owner_token"],
             }
-        )
-    assert reset
-    assert released == []
+        ) is False
+    finally:
+        reader.execute("ROLLBACK")
+        reader.close()
+
+    stranded = admission.executor_drain_status()
+    assert stranded["state"] == "active"
+    assert stranded["lease"]["owner_run_id"] == lease.owner_run_id
+    assert stranded["lease"]["fencing_token"] == lease.fencing_token
+    assert stranded["lease"]["ledger_execution_id"] == execution["id"]
+    preserved = executions.latest_execution("62714b869845")
+    assert preserved["status"] == "running"
+    assert preserved["terminal_at"] is None
+    assert job_outcomes
+    assert job_outcomes[-1][0] is False
+    assert "Executor admission cleanup failed closed" in job_outcomes[-1][1]
+
+    clock[0] += timedelta(seconds=2)
+    monkeypatch.setattr(executions, "_owner_liveness", lambda *_args: "dead")
+    assert executions.recover_interrupted_executions() == 1
+    recovered = executions.latest_execution("62714b869845")
+    assert recovered["status"] == "interrupted"
+    assert admission.executor_drain_status()["state"] == "finalized"
+
+    successor = admission.acquire_executor_lease(
+        job_id="dcab830aa41c",
+        task_id="next",
+        owner_run_id="next-owner",
+        ledger_execution_id="next-ledger",
+    )
+    assert successor is not None
+    assert successor.fencing_token > lease.fencing_token
+    assert job_outcomes[-1][0] is False
