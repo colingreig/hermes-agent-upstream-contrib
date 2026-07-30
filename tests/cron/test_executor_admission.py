@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import timedelta
+import json
 import os
+from pathlib import Path
 import sqlite3
 import time
 
@@ -17,6 +19,63 @@ def _store(monkeypatch, tmp_path):
     database = tmp_path / "state" / "executor-admission.db"
     monkeypatch.setattr(admission, "_database_path", lambda: database)
     return admission, database
+
+
+def test_production_executor_policy_matches_rebuilt_fleet_and_shares_singleton(
+    monkeypatch, tmp_path
+):
+    admission, _database = _store(monkeypatch, tmp_path)
+    root = Path(__file__).resolve().parents[2]
+    fleet = json.loads(
+        (root / "machine-setup" / "fleet-config" / "jobs.json").read_text()
+    )["jobs"]
+    policy_names = frozenset(admission.PRODUCTION_EXECUTOR_JOBS.values())
+    fleet_executors = {
+        str(job["id"]): str(job["name"])
+        for job in fleet
+        if str(job.get("name")) in policy_names
+    }
+
+    assert fleet_executors == admission.PRODUCTION_EXECUTOR_JOBS
+    assert not admission.RETIRED_EXECUTOR_JOB_IDS.intersection(
+        str(job["id"]) for job in fleet
+    )
+    assert all(
+        admission.is_executor_job(job)
+        for job in fleet
+        if str(job["id"]) in fleet_executors
+    )
+
+    code = admission.acquire_executor_lease(
+        job_id="62714b869845",
+        owner_run_id="code-owner",
+        ledger_execution_id="code-ledger",
+    )
+    assert code is not None
+    assert admission.acquire_executor_lease(
+        job_id="dcab830aa41c",
+        owner_run_id="content-owner",
+        ledger_execution_id="content-ledger",
+    ) is None
+    admission.release_executor_lease(code)
+    assert admission.acquire_executor_lease(
+        job_id="dcab830aa41c",
+        owner_run_id="content-owner",
+        ledger_execution_id="content-ledger",
+    ) is not None
+
+    retired = {
+        "id": "baa3251e033d",
+        "name": "clickup-executor-2",
+        "skill": "clickup-queue-poller",
+    }
+    assert admission.is_executor_job(retired)
+    with pytest.raises(admission.ExecutorAdmissionError, match="retired"):
+        admission.acquire_executor_lease(
+            job_id=retired["id"],
+            owner_run_id="retired-owner",
+            ledger_execution_id="retired-ledger",
+        )
 
 
 def test_lease_contains_required_identity_and_fences_all_executor_jobs(
@@ -44,7 +103,7 @@ def test_lease_contains_required_identity_and_fences_all_executor_jobs(
     }
     assert lease.task_id == "86e2gmgc6"
     assert admission.acquire_executor_lease(
-        job_id="baa3251e033d",
+        job_id="dcab830aa41c",
         task_id="another-task",
         owner_run_id="run-secondary",
         ledger_execution_id="ledger-secondary",
@@ -56,7 +115,7 @@ def test_lease_contains_required_identity_and_fences_all_executor_jobs(
     admission.release_executor_lease(refreshed)
 
     successor = admission.acquire_executor_lease(
-        job_id="baa3251e033d",
+        job_id="dcab830aa41c",
         task_id="another-task",
         owner_run_id="run-secondary",
         ledger_execution_id="ledger-secondary",
@@ -220,7 +279,7 @@ def test_expiry_never_reclaims_an_uncertain_owner(monkeypatch, tmp_path):
     clock[0] += timedelta(seconds=2)
 
     assert admission.acquire_executor_lease(
-        job_id="baa3251e033d",
+        job_id="dcab830aa41c",
         task_id="other",
         owner_run_id="other-owner",
         ledger_execution_id="other-ledger",
@@ -266,7 +325,7 @@ def test_expired_owner_recovery_requires_reviewed_exact_dead_owner_proof(
             reason="reviewed exact PID and start-time proof",
         )
     assert admission.acquire_executor_lease(
-        job_id="baa3251e033d",
+        job_id="dcab830aa41c",
         owner_run_id="successor",
         ledger_execution_id="successor-ledger",
     ) is None
@@ -277,6 +336,7 @@ def test_expired_owner_recovery_requires_reviewed_exact_dead_owner_proof(
         "disposition": "stale",
         "owner_liveness": "dead",
         "proposed_terminal_status": "interrupted",
+        "proposed_terminal_reason": "lease_expired_owner_dead",
     }
     monkeypatch.setattr(admission, "_reviewed_dead_owner_proof", lambda _row: proof)
     receipt = admission.recover_expired_executor_lease(
@@ -290,7 +350,7 @@ def test_expired_owner_recovery_requires_reviewed_exact_dead_owner_proof(
     assert admission.executor_drain_status()["state"] == "finalized"
 
     successor = admission.acquire_executor_lease(
-        job_id="baa3251e033d",
+        job_id="dcab830aa41c",
         owner_run_id="successor",
         ledger_execution_id="successor-ledger",
     )
