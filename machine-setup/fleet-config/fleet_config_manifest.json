@@ -84,7 +84,7 @@
     {
       "src_rel": "jobs.json",
       "dest_abs": "~/.hermes/cron/jobs.json",
-      "sha256": "28bead754c5d09ef4edd95b5b14b9b1187756af218c1306d09fe215d82f9cb4d",
+      "sha256": "a3887a078e548571ee55de5ab38c8de673a5143bce6a7e80dc364a8aef6b304e",
       "role": "curated 16-job cron set (13 kept + 3 consolidated), wholesale-replaces the live jobs.json",
       "deploy_mode": "jobs_json"
     }

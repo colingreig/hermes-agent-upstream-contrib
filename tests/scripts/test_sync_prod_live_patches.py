@@ -322,14 +322,20 @@ def test_all_triggers_share_certificate_and_exact_sha_cas_path(workflow):
 
     collect = _step(workflow, "Collect governing CI evidence")["run"]
     certify = _step(workflow, "Certify exact SHA, aggregate job, and freeze state")["run"]
-    push = _step(
+    push_step = _step(
         workflow,
         "Re-read freeze, CAS assert, and atomically publish branch and receipt",
-    )["run"]
+    )
+    push = push_step["run"]
 
     assert "event=push" in collect
     assert "scripts/certify_prod_live_patches.py certify" in certify
-    assert "actions/variables/PROD_LIVE_PATCHES_FREEZE" in push
+    # GITHUB_TOKEN cannot read the Actions variables REST endpoint, so the
+    # publish-boundary freeze value comes from the vars context (materialized
+    # at job dispatch) and is strictly re-validated inside the guarded window.
+    assert push_step["env"]["FRESH_FREEZE"] == "${{ vars.PROD_LIVE_PATCHES_FREEZE }}"
+    assert "actions/variables/PROD_LIVE_PATCHES_FREEZE" not in push
+    assert 'printf \'%s\\n\' "$FRESH_FREEZE" > "$FRESH_FREEZE_PATH"' in push
     assert "validate-freeze" in push
     assert "git fetch --no-tags origin" in push
     assert '[ "$FRESH_MAIN" = "$CERTIFIED_SHA" ]' in push
@@ -341,7 +347,7 @@ def test_all_triggers_share_certificate_and_exact_sha_cas_path(workflow):
     assert push.index("git fetch --no-tags origin") < push.index("FRESH_MAIN=")
     receipt_ref_check = push.index('git ls-remote origin "$RECEIPT_REF"')
     final_freeze_read = push.rindex(
-        "actions/variables/PROD_LIVE_PATCHES_FREEZE"
+        '"$FRESH_FREEZE" > "$FRESH_FREEZE_PATH"'
     )
     final_freeze_validation = push.rindex(
         "scripts/certify_prod_live_patches.py validate-freeze"
