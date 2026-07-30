@@ -27,10 +27,15 @@ again.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
+import re
 import shutil
 import subprocess
+import time
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -39,12 +44,23 @@ logger = logging.getLogger(__name__)
 # channel instead of Colin's DM.
 OPS_ALERT_SLACK_TARGET = os.environ.get("OPS_ALERT_SLACK_TARGET", "slack:D0BA2PM9CFM")
 OPS_ALERT_SLACK_MENTION = os.environ.get("OPS_ALERT_SLACK_MENTION", "<@UN4CQ1EGG>")
+OPS_ALERT_RECEIPTS_LEDGER = os.path.expanduser(
+    os.environ.get("HERMES_OPS_ALERT_RECEIPTS_LEDGER", "~/.hermes/logs/ops-alert-receipts.jsonl")
+)
 
 # Process-lifetime dedup. Intentionally not persisted to disk: these alerts
 # fire from inside the gateway/agent process itself (not a standalone cron
 # like degraded_secrets_monitor.py), so a gateway restart is itself a natural
 # "the situation may have changed" reset point.
 _ALERTED_SIGNATURES: set = set()
+_RECEIPT_HEADER_SECRET = re.compile(
+    r"(?i)\b(authorization|proxy-authorization|cookie|set-cookie)\s*:\s*[^\r\n]+"
+)
+_RECEIPT_SCHEME_SECRET = re.compile(r"(?i)\b(bearer|basic)\s+[A-Za-z0-9+/=._~-]+")
+_RECEIPT_ASSIGNMENT_SECRET = re.compile(
+    r"(?i)\b(auth(?:orization)?|token|secret|password|passwd|api[_-]?key|"
+    r"access[_-]?key|client[_-]?secret)(\s*[:=]\s*)(?:\"[^\"]*\"|'[^']*'|[^\s,;}]+)"
+)
 
 
 def alert_once(signature: str, message: str) -> bool:
@@ -61,30 +77,142 @@ def alert_once(signature: str, message: str) -> bool:
         return False
     _ALERTED_SIGNATURES.add(signature)
     try:
-        _send_slack(message)
+        _send_slack(message, signature=signature)
     except Exception:
         logger.debug("ops_alerts: alert send failed", exc_info=True)
     return True
 
 
-def _send_slack(message: str) -> bool:
+def _redact_receipt_text(value: object, *, limit: int = 500) -> str:
+    text = str(value).replace("\r", " ").replace("\n", " ")
+    text = _RECEIPT_HEADER_SECRET.sub(
+        lambda match: f"{match.group(1)}: <redacted>",
+        text,
+    )
+    text = _RECEIPT_SCHEME_SECRET.sub(
+        lambda match: f"{match.group(1)} <redacted>",
+        text,
+    )
+    text = _RECEIPT_ASSIGNMENT_SECRET.sub(
+        lambda match: f"{match.group(1)}{match.group(2)}<redacted>",
+        text,
+    )
+    return text[:limit]
+
+
+def _parse_send_payload(stdout: str) -> dict:
+    if not isinstance(stdout, (str, bytes, bytearray)):
+        return {}
+    try:
+        payload = json.loads(stdout or "{}")
+    except json.JSONDecodeError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _write_receipt(entry: dict) -> None:
+    try:
+        path = Path(OPS_ALERT_RECEIPTS_LEDGER)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(entry, sort_keys=True) + "\n")
+    except Exception:
+        logger.debug("ops_alerts: receipt write failed", exc_info=True)
+
+
+def _receipt_entry(
+    *,
+    signature: str,
+    message: str,
+    target: str,
+    hermes_bin: str,
+    dry_run: bool,
+    success: bool,
+    returncode: int | None = None,
+    stdout: str = "",
+    stderr: str = "",
+    error: object = None,
+) -> dict:
+    payload = _parse_send_payload(stdout)
+    return {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "signature": signature or None,
+        "target": target,
+        "hermes_bin": hermes_bin,
+        "dry_run": dry_run,
+        "success": success,
+        "returncode": returncode,
+        "message_sha256": hashlib.sha256(message.encode("utf-8")).hexdigest(),
+        "stdout_tail": _redact_receipt_text(stdout),
+        "stderr_tail": _redact_receipt_text(stderr),
+        "error": _redact_receipt_text(error) if error is not None else None,
+        "send_payload": {
+            key: payload.get(key)
+            for key in ("success", "platform", "chat_id", "message_id", "error", "note")
+            if key in payload
+        },
+    }
+
+
+def _send_slack(message: str, *, signature: str = "") -> bool:
     full_message = (
         f"{OPS_ALERT_SLACK_MENTION}\n{message}" if OPS_ALERT_SLACK_MENTION else message
     )
+    hermes_bin = shutil.which("hermes") or os.path.expanduser("~/.local/bin/hermes")
     if os.environ.get("DRY_RUN"):
         logger.info("[ops_alerts] DRY_RUN slack:\n%s", full_message)
+        _write_receipt(
+            _receipt_entry(
+                signature=signature,
+                message=full_message,
+                target=OPS_ALERT_SLACK_TARGET,
+                hermes_bin=hermes_bin,
+                dry_run=True,
+                success=True,
+            )
+        )
         return True
-    hermes_bin = shutil.which("hermes") or os.path.expanduser("~/.local/bin/hermes")
     try:
-        subprocess.run(
-            [hermes_bin, "send", "--to", OPS_ALERT_SLACK_TARGET, full_message],
+        result = subprocess.run(
+            [hermes_bin, "send", "--to", OPS_ALERT_SLACK_TARGET, full_message, "--json"],
             check=True,
             capture_output=True,
+            text=True,
             timeout=20,
+        )
+        _write_receipt(
+            _receipt_entry(
+                signature=signature,
+                message=full_message,
+                target=OPS_ALERT_SLACK_TARGET,
+                hermes_bin=hermes_bin,
+                dry_run=False,
+                success=True,
+                returncode=result.returncode,
+                stdout=result.stdout,
+                stderr=result.stderr,
+            )
         )
         return True
     except Exception as e:
         logger.warning("ops_alerts: slack send failed: %r", e)
+        stdout = getattr(e, "stdout", "") or ""
+        stderr = getattr(e, "stderr", "") or ""
+        returncode = getattr(e, "returncode", None)
+        _write_receipt(
+            _receipt_entry(
+                signature=signature,
+                message=full_message,
+                target=OPS_ALERT_SLACK_TARGET,
+                hermes_bin=hermes_bin,
+                dry_run=False,
+                success=False,
+                returncode=returncode,
+                stdout=stdout,
+                stderr=stderr,
+                error=e,
+            )
+        )
         return False
 
 
