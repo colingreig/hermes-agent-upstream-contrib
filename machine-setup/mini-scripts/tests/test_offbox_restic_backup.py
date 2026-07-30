@@ -107,3 +107,72 @@ def test_real_transport_boundary_reports_unsent(monkeypatch, tmp_path):
     )
 
     assert not backup.send_failure_alert("transport probe")
+
+
+def test_backup_failure_stops_before_retention_and_has_explicit_marker(monkeypatch):
+    monkeypatch.setattr(backup, "backup_paths", lambda: ["/tmp/hermes"])
+    monkeypatch.setattr(backup, "restic_bin", lambda: "restic")
+    calls = []
+    logs = []
+
+    def run(cmd, *, env=None, check=False):
+        calls.append(cmd)
+        raise subprocess.CalledProcessError(1, cmd)
+
+    monkeypatch.setattr(backup, "run", run)
+    monkeypatch.setattr(backup, "log", logs.append)
+
+    try:
+        backup.backup({}, host="mini")
+    except backup.BackupError as exc:
+        assert "restic backup failed" in str(exc)
+    else:
+        raise AssertionError("backup failure must propagate")
+
+    assert [cmd[1] for cmd in calls] == ["backup"]
+    assert "backup and retention complete" not in logs
+
+
+def test_retention_failure_happens_after_backup_and_has_explicit_marker(monkeypatch):
+    monkeypatch.setattr(backup, "backup_paths", lambda: ["/tmp/hermes"])
+    monkeypatch.setattr(backup, "restic_bin", lambda: "restic")
+    calls = []
+    logs = []
+
+    def run(cmd, *, env=None, check=False):
+        calls.append(cmd)
+        if cmd[1] == "forget":
+            raise subprocess.CalledProcessError(1, cmd)
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(backup, "run", run)
+    monkeypatch.setattr(backup, "log", logs.append)
+
+    try:
+        backup.backup({}, host="mini")
+    except backup.BackupError as exc:
+        assert "restic retention failed" in str(exc)
+    else:
+        raise AssertionError("retention failure must propagate")
+
+    assert [cmd[1] for cmd in calls] == ["backup", "forget"]
+    assert "backup and retention complete" not in logs
+
+
+def test_success_runs_backup_then_retention_before_completion(monkeypatch):
+    monkeypatch.setattr(backup, "backup_paths", lambda: ["/tmp/hermes"])
+    monkeypatch.setattr(backup, "restic_bin", lambda: "restic")
+    calls = []
+    logs = []
+
+    def run(cmd, *, env=None, check=False):
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(backup, "run", run)
+    monkeypatch.setattr(backup, "log", logs.append)
+
+    backup.backup({}, host="mini")
+
+    assert [cmd[1] for cmd in calls] == ["backup", "forget"]
+    assert logs[-1] == "backup and retention complete"

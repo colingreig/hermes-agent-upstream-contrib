@@ -191,7 +191,10 @@ def main(argv=None) -> int:
     if snapshot is None:
         return 2
     if not snapshot:
-        _log("sweep-finish reaped=0 skipped_young=0 skipped_live=0 (empty ps snapshot)")
+        _log(
+            "sweep-finish candidates=0 reaped=0 skipped_young=0 "
+            f"skipped_live=0 failed=0 dry_run={args.dry_run} (empty ps snapshot)"
+        )
         return 0
 
     candidates = _find_mcp_serve_candidates(snapshot)

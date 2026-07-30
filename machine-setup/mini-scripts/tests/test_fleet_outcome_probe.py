@@ -30,6 +30,22 @@ def _completed(returncode=0, stdout="", stderr=""):
     return subprocess.CompletedProcess(["command"], returncode, stdout, stderr)
 
 
+def _canonical_contract(*, cron_name=None, launch_label=None):
+    contracts = json.loads(CONTRACTS_PATH.read_text(encoding="utf-8"))
+    if cron_name is not None:
+        return next(item for item in contracts["cron_jobs"] if item["name"] == cron_name)
+    return next(item for item in contracts["launch_agents"] if item["label"] == launch_label)
+
+
+def _fresh_artifact(tmp_path, text):
+    artifact = tmp_path / "evidence.log"
+    artifact.write_text(text, encoding="utf-8")
+    import os
+
+    os.utime(artifact, (NOW.timestamp(), NOW.timestamp()))
+    return artifact
+
+
 def _fixture(tmp_path):
     active_id = "active"
     disabled_id = "disabled"
@@ -382,6 +398,333 @@ def test_run_end_boundary_rejects_current_partial_failure_not_old_failure(tmp_pa
         now=NOW,
     )
     assert {item["code"] for item in findings} == {"failure_marker"}
+
+    artifact.write_text(
+        "RUN_COMPLETE\ncurrent work\nRUN_COMPLETE\nPARTIAL_FAILURE next run\n",
+        encoding="utf-8",
+    )
+    os.utime(artifact, (NOW.timestamp(), NOW.timestamp()))
+    findings = module._check_text_evidence(
+        surface="launchd",
+        identifier="fixture",
+        path=artifact,
+        outcome=outcome,
+        now=NOW,
+    )
+    assert {item["code"] for item in findings} == {"failure_marker", "run_incomplete"}
+
+    artifact.write_text(
+        "RUN_COMPLETE\ncurrent work\nRUN_COMPLETE\nnext run still working\n",
+        encoding="utf-8",
+    )
+    os.utime(artifact, (NOW.timestamp(), NOW.timestamp()))
+    findings = module._check_text_evidence(
+        surface="launchd",
+        identifier="fixture",
+        path=artifact,
+        outcome=outcome,
+        now=NOW,
+    )
+    assert {item["code"] for item in findings} == {"run_incomplete"}
+
+
+def test_board_sync_distinguishes_empty_and_nonempty_structured_failures(tmp_path):
+    module = _load_module()
+    outcome = _canonical_contract(cron_name="ignite-board-sync nightly scheduled run")[
+        "outcome"
+    ]
+
+    green = _fresh_artifact(
+        tmp_path,
+        'sync complete\n{"failures": []}\nThe failure summary is intentionally empty.\n',
+    )
+    assert module._check_text_evidence(
+        surface="cron",
+        identifier="board-sync",
+        path=green,
+        outcome=outcome,
+        now=NOW,
+    ) == []
+
+    green.write_text(
+        'sync complete\n{"failures": [{"task": "86e", "reason": "missing heading"}]}\n',
+        encoding="utf-8",
+    )
+    import os
+
+    os.utime(green, (NOW.timestamp(), NOW.timestamp()))
+    findings = module._check_text_evidence(
+        surface="cron",
+        identifier="board-sync",
+        path=green,
+        outcome=outcome,
+        now=NOW,
+    )
+    assert {item["code"] for item in findings} == {"failure_marker"}
+
+    green.write_text("sync complete\nFAILED: board refresh aborted\n", encoding="utf-8")
+    os.utime(green, (NOW.timestamp(), NOW.timestamp()))
+    findings = module._check_text_evidence(
+        surface="cron",
+        identifier="board-sync",
+        path=green,
+        outcome=outcome,
+        now=NOW,
+    )
+    assert {item["code"] for item in findings} == {"failure_marker"}
+
+
+def test_gateway_contract_requires_bounded_healthy_http_response(monkeypatch):
+    module = _load_module()
+    outcome = _canonical_contract(launch_label="ai.hermes.gateway")["outcome"]
+
+    class Response:
+        status = 200
+
+        def __init__(self, body):
+            self.body = body
+
+        def read(self, _limit):
+            return self.body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(
+        module.urllib.request,
+        "urlopen",
+        lambda url, timeout: Response(b'{"status":"ok","platform":"hermes-agent"}'),
+    )
+    assert module._check_endpoint(
+        surface="launchd",
+        identifier="ai.hermes.gateway",
+        outcome=outcome,
+    ) == []
+
+    for body in (
+        b'{"status":"unhealthy","platform":"hermes-agent"}',
+        b'{"status":"ok"}',
+        b"not-json",
+        b'{"status":"ok","platform":"hermes-agent" trailing garbage',
+    ):
+        monkeypatch.setattr(
+            module.urllib.request,
+            "urlopen",
+            lambda url, timeout, body=body: Response(body),
+        )
+        findings = module._check_endpoint(
+            surface="launchd",
+            identifier="ai.hermes.gateway",
+            outcome=outcome,
+        )
+        assert findings
+
+    def closed_listener(_url, timeout):
+        raise module.urllib.error.URLError("connection refused")
+
+    monkeypatch.setattr(module.urllib.request, "urlopen", closed_listener)
+    findings = module._check_endpoint(
+        surface="launchd",
+        identifier="ai.hermes.gateway",
+        outcome=outcome,
+    )
+    assert {item["code"] for item in findings} == {"endpoint_failed"}
+
+
+def test_runtime_cleanup_uses_full_completion_boundary_and_rejects_trailing_run(tmp_path):
+    module = _load_module()
+    outcome = _canonical_contract(
+        launch_label="com.colingreig.hermes.runtime-artifact-cleanup"
+    )["outcome"]
+    artifact = _fresh_artifact(
+        tmp_path,
+        """remove-failed historical
+[2026-07-29] complete dry_run=False
+current cleanup
+[2026-07-30] complete dry_run=False
+""",
+    )
+    assert module._check_text_evidence(
+        surface="launchd",
+        identifier="runtime-cleanup",
+        path=artifact,
+        outcome=outcome,
+        now=NOW,
+    ) == []
+
+    artifact.write_text(
+        """[2026-07-29] complete dry_run=False
+[2026-07-30] complete dry_run=False
+remove-failed current run
+""",
+        encoding="utf-8",
+    )
+    import os
+
+    os.utime(artifact, (NOW.timestamp(), NOW.timestamp()))
+    findings = module._check_text_evidence(
+        surface="launchd",
+        identifier="runtime-cleanup",
+        path=artifact,
+        outcome=outcome,
+        now=NOW,
+    )
+    assert {item["code"] for item in findings} == {"failure_marker", "run_incomplete"}
+
+    artifact.write_text("[2026-07-30] complete dry_run=True\n", encoding="utf-8")
+    os.utime(artifact, (NOW.timestamp(), NOW.timestamp()))
+    findings = module._check_text_evidence(
+        surface="launchd",
+        identifier="runtime-cleanup",
+        path=artifact,
+        outcome=outcome,
+        now=NOW,
+    )
+    assert {item["code"] for item in findings} == {"success_marker_missing"}
+
+
+def test_clickup_lifecycle_accepts_human_headings_but_requires_all_sections(tmp_path):
+    module = _load_module()
+    outcome = _canonical_contract(cron_name="clickup-lifecycle")["outcome"]
+    artifact = _fresh_artifact(
+        tmp_path,
+        """# Cron Job
+## Response
+## Closeout Audit
+Reviewed 0 tasks.
+## Stalled Task Reconciler
+Reviewed 0 tasks.
+## Staleness Sweep
+Reviewed 0 tasks.
+## Drift Reconciliation
+Reviewed 0 tasks.
+""",
+    )
+    assert module._check_text_evidence(
+        surface="cron",
+        identifier="clickup-lifecycle",
+        path=artifact,
+        outcome=outcome,
+        now=NOW,
+    ) == []
+
+    artifact.write_text(
+        """# Cron Job
+## Response
+Complete and clean.
+## Closeout Audit
+## Stalled Task Reconciler
+## Staleness Sweep
+""",
+        encoding="utf-8",
+    )
+    import os
+
+    os.utime(artifact, (NOW.timestamp(), NOW.timestamp()))
+    findings = module._check_text_evidence(
+        surface="cron",
+        identifier="clickup-lifecycle",
+        path=artifact,
+        outcome=outcome,
+        now=NOW,
+    )
+    assert {item["code"] for item in findings} == {"required_marker_missing"}
+
+    artifact.write_text(
+        """# Cron Job
+## Response
+(FAILED)
+## Closeout Audit
+## Stalled Task Reconciler
+## Staleness Sweep
+## Drift Reconciliation
+""",
+        encoding="utf-8",
+    )
+    os.utime(artifact, (NOW.timestamp(), NOW.timestamp()))
+    findings = module._check_text_evidence(
+        surface="cron",
+        identifier="clickup-lifecycle",
+        path=artifact,
+        outcome=outcome,
+        now=NOW,
+    )
+    assert "failure_marker" in {item["code"] for item in findings}
+
+
+def test_restic_and_mcp_contracts_require_clean_completed_runs(tmp_path):
+    module = _load_module()
+    restic = _canonical_contract(launch_label="com.hermes.offbox-restic-backup")[
+        "outcome"
+    ]
+    artifact = _fresh_artifact(
+        tmp_path,
+        """running restic backup for 2 target(s)
+running retention (keep-daily 7 / keep-weekly 4 / keep-monthly 6)
+backup and retention complete
+""",
+    )
+    assert module._check_text_evidence(
+        surface="launchd",
+        identifier="restic",
+        path=artifact,
+        outcome=restic,
+        now=NOW,
+    ) == []
+
+    artifact.write_text(
+        """running restic backup for 2 target(s)
+restic backup failed: exit 1
+""",
+        encoding="utf-8",
+    )
+    import os
+
+    os.utime(artifact, (NOW.timestamp(), NOW.timestamp()))
+    assert module._check_text_evidence(
+        surface="launchd",
+        identifier="restic",
+        path=artifact,
+        outcome=restic,
+        now=NOW,
+    )
+
+    mcp = _canonical_contract(
+        launch_label="com.colingreig.hermes.mcp-serve-reaper"
+    )["outcome"]
+    artifact.write_text(
+        "sweep-start\nsweep-finish candidates=1 reaped=0 failed=0 dry_run=False\n",
+        encoding="utf-8",
+    )
+    os.utime(artifact, (NOW.timestamp(), NOW.timestamp()))
+    assert module._check_text_evidence(
+        surface="launchd",
+        identifier="mcp",
+        path=artifact,
+        outcome=mcp,
+        now=NOW,
+    ) == []
+
+    artifact.write_text(
+        "sweep-start\nsweep-finish candidates=1 reaped=0 failed=1 dry_run=False\n",
+        encoding="utf-8",
+    )
+    os.utime(artifact, (NOW.timestamp(), NOW.timestamp()))
+    findings = module._check_text_evidence(
+        surface="launchd",
+        identifier="mcp",
+        path=artifact,
+        outcome=mcp,
+        now=NOW,
+    )
+    assert {item["code"] for item in findings} == {
+        "failure_marker",
+        "required_marker_missing",
+        "success_marker_missing",
+    }
 
 
 def test_drill_trips_one_real_predicate_per_contract():

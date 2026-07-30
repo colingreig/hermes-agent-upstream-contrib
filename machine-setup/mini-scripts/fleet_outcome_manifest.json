@@ -23,14 +23,14 @@
       "destination_root": "scripts",
       "destination": "fleet_outcome_probe.py",
       "mode": "0755",
-      "sha256": "2dad36422a50082895b2618792519b976a1734ae05608970ce27e5b0b2a139d0"
+      "sha256": "28869ad20b81f19f4e4ec4db1cee944e60a2199db8bcc76f926e34738754d10d"
     },
     {
       "source": "fleet_outcome_contracts.json",
       "destination_root": "scripts",
       "destination": "fleet_outcome_contracts.json",
       "mode": "0644",
-      "sha256": "44795d4f84cd4c809c380cea5815e0653ce59511ca9efe4e755e66741391083b"
+      "sha256": "284bc3a88ec4c8587f9d31632a4d05deb41626dce95bdfb65a6625001ca564b8"
     },
     {
       "source": "hermes_usage_alert.py",
@@ -51,14 +51,14 @@
       "destination_root": "scripts",
       "destination": "mcp_serve_reaper.py",
       "mode": "0755",
-      "sha256": "cec4324853e3149a90f1c69aadb4035bb834caffd931010a24b20e3b7bf2ca67"
+      "sha256": "5a69ddec5c41524d5a22f3fc3af252903d7734b48f6b602aee4b552bc497236d"
     },
     {
       "source": "offbox_restic_backup.py",
       "destination_root": "scripts",
       "destination": "offbox_restic_backup.py",
       "mode": "0755",
-      "sha256": "d7fe1526434b4dadd297d3419aabb3570626c18bac1befe1e95acc9207ba0778"
+      "sha256": "a067ac94d344e9c856d7342c2bc5f0561466a340410572e9c0d86b0c07e0b7f2"
     },
     {
       "source": "launchd/com.colingreig.hermes.fleet-outcome-probe.plist",

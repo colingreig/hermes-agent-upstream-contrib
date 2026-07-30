@@ -202,24 +202,30 @@ def backup(env: dict[str, str], *, host: str) -> None:
         cmd.extend(["--exclude", pattern])
     cmd.extend(targets)
     log(f"running restic backup for {len(targets)} target(s)")
-    run(cmd, env=env, check=True)
+    try:
+        run(cmd, env=env, check=True)
+    except Exception as exc:
+        raise BackupError(f"restic backup failed: {exc}") from exc
     log("running retention (keep-daily 7 / keep-weekly 4 / keep-monthly 6)")
-    run(
-        [
-            restic_bin(),
-            "forget",
-            "--prune",
-            f"--keep-daily={RETENTION['daily']}",
-            f"--keep-weekly={RETENTION['weekly']}",
-            f"--keep-monthly={RETENTION['monthly']}",
-            "--host",
-            host,
-            "--tag",
-            "offbox-nightly",
-        ],
-        env=env,
-        check=True,
-    )
+    try:
+        run(
+            [
+                restic_bin(),
+                "forget",
+                "--prune",
+                f"--keep-daily={RETENTION['daily']}",
+                f"--keep-weekly={RETENTION['weekly']}",
+                f"--keep-monthly={RETENTION['monthly']}",
+                "--host",
+                host,
+                "--tag",
+                "offbox-nightly",
+            ],
+            env=env,
+            check=True,
+        )
+    except Exception as exc:
+        raise BackupError(f"restic retention failed: {exc}") from exc
     log("backup and retention complete")
 
 

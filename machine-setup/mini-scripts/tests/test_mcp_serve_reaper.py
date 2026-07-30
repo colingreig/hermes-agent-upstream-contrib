@@ -124,6 +124,14 @@ def test_snapshot_failure_is_nonzero_not_false_green(monkeypatch):
     assert reaper.main([]) == 2
 
 
+def test_empty_snapshot_emits_explicit_zero_failure_finish(monkeypatch, capsys):
+    monkeypatch.setattr(reaper, "_ps_snapshot", lambda: {})
+    assert reaper.main([]) == 0
+    output = capsys.readouterr().out
+    assert "sweep-finish" in output
+    assert "failed=0" in output
+
+
 def test_per_process_reap_failure_is_nonzero(monkeypatch):
     snapshot = {
         950: {"ppid": 1, "etime_seconds": 999999, "command": HERMES_MCP_SERVE_CMD},
