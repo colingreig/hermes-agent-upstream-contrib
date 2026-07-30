@@ -12,6 +12,7 @@ from __future__ import annotations
 from datetime import timedelta
 import hashlib
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -40,6 +41,7 @@ HISTORICAL_RECONCILIATION_EXECUTION_IDS = (
 _lock = threading.RLock()
 _PROCESS_ID = uuid.uuid4().hex
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+logger = logging.getLogger(__name__)
 
 _CREATE_EXECUTIONS_SQL = """CREATE TABLE executions (
     id TEXT PRIMARY KEY,
@@ -861,6 +863,26 @@ def recover_interrupted_executions() -> int:
     with _lock, _connect() as conn:
         for entry in manifest["entries"]:
             if entry["disposition"] != "stale":
+                continue
+            try:
+                from cron.executor_admission import (
+                    EXECUTOR_JOB_IDS,
+                    ExecutorAdmissionError,
+                    recover_executor_lease_before_execution_reap,
+                )
+
+                if str(entry["job_id"]) in EXECUTOR_JOB_IDS:
+                    recover_executor_lease_before_execution_reap(entry)
+            except ExecutorAdmissionError as exc:
+                # Do not consume the durable owner proof unless the matching
+                # singleton can be finalized first. Startup can continue and
+                # retry after both leases expire.
+                logger.error(
+                    "Preserving cron execution %s because executor "
+                    "admission recovery failed closed: %s",
+                    entry["execution_id"],
+                    exc,
+                )
                 continue
             now = _hermes_now().isoformat()
             cur = conn.execute(

@@ -9,6 +9,7 @@ import sqlite3
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
+from datetime import timedelta
 from pathlib import Path
 
 
@@ -17,6 +18,14 @@ def _point_ledger(monkeypatch, tmp_path):
 
     monkeypatch.setattr(executions, "EXECUTIONS_FILE", tmp_path / "cron" / "executions.db")
     return executions
+
+
+def _point_admission(monkeypatch, tmp_path):
+    import cron.executor_admission as admission
+
+    database = tmp_path / "state" / "executor-admission.db"
+    monkeypatch.setattr(admission, "_database_path", lambda: database)
+    return admission, database
 
 
 def test_execution_transitions_are_durable(monkeypatch, tmp_path):
@@ -158,6 +167,251 @@ def test_recovery_rejects_recycled_pid(monkeypatch, tmp_path):
 
     assert executions.recover_interrupted_executions() == 1
     assert executions.latest_execution("recycled")["status"] == "interrupted"
+
+
+def test_startup_reaper_recovers_matching_executor_lease_before_ledger_proof(
+    monkeypatch, tmp_path
+):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    admission, database = _point_admission(monkeypatch, tmp_path)
+    clock = [admission._now()]
+    monkeypatch.setattr(admission, "_now", lambda: clock[0])
+    monkeypatch.setattr(executions, "_hermes_now", lambda: clock[0])
+    monkeypatch.setattr(executions, "_owner_liveness", lambda *_args: "dead")
+
+    record = executions.create_execution(
+        "62714b869845", source="builtin", lease_seconds=1
+    )
+    executions.mark_execution_running(
+        record["id"], owner_token=record["owner_token"]
+    )
+    lease = admission.acquire_executor_lease(
+        job_id="62714b869845",
+        task_id="task",
+        owner_run_id="owner",
+        ledger_execution_id=record["id"],
+        lease_seconds=1,
+    )
+    assert lease is not None
+    # mark_execution_running renews the execution lease at the production
+    # default (120s), so cross that boundary as a real restart would.
+    clock[0] += timedelta(seconds=121)
+
+    assert executions.recover_interrupted_executions() == 1
+    recovered_execution = executions.latest_execution("62714b869845")
+    assert recovered_execution["status"] == "interrupted"
+    assert (
+        recovered_execution["terminal_reason"]
+        == "lease_expired_owner_dead"
+    )
+    assert admission.executor_drain_status()["state"] == "finalized"
+
+    successor = admission.acquire_executor_lease(
+        job_id="dcab830aa41c",
+        task_id="next-task",
+        owner_run_id="successor",
+        ledger_execution_id="successor-ledger",
+    )
+    assert successor is not None
+    assert successor.fencing_token > lease.fencing_token
+
+    with sqlite3.connect(database) as conn:
+        receipt = conn.execute(
+            "SELECT ledger_execution_id,reviewed_by,reason,proof_json "
+            "FROM recovery_receipts"
+        ).fetchone()
+        history = conn.execute(
+            "SELECT state,terminal_status,recovery_receipt_id "
+            "FROM executor_lease_history WHERE ledger_execution_id=?",
+            (record["id"],),
+        ).fetchone()
+    assert receipt[0:2] == (record["id"], "cron-startup-reaper")
+    assert "lease_expired_owner_dead" in receipt[2]
+    assert json.loads(receipt[3])["execution_id"] == record["id"]
+    assert history[0:2] == ("recovered", "interrupted")
+    assert history[2]
+
+
+def test_startup_reaper_does_not_recover_mismatched_executor_lease(
+    monkeypatch, tmp_path
+):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    admission, _database = _point_admission(monkeypatch, tmp_path)
+    clock = [admission._now()]
+    monkeypatch.setattr(admission, "_now", lambda: clock[0])
+    monkeypatch.setattr(executions, "_hermes_now", lambda: clock[0])
+    monkeypatch.setattr(executions, "_owner_liveness", lambda *_args: "dead")
+
+    record = executions.create_execution(
+        "62714b869845", source="builtin", lease_seconds=1
+    )
+    executions.mark_execution_running(
+        record["id"], owner_token=record["owner_token"]
+    )
+    lease = admission.acquire_executor_lease(
+        job_id="62714b869845",
+        owner_run_id="different-owner",
+        ledger_execution_id="different-execution",
+        lease_seconds=1,
+    )
+    assert lease is not None
+    clock[0] += timedelta(seconds=121)
+
+    assert executions.recover_interrupted_executions() == 1
+    assert executions.latest_execution("62714b869845")["status"] == "interrupted"
+    status = admission.executor_drain_status()
+    assert status["state"] == "active"
+    assert status["lease"]["ledger_execution_id"] == "different-execution"
+    assert admission.acquire_executor_lease(
+        job_id="dcab830aa41c",
+        owner_run_id="successor",
+        ledger_execution_id="successor-ledger",
+    ) is None
+
+
+def test_startup_reaper_preserves_live_executor_owner_and_lease(
+    monkeypatch, tmp_path
+):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    admission, _database = _point_admission(monkeypatch, tmp_path)
+    clock = [admission._now()]
+    monkeypatch.setattr(admission, "_now", lambda: clock[0])
+    monkeypatch.setattr(executions, "_hermes_now", lambda: clock[0])
+    monkeypatch.setattr(executions, "_owner_liveness", lambda *_args: "live")
+
+    record = executions.create_execution(
+        "62714b869845", source="builtin", lease_seconds=1
+    )
+    executions.mark_execution_running(
+        record["id"], owner_token=record["owner_token"]
+    )
+    lease = admission.acquire_executor_lease(
+        job_id="62714b869845",
+        owner_run_id="live-owner",
+        ledger_execution_id=record["id"],
+        lease_seconds=1,
+    )
+    assert lease is not None
+    clock[0] += timedelta(seconds=121)
+
+    assert executions.recover_interrupted_executions() == 0
+    assert executions.latest_execution("62714b869845")["status"] == "running"
+    assert admission.executor_drain_status()["state"] == "active"
+
+
+def test_startup_reaper_preserves_proof_until_matching_admission_lease_expires(
+    monkeypatch, tmp_path
+):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    admission, _database = _point_admission(monkeypatch, tmp_path)
+    clock = [admission._now()]
+    monkeypatch.setattr(admission, "_now", lambda: clock[0])
+    monkeypatch.setattr(executions, "_hermes_now", lambda: clock[0])
+    monkeypatch.setattr(executions, "_owner_liveness", lambda *_args: "dead")
+
+    record = executions.create_execution(
+        "62714b869845", source="builtin", lease_seconds=1
+    )
+    executions.mark_execution_running(
+        record["id"], owner_token=record["owner_token"]
+    )
+    lease = admission.acquire_executor_lease(
+        job_id="62714b869845",
+        owner_run_id="owner",
+        ledger_execution_id=record["id"],
+        lease_seconds=300,
+    )
+    assert lease is not None
+    clock[0] += timedelta(seconds=121)
+
+    assert executions.recover_interrupted_executions() == 0
+    assert executions.latest_execution("62714b869845")["status"] == "running"
+    assert admission.executor_drain_status()["state"] == "active"
+
+    clock[0] += timedelta(seconds=180)
+    assert executions.recover_interrupted_executions() == 1
+    assert executions.latest_execution("62714b869845")["status"] == "interrupted"
+    assert admission.executor_drain_status()["state"] == "finalized"
+
+
+def test_quick_restart_preserves_owner_dead_proof_until_both_leases_expire(
+    monkeypatch, tmp_path
+):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    admission, _database = _point_admission(monkeypatch, tmp_path)
+    clock = [admission._now()]
+    monkeypatch.setattr(admission, "_now", lambda: clock[0])
+    monkeypatch.setattr(executions, "_hermes_now", lambda: clock[0])
+    monkeypatch.setattr(executions, "_owner_liveness", lambda *_args: "dead")
+
+    record = executions.create_execution("62714b869845", source="builtin")
+    executions.mark_execution_running(
+        record["id"], owner_token=record["owner_token"]
+    )
+    lease = admission.acquire_executor_lease(
+        job_id="62714b869845",
+        owner_run_id="owner",
+        ledger_execution_id=record["id"],
+    )
+    assert lease is not None
+    clock[0] += timedelta(seconds=1)
+
+    manifest = executions.classify_stale_executions()
+    assert manifest["entries"][0]["proposed_terminal_reason"] == "owner_dead"
+    assert executions.recover_interrupted_executions() == 0
+    assert executions.latest_execution("62714b869845")["status"] == "running"
+    assert admission.executor_drain_status()["state"] == "active"
+
+    clock[0] += timedelta(seconds=120)
+    assert executions.recover_interrupted_executions() == 1
+    assert executions.latest_execution("62714b869845")["status"] == "interrupted"
+    assert admission.executor_drain_status()["state"] == "finalized"
+    assert admission.acquire_executor_lease(
+        job_id="dcab830aa41c",
+        owner_run_id="successor",
+        ledger_execution_id="successor-ledger",
+    ) is not None
+
+
+def test_startup_recovery_is_idempotent_after_admission_first_crash_midpoint(
+    monkeypatch, tmp_path
+):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    admission, database = _point_admission(monkeypatch, tmp_path)
+    clock = [admission._now()]
+    monkeypatch.setattr(admission, "_now", lambda: clock[0])
+    monkeypatch.setattr(executions, "_hermes_now", lambda: clock[0])
+    monkeypatch.setattr(executions, "_owner_liveness", lambda *_args: "dead")
+
+    record = executions.create_execution("62714b869845", source="builtin")
+    executions.mark_execution_running(
+        record["id"], owner_token=record["owner_token"]
+    )
+    lease = admission.acquire_executor_lease(
+        job_id="62714b869845",
+        owner_run_id="owner",
+        ledger_execution_id=record["id"],
+    )
+    assert lease is not None
+    clock[0] += timedelta(seconds=121)
+    proof = executions.classify_stale_executions()["entries"][0]
+
+    # Simulate power loss immediately after the admission transaction commits
+    # but before executions.db receives its terminal UPDATE.
+    assert admission.recover_executor_lease_before_execution_reap(proof) is True
+    assert admission.executor_drain_status()["state"] == "finalized"
+    assert executions.latest_execution("62714b869845")["status"] == "running"
+
+    assert executions.recover_interrupted_executions() == 1
+    assert executions.latest_execution("62714b869845")["status"] == "interrupted"
+    assert admission.executor_drain_status()["state"] == "finalized"
+    with sqlite3.connect(database) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM recovery_receipts").fetchone()[0] == 1
+    assert admission.acquire_executor_lease(
+        job_id="dcab830aa41c",
+        owner_run_id="successor",
+        ledger_execution_id="successor-ledger",
+    ) is not None
 
 
 def test_restart_marks_interrupted_execution_without_requeue(tmp_path):

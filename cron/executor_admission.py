@@ -24,7 +24,16 @@ from typing import Any, Optional
 from hermes_constants import get_hermes_home
 
 
-EXECUTOR_JOB_IDS = frozenset({"62714b869845", "baa3251e033d"})
+# Production identities come from machine-setup/fleet-config/jobs.json.  Cron
+# execution records contain only job_id (not the job name/prompt), so startup
+# recovery needs this compact identity policy in core.  A regression test binds
+# it to the fleet manifest so a future rebuild cannot silently drift.
+PRODUCTION_EXECUTOR_JOBS = {
+    "62714b869845": "clickup-executor",
+    "dcab830aa41c": "content-lane-executor",
+}
+EXECUTOR_JOB_IDS = frozenset(PRODUCTION_EXECUTOR_JOBS)
+RETIRED_EXECUTOR_JOB_IDS = frozenset({"baa3251e033d"})
 DEFAULT_LEASE_SECONDS = 120
 _SCHEMA_VERSION = 2
 
@@ -233,7 +242,7 @@ def _connect() -> sqlite3.Connection:
 def is_executor_job(job: dict[str, Any]) -> bool:
     job_id = str(job.get("id") or "")
     if job_id in EXECUTOR_JOB_IDS:
-        return True
+        return str(job.get("name") or "") == PRODUCTION_EXECUTOR_JOBS[job_id]
     return (
         str(job.get("skill") or "") == "clickup-queue-poller"
         and str(job.get("name") or "").startswith("clickup-executor")
@@ -249,6 +258,10 @@ def request_executor_wake(
     rejects the request, leaving execution to the next native schedule.
     """
     if job_id not in EXECUTOR_JOB_IDS:
+        if job_id in RETIRED_EXECUTOR_JOB_IDS:
+            raise ExecutorAdmissionError(
+                f"retired executor job id is not admissible: {job_id}"
+            )
         raise ExecutorAdmissionError(f"unrecognized executor job id: {job_id}")
     normalized_task = str(task_id or "__unclaimed__")
     requested_at = _iso(_now())
@@ -307,6 +320,10 @@ def acquire_executor_lease(
     or releases it.
     """
     if job_id not in EXECUTOR_JOB_IDS:
+        if job_id in RETIRED_EXECUTOR_JOB_IDS:
+            raise ExecutorAdmissionError(
+                f"retired executor job id is not admissible: {job_id}"
+            )
         raise ExecutorAdmissionError(f"unrecognized executor job id: {job_id}")
     run_id = str(owner_run_id or uuid.uuid4().hex)
     if not run_id or not ledger_execution_id:
@@ -644,6 +661,196 @@ def _reviewed_dead_owner_proof(lease: sqlite3.Row) -> dict[str, Any]:
     return proof
 
 
+def _validate_dead_owner_proof(
+    lease: sqlite3.Row,
+    proof: dict[str, Any],
+) -> None:
+    """Bind reviewed execution proof to one exact admission owner."""
+    if (
+        proof.get("execution_id") != lease["ledger_execution_id"]
+        or str(proof.get("job_id")) != str(lease["job_id"])
+        or proof.get("disposition") != "stale"
+        or proof.get("owner_liveness") != "dead"
+        or proof.get("proposed_terminal_status") != "interrupted"
+    ):
+        raise ExecutorAdmissionError(
+            "expired executor lease owner is not proven dead by exact "
+            "execution/PID/start-time evidence"
+        )
+    if proof.get("proposed_terminal_reason") not in {
+        "owner_dead",
+        "lease_expired_owner_dead",
+    }:
+        raise ExecutorAdmissionError(
+            "executor recovery requires an exact dead-owner terminal reason"
+        )
+
+
+def _recover_expired_executor_lease_with_proof(
+    conn: sqlite3.Connection,
+    current: sqlite3.Row,
+    *,
+    proof: dict[str, Any],
+    reviewed_by: str,
+    reason: str,
+    now_iso: str,
+) -> dict[str, Any]:
+    """Persist one exact recovery receipt and fence the matching lease."""
+    owner_run_id = str(current["owner_run_id"])
+    fencing_token = int(current["fencing_token"])
+    ledger_execution_id = str(current["ledger_execution_id"])
+    receipt_body = {
+        "task_id": current["task_id"],
+        "job_id": current["job_id"],
+        "owner_run_id": owner_run_id,
+        "fencing_token": fencing_token,
+        "ledger_execution_id": ledger_execution_id,
+        "reviewed_by": reviewed_by,
+        "reason": reason,
+        "recovered_at": now_iso,
+        "proof": proof,
+    }
+    receipt_id = uuid.uuid5(
+        uuid.NAMESPACE_URL,
+        json.dumps(receipt_body, sort_keys=True, separators=(",", ":")),
+    ).hex
+    conn.execute("BEGIN IMMEDIATE")
+    cur = conn.execute(
+        """
+        UPDATE executor_lease
+        SET state='finalized', terminal_status='interrupted', finalized_at=?
+        WHERE singleton=1 AND state='active' AND expires_at<?
+          AND job_id=? AND owner_run_id=? AND fencing_token=?
+          AND ledger_execution_id=?
+        """,
+        (
+            now_iso,
+            now_iso,
+            current["job_id"],
+            owner_run_id,
+            fencing_token,
+            ledger_execution_id,
+        ),
+    )
+    if cur.rowcount != 1:
+        conn.execute("ROLLBACK")
+        raise ExecutorAdmissionError(
+            "expired executor recovery lost its fencing CAS"
+        )
+    conn.execute(
+        """
+        INSERT INTO recovery_receipts(
+            receipt_id,task_id,job_id,owner_run_id,fencing_token,
+            ledger_execution_id,reviewed_by,reason,recovered_at,proof_json
+        ) VALUES (?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            receipt_id,
+            current["task_id"],
+            current["job_id"],
+            owner_run_id,
+            fencing_token,
+            ledger_execution_id,
+            reviewed_by,
+            reason,
+            now_iso,
+            json.dumps(proof, sort_keys=True, separators=(",", ":")),
+        ),
+    )
+    history_cur = conn.execute(
+        """
+        UPDATE executor_lease_history
+        SET state='recovered', terminal_status='interrupted',
+            finalized_at=?, recovered_at=?, recovery_receipt_id=?,
+            revision=revision+1
+        WHERE state='active' AND job_id=? AND owner_run_id=?
+          AND fencing_token=? AND ledger_execution_id=?
+        """,
+        (
+            now_iso,
+            now_iso,
+            receipt_id,
+            current["job_id"],
+            owner_run_id,
+            fencing_token,
+            ledger_execution_id,
+        ),
+    )
+    if history_cur.rowcount != 1:
+        conn.execute("ROLLBACK")
+        raise ExecutorAdmissionError(
+            "expired executor recovery history lost its fencing CAS"
+        )
+    conn.execute("COMMIT")
+    return {**receipt_body, "receipt_id": receipt_id}
+
+
+def recover_executor_lease_before_execution_reap(
+    proof: dict[str, Any],
+) -> bool:
+    """Finalize the matching singleton before startup consumes its proof.
+
+    The execution reaper has already classified the durable PID/start-time
+    identity.  A matching admission lease must also expire before either row
+    is finalized.  A non-matching singleton is unrelated and remains fenced.
+    """
+    if proof.get("proposed_terminal_reason") not in {
+        "owner_dead",
+        "lease_expired_owner_dead",
+    }:
+        return False
+    database = _database_path()
+    if not database.exists() and not database.is_symlink():
+        return False
+
+    now_iso = _iso(_now())
+    conn = _connect()
+    try:
+        current = conn.execute(
+            """
+            SELECT * FROM executor_lease
+            WHERE singleton=1 AND state='active'
+              AND job_id=? AND ledger_execution_id=?
+            """,
+            (str(proof.get("job_id")), str(proof.get("execution_id"))),
+        ).fetchone()
+        if current is None:
+            return False
+        if current["expires_at"] >= now_iso:
+            raise ExecutorAdmissionError(
+                "matching executor lease has not expired; preserving execution proof"
+            )
+        _validate_dead_owner_proof(current, proof)
+        _recover_expired_executor_lease_with_proof(
+            conn,
+            current,
+            proof=proof,
+            reviewed_by="cron-startup-reaper",
+            reason=(
+                "startup execution recovery observed exact dead-owner proof: "
+                f"{proof['proposed_terminal_reason']}"
+            ),
+            now_iso=now_iso,
+        )
+        return True
+    except ExecutorAdmissionError:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        raise
+    except (ValueError, TypeError, sqlite3.Error) as exc:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        raise ExecutorAdmissionError(
+            f"startup executor recovery failed: {exc}"
+        ) from exc
+    finally:
+        conn.close()
+
+
 def recover_expired_executor_lease(
     *,
     owner_run_id: str,
@@ -680,88 +887,15 @@ def recover_expired_executor_lease(
                 "expired executor recovery rejected by exact fencing CAS"
             )
         proof = _reviewed_dead_owner_proof(current)
-        receipt_body = {
-            "task_id": current["task_id"],
-            "job_id": current["job_id"],
-            "owner_run_id": owner_run_id,
-            "fencing_token": int(fencing_token),
-            "ledger_execution_id": ledger_execution_id,
-            "reviewed_by": reviewer,
-            "reason": rationale,
-            "recovered_at": now_iso,
-            "proof": proof,
-        }
-        receipt_id = uuid.uuid5(
-            uuid.NAMESPACE_URL,
-            json.dumps(receipt_body, sort_keys=True, separators=(",", ":")),
-        ).hex
-        conn.execute("BEGIN IMMEDIATE")
-        cur = conn.execute(
-            """
-            UPDATE executor_lease
-            SET state='finalized', terminal_status='interrupted', finalized_at=?
-            WHERE singleton=1 AND state='active' AND expires_at<?
-              AND owner_run_id=? AND fencing_token=? AND ledger_execution_id=?
-            """,
-            (
-                now_iso,
-                now_iso,
-                owner_run_id,
-                int(fencing_token),
-                ledger_execution_id,
-            ),
+        _validate_dead_owner_proof(current, proof)
+        return _recover_expired_executor_lease_with_proof(
+            conn,
+            current,
+            proof=proof,
+            reviewed_by=reviewer,
+            reason=rationale,
+            now_iso=now_iso,
         )
-        if cur.rowcount != 1:
-            conn.execute("ROLLBACK")
-            raise ExecutorAdmissionError(
-                "expired executor recovery lost its fencing CAS"
-            )
-        conn.execute(
-            """
-            INSERT INTO recovery_receipts(
-                receipt_id,task_id,job_id,owner_run_id,fencing_token,
-                ledger_execution_id,reviewed_by,reason,recovered_at,proof_json
-            ) VALUES (?,?,?,?,?,?,?,?,?,?)
-            """,
-            (
-                receipt_id,
-                current["task_id"],
-                current["job_id"],
-                owner_run_id,
-                int(fencing_token),
-                ledger_execution_id,
-                reviewer,
-                rationale,
-                now_iso,
-                json.dumps(proof, sort_keys=True, separators=(",", ":")),
-            ),
-        )
-        history_cur = conn.execute(
-            """
-            UPDATE executor_lease_history
-            SET state='recovered', terminal_status='interrupted',
-                finalized_at=?, recovered_at=?, recovery_receipt_id=?,
-                revision=revision+1
-            WHERE state='active' AND job_id=? AND owner_run_id=?
-              AND fencing_token=? AND ledger_execution_id=?
-            """,
-            (
-                now_iso,
-                now_iso,
-                receipt_id,
-                current["job_id"],
-                owner_run_id,
-                int(fencing_token),
-                ledger_execution_id,
-            ),
-        )
-        if history_cur.rowcount != 1:
-            conn.execute("ROLLBACK")
-            raise ExecutorAdmissionError(
-                "expired executor recovery history lost its fencing CAS"
-            )
-        conn.execute("COMMIT")
-        return {**receipt_body, "receipt_id": receipt_id}
     except ExecutorAdmissionError:
         try:
             conn.execute("ROLLBACK")

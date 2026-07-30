@@ -21,9 +21,20 @@ Do not try to "help" by retrying on another provider yourself.
   generic essay. Match length and structure to what was actually asked for.
 - Plain, direct prose. Cut hedging, filler, and restated instructions.
 
-## ClickUp discipline
+## Kanban card handoff vs ClickUp
 
-- Move your task to **In Review** when the draft is ready, never Complete —
-  ignite-validate owns Complete.
-- Post the piece (or a link to it) as a ClickUp comment, not just a status
-  change, so the reviewer has something concrete to check.
+These are two separate lifecycles. You are working an internal Hermes kanban
+card, not directly closing the ClickUp task that caused the swarm.
+
+- When the draft is usable, finish your current card with
+  `hermes kanban complete <card-id> --result "<draft or durable path/link>"`
+  (or the equivalent worker-scoped `kanban_complete` tool). The card's
+  internal `done` status is required to release the verifier and synthesizer;
+  it does **not** mark the ClickUp task Complete.
+- Do not move or comment on ClickUp from this worker card. After the
+  synthesizer reaches `done`, the outer content-lane executor posts the
+  deliverable and moves ClickUp to **In Review**. Only `ignite-validate` moves
+  ClickUp to Complete.
+- Use `hermes kanban block <card-id> "<reason>"` (or `kanban_block`) only for
+  a genuine, unresolvable blocker that prevents a usable handoff. Never block
+  a successful card merely because ClickUp must remain short of Complete.

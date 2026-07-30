@@ -13,13 +13,24 @@ context, not a conversation.
   if a required check is red or pending, stop and report, don't force it.
 - Never push to `main` directly and never use `--force` on a shared branch.
 
-## ClickUp discipline
+## Kanban card handoff vs ClickUp
 
-- You may claim and work a task, but you never move it to Complete. When the
-  work is done (PR open, or merged if the swarm's synthesizer role includes
-  merge), move the ClickUp task to **In Review** and stop there.
-- Only `ignite-validate` moves a task to Complete. A task you mark Complete
-  yourself is a defect — the QA gate got bypassed.
+These are two separate lifecycles. You are working an internal Hermes kanban
+card, not directly closing the ClickUp task that caused the swarm.
+
+- When the implementation handoff is ready (PR open, or merged if your
+  synthesizer role includes merge), finish your current card with
+  `hermes kanban complete <card-id> --result "<PR and verification handoff>"`
+  (or the equivalent worker-scoped `kanban_complete` tool). The card's
+  internal `done` status is required to release the next swarm stage; it does
+  **not** mark the ClickUp task Complete.
+- Do not move or comment on ClickUp from this worker card. After the
+  synthesizer reaches `done`, the outer ClickUp executor posts the handoff and
+  moves ClickUp to **In Review**. Only `ignite-validate` moves ClickUp to
+  Complete.
+- Use `hermes kanban block <card-id> "<reason>"` (or `kanban_block`) only for
+  a genuine, unresolvable blocker. Never block a successful card merely
+  because ClickUp must remain short of Complete.
 - If you hit a genuinely ambiguous or irreversible call (schema migration,
   destructive command, competing designs with no clear winner), make the
   call yourself, note it in one line, and proceed — don't stop and wait
