@@ -185,7 +185,17 @@ def _check_text_evidence(
                     )
                 ]
             start = ends[-2].end() if len(ends) > 1 else 0
-            text = text[start : ends[-1].end()]
+            trailing = text[ends[-1].end() :]
+            text = text[start:]
+            if trailing.strip():
+                findings.append(
+                    _finding(
+                        surface,
+                        identifier,
+                        "run_incomplete",
+                        f"{path} has evidence after its latest completed-run marker",
+                    )
+                )
         elif run_start_pattern:
             starts = list(
                 re.finditer(str(run_start_pattern), text, re.IGNORECASE | re.MULTILINE)
@@ -567,6 +577,39 @@ def _check_endpoint(
                             f"{outcome['url']} returned {response.status}",
                         )
                     ]
+                required_values = dict(outcome.get("required_values") or {})
+                if required_values:
+                    try:
+                        payload = json.loads(body)
+                    except json.JSONDecodeError as exc:
+                        return [
+                            _finding(
+                                surface,
+                                identifier,
+                                "http_invalid_json",
+                                f"{outcome['url']} returned malformed JSON: {exc}",
+                            )
+                        ]
+                    if not isinstance(payload, dict):
+                        return [
+                            _finding(
+                                surface,
+                                identifier,
+                                "http_wrong_shape",
+                                f"{outcome['url']} did not return a JSON object",
+                            )
+                        ]
+                    for key, expected in required_values.items():
+                        if payload.get(key) != expected:
+                            return [
+                                _finding(
+                                    surface,
+                                    identifier,
+                                    "http_value_mismatch",
+                                    f"{outcome['url']} key {key!r} is "
+                                    f"{payload.get(key)!r}, expected {expected!r}",
+                                )
+                            ]
                 patterns = list(outcome.get("success_patterns") or [])
                 if patterns and not _patterns_match(body, patterns):
                     return [

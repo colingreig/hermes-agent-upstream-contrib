@@ -143,7 +143,7 @@
         "kind": "cron_output",
         "max_age_seconds": 108000,
         "success_patterns": ["Status:\\*\\* silent", "sync", "complete", "updated"],
-        "failure_patterns": ["\\(FAILED\\)", "Status: .*failed", "Traceback", "FAIL"]
+        "failure_patterns": ["\\(FAILED\\)", "\\bFAIL(?:ED)?\\b", "Status: .*failed", "Traceback", "\"status\"\\s*:\\s*\"(?:failed|error)\"", "\"success\"\\s*:\\s*false", "\"failures\"\\s*:\\s*\\[(?!\\s*\\])"]
       }
     },
     {
@@ -180,8 +180,8 @@
         "kind": "cron_output",
         "max_age_seconds": 7200,
         "response_only": true,
-        "success_patterns": ["complete", "clean", "reconciled", "no drift", "no actionable"],
-        "required_patterns": ["clickup_closeout_audit", "stalled_task_reconciler", "staleness_sweep", "reconcil"],
+        "success_patterns": ["complete", "clean", "reconciled", "no drift", "no actionable", "Closeout Audit", "clickup_closeout_audit", "Stalled Task Reconciler", "stalled_task_reconciler", "Staleness Sweep", "staleness_sweep", "Drift Reconciliation", "drift_reconcil(?:iation|er)"],
+        "required_patterns": ["(?:clickup_closeout_audit|Closeout Audit)", "(?:stalled_task_reconciler|Stalled Task Reconciler)", "(?:staleness_sweep|Staleness Sweep)", "(?:drift_reconcil(?:iation|er)|Drift Reconciliation)"],
         "failure_patterns": ["\\(FAILED\\)", "\\(No response generated\\)", "Status: .*failed", "Traceback"]
       }
     },
@@ -232,13 +232,15 @@
       "label": "ai.hermes.gateway",
       "expected": "loaded",
       "outcome": {
-        "kind": "text_artifact",
-        "path": "~/.hermes/logs/gateway.log",
-        "max_age_seconds": 1800,
-        "tail_lines": 200,
-        "latest_record_pattern": ".",
-        "success_patterns": ["gateway", "connected", "started", "polling", "message"],
-        "failure_patterns": ["FATAL.*(?:credential|auth|secret)", "parked after permanent authentication", "Socket Mode unhealthy"]
+        "kind": "http",
+        "url": "http://127.0.0.1:8642/health",
+        "statuses": [200],
+        "required_values": {
+          "status": "ok",
+          "platform": "hermes-agent"
+        },
+        "required_patterns": ["\"status\"\\s*:\\s*\"ok\"", "\"platform\"\\s*:\\s*\"hermes-agent\""],
+        "timeout_seconds": 5
       }
     },
     {
@@ -324,7 +326,7 @@
         "path": "~/.hermes/logs/runtime-artifact-cleanup.log",
         "max_age_seconds": 129600,
         "tail_lines": 2000,
-        "run_end_pattern": "complete dry_run=",
+        "run_end_pattern": "^.*\\bcomplete dry_run=(?:False|True)[^\\r\\n]*$",
         "success_patterns": ["complete dry_run=False"],
         "failure_patterns": ["remove-failed", "Traceback"]
       }
@@ -363,9 +365,10 @@
         "path": "~/Library/Logs/Hermes/offbox-restic-backup.log",
         "max_age_seconds": 129600,
         "tail_lines": 10000,
-        "run_start_pattern": "running restic backup",
+        "run_end_pattern": "^.*backup and retention complete[^\\r\\n]*$",
         "success_patterns": ["backup and retention complete"],
-        "failure_patterns": ["backup failed", "failed to send Slack alert", "Traceback"]
+        "required_patterns": ["running restic backup", "running retention", "backup and retention complete"],
+        "failure_patterns": ["restic backup failed", "restic retention failed", "failed to send Slack alert", "Traceback"]
       }
     },
     {
@@ -377,8 +380,9 @@
         "max_age_seconds": 7200,
         "tail_lines": 500,
         "run_start_pattern": "sweep-start",
-        "success_patterns": ["sweep-finish"],
-        "failure_patterns": ["ERROR_PS_SNAPSHOT", "ERROR_SIGTERM", "ERROR_SIGKILL"]
+        "success_patterns": ["sweep-finish[^\\r\\n]*\\bfailed=0\\b"],
+        "required_patterns": ["sweep-finish[^\\r\\n]*\\bfailed=0\\b"],
+        "failure_patterns": ["sweep-finish[^\\r\\n]*\\bfailed=[1-9][0-9]*\\b", "ERROR_[A-Z_]+"]
       }
     },
     {
