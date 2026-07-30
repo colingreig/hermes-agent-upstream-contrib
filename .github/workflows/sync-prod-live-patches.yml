@@ -17,7 +17,6 @@ on:
 permissions:
   actions: read
   contents: write
-  variables: read
 
 concurrency:
   group: sync-prod-live-patches
@@ -199,6 +198,13 @@ jobs:
           RECEIPT_BLOB: ${{ steps.receipt.outputs.blob }}
           RECEIPT_REF: ${{ steps.receipt.outputs.ref }}
           FRESH_FREEZE_PATH: ${{ runner.temp }}/prod-live-patches-freeze-fresh.json
+          # GITHUB_TOKEN cannot read the Actions variables REST endpoint
+          # ("Resource not accessible by integration"), and `variables` is not
+          # a valid workflow permissions scope. The vars context is the only
+          # freeze source available to this token; it is materialized when the
+          # job is dispatched, so the freeze decision is at-job-start fresh
+          # rather than at-publish fresh.
+          FRESH_FREEZE: ${{ vars.PROD_LIVE_PATCHES_FREEZE }}
         run: |
           set -euo pipefail
           git fetch --no-tags origin \
@@ -222,11 +228,10 @@ jobs:
             echo "::error::immutable receipt ref already exists"
             exit 1
           }
-          # This API read and strict parse intentionally happen after every
-          # fetch/CAS/ref preparation operation. There is no command between
-          # the final freeze decision and the atomic publication boundary.
-          gh api "repos/$REPOSITORY/actions/variables/PROD_LIVE_PATCHES_FREEZE" \
-            --jq .value > "$FRESH_FREEZE_PATH"
+          # This strict parse intentionally happens after every fetch/CAS/ref
+          # preparation operation. There is no command between the final
+          # freeze decision and the atomic publication boundary.
+          printf '%s\n' "$FRESH_FREEZE" > "$FRESH_FREEZE_PATH"
           python3 scripts/certify_prod_live_patches.py validate-freeze \
             --input "$FRESH_FREEZE_PATH"
           # Git protocol atomic push is the publication boundary: the release
