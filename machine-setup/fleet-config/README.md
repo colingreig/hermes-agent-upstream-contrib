@@ -166,8 +166,10 @@ Starting point: the pre-freeze snapshot at
 - `pr-staleness-alert` and `research-stage-monitor` are dropped as
   **standalone** jobs. `research-stage-monitor`'s check is folded into
   `content-lane-executor`'s prompt (it's already agent-driven, so adding a
-  Bash step is free). `pr-staleness-alert`'s daily check is **not** folded
-  into `ci-health-watch` at the script level — see Deviations below.
+  Bash step is free). `ci-health-watch-cron.py` now provides the
+  `pr-staleness-alert` daily fold without changing either underlying
+  monitor; the bundled `jobs.json` remains unchanged because the live cron
+  rewire is a separate ops step — see Deviations below.
 
 ### Modified: clickup-executor / content-lane-executor
 
@@ -236,20 +238,17 @@ use it to find the right timestamp/paths rather than guessing.
 
 ## Deviations from the original spec
 
-- **`pr-staleness-alert` fold into `ci-health-watch`**: not implemented at
-  the script level. `ci-health-watch` runs every 5 minutes as a pure
-  `no_agent` script (`ci_health_watch.py`, a reviewed PR-pipeline
-  trust-boundary component); converting it to an LLM-orchestrated job to
-  bolt on a once-daily extra check would 12x its cron cost for a monitor
-  that currently costs nothing, and hand-editing `ci_health_watch.py`'s
-  logic blind (its source lives in this repo but is security-reviewed
-  trust-boundary code) was judged out of scope for a config-only bundle.
-  `pr-staleness-alert` is dropped as a standalone cron entry per spec; the
-  actual daily-check fold is left as a follow-up requiring a small wrapper
-  script in the `ci_health_watch.py` style (see
-  `research-stage-monitor-cron.py` for the established "thin wrapper bakes
-  in a flag/extra call" pattern this repo already uses for the same
-  constraint — mini cron jobs can't pass argv).
+- **`pr-staleness-alert` fold into `ci-health-watch`**: implemented by the
+  argv-free `machine-setup/mini-scripts/ci-health-watch-cron.py` follow-up.
+  The wrapper always runs the reviewed `ci_health_watch.py` unchanged and
+  propagates its output and exit code. At most once per rolling 24 hours,
+  gated by the distinct atomic state file
+  `~/.hermes/state/ci-health-pr-staleness-last-run.json`, it also invokes
+  the existing `pr_staleness_alert.py` scan and routes emitted alerts through
+  `hermes send --to slack:hermes`. This preserves the five-minute pure
+  `no_agent` monitor and avoids both LLM cron cost and trust-boundary edits.
+  The fleet bundle's `jobs.json` intentionally has no change; pointing the
+  live `ci-health-watch` job at this wrapper remains a separate ops step.
 - **Profile bootstrap dirs**: the task text listed 8 dirs (memories,
   sessions, skills, logs, plans, workspace, cron, home); the installer
   creates the real 9 from `hermes_cli/profiles.py::_PROFILE_DIRS`, which
