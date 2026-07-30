@@ -183,6 +183,10 @@ def main(argv=None) -> int:
                          help="seconds to wait after SIGTERM before SIGKILL (default: 10)")
     args = parser.parse_args(argv)
 
+    _log(
+        f"sweep-start min_age_minutes={args.min_age_minutes} "
+        f"grace_seconds={args.grace_seconds} dry_run={args.dry_run}"
+    )
     snapshot = _ps_snapshot()
     if snapshot is None:
         return 2

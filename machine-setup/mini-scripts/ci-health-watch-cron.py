@@ -168,30 +168,54 @@ def _run_daily_staleness() -> None:
         )
 
 
-def _fleet_probe_problem(*, now: datetime | None = None) -> str | None:
+def _fleet_probe_problem(*, now: datetime | None = None) -> tuple[str, str] | None:
     current = (now or _now()).astimezone(timezone.utc)
     try:
         payload = json.loads(FLEET_PROBE_RECEIPT.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
-        return f"fleet outcome probe receipt unreadable at {FLEET_PROBE_RECEIPT}: {exc}"
+        return (
+            "receipt-unreadable",
+            f"fleet outcome probe receipt unreadable at {FLEET_PROBE_RECEIPT}: {exc}",
+        )
+    if not isinstance(payload, dict) or payload.get("mode") != "production":
+        return ("receipt-mode-invalid", "fleet outcome probe receipt is not a production receipt")
     checked_at = _parse_time(payload.get("checked_at") if isinstance(payload, dict) else None)
     if checked_at is None:
-        return f"fleet outcome probe receipt has no valid checked_at: {FLEET_PROBE_RECEIPT}"
+        return (
+            "receipt-timestamp-invalid",
+            f"fleet outcome probe receipt has no valid checked_at: {FLEET_PROBE_RECEIPT}",
+        )
     age = current - checked_at
     if age < -timedelta(minutes=1):
         return (
+            "receipt-timestamp-future",
             f"fleet outcome probe heartbeat is timestamped "
-            f"{int(-age.total_seconds())}s in the future"
+            f"{int(-age.total_seconds())}s in the future",
         )
     if age > FLEET_PROBE_MAX_AGE:
         return (
+            "receipt-stale",
             f"fleet outcome probe heartbeat is stale ({int(age.total_seconds())}s; "
-            f"limit {int(FLEET_PROBE_MAX_AGE.total_seconds())}s)"
+            f"limit {int(FLEET_PROBE_MAX_AGE.total_seconds())}s)",
+        )
+    alarm = payload.get("alarm")
+    if not isinstance(alarm, dict):
+        return ("alarm-receipt-invalid", "fleet outcome probe receipt has no alarm result")
+    action = str(alarm.get("action") or "")
+    if action in {
+        "delivery-failed",
+        "recovery-delivery-failed",
+        "dry-run",
+        "recovery-dry-run",
+    }:
+        return (
+            "alarm-delivery-unconfirmed",
+            f"fleet outcome probe alarm delivery is unconfirmed (action={action})",
         )
     return None
 
 
-def _route_fleet_probe_watchdog(problem: str | None) -> None:
+def _route_fleet_probe_watchdog(problem: tuple[str, str] | None) -> None:
     state = _load_state(FLEET_WATCHDOG_STATE)
     previous = str(state.get("delivered_signature") or "")
     if problem is None:
@@ -217,12 +241,13 @@ def _route_fleet_probe_watchdog(problem: str | None) -> None:
         _atomic_json(FLEET_WATCHDOG_STATE, state)
         return
 
-    signature = hashlib.sha256(problem.encode("utf-8")).hexdigest()
+    problem_code, problem_detail = problem
+    signature = hashlib.sha256(problem_code.encode("utf-8")).hexdigest()
     if state.get("active") and previous == signature:
         return
     message = (
         "🚨 Hermes fleet outcome probe stopped checking in\n"
-        f"{problem}\n"
+        f"{problem_detail}\n"
         "Next: inspect the fleet-outcome-probe LaunchAgent and its launchd error log."
     )
     try:

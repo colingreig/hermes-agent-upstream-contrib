@@ -36,7 +36,14 @@ def _isolate_watchdog(module, tmp_path, *, checked_at=None):
     module.FLEET_WATCHDOG_STATE = tmp_path / "fleet-watchdog.json"
     observed = checked_at or module._now()
     module.FLEET_PROBE_RECEIPT.write_text(
-        json.dumps({"checked_at": observed.isoformat(), "status": "clean"}),
+        json.dumps(
+            {
+                "checked_at": observed.isoformat(),
+                "mode": "production",
+                "status": "clean",
+                "alarm": {"action": "clean"},
+            }
+        ),
         encoding="utf-8",
     )
 
@@ -170,11 +177,18 @@ def test_stale_fleet_probe_alert_is_delivery_aware_and_deduped(tmp_path):
     module.FLEET_PROBE_RECEIPT = tmp_path / "fleet-receipt.json"
     module.FLEET_WATCHDOG_STATE = tmp_path / "fleet-watchdog.json"
     module.FLEET_PROBE_RECEIPT.write_text(
-        json.dumps({"checked_at": (NOW - timedelta(hours=1)).isoformat()}),
+        json.dumps(
+            {
+                "checked_at": (NOW - timedelta(hours=1)).isoformat(),
+                "mode": "production",
+                "status": "clean",
+                "alarm": {"action": "clean"},
+            }
+        ),
         encoding="utf-8",
     )
     problem = module._fleet_probe_problem(now=NOW)
-    assert problem and "stale" in problem
+    assert problem and problem[0] == "receipt-stale"
 
     failed = _completed(["hermes"], returncode=1, stderr="offline")
     with mock.patch.object(module, "_now", return_value=NOW):
@@ -191,6 +205,12 @@ def test_stale_fleet_probe_alert_is_delivery_aware_and_deduped(tmp_path):
     assert sender.call_count == 1
     state = json.loads(module.FLEET_WATCHDOG_STATE.read_text(encoding="utf-8"))
     assert state["active"] is True
+
+    later_problem = module._fleet_probe_problem(now=NOW + timedelta(minutes=5))
+    assert later_problem and later_problem[0] == "receipt-stale"
+    with mock.patch.object(module, "_send_slack", sender):
+        module._route_fleet_probe_watchdog(later_problem)
+    assert sender.call_count == 1
 
 
 def test_fleet_probe_recovery_clears_only_after_confirmed_delivery(tmp_path):
@@ -212,3 +232,23 @@ def test_fleet_probe_recovery_clears_only_after_confirmed_delivery(tmp_path):
         with mock.patch.object(module, "_send_slack", return_value=_completed(["hermes"])):
             module._route_fleet_probe_watchdog(None)
     assert json.loads(module.FLEET_WATCHDOG_STATE.read_text())["active"] is False
+
+
+def test_unconfirmed_probe_alarm_delivery_is_not_a_healthy_heartbeat(tmp_path):
+    module = _load_module()
+    module.FLEET_PROBE_RECEIPT = tmp_path / "fleet-receipt.json"
+    module.FLEET_PROBE_RECEIPT.write_text(
+        json.dumps(
+            {
+                "checked_at": NOW.isoformat(),
+                "mode": "production",
+                "status": "alert",
+                "alarm": {"action": "delivery-failed"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert module._fleet_probe_problem(now=NOW) == (
+        "alarm-delivery-unconfirmed",
+        "fleet outcome probe alarm delivery is unconfirmed (action=delivery-failed)",
+    )

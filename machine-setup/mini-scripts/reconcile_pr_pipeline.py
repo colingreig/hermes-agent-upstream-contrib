@@ -459,7 +459,7 @@ def _cron_jobs_lock(jobs_path: Path):
 
 
 def _managed_ci_health_script(destination: Path) -> str:
-    return "ci_health_watch.py"
+    return "ci-health-watch-cron.py"
 
 
 def _load_cron_jobs_document(path: Path) -> dict[str, Any]:

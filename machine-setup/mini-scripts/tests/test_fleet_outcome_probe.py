@@ -127,6 +127,7 @@ def test_evaluate_requires_fresh_semantic_outcome_not_only_scheduler_ok(tmp_path
         home=tmp_path,
         now=NOW,
         launchctl=launchctl,
+        launch_inventory=lambda: {"com.colingreig.hermes.fixture"},
     )
     assert findings == []
     assert {item["id"] for item in evidence} == {
@@ -145,6 +146,7 @@ def test_evaluate_requires_fresh_semantic_outcome_not_only_scheduler_ok(tmp_path
         home=tmp_path,
         now=NOW,
         launchctl=launchctl,
+        launch_inventory=lambda: {"com.colingreig.hermes.fixture"},
     )
     codes = {item["code"] for item in findings}
     assert "failure_marker" in codes
@@ -168,6 +170,10 @@ def test_unknown_enabled_cron_and_monitored_plist_fail_closed(tmp_path):
         home=tmp_path,
         now=NOW,
         launchctl=lambda label: _completed(0 if label.endswith(".fixture") else 113),
+        launch_inventory=lambda: {
+            "com.colingreig.hermes.fixture",
+            "com.colingreig.hermes.unknown",
+        },
     )
     assert ("cron", "new", "uncovered_enabled_job") in {
         (item["surface"], item["id"], item["code"]) for item in findings
@@ -250,8 +256,8 @@ def test_canonical_contract_inventory_covers_exact_jobs_and_semantic_outcomes():
     assert {item["id"] for item in contracts["cron_jobs"]} == {
         item["id"] for item in jobs
     }
-    assert len(contracts["launch_agents"]) == 18
-    assert sum(item["expected"] == "loaded" for item in contracts["launch_agents"]) == 17
+    assert len(contracts["launch_agents"]) == 19
+    assert sum(item["expected"] == "loaded" for item in contracts["launch_agents"]) == 18
     assert sum(item["expected"] == "retired" for item in contracts["launch_agents"]) == 1
 
     for item in contracts["cron_jobs"]:
@@ -264,14 +270,79 @@ def test_canonical_contract_inventory_covers_exact_jobs_and_semantic_outcomes():
         outcome = item["outcome"]
         if item["expected"] == "retired" or outcome["kind"] in {"self", "tcp"}:
             continue
-        assert outcome.get("success_patterns")
+        assert outcome.get("success_patterns") or outcome.get("required_patterns")
 
 
-def test_drill_injects_one_finding_per_contract():
+def test_launchctl_inventory_ignores_enabled_overrides_outside_services():
+    module = _load_module()
+    text = """
+gui/501 = {
+\tservices = {
+\t       0      0 \tcom.colingreig.hermes.real-monitor
+\t       0      - \tcom.apple.Finder
+\t}
+\tdisabled services = {
+\t\t"com.ignite.retired-override" => enabled
+\t\t"com.colingreig.hermes.old-cleaner" => enabled
+\t}
+}
+"""
+    assert module._labels_from_launchctl_domain(text) == {
+        "com.colingreig.hermes.real-monitor"
+    }
+
+
+def test_run_end_boundary_rejects_current_partial_failure_not_old_failure(tmp_path):
+    module = _load_module()
+    artifact = tmp_path / "runner.log"
+    outcome = {
+        "kind": "text_artifact",
+        "max_age_seconds": 60,
+        "tail_lines": 100,
+        "run_end_pattern": "RUN_COMPLETE",
+        "success_patterns": ["RUN_COMPLETE"],
+        "failure_patterns": ["PARTIAL_FAILURE"],
+    }
+    artifact.write_text(
+        "PARTIAL_FAILURE old\nRUN_COMPLETE\ncurrent work\nRUN_COMPLETE\n",
+        encoding="utf-8",
+    )
+    import os
+
+    os.utime(artifact, (NOW.timestamp(), NOW.timestamp()))
+    assert (
+        module._check_text_evidence(
+            surface="launchd",
+            identifier="fixture",
+            path=artifact,
+            outcome=outcome,
+            now=NOW,
+        )
+        == []
+    )
+
+    artifact.write_text(
+        "RUN_COMPLETE\ncurrent work\nPARTIAL_FAILURE current\nRUN_COMPLETE\n",
+        encoding="utf-8",
+    )
+    os.utime(artifact, (NOW.timestamp(), NOW.timestamp()))
+    findings = module._check_text_evidence(
+        surface="launchd",
+        identifier="fixture",
+        path=artifact,
+        outcome=outcome,
+        now=NOW,
+    )
+    assert {item["code"] for item in findings} == {"failure_marker"}
+
+
+def test_drill_trips_one_real_predicate_per_contract():
     module = _load_module()
     contracts = json.loads(CONTRACTS_PATH.read_text(encoding="utf-8"))
-    findings = module._synthetic_findings(contracts)
-    assert len(findings) == 34
-    assert len({(item["surface"], item["id"]) for item in findings}) == 34
+    findings = module._inject_contract_failures(contracts, now=NOW)
+    assert len(findings) == 35
+    assert len({(item["surface"], item["id"]) for item in findings}) == 35
+    assert all(item["code"] != "synthetic_outcome_failure" for item in findings)
+    assert all(item["detail"].startswith("SYNTHETIC DRILL:") for item in findings)
     assert module.DEFAULT_DRILL_STATE != module.DEFAULT_STATE
     assert module.DEFAULT_DRILL_RECEIPT != module.DEFAULT_RECEIPT

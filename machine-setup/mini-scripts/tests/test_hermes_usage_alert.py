@@ -34,6 +34,7 @@ def _completed(returncode=0, stdout="", stderr=""):
 
 def _prepare(module, tmp_path, *, status="error"):
     module.STATE_PATH = str(tmp_path / "state.json")
+    module.RECEIPT_PATH = str(tmp_path / "receipt.json")
     module.JOBS_PATH = str(tmp_path / "jobs.json")
     module.LOGS = []
     Path(module.JOBS_PATH).write_text(
@@ -61,6 +62,7 @@ def test_slack_failure_does_not_advance_offsets_or_dedup(tmp_path):
     ):
         assert module.main() == 2
     assert not Path(module.STATE_PATH).exists()
+    assert json.loads(Path(module.RECEIPT_PATH).read_text())["delivery"] == "failed"
 
 
 def test_confirmed_slack_delivery_persists_dedup_state(tmp_path):
@@ -74,6 +76,7 @@ def test_confirmed_slack_delivery_persists_dedup_state(tmp_path):
     state = json.loads(Path(module.STATE_PATH).read_text(encoding="utf-8"))
     assert state["cron_job_statuses"]["job-1"] == "error"
     assert state["cron_job_error_last_alert"]["job-1"]
+    assert json.loads(Path(module.RECEIPT_PATH).read_text())["delivery"] == "confirmed"
 
 
 def test_clean_scan_is_silent_but_records_observation(tmp_path):
@@ -84,3 +87,9 @@ def test_clean_scan_is_silent_but_records_observation(tmp_path):
     sender.assert_not_called()
     state = json.loads(Path(module.STATE_PATH).read_text(encoding="utf-8"))
     assert state["cron_job_statuses"]["job-1"] == "ok"
+    assert json.loads(Path(module.RECEIPT_PATH).read_text()) == {
+        "checked_at": mock.ANY,
+        "delivery": "confirmed",
+        "schema_version": 1,
+        "status": "clean",
+    }

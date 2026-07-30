@@ -168,6 +168,70 @@ def _check_text_evidence(
     if outcome.get("kind") == "text_artifact":
         tail_lines = int(outcome.get("tail_lines", 200))
         text = "\n".join(text.splitlines()[-tail_lines:])
+        run_start_pattern = outcome.get("run_start_pattern")
+        run_end_pattern = outcome.get("run_end_pattern")
+        latest_record_pattern = outcome.get("latest_record_pattern")
+        if run_end_pattern:
+            ends = list(
+                re.finditer(str(run_end_pattern), text, re.IGNORECASE | re.MULTILINE)
+            )
+            if not ends:
+                return [
+                    _finding(
+                        surface,
+                        identifier,
+                        "run_boundary_missing",
+                        f"{path} has no declared run-end marker",
+                    )
+                ]
+            start = ends[-2].end() if len(ends) > 1 else 0
+            text = text[start : ends[-1].end()]
+        elif run_start_pattern:
+            starts = list(
+                re.finditer(str(run_start_pattern), text, re.IGNORECASE | re.MULTILINE)
+            )
+            if not starts:
+                return [
+                    _finding(
+                        surface,
+                        identifier,
+                        "run_boundary_missing",
+                        f"{path} has no declared run-start marker",
+                    )
+                ]
+            text = text[starts[-1].start() :]
+        elif latest_record_pattern:
+            records = [
+                line
+                for line in text.splitlines()
+                if re.search(
+                    str(latest_record_pattern),
+                    line,
+                    re.IGNORECASE | re.MULTILINE,
+                )
+            ]
+            if not records:
+                return [
+                    _finding(
+                        surface,
+                        identifier,
+                        "record_boundary_missing",
+                        f"{path} has no declared outcome record",
+                    )
+                ]
+            text = records[-1]
+    if outcome.get("response_only"):
+        marker = "## Response"
+        if marker not in text:
+            return [
+                _finding(
+                    surface,
+                    identifier,
+                    "response_section_missing",
+                    f"{path} has no {marker} section",
+                )
+            ]
+        text = text.rsplit(marker, 1)[1]
 
     forbidden = list(outcome.get("failure_patterns") or [])
     if forbidden and _patterns_match(text, forbidden):
@@ -437,6 +501,42 @@ def _plist_labels(path: Path) -> set[str]:
     return labels
 
 
+def _labels_from_launchctl_domain(text: str) -> set[str]:
+    marker = "\n\tservices = {\n"
+    if marker not in text:
+        raise ProbeError("launchctl domain output has no services inventory")
+    services = text.split(marker, 1)[1].split("\n\t}\n", 1)[0]
+    candidates = {
+        match.group(1)
+        for line in services.splitlines()
+        if (
+            match := re.search(
+                r"\s((?:ai\.hermes|com\.hermes|com\.ignite|"
+                r"com\.colingreig\.(?:hermes|ignite|pull_anthropic))"
+                r"[A-Za-z0-9_.-]*)\s*$",
+                line,
+            )
+        )
+    }
+    return {label for label in candidates if MONITORED_LABEL_RE.search(label)}
+
+
+def _launchctl_inventory() -> set[str]:
+    try:
+        result = subprocess.run(
+            ["launchctl", "print", f"gui/{os.getuid()}"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ProbeError(f"could not inventory loaded LaunchAgents: {exc}") from exc
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "launchctl print failed").strip()
+        raise ProbeError(f"could not inventory loaded LaunchAgents: {detail[-500:]}")
+    return _labels_from_launchctl_domain(result.stdout)
+
+
 def _check_endpoint(
     *,
     surface: str,
@@ -477,6 +577,16 @@ def _check_endpoint(
                             f"{outcome['url']} lacked its success marker",
                         )
                     ]
+                for pattern in list(outcome.get("required_patterns") or []):
+                    if not re.search(pattern, body, re.IGNORECASE | re.MULTILINE):
+                        return [
+                            _finding(
+                                surface,
+                                identifier,
+                                "http_required_marker_missing",
+                                f"{outcome['url']} lacked marker {pattern!r}",
+                            )
+                        ]
                 return []
         except (OSError, urllib.error.URLError) as exc:
             return [_finding(surface, identifier, "endpoint_failed", str(exc))]
@@ -490,6 +600,7 @@ def _check_launch_contracts(
     home: Path,
     now: datetime,
     launchctl: Callable[[str], subprocess.CompletedProcess[str]],
+    loaded_inventory: set[str],
 ) -> tuple[list[dict[str, str]], list[dict[str, Any]]]:
     by_label = {str(contract["label"]): contract for contract in contracts}
     if len(by_label) != len(contracts):
@@ -497,7 +608,8 @@ def _check_launch_contracts(
 
     findings: list[dict[str, str]] = []
     evidence: list[dict[str, Any]] = []
-    for label in sorted(_plist_labels(launch_agents_dir) - set(by_label)):
+    discovered = _plist_labels(launch_agents_dir) | loaded_inventory
+    for label in sorted(discovered - set(by_label)):
         findings.append(_finding("launchd", label, "uncovered_plist", str(launch_agents_dir)))
 
     for contract in contracts:
@@ -576,6 +688,7 @@ def evaluate(
     home: Path,
     now: datetime,
     launchctl: Callable[[str], subprocess.CompletedProcess[str]] = _launchctl_print,
+    launch_inventory: Callable[[], set[str]] = _launchctl_inventory,
 ) -> tuple[list[dict[str, str]], list[dict[str, Any]]]:
     if contracts.get("schema_version") != 1:
         raise ProbeError("unsupported or missing contract schema_version")
@@ -597,6 +710,7 @@ def evaluate(
         home=home,
         now=now,
         launchctl=launchctl,
+        loaded_inventory=launch_inventory(),
     )
     return cron_findings + launch_findings, cron_evidence + launch_evidence
 
@@ -705,21 +819,79 @@ def route_alarm(
     return {"action": "recovery-sent", "signature": previous_signature}
 
 
-def _synthetic_findings(contracts: dict[str, Any]) -> list[dict[str, str]]:
-    findings = [
-        _finding("cron", str(item["id"]), "synthetic_outcome_failure", item["name"])
-        for item in contracts["cron_jobs"]
-    ]
-    findings.extend(
-        _finding(
-            "launchd",
-            str(item["label"]),
-            "synthetic_outcome_failure",
-            f"expected={item['expected']}",
-        )
-        for item in contracts["launch_agents"]
-    )
-    return findings
+def _inject_contract_failures(
+    contracts: dict[str, Any],
+    *,
+    now: datetime | None = None,
+) -> list[dict[str, str]]:
+    """Exercise one real failure predicate for every declared contract."""
+    observed_at = now or _now()
+    injected: list[dict[str, str]] = []
+    with tempfile.TemporaryDirectory(prefix="fleet-outcome-drill-") as temporary:
+        root = Path(temporary)
+        output_root = root / "output"
+        launch_agents_dir = root / "LaunchAgents"
+        launch_agents_dir.mkdir()
+
+        for contract in contracts["cron_jobs"]:
+            job_id = str(contract["id"])
+            live_enabled = True if contract["enabled"] else True
+            jobs_path = root / f"jobs-{job_id}.json"
+            _atomic_json(
+                jobs_path,
+                {
+                    "jobs": [
+                        {
+                            "id": job_id,
+                            "name": contract["name"],
+                            "enabled": live_enabled,
+                            "last_status": "ok",
+                            "last_run_at": observed_at.isoformat(),
+                        }
+                    ]
+                },
+            )
+            findings, _ = _check_cron_contracts(
+                [contract],
+                jobs_path=jobs_path,
+                output_root=output_root,
+                home=root,
+                now=observed_at,
+            )
+            matching = [item for item in findings if item["id"] == job_id]
+            if not matching:
+                raise ProbeError(f"drill could not trip cron contract {job_id}")
+            selected = dict(matching[0])
+            selected["detail"] = f"SYNTHETIC DRILL: {selected['detail']}"
+            injected.append(selected)
+
+        for contract in contracts["launch_agents"]:
+            label = str(contract["label"])
+            should_look_loaded = contract["expected"] == "retired"
+
+            def fake_launchctl(_label: str, loaded: bool = should_look_loaded):
+                return subprocess.CompletedProcess(
+                    ["launchctl"],
+                    0 if loaded else 113,
+                    "synthetic loaded service" if loaded else "",
+                    "" if loaded else "synthetic missing service",
+                )
+
+            findings, _ = _check_launch_contracts(
+                [contract],
+                launch_agents_dir=launch_agents_dir,
+                home=root,
+                now=observed_at,
+                launchctl=fake_launchctl,
+                loaded_inventory={label} if should_look_loaded else set(),
+            )
+            matching = [item for item in findings if item["id"] == label]
+            if not matching:
+                raise ProbeError(f"drill could not trip LaunchAgent contract {label}")
+            selected = dict(matching[0])
+            selected["detail"] = f"SYNTHETIC DRILL: {selected['detail']}"
+            injected.append(selected)
+    return injected
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -753,7 +925,7 @@ def main(argv: list[str] | None = None) -> int:
         raise ProbeError(f"{args.contracts} is not an object")
 
     if args.drill_all:
-        findings = _synthetic_findings(contracts)
+        findings = _inject_contract_failures(contracts, now=now)
         evidence: list[dict[str, Any]] = []
         real_alert = args.real_alert and not args.no_alert
         state_path = DEFAULT_DRILL_STATE if args.state == DEFAULT_STATE else args.state

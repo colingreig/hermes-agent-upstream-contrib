@@ -9,7 +9,8 @@
       "outcome": {
         "kind": "cron_output",
         "max_age_seconds": 7200,
-        "success_patterns": ["## Response"],
+        "response_only": true,
+        "success_patterns": ["swarm", "No actionable", "no eligible", "claimed", "in review", "blocked"],
         "failure_patterns": ["\\(FAILED\\)", "\\(No response generated\\)", "Status: .*failed", "Traceback"]
       }
     },
@@ -21,7 +22,8 @@
       "outcome": {
         "kind": "cron_output",
         "max_age_seconds": 7200,
-        "success_patterns": ["## Response"],
+        "response_only": true,
+        "success_patterns": ["swarm", "No actionable", "no eligible", "claimed", "in review", "blocked"],
         "failure_patterns": ["\\(FAILED\\)", "\\(No response generated\\)", "Status: .*failed", "Traceback"]
       }
     },
@@ -153,6 +155,7 @@
         "kind": "cron_output",
         "max_age_seconds": 3600,
         "success_patterns": ["\"total\"\\s*:", "\"db_total\"\\s*:"],
+        "required_patterns": ["\"total\"\\s*:", "\"db_total\"\\s*:"],
         "failure_patterns": ["\\(FAILED\\)", "Status: .*failed", "Traceback", "\\bERROR\\b", "FLIP-FAILED"]
       }
     },
@@ -176,7 +179,9 @@
       "outcome": {
         "kind": "cron_output",
         "max_age_seconds": 7200,
-        "success_patterns": ["## Response"],
+        "response_only": true,
+        "success_patterns": ["complete", "clean", "reconciled", "no drift", "no actionable"],
+        "required_patterns": ["clickup_closeout_audit", "stalled_task_reconciler", "staleness_sweep", "reconcil"],
         "failure_patterns": ["\\(FAILED\\)", "\\(No response generated\\)", "Status: .*failed", "Traceback"]
       }
     },
@@ -205,7 +210,9 @@
       "outcome": {
         "kind": "cron_output",
         "max_age_seconds": 108000,
-        "success_patterns": ["## Response"],
+        "response_only": true,
+        "success_patterns": ["Success", "complete", "Nothing to clean", "No stale", "safety gate"],
+        "required_patterns": ["repo_gc_sweep", "cleanup_hermes_baks", "orphan_unpushed_cron"],
         "failure_patterns": ["\\(FAILED\\)", "\\(No response generated\\)", "Status: .*failed", "Traceback"]
       }
     }
@@ -228,7 +235,8 @@
         "kind": "text_artifact",
         "path": "~/.hermes/logs/gateway.log",
         "max_age_seconds": 1800,
-        "tail_lines": 30,
+        "tail_lines": 200,
+        "latest_record_pattern": ".",
         "success_patterns": ["gateway", "connected", "started", "polling", "message"],
         "failure_patterns": ["FATAL.*(?:credential|auth|secret)", "parked after permanent authentication", "Socket Mode unhealthy"]
       }
@@ -240,7 +248,7 @@
         "kind": "http",
         "url": "http://127.0.0.1:9119/health",
         "statuses": [200],
-        "success_patterns": ["ok", "healthy", "\"status\""],
+        "required_patterns": ["<title>Hermes Agent - Dashboard</title>", "HERMES_DASHBOARD_EMBEDDED_CHAT__=true"],
         "timeout_seconds": 5
       }
     },
@@ -251,6 +259,7 @@
         "kind": "text_artifact",
         "path": "~/.hermes/logs/daily-spend-alert.log",
         "max_age_seconds": 129600,
+        "latest_record_pattern": "\\[daily_spend_alert\\]",
         "success_patterns": ["daily_spend_alert.*(?:OK|daily spend alert)"],
         "failure_patterns": ["FATAL", "slack send failed"]
       }
@@ -263,6 +272,7 @@
         "path": "~/.hermes/logs/degraded-secrets-monitor.launchd.log",
         "max_age_seconds": 1800,
         "tail_lines": 5,
+        "latest_record_pattern": "\\[degraded-secrets-monitor\\]",
         "success_patterns": ["degraded-secrets-monitor.*(?:healthy|alerted|recovered)"],
         "failure_patterns": ["credential pool degraded", "FATAL-loop", "gateway parked", "unresolved placeholder", "alert delivery incomplete", "alerted \\(slack=False", "slack send failed", "clickup comment failed"]
       }
@@ -275,6 +285,7 @@
         "path": "~/.hermes/logs/heartbeat.log",
         "max_age_seconds": 2400,
         "tail_lines": 1,
+        "latest_record_pattern": "(?:OK|WARN|DORMANT):",
         "success_patterns": ["OK: heartbeat ping delivered"],
         "failure_patterns": ["DORMANT", "heartbeat ping FAILED"]
       }
@@ -286,6 +297,8 @@
         "kind": "text_artifact",
         "path": "~/.hermes/logs/ignite-sentinel.log",
         "max_age_seconds": 5400,
+        "tail_lines": 2000,
+        "run_start_pattern": "sentinel_run: secrets resolved, running monitor.py",
         "success_patterns": ["sentinel_run: secrets resolved, running monitor.py", "\"(?:status|issues|findings|healthy)\""],
         "failure_patterns": ["sentinel_run: FATAL", "Sentry GET .* failed", "\"errors\"\\s*:\\s*\\[[^\\]]", "Traceback"]
       }
@@ -297,6 +310,8 @@
         "kind": "text_artifact",
         "path": "~/.hermes/logs/ignite-sentinel-digest.log",
         "max_age_seconds": 129600,
+        "tail_lines": 4000,
+        "run_start_pattern": "sentinel_digest_run: secrets resolved",
         "success_patterns": ["sentinel_digest_run: secrets resolved", "digest.*(?:sent|complete)", "\"(?:status|sent)\""],
         "failure_patterns": ["sentinel_digest_run: FATAL", "timed out", "Traceback"]
       }
@@ -308,6 +323,8 @@
         "kind": "text_artifact",
         "path": "~/.hermes/logs/runtime-artifact-cleanup.log",
         "max_age_seconds": 129600,
+        "tail_lines": 2000,
+        "run_end_pattern": "complete dry_run=",
         "success_patterns": ["complete dry_run=False"],
         "failure_patterns": ["remove-failed", "Traceback"]
       }
@@ -319,7 +336,10 @@
         "kind": "text_artifact",
         "path": "~/.hermes/logs/worktree-backstop-sweep.log",
         "max_age_seconds": 129600,
+        "tail_lines": 10000,
+        "run_end_pattern": "BARE_WORKTREE_PRUNE_DONE",
         "success_patterns": ["sweep-finish", "BARE_WORKTREE_PRUNE_DONE"],
+        "required_patterns": ["sweep-finish", "BARE_WORKTREE_PRUNE_DONE"],
         "failure_patterns": ["ERROR_REMOVING", "FAILED_SAFETY_PATH_CHECK", "Traceback"]
       }
     },
@@ -330,6 +350,7 @@
         "kind": "text_artifact",
         "path": "~/.hermes/logs/ignite-marketplace-sync.log",
         "max_age_seconds": 10800,
+        "latest_record_pattern": "sync.sh exited",
         "success_patterns": ["sync.sh exited 0"],
         "failure_patterns": ["FAIL:", "sync.sh exited [1-9]"]
       }
@@ -341,6 +362,8 @@
         "kind": "text_artifact",
         "path": "~/Library/Logs/Hermes/offbox-restic-backup.log",
         "max_age_seconds": 129600,
+        "tail_lines": 10000,
+        "run_start_pattern": "running restic backup",
         "success_patterns": ["backup and retention complete"],
         "failure_patterns": ["backup failed", "failed to send Slack alert", "Traceback"]
       }
@@ -352,6 +375,8 @@
         "kind": "text_artifact",
         "path": "~/.hermes/logs/mcp-serve-reaper.launchd.log",
         "max_age_seconds": 7200,
+        "tail_lines": 500,
+        "run_start_pattern": "sweep-start",
         "success_patterns": ["sweep-finish"],
         "failure_patterns": ["ERROR_PS_SNAPSHOT", "ERROR_SIGTERM", "ERROR_SIGKILL"]
       }
@@ -397,6 +422,22 @@
         "statuses": [200],
         "success_patterns": ["\"webSocketDebuggerUrl\""],
         "timeout_seconds": 5
+      }
+    },
+    {
+      "label": "com.colingreig.hermes.usage-alert",
+      "expected": "loaded",
+      "outcome": {
+        "kind": "json_artifact",
+        "path": "~/.hermes/state/hermes-usage-alert.json",
+        "max_age_seconds": 1800,
+        "timestamp_key": "checked_at",
+        "required_values": {
+          "schema_version": 1,
+          "delivery": "confirmed"
+        },
+        "success_patterns": ["\"status\"\\s*:\\s*\"(?:clean|alert|deduped)\""],
+        "failure_patterns": ["\"delivery\"\\s*:\\s*\"failed\""]
       }
     },
     {

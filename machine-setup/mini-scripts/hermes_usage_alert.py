@@ -56,6 +56,9 @@ JOBS_PATH = os.environ.get("HERMES_USAGE_ALERT_JOBS_PATH") or os.path.join(HOME,
 STATE_PATH = os.environ.get("HERMES_USAGE_ALERT_STATE_PATH") or os.path.join(
     HOME, ".hermes/scripts/.usage_alert_state.json"
 )
+RECEIPT_PATH = os.environ.get("HERMES_USAGE_ALERT_RECEIPT_PATH") or os.path.join(
+    HOME, ".hermes/state/hermes-usage-alert.json"
+)
 HERMES_BIN = os.path.join(HOME, ".local/bin/hermes")
 SLACK_TARGET = "slack:hermes"
 
@@ -144,12 +147,32 @@ def _load_state():
 
 
 def _save_state(state):
-    os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
-    tmp = STATE_PATH + ".tmp"
+    _save_json(STATE_PATH, state)
+
+
+def _save_json(path, payload):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2, sort_keys=True)
+        json.dump(payload, f, indent=2, sort_keys=True)
         f.write("\n")
-    os.replace(tmp, STATE_PATH)
+    os.replace(tmp, path)
+
+
+def _write_receipt(*, status: str, delivery: str, now: float) -> None:
+    _save_json(
+        RECEIPT_PATH,
+        {
+            "schema_version": 1,
+            "checked_at": datetime_from_timestamp(now),
+            "status": status,
+            "delivery": delivery,
+        },
+    )
+
+
+def datetime_from_timestamp(value: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(value))
 
 
 def _scan_new_lines(path, offset):
@@ -345,6 +368,7 @@ def main():
 
     if not events_by_kind:
         _save_state(state)
+        _write_receipt(status="clean", delivery="confirmed", now=time.time())
         return 0  # silent — empty stdout
 
     now = time.time()
@@ -375,6 +399,7 @@ def main():
             ))
         except (OSError, subprocess.SubprocessError) as exc:
             print(f"[hermes_usage_alert] Slack delivery failed: {exc}", file=sys.stderr)
+            _write_receipt(status="alert", delivery="failed", now=now)
             return 2
         if delivery.returncode != 0:
             detail = (delivery.stderr or delivery.stdout or "unknown failure").strip()
@@ -382,12 +407,15 @@ def main():
                 f"[hermes_usage_alert] Slack delivery exited {delivery.returncode}: {detail}",
                 file=sys.stderr,
             )
+            _write_receipt(status="alert", delivery="failed", now=now)
             return 2
         _save_state(state)
+        _write_receipt(status="alert", delivery="confirmed", now=now)
     else:
         # We still updated offsets / job status caches above, so this run stays
         # silent but does not re-alert the same already-seen signals forever.
         _save_state(state)
+        _write_receipt(status="deduped", delivery="confirmed", now=now)
     return 0
 
 

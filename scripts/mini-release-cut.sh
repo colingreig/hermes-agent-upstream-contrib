@@ -14,9 +14,10 @@
 # the `runtime-current` symlink and restarts the services. It NEVER mutates
 # persistent runtime state (DBs, config, cron, logs, LaunchAgents). The sole
 # operational-file exceptions are exact-path, hash-verified, rollback-safe
-# deployments of clickup_workspace_refresh.py and the canonical launchd
-# wrappers/plists through reconcile_launchd_environment.py, plus canonical
-# external-skill config/wrappers/plists through reconcile_marketplace_skills.py.
+# deployments of clickup_workspace_refresh.py, the canonical launchd
+# wrappers/plists through reconcile_launchd_environment.py, canonical
+# external-skill config/wrappers/plists through reconcile_marketplace_skills.py,
+# and fleet scripts/plists/cron wiring through reconcile_fleet_outcomes.py.
 #
 # Tracked in ClickUp 86e2ddah5; conditional polling/governed script deployment
 # added under 86e2gdfwc.
@@ -45,6 +46,8 @@ DEPLOYED_REFRESH="$HERMES_HOME/scripts/clickup_workspace_refresh.py"
 VENDORED_LAUNCHD_RECONCILER_REL="machine-setup/mini-scripts/reconcile_launchd_environment.py"
 VENDORED_SKILLS_RECONCILER_REL="machine-setup/mini-scripts/reconcile_marketplace_skills.py"
 VENDORED_PR_PIPELINE_RECONCILER_REL="machine-setup/mini-scripts/reconcile_pr_pipeline.py"
+VENDORED_FLEET_OUTCOMES_RECONCILER_REL="machine-setup/mini-scripts/reconcile_fleet_outcomes.py"
+VENDORED_FLEET_OUTCOMES_MANIFEST_REL="machine-setup/mini-scripts/fleet_outcome_manifest.json"
 PROMOTION_CERTIFIER_REL="scripts/certify_prod_live_patches.py"
 
 UID_NUM="$(id -u)"
@@ -83,6 +86,7 @@ PROMOTION_RECEIPT_ID=""
 PR_PIPELINE_CHANGED=0
 PR_PIPELINE_RECEIPT_ID=""
 REVIEW_GATE_SMOKE_STATUS=""
+FLEET_OUTCOMES_CHANGED=0
 
 usage() {
   cat <<'EOF'
@@ -560,6 +564,61 @@ rollback_governed_marketplace_skills() {
   MARKETPLACE_SKILLS_CHANGED=0
 }
 
+# Install the source-controlled fleet-outcome scripts, contracts, plists, and
+# exact CI-cron wrapper field as one snapshot-backed transaction. The
+# reconciler performs its own hash verification, jobs.json lock, launchd
+# registration proof, and rollback on any failed verification.
+install_governed_fleet_outcomes() {
+  local release_dir="${1:-}"
+  local reconciler="$release_dir/$VENDORED_FLEET_OUTCOMES_RECONCILER_REL"
+  local manifest="$release_dir/$VENDORED_FLEET_OUTCOMES_MANIFEST_REL"
+  local source_root
+  source_root="$(dirname "$reconciler")"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    dry_run_target_regular_file_metadata "$VENDORED_FLEET_OUTCOMES_RECONCILER_REL" || return 1
+    dry_run_target_regular_file_metadata "$VENDORED_FLEET_OUTCOMES_MANIFEST_REL" || return 1
+    printf '\033[35m[DRY-RUN]\033[0m %s %s install --source-root %s --manifest %s --home %s --hermes-home %s --reload\n' \
+      "$release_dir/venv/bin/python" "$reconciler" "$source_root" "$manifest" \
+      "$HOME" "$HERMES_HOME"
+    return 0
+  fi
+  [ -f "$reconciler" ] && [ ! -L "$reconciler" ] \
+    || { warn "fleet-outcome reconciler missing or symlinked: $reconciler"; return 1; }
+  [ -f "$manifest" ] && [ ! -L "$manifest" ] \
+    || { warn "fleet-outcome manifest missing or symlinked: $manifest"; return 1; }
+  if ! "$release_dir/venv/bin/python" "$reconciler" install \
+    --source-root "$source_root" --manifest "$manifest" \
+    --home "$HOME" --hermes-home "$HERMES_HOME" --reload; then
+    return 1
+  fi
+  FLEET_OUTCOMES_CHANGED=1
+}
+
+rollback_governed_fleet_outcomes() {
+  local reason="${1:-automatic}"
+  local reconciler="$HERMES_HOME/scripts/reconcile_fleet_outcomes.py"
+  local manifest="$HERMES_HOME/scripts/fleet_outcome_manifest.json"
+  if [ "$FLEET_OUTCOMES_CHANGED" -ne 1 ] && [ "$reason" != "explicit --rollback" ]; then
+    return 0
+  fi
+  if [ ! -f "$reconciler" ] || [ -L "$reconciler" ] \
+    || [ ! -f "$manifest" ] || [ -L "$manifest" ]; then
+    [ "$FLEET_OUTCOMES_CHANGED" -eq 1 ] && return 1
+    warn "no governed fleet-outcome snapshot available; leaving pre-contract files unchanged"
+    return 0
+  fi
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '\033[35m[DRY-RUN]\033[0m %s %s rollback --source-root %s --manifest %s --home %s --hermes-home %s --reload\n' \
+      "$CURRENT_LINK/venv/bin/python" "$reconciler" "$HERMES_HOME/scripts" \
+      "$manifest" "$HOME" "$HERMES_HOME"
+    return 0
+  fi
+  "$CURRENT_LINK/venv/bin/python" "$reconciler" rollback \
+    --source-root "$HERMES_HOME/scripts" --manifest "$manifest" \
+    --home "$HOME" --hermes-home "$HERMES_HOME" --reload
+  FLEET_OUTCOMES_CHANGED=0
+}
+
 # Reconcile the canonical PR-pipeline package from the exact release being
 # activated. The reconciler copies and hash-verifies the manifest closure,
 # records the exact source commit, and smokes the deployed root entrypoint with
@@ -915,6 +974,8 @@ rollback_to_previous() {
     || die "rollback could not restore governed ClickUp refresh — MANUAL INTERVENTION REQUIRED"
   install_clickup_cli "$prev" \
     || die "rollback could not restore managed ClickUp CLI — MANUAL INTERVENTION REQUIRED"
+  rollback_governed_fleet_outcomes "$reason" \
+    || die "rollback could not restore governed fleet outcomes — MANUAL INTERVENTION REQUIRED"
   restore_governed_pr_pipeline_for_release "$prev" \
     || die "rollback could not restore governed PR pipeline — MANUAL INTERVENTION REQUIRED"
   rollback_governed_marketplace_skills "$reason" \
@@ -991,14 +1052,16 @@ prune_releases() {
 # ---------------------------------------------------------------------------
 # Ungoverned mini-scripts drift check.
 #
-# Two bundles (self_report_manifest.json + install_self_report.py,
-# spend_manifest.json + install_spend.py) declare which
-# machine-setup/mini-scripts/ files are sha-pinned and governed; a third
+# Three bundles (self_report_manifest.json + install_self_report.py,
+# spend_manifest.json + install_spend.py, and fleet_outcome_manifest.json +
+# reconcile_fleet_outcomes.py) declare which
+# machine-setup/mini-scripts/ files are sha-pinned and governed; a fourth
 # (pr_pipeline/manifest.json) owns its whole subtree the same way. Every
 # other file under machine-setup/mini-scripts/ is a manual-copy asset (see
-# the README). None of these installers runs automatically as part of this
-# cut — they require an explicit, deliberate invocation — so a file inside a
-# declared bundle can still go undeployed if nobody re-ran its installer.
+# the README). The fleet-outcome reconciler runs automatically as part of this
+# cut. The self-report and spend installers remain explicit invocations, so a
+# file inside either of those bundles can still go undeployed if nobody re-ran
+# its installer.
 # What THIS check guards against is different and narrower: the receipt
 # claiming "governed script deployment verified" while a
 # machine-setup/mini-scripts/ file changed in the cut release that isn't
@@ -1027,6 +1090,8 @@ except Exception:
 for entry in manifest.get('files', []):
     if entry.get('src_base') == 'mirror':
         print(root + '/' + entry['src_rel'])
+    elif entry.get('source'):
+        print(root + '/' + entry['source'])
 " "$root"
 }
 
@@ -1046,11 +1111,14 @@ find_uncovered_mini_scripts_changes() {
     {
       covered_mini_scripts_paths "$root/self_report_manifest.json" "$root"
       covered_mini_scripts_paths "$root/spend_manifest.json" "$root"
+      covered_mini_scripts_paths "$root/fleet_outcome_manifest.json" "$root"
       printf '%s\n' \
         "$VENDORED_REFRESH_REL" \
         "$VENDORED_LAUNCHD_RECONCILER_REL" \
         "$VENDORED_SKILLS_RECONCILER_REL" \
-        "$VENDORED_PR_PIPELINE_RECONCILER_REL"
+        "$VENDORED_PR_PIPELINE_RECONCILER_REL" \
+        "$VENDORED_FLEET_OUTCOMES_RECONCILER_REL" \
+        "$VENDORED_FLEET_OUTCOMES_MANIFEST_REL"
     } 2>/dev/null
   )"
 
@@ -1238,6 +1306,8 @@ if [ "$IF_ADVANCED" -eq 1 ]; then
       fi
       reconcile_governed_pr_pipeline "$CURRENT_LINK" "$SHA" \
         || die "active runtime PR pipeline could not reconcile to exact source $SHA"
+      install_governed_fleet_outcomes "$CURRENT_LINK" \
+        || die "active runtime fleet outcomes could not reconcile to exact source $SHA"
       smoke_live_review_poll_gate "$CURRENT_LINK" \
         || die "active runtime root review_poll_gate smoke failed"
       write_release_receipt "noop" "$ACTIVE_SHA" "$SHA" "$ACTIVE_TARGET" \
@@ -1465,6 +1535,7 @@ PY
     "$LAUNCHD_SOURCE_ROOT/reconcile_launchd_environment.py" \
     "$LAUNCHD_SOURCE_ROOT/reconcile_marketplace_skills.py" \
     "$LAUNCHD_SOURCE_ROOT/reconcile_pr_pipeline.py" \
+    "$LAUNCHD_SOURCE_ROOT/reconcile_fleet_outcomes.py" \
     "$LAUNCHD_SOURCE_ROOT/review_poll_gate.py" \
     "$LAUNCHD_SOURCE_ROOT/mini_health_attestation.py" \
     "$LAUNCHD_SOURCE_ROOT/record_skill_pull_success.py" \
@@ -1526,6 +1597,11 @@ fi
 if ! reconcile_governed_pr_pipeline "$NEW_DIR" "$SHA"; then
   warn "governed PR-pipeline reconciliation failed — rolling back"
   rollback_to_previous "governed PR-pipeline reconciliation failed"
+  die "cut aborted and rolled back to previous release"
+fi
+if ! install_governed_fleet_outcomes "$NEW_DIR"; then
+  warn "governed fleet-outcome reconciliation failed — rolling back"
+  rollback_to_previous "governed fleet-outcome reconciliation failed"
   die "cut aborted and rolled back to previous release"
 fi
 if ! smoke_live_review_poll_gate "$NEW_DIR"; then

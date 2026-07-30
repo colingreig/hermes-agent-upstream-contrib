@@ -20,9 +20,10 @@ The probe fails closed when a new enabled cron or Hermes/Ignite LaunchAgent has
 no contract. Findings go directly to `hermes send --to slack:hermes`; alert
 signatures and recoveries are persisted only after confirmed delivery.
 
-`fleet_outcome_probe.py --drill-all --real-alert` injects one failure for every
-row below through the production formatter, Slack sender, receipt writer, and
-dedupe state. It does not change live cron or launchd state. The five-minute
+`fleet_outcome_probe.py --drill-all --real-alert` creates an isolated fixture
+for every row below and trips that row's real missing/stale/unloaded predicate
+through the production formatter, Slack sender, receipt writer, and dedupe
+state. It does not change live cron or launchd state. The five-minute
 `ci-health-watch-cron.py` separately alarms if the probe receipt stops updating,
 while the probe verifies CI health's semantic `"health": "OK"` result. These
 two scheduling planes therefore cross-watch rather than self-monitor.
@@ -48,7 +49,7 @@ two scheduling planes therefore cross-watch rather than self-monitor.
 | `f23a03e9d1b2` | fleet-health-digest | enabled | fresh parsed delivery receipt with `status=sent` | missing/stale/failed delivery |
 | `59bdd8ebc468` | repo-maintenance | enabled | fresh non-empty maintenance response | empty/failed/stale maintenance pass |
 
-## LaunchAgent fleet: 17 active + 1 retired
+## LaunchAgent fleet: 18 active + 1 retired
 
 | Label | Expected | Outcome proof (not exit-only) | Alarm condition |
 |---|---:|---|---|
@@ -68,6 +69,7 @@ two scheduling planes therefore cross-watch rather than self-monitor.
 | `com.colingreig.ignite-skills-pull` | loaded | fresh parsed commit-pinned success receipt | stale/missing/invalid receipt |
 | `com.colingreig.pull_anthropic_skills` | loaded | fresh parsed commit-pinned success receipt | stale/missing/invalid receipt |
 | `com.colingreig.chrome-cdp` | loaded | semantic `/json/version` response with CDP WebSocket URL | endpoint failure or unloaded agent |
+| `com.colingreig.hermes.usage-alert` | loaded | fresh durable receipt proving a clean scan, deduped alert, or confirmed Slack delivery | stale/missing receipt or failed delivery |
 | `com.colingreig.hermes.fleet-outcome-probe` | loaded | current process execution plus CI-wrapper heartbeat cross-watch | unloaded agent or stale probe receipt |
 | `com.colingreig.hermes.release-poll` | retired | plist absent and `launchctl print` fails | any plist/load resurrection |
 
@@ -80,7 +82,12 @@ even though the label is not part of the active contract.
 Repository tests prove semantic failures are distinguishable from scheduler
 success, unknown enabled jobs and monitored plists fail closed, a failed Slack
 send does not advance dedupe, confirmed delivery dedupes a repeat, and the
-drill emits exactly one finding per contract.
+drill emits exactly one finding per contract by executing its real predicate.
+The content-addressed `fleet_outcome_manifest.json` and
+`reconcile_fleet_outcomes.py` deploy the scripts, contracts, two LaunchAgents,
+and CI cron wrapper field as one scheduler-locked, snapshot-backed transaction.
+The normal Mini release cut invokes this reconciler and rolls it back with the
+release if byte, cron, launchd, or registration verification fails.
 
 The live Mini cutover receipt and Slack drill receipt are attached to ClickUp
 task `86e2jbbhx`; they are intentionally operational evidence rather than

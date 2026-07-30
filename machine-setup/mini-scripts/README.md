@@ -525,15 +525,18 @@ proof packet:
   scheduling plane. The full inventory and outcome mapping is in
   `../fleet-config/MONITOR_COVERAGE.md`.
 
-  Deploy only the three named files, then bootstrap the plist:
+  Deployment is governed by the content-addressed
+  `fleet_outcome_manifest.json` and transactional
+  `reconcile_fleet_outcomes.py`. The normal Mini release cut invokes it
+  automatically. For an explicit verification or repair from an exact release:
 
   ```bash
-  install -m 0755 fleet_outcome_probe.py ~/.hermes/scripts/fleet_outcome_probe.py
-  install -m 0644 fleet_outcome_contracts.json ~/.hermes/scripts/fleet_outcome_contracts.json
-  install -m 0644 launchd/com.colingreig.hermes.fleet-outcome-probe.plist \
-    ~/Library/LaunchAgents/com.colingreig.hermes.fleet-outcome-probe.plist
-  launchctl bootstrap gui/$(id -u) \
-    ~/Library/LaunchAgents/com.colingreig.hermes.fleet-outcome-probe.plist
+  ~/.hermes/runtime-current/venv/bin/python \
+    ~/.hermes/runtime-current/machine-setup/mini-scripts/reconcile_fleet_outcomes.py \
+    verify \
+    --source-root ~/.hermes/runtime-current/machine-setup/mini-scripts \
+    --manifest ~/.hermes/runtime-current/machine-setup/mini-scripts/fleet_outcome_manifest.json \
+    --reload
   ```
 - `hermes_report_build.py` fix (2026-07-26): the status-email spend section
   rendered a served-ledger read failure the same as a genuine $0.00 day —
