@@ -438,7 +438,13 @@ class _ExecutorAdmissionHeartbeat:
 
     def stop(self) -> None:
         self._stop.set()
-        self._thread.join(timeout=1.0)
+        self._thread.join(timeout=2.0)
+        if self._thread.is_alive() and self.error is None:
+            self.error = ExecutorAdmissionError(
+                "executor admission heartbeat did not stop within its bounded "
+                "SQLite operation window"
+            )
+            self.cancel_event.set()
 
     def _run(self) -> None:
         while not self._stop.wait(_EXECUTION_HEARTBEAT_SECONDS):
@@ -4937,7 +4943,10 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
     lease_heartbeat = None
     executor_lease = None
     executor_lease_heartbeat = None
+    executor_lease_finalized = False
     executor_terminal_status = "failed"
+    deferred_executor_outcome = None
+    deferred_executor_skip_job_status = False
     interrupted_by_gateway = False
     from tools.env_passthrough import (
         begin_env_passthrough_scope,
@@ -4945,6 +4954,102 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
     )
 
     _env_scope_tokens = begin_env_passthrough_scope()
+
+    def _settle_executor_and_record(
+        outcome: _CronExecutionOutcome,
+        *,
+        skip_job_status: bool = False,
+    ) -> bool:
+        """Settle admission before making the execution outcome terminal."""
+        nonlocal executor_lease
+        nonlocal executor_lease_finalized
+        nonlocal executor_lease_heartbeat
+        nonlocal lease_heartbeat
+        nonlocal deferred_executor_outcome
+        nonlocal deferred_executor_skip_job_status
+        if lease_heartbeat is not None:
+            lease_heartbeat.stop()
+            lease_heartbeat = None
+        if executor_lease_heartbeat is not None:
+            admission_heartbeat = executor_lease_heartbeat
+            admission_heartbeat.stop()
+            executor_lease_heartbeat = None
+            if admission_heartbeat.error is not None:
+                outcome = _normalize_cron_outcome(
+                    False,
+                    "",
+                    "Executor admission heartbeat failed closed: "
+                    f"{admission_heartbeat.error}",
+                )._replace(reason="executor_admission_heartbeat_failed")
+
+        cleanup_errors: list[BaseException] = []
+        lease = executor_lease
+        if lease is not None:
+            if not executor_lease_finalized:
+                try:
+                    finalize_executor_lease(
+                        lease,
+                        status="completed" if outcome.success else "failed",
+                    )
+                    executor_lease_finalized = True
+                except BaseException as exc:
+                    cleanup_errors.append(exc)
+            try:
+                # Finalization and release are independent exact-CAS operations.
+                # An active row can still be safely released if finalization
+                # failed before changing it.
+                release_executor_lease(lease)
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+            else:
+                executor_lease = None
+                executor_lease_finalized = False
+
+        if cleanup_errors:
+            detail = "; ".join(
+                f"{type(exc).__name__}: {exc}" for exc in cleanup_errors
+            )
+            logger.error(
+                "Executor job '%s' admission cleanup failed: %s",
+                job["id"],
+                detail,
+            )
+            outcome = _normalize_cron_outcome(
+                False,
+                "",
+                f"Executor admission cleanup failed closed: {detail}",
+            )._replace(reason="executor_admission_cleanup_failed")
+        if executor_lease is not None:
+            # Keep the execution row claimed/running until the exact admission
+            # tuple is released. If this process dies while SQLite contention
+            # persists, startup stale-owner recovery needs that non-terminal
+            # ledger row as its durable PID/start-time proof. The scheduled-job
+            # surface still goes red immediately.
+            deferred_executor_outcome = outcome
+            deferred_executor_skip_job_status = skip_job_status
+            if not skip_job_status:
+                try:
+                    mark_job_run(
+                        job["id"],
+                        False,
+                        outcome.error,
+                        delivery_error=outcome.delivery_error,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Job '%s': could not persist deferred executor cleanup "
+                        "failure",
+                        job["id"],
+                    )
+            return False
+        return _record_cron_outcome(
+            job,
+            execution_id,
+            owner_token,
+            outcome,
+            skip_job_status=skip_job_status,
+        )
+
     try:
         if is_executor_job(job):
             try:
@@ -4968,9 +5073,24 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
                     job, execution_id, owner_token, outcome
                 )
             if executor_lease is None:
+                output = f"""# Cron Job: {job.get('name', job['id'])}
+
+**Job ID:** {job['id']}
+**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}
+**Schedule:** {job.get('schedule_display', 'N/A')}
+
+## Prompt
+
+Executor admission check only; no agent was dispatched.
+
+## Response
+
+Zero ClickUp claims and zero swarms were started because another positively observed fenced executor owner is active. This scheduled tick completed as a clean no-claim.
+"""
+                save_job_output(job["id"], output)
                 outcome = _normalize_cron_outcome(
-                    False, "", "Another fenced executor owner is active."
-                )._replace(reason="executor_admission_denied")
+                    True, SILENT_MARKER, None
+                )._replace(reason="executor_admission_no_claim")
                 return _record_cron_outcome(
                     job, execution_id, owner_token, outcome
                 )
@@ -4992,8 +5112,8 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             outcome = _normalize_cron_outcome(
                 False, "", "Dispatch claim rejected; execution was not started."
             )._replace(reason="dispatch_rejected")
-            recorded = _record_cron_outcome(
-                job, execution_id, owner_token, outcome, skip_job_status=True
+            recorded = _settle_executor_and_record(
+                outcome, skip_job_status=True
             )
             executor_terminal_status = "completed" if recorded else "failed"
             return recorded
@@ -5141,10 +5261,7 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
                 "Executor admission heartbeat failed closed: "
                 f"{executor_lease_heartbeat.error}",
             )._replace(reason="executor_admission_heartbeat_failed")
-        recorded = _record_cron_outcome(
-            job,
-            execution_id,
-            owner_token,
+        recorded = _settle_executor_and_record(
             outcome,
             skip_job_status=_consume_interrupted_flag(job["id"]),
         )
@@ -5159,10 +5276,7 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         outcome = _deliver_cron_outcome(
             job, outcome, "", adapters=adapters, loop=loop
         )
-        recorded = _record_cron_outcome(
-            job,
-            execution_id,
-            owner_token,
+        recorded = _settle_executor_and_record(
             outcome,
             skip_job_status=_consume_interrupted_flag(job["id"]),
         )
@@ -5173,10 +5287,7 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         outcome = _normalize_cron_outcome(
             False, "", f"{type(e).__name__}: {e}", interrupted=_is_interrupted(job["id"])
         )._replace(reason="signal")
-        _record_cron_outcome(
-            job,
-            execution_id,
-            owner_token,
+        _settle_executor_and_record(
             outcome,
             skip_job_status=_consume_interrupted_flag(job["id"]),
         )
@@ -5189,10 +5300,42 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             if executor_lease_heartbeat is not None:
                 executor_lease_heartbeat.stop()
             if executor_lease is not None:
-                finalize_executor_lease(
-                    executor_lease, status=executor_terminal_status
-                )
-                release_executor_lease(executor_lease)
+                cleanup_errors = []
+                if not executor_lease_finalized:
+                    try:
+                        finalize_executor_lease(
+                            executor_lease, status=executor_terminal_status
+                        )
+                        executor_lease_finalized = True
+                    except BaseException as exc:
+                        cleanup_errors.append(exc)
+                try:
+                    release_executor_lease(executor_lease)
+                except BaseException as release_error:
+                    cleanup_errors.append(release_error)
+                else:
+                    executor_lease = None
+                    executor_lease_finalized = False
+                    if deferred_executor_outcome is not None:
+                        _record_cron_outcome(
+                            job,
+                            execution_id,
+                            owner_token,
+                            deferred_executor_outcome,
+                            skip_job_status=deferred_executor_skip_job_status,
+                        )
+                        deferred_executor_outcome = None
+                if cleanup_errors:
+                    logger.error(
+                        "Executor job '%s' remains durably fenced after final "
+                        "cleanup retry; preserving its non-terminal execution "
+                        "owner proof: %s",
+                        job["id"],
+                        "; ".join(
+                            f"{type(exc).__name__}: {exc}"
+                            for exc in cleanup_errors
+                        ),
+                    )
         finally:
             reset_env_passthrough_scope(_env_scope_tokens)
 

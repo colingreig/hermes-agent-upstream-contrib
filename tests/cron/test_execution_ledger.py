@@ -12,6 +12,8 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from pathlib import Path
 
+import pytest
+
 
 def _point_ledger(monkeypatch, tmp_path):
     import cron.executions as executions
@@ -262,11 +264,15 @@ def test_startup_reaper_does_not_recover_mismatched_executor_lease(
     status = admission.executor_drain_status()
     assert status["state"] == "active"
     assert status["lease"]["ledger_execution_id"] == "different-execution"
-    assert admission.acquire_executor_lease(
-        job_id="dcab830aa41c",
-        owner_run_id="successor",
-        ledger_execution_id="successor-ledger",
-    ) is None
+    with pytest.raises(
+        admission.ExecutorAdmissionError,
+        match="expired.*uncertain",
+    ):
+        admission.acquire_executor_lease(
+            job_id="dcab830aa41c",
+            owner_run_id="successor",
+            ledger_execution_id="successor-ledger",
+        )
 
 
 def test_startup_reaper_preserves_live_executor_owner_and_lease(

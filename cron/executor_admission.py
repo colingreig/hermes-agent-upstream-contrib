@@ -17,6 +17,7 @@ import json
 import os
 import sqlite3
 import threading
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Optional
@@ -36,6 +37,9 @@ EXECUTOR_JOB_IDS = frozenset(PRODUCTION_EXECUTOR_JOBS)
 RETIRED_EXECUTOR_JOB_IDS = frozenset({"baa3251e033d"})
 DEFAULT_LEASE_SECONDS = 120
 _SCHEMA_VERSION = 2
+_SQLITE_BUSY_DEADLINE_SECONDS = 1.0
+_SQLITE_BUSY_SLICE_SECONDS = 0.05
+_SQLITE_BUSY_RETRY_SECONDS = 0.01
 
 
 class ExecutorAdmissionError(RuntimeError):
@@ -60,74 +64,61 @@ class ExecutorLease:
 _schema_lock = threading.Lock()
 
 
-def _database_path() -> Path:
-    return get_hermes_home().resolve() / "state" / "executor-admission.db"
+def _is_sqlite_busy(exc: sqlite3.Error) -> bool:
+    code = getattr(exc, "sqlite_errorcode", None)
+    if isinstance(code, int):
+        primary_code = code & 0xFF
+        return primary_code in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}
+    text = str(exc).lower()
+    return "database is locked" in text or "database table is locked" in text
 
 
-def _now() -> datetime:
-    return datetime.now(timezone.utc)
+def _retry_sqlite_busy(operation, *, action: str, deadline: float | None = None):
+    """Retry only transient SQLite ownership contention within a hard bound."""
+    if deadline is None:
+        deadline = time.monotonic() + _SQLITE_BUSY_DEADLINE_SECONDS
+    while True:
+        try:
+            return operation()
+        except sqlite3.OperationalError as exc:
+            if not _is_sqlite_busy(exc):
+                raise
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise sqlite3.OperationalError(
+                    f"{action} remained busy past the bounded admission deadline"
+                ) from exc
+            time.sleep(min(_SQLITE_BUSY_RETRY_SECONDS, remaining))
 
 
-def _iso(value: datetime) -> str:
-    return value.isoformat()
+def _begin_immediate(
+    conn: sqlite3.Connection, *, deadline: float | None = None
+) -> None:
+    _retry_sqlite_busy(
+        lambda: conn.execute("BEGIN IMMEDIATE"),
+        action="executor admission write acquisition",
+        deadline=deadline,
+    )
 
 
-def _assert_owned_safe_path(path: Path, *, kind: str) -> None:
-    try:
-        stat = path.lstat()
-    except OSError as exc:
-        raise ExecutorAdmissionError(f"cannot inspect executor admission {kind}: {exc}") from exc
-    if path.is_symlink():
-        raise ExecutorAdmissionError(f"executor admission {kind} must not be a symlink: {path}")
-    getuid = getattr(os, "getuid", None)
-    if not callable(getuid):
-        raise ExecutorAdmissionError(
-            "executor admission ownership cannot be verified because the "
-            f"POSIX user identity API is unavailable: {path}"
-        )
-    try:
-        current_uid = getuid()
-    except Exception as exc:
-        raise ExecutorAdmissionError(
-            "executor admission ownership cannot be verified because the "
-            f"current user ID is unavailable: {path}: {exc}"
-        ) from exc
-    if stat.st_uid != current_uid:
-        raise ExecutorAdmissionError(
-            f"executor admission {kind} is not owned by the current user: {path}"
-        )
-    if stat.st_mode & 0o022:
-        raise ExecutorAdmissionError(
-            f"executor admission {kind} is group/world-writable: {path}"
-        )
+def _commit(conn: sqlite3.Connection, *, deadline: float | None = None) -> None:
+    # SQLite leaves the transaction active when COMMIT returns BUSY, so the
+    # exact same transaction can be safely retried until readers drain.
+    _retry_sqlite_busy(
+        lambda: conn.execute("COMMIT"),
+        action="executor admission commit",
+        deadline=deadline,
+    )
 
 
-def _connect() -> sqlite3.Connection:
-    path = _database_path()
-    conn: sqlite3.Connection | None = None
-    try:
-        parent_existed = path.parent.exists()
-        path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
-        if not parent_existed:
-            os.chmod(path.parent, 0o700)
-        _assert_owned_safe_path(path.parent, kind="directory")
-        existed = path.exists() or path.is_symlink()
-        if existed:
-            _assert_owned_safe_path(path, kind="database")
-        conn = sqlite3.connect(path, timeout=0, isolation_level=None)
-        if not existed:
-            if path.is_symlink():
-                raise ExecutorAdmissionError(
-                    f"executor admission database became a symlink: {path}"
-                )
-            os.chmod(path, 0o600)
-        _assert_owned_safe_path(path, kind="database")
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA busy_timeout=0")
-        conn.execute("PRAGMA synchronous=FULL")
-        with _schema_lock:
+def _bootstrap_schema(conn: sqlite3.Connection) -> None:
+    """Apply idempotent migrations under one cross-process write fence."""
+
+    def migrate() -> None:
+        try:
             conn.executescript(
                 """
+                BEGIN IMMEDIATE;
                 CREATE TABLE IF NOT EXISTS admission_state (
                     singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
                     last_fencing_token INTEGER NOT NULL
@@ -224,8 +215,97 @@ def _connect() -> sqlite3.Connection:
                 WHERE singleton = 1;
 
                 PRAGMA user_version = 2;
+                COMMIT;
                 """
             )
+        except sqlite3.Error:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+
+    _retry_sqlite_busy(migrate, action="executor admission schema bootstrap")
+
+
+def _database_path() -> Path:
+    return get_hermes_home().resolve() / "state" / "executor-admission.db"
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _iso(value: datetime) -> str:
+    return value.isoformat()
+
+
+def _assert_owned_safe_path(path: Path, *, kind: str) -> None:
+    try:
+        stat = path.lstat()
+    except OSError as exc:
+        raise ExecutorAdmissionError(f"cannot inspect executor admission {kind}: {exc}") from exc
+    if path.is_symlink():
+        raise ExecutorAdmissionError(f"executor admission {kind} must not be a symlink: {path}")
+    getuid = getattr(os, "getuid", None)
+    if not callable(getuid):
+        raise ExecutorAdmissionError(
+            "executor admission ownership cannot be verified because the "
+            f"POSIX user identity API is unavailable: {path}"
+        )
+    try:
+        current_uid = getuid()
+    except Exception as exc:
+        raise ExecutorAdmissionError(
+            "executor admission ownership cannot be verified because the "
+            f"current user ID is unavailable: {path}: {exc}"
+        ) from exc
+    if stat.st_uid != current_uid:
+        raise ExecutorAdmissionError(
+            f"executor admission {kind} is not owned by the current user: {path}"
+        )
+    if stat.st_mode & 0o022:
+        raise ExecutorAdmissionError(
+            f"executor admission {kind} is group/world-writable: {path}"
+        )
+
+
+def _connect() -> sqlite3.Connection:
+    path = _database_path()
+    conn: sqlite3.Connection | None = None
+    try:
+        parent_existed = path.parent.exists()
+        path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+        if not parent_existed:
+            os.chmod(path.parent, 0o700)
+        _assert_owned_safe_path(path.parent, kind="directory")
+        existed = path.exists() or path.is_symlink()
+        if existed:
+            _assert_owned_safe_path(path, kind="database")
+        conn = sqlite3.connect(
+            path,
+            timeout=_SQLITE_BUSY_SLICE_SECONDS,
+            isolation_level=None,
+        )
+        if not existed:
+            if path.is_symlink():
+                raise ExecutorAdmissionError(
+                    f"executor admission database became a symlink: {path}"
+                )
+            os.chmod(path, 0o600)
+        _assert_owned_safe_path(path, kind="database")
+        conn.row_factory = sqlite3.Row
+        conn.execute(
+            f"PRAGMA busy_timeout={int(_SQLITE_BUSY_SLICE_SECONDS * 1000)}"
+        )
+        conn.execute("PRAGMA synchronous=FULL")
+        with _schema_lock:
+            version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+            if version > _SCHEMA_VERSION:
+                raise ExecutorAdmissionError(
+                    "executor admission schema is newer than this runtime "
+                    f"({version} > {_SCHEMA_VERSION})"
+                )
+            if version < _SCHEMA_VERSION:
+                _bootstrap_schema(conn)
         return conn
     except ExecutorAdmissionError:
         if conn is not None:
@@ -267,7 +347,8 @@ def request_executor_wake(
     requested_at = _iso(_now())
     conn = _connect()
     try:
-        conn.execute("BEGIN IMMEDIATE")
+        transaction_deadline = time.monotonic() + _SQLITE_BUSY_DEADLINE_SECONDS
+        _begin_immediate(conn, deadline=transaction_deadline)
         conn.execute(
             """
             INSERT INTO pending_wakes(job_id, task_id, reason, requested_at)
@@ -279,7 +360,7 @@ def request_executor_wake(
             """,
             (job_id, normalized_task, str(reason), requested_at),
         )
-        conn.execute("COMMIT")
+        _commit(conn, deadline=transaction_deadline)
     except sqlite3.Error as exc:
         try:
             conn.execute("ROLLBACK")
@@ -335,12 +416,18 @@ def acquire_executor_lease(
     expires_iso = _iso(now + timedelta(seconds=max(1, int(lease_seconds))))
     conn = _connect()
     try:
-        conn.execute("BEGIN IMMEDIATE")
+        transaction_deadline = time.monotonic() + _SQLITE_BUSY_DEADLINE_SECONDS
+        _begin_immediate(conn, deadline=transaction_deadline)
         current = conn.execute(
             "SELECT * FROM executor_lease WHERE singleton=1"
         ).fetchone()
         if current is not None and current["state"] == "active":
             conn.execute("ROLLBACK")
+            if current["expires_at"] < now_iso:
+                raise ExecutorAdmissionError(
+                    "active executor lease is expired and its owner is uncertain; "
+                    "exact stale-owner recovery is required"
+                )
             return None
         if current is not None:
             conn.execute(
@@ -404,7 +491,7 @@ def acquire_executor_lease(
         )
         if pending is not None:
             conn.execute("DELETE FROM pending_wakes WHERE job_id=?", (job_id,))
-        conn.execute("COMMIT")
+        _commit(conn, deadline=transaction_deadline)
         return ExecutorLease(
             task_id=resolved_task,
             job_id=job_id,
@@ -439,7 +526,8 @@ def heartbeat_executor_lease(
     expires_iso = _iso(now + timedelta(seconds=max(1, int(lease_seconds))))
     conn = _connect()
     try:
-        conn.execute("BEGIN IMMEDIATE")
+        transaction_deadline = time.monotonic() + _SQLITE_BUSY_DEADLINE_SECONDS
+        _begin_immediate(conn, deadline=transaction_deadline)
         cur = conn.execute(
             """
             UPDATE executor_lease
@@ -484,7 +572,7 @@ def heartbeat_executor_lease(
             raise ExecutorAdmissionError(
                 "executor lease heartbeat history rejected by fencing CAS"
             )
-        conn.execute("COMMIT")
+        _commit(conn, deadline=transaction_deadline)
         return ExecutorLease(
             **{
                 **lease.as_dict(),
@@ -510,7 +598,8 @@ def finalize_executor_lease(lease: ExecutorLease, *, status: str) -> None:
     now_iso = _iso(_now())
     conn = _connect()
     try:
-        conn.execute("BEGIN IMMEDIATE")
+        transaction_deadline = time.monotonic() + _SQLITE_BUSY_DEADLINE_SECONDS
+        _begin_immediate(conn, deadline=transaction_deadline)
         cur = conn.execute(
             """
             UPDATE executor_lease
@@ -555,7 +644,7 @@ def finalize_executor_lease(lease: ExecutorLease, *, status: str) -> None:
             raise ExecutorAdmissionError(
                 "executor lease finalization history rejected by fencing CAS"
             )
-        conn.execute("COMMIT")
+        _commit(conn, deadline=transaction_deadline)
     except ExecutorAdmissionError:
         raise
     except sqlite3.Error as exc:
@@ -572,7 +661,8 @@ def release_executor_lease(lease: ExecutorLease) -> None:
     now_iso = _iso(_now())
     conn = _connect()
     try:
-        conn.execute("BEGIN IMMEDIATE")
+        transaction_deadline = time.monotonic() + _SQLITE_BUSY_DEADLINE_SECONDS
+        _begin_immediate(conn, deadline=transaction_deadline)
         history_cur = conn.execute(
             """
             UPDATE executor_lease_history
@@ -616,7 +706,7 @@ def release_executor_lease(lease: ExecutorLease) -> None:
             raise ExecutorAdmissionError(
                 "executor lease release rejected by fencing CAS"
             )
-        conn.execute("COMMIT")
+        _commit(conn, deadline=transaction_deadline)
     except ExecutorAdmissionError:
         raise
     except sqlite3.Error as exc:
@@ -714,7 +804,8 @@ def _recover_expired_executor_lease_with_proof(
         uuid.NAMESPACE_URL,
         json.dumps(receipt_body, sort_keys=True, separators=(",", ":")),
     ).hex
-    conn.execute("BEGIN IMMEDIATE")
+    transaction_deadline = time.monotonic() + _SQLITE_BUSY_DEADLINE_SECONDS
+    _begin_immediate(conn, deadline=transaction_deadline)
     cur = conn.execute(
         """
         UPDATE executor_lease
@@ -781,7 +872,7 @@ def _recover_expired_executor_lease_with_proof(
         raise ExecutorAdmissionError(
             "expired executor recovery history lost its fencing CAS"
         )
-    conn.execute("COMMIT")
+    _commit(conn, deadline=transaction_deadline)
     return {**receipt_body, "receipt_id": receipt_id}
 
 
