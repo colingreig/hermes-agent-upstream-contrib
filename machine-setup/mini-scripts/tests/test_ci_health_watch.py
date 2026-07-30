@@ -410,10 +410,12 @@ class CiHealthWatchTests(unittest.TestCase):
 
     def test_topology_rejects_duplicate_and_unknown_runner_fleet(self):
         topology = json.loads(TOPOLOGY.read_text(encoding="utf-8"))
-        for mutation in ("duplicate", "unknown"):
+        for mutation in ("duplicate", "three-runners", "unknown"):
             candidate = json.loads(json.dumps(topology))
             if mutation == "duplicate":
                 candidate["expected_runners"].append(dict(candidate["expected_runners"][0]))
+            elif mutation == "three-runners":
+                candidate["expected_runners"] = candidate["expected_runners"][:3]
             else:
                 candidate["expected_runners"][-1]["repo"] = "colingreig/unknown"
             path = Path(self.tmp.name) / f"{mutation}.json"
