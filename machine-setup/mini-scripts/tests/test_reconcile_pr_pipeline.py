@@ -145,6 +145,8 @@ class PipelineDeploymentTests(unittest.TestCase):
         for source in sorted(PIPELINE.glob(manifest_data["package_glob"])):
             if source.is_file():
                 add(source, Path(manifest_data["package_destination"]) / source.name)
+        for name in manifest_data.get("package_files", []):
+            add(PIPELINE / name, Path(manifest_data["package_destination"]) / name)
         return self.mod.ResolvedManifest(
             path=PIPELINE / "manifest.json",
             sha256=hashlib.sha256((PIPELINE / "manifest.json").read_bytes()).hexdigest(),

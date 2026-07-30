@@ -264,6 +264,12 @@ def resolve_manifest(path: Path = DEFAULT_MANIFEST) -> ResolvedManifest:
     package_glob = data.get("package_glob")
     if package_glob != "*.py":
         raise ManifestError("package_glob must be the fixed '*.py' source set")
+    raw_package_files = data.get("package_files", [])
+    if not isinstance(raw_package_files, list):
+        raise ManifestError("package_files must be a string list")
+    package_files = tuple(_safe_filename(name, field="package_files item") for name in raw_package_files)
+    if tuple(sorted(package_files)) != package_files or len(set(package_files)) != len(package_files):
+        raise ManifestError("package_files must be unique and sorted")
     package_destination = _safe_directory(data.get("package_destination"), field="package_destination")
     if package_destination != "pr_pipeline":
         raise ManifestError("package_destination must be the canonical 'pr_pipeline' package")
@@ -313,6 +319,8 @@ def resolve_manifest(path: Path = DEFAULT_MANIFEST) -> ResolvedManifest:
         raise ManifestError("pr_pipeline package must contain __init__.py and at least one Python file")
     for source in package_sources:
         add(source, Path(package_destination) / source.name)
+    for name in package_files:
+        add(root / name, Path(package_destination) / name)
 
     required_review_gate_paths = (REVIEW_GATE_ROOT_SHIM, *REVIEW_GATE_PACKAGE_CLOSURE)
     missing_review_gate_sources = [
