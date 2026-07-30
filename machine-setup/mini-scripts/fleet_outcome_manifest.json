@@ -23,14 +23,14 @@
       "destination_root": "scripts",
       "destination": "fleet_outcome_probe.py",
       "mode": "0755",
-      "sha256": "28869ad20b81f19f4e4ec4db1cee944e60a2199db8bcc76f926e34738754d10d"
+      "sha256": "cc600150c79e16c2f5d9fe02d41f72ce8cd883a3823c1c442bd4410d95bf719c"
     },
     {
       "source": "fleet_outcome_contracts.json",
       "destination_root": "scripts",
       "destination": "fleet_outcome_contracts.json",
       "mode": "0644",
-      "sha256": "284bc3a88ec4c8587f9d31632a4d05deb41626dce95bdfb65a6625001ca564b8"
+      "sha256": "14bd0dce430a94e44bb87bc6eb127b9e69f2fe93c57e40844162ceb52e1c3590"
     },
     {
       "source": "hermes_usage_alert.py",
