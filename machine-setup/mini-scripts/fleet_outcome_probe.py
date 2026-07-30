@@ -304,6 +304,31 @@ def _check_artifact(
                     f"{path} key {key!r} is {payload.get(key)!r}, expected {expected!r}",
                 )
             )
+    linked = outcome.get("linked_artifact")
+    if linked:
+        linked_path = _expand_path(str(linked["path"]), home=home)
+        hash_key = str(linked.get("sha256_key") or "sha256")
+        try:
+            observed_hash = hashlib.sha256(linked_path.read_bytes()).hexdigest()
+        except OSError as exc:
+            findings.append(
+                _finding(
+                    surface,
+                    identifier,
+                    "linked_artifact_missing",
+                    f"{linked_path}: {exc}",
+                )
+            )
+        else:
+            if payload.get(hash_key) != observed_hash:
+                findings.append(
+                    _finding(
+                        surface,
+                        identifier,
+                        "linked_artifact_hash_mismatch",
+                        f"{path} {hash_key!r} does not match {linked_path}",
+                    )
+                )
     timestamp_key = outcome.get("timestamp_key")
     if timestamp_key:
         observed = _parse_time(payload.get(timestamp_key))
