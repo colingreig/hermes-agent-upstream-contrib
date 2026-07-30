@@ -15,6 +15,26 @@ the mini:
 snapshots each existing destination, writes atomically, and re-verifies the
 deployed bytes.
 
+## Production release path
+
+The rebuilt fleet has one production release path: an operator manually runs
+the governed cutter with the exact certified full SHA and its immutable
+promotion receipt ID:
+
+```bash
+~/.hermes/runtime-current/scripts/mini-release-cut.sh \
+  --ref <certified-full-sha> \
+  --certified-sha <same-certified-full-sha> \
+  --promotion-receipt-id <promotion-receipt-sha256>
+```
+
+The automatic LaunchAgent `com.colingreig.hermes.release-poll` is retired for
+this fleet and is not installed, loaded, or enabled by the fleet bundle. Do not
+bootstrap it as part of fleet setup or normal release operations. The generic
+poller scripts and tests remain in the repository as an opt-in contingency for
+a deployment that explicitly adopts that operating model; they are not a
+second Hermes fleet production path.
+
 ## Why an overlay, not a full config.yaml replacement
 
 `~/.hermes/config.yaml` carries hundreds of live, hand-tuned settings

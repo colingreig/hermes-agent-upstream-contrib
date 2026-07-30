@@ -18,6 +18,25 @@ below: `clickup_workspace_refresh.py` and the canonical launchd environment.
 
 Tracked in ClickUp `86e2ddah5`.
 
+## Rebuilt fleet production policy
+
+The rebuilt Hermes fleet has one production release path: an operator manually
+runs the governed cutter with the exact certified full SHA and the immutable
+promotion receipt ID that authorizes that same SHA:
+
+```bash
+~/.hermes/runtime-current/scripts/mini-release-cut.sh \
+  --ref <certified-full-sha> \
+  --certified-sha <same-certified-full-sha> \
+  --promotion-receipt-id <promotion-receipt-sha256>
+```
+
+The automatic LaunchAgent `com.colingreig.hermes.release-poll` is retired for
+this fleet and is not installed, loaded, or enabled. Do not bootstrap it during
+fleet setup or normal release operations. The generic poller tooling remains
+source-controlled and tested only as an opt-in contingency for another
+deployment that explicitly adopts polling.
+
 ## Layout on the mini
 
 - Releases live at `~/.hermes/releases/v<version>-<12charsha>/` (a git clone +
@@ -52,48 +71,69 @@ which is not on a non-interactive ssh PATH — the script extends PATH itself.
 
 ```bash
 # Standard cut of prod-live-patches:
-~/.hermes/runtime-current/scripts/mini-release-cut.sh --ref <certified-full-sha> --certified-sha <certified-full-sha>
+~/.hermes/runtime-current/scripts/mini-release-cut.sh \
+  --ref <certified-full-sha> \
+  --certified-sha <same-certified-full-sha> \
+  --promotion-receipt-id <promotion-receipt-sha256>
 
 # Preview every mutating action, change nothing:
 ~/.hermes/runtime-current/scripts/mini-release-cut.sh --ref prod-live-patches --dry-run
 
-# Polling-safe mode: equal is a successful no-op; only a strict descendant cuts:
-~/.hermes/runtime-current/scripts/mini-release-cut.sh --ref prod-live-patches --certified-sha <certified-full-sha> --if-advanced
+# Generic contingency only: equal is a no-op; only a strict descendant cuts:
+~/.hermes/runtime-current/scripts/mini-release-cut.sh \
+  --ref <certified-full-sha> \
+  --certified-sha <same-certified-full-sha> \
+  --promotion-receipt-id <promotion-receipt-sha256> \
+  --if-advanced
 
 # Cut a specific sha or branch:
-~/.hermes/runtime-current/scripts/mini-release-cut.sh --ref <sha-or-branch> --certified-sha <same-full-sha>
+~/.hermes/runtime-current/scripts/mini-release-cut.sh \
+  --ref <certified-full-sha> \
+  --certified-sha <same-certified-full-sha> \
+  --promotion-receipt-id <promotion-receipt-sha256>
 
 # Roll back to the previous release (no build):
 ~/.hermes/runtime-current/scripts/mini-release-cut.sh --rollback
 
 # Cut, then prune releases older than the newest 3:
-~/.hermes/runtime-current/scripts/mini-release-cut.sh --ref <certified-full-sha> --certified-sha <certified-full-sha> --prune
+~/.hermes/runtime-current/scripts/mini-release-cut.sh \
+  --ref <certified-full-sha> \
+  --certified-sha <same-certified-full-sha> \
+  --promotion-receipt-id <promotion-receipt-sha256> \
+  --prune
 ```
 
 `--ref` defaults to `prod-live-patches`.
-Every real cut and preflight requires `--certified-sha`. The resolved target
-must equal it exactly; ancestry is not accepted as certification. Dry-runs and
-explicit rollback are the only exceptions.
+Every real cut and preflight requires both `--certified-sha` and
+`--promotion-receipt-id`. The resolved target must equal the full certified SHA
+exactly, and the immutable promotion receipt must authorize that same target;
+ancestry is not accepted as certification. Dry-runs and explicit rollback are
+the only exceptions.
 
-## Optional local polling job
+## Optional local polling contingency
 
-The poller is local-only and does not expose a webhook. Its wrapper delegates
-all decisions to the locked cutter:
+This generic contingency is not installed or enabled for the rebuilt Hermes
+fleet. Its source remains available for a different deployment only after an
+explicit decision to adopt polling. The poller is local-only, exposes no
+webhook, and delegates all decisions to the locked cutter:
 
 ```bash
 ~/.hermes/runtime-current/scripts/install-mini-release-poller.sh --install \
-  --certified-sha <full-sha>
+  --certified-sha <full-sha> \
+  --promotion-receipt-id <promotion-receipt-sha256>
 # Review the installed plist, then explicitly load it:
 ~/.hermes/runtime-current/scripts/install-mini-release-poller.sh --install-and-enable \
   --actor "<operator-id>" --reason "<exact-SHA CI evidence>" \
-  --certified-sha <full-sha>
+  --certified-sha <full-sha> \
+  --promotion-receipt-id <promotion-receipt-sha256>
 
 # Governed controls used during rollout:
 ~/.hermes/runtime-current/scripts/install-mini-release-poller.sh --freeze \
   --actor "<operator-id>" --reason "<why>"
 ~/.hermes/runtime-current/scripts/install-mini-release-poller.sh --unfreeze \
   --actor "<operator-id>" --reason "<exact-SHA CI evidence>" \
-  --certified-sha <full-sha>
+  --certified-sha <full-sha> \
+  --promotion-receipt-id <promotion-receipt-sha256>
 ~/.hermes/runtime-current/scripts/install-mini-release-poller.sh --status
 ```
 
@@ -105,9 +145,10 @@ Poll-control changes are content-addressed, persist under `releases/`, and
 require an explicit actor and reason. Missing, corrupt, locked, or
 unsafe-permission control state prevents polling. A failed managed cut records
 a frozen receipt, or remains fail-closed if the control itself is unavailable.
-Do not enable it until `prod-live-patches` contains the active runtime commit:
-on 2026-07-26 the Mini's active `231607384a1d` and branch `9a48716a786d` were
-diverged, so bootstrap is intentionally blocked until the branch is reconciled.
+Any deployment that explicitly adopts this contingency must first prove its
+promotion branch contains the active runtime commit; the locked preflight
+accepts only an equal or strict-descendant target and rejects all unverifiable
+authority.
 
 ## What a cut does (order matters)
 
@@ -145,8 +186,8 @@ diverged, so bootstrap is intentionally blocked until the branch is reconciled.
    `~/.hermes/scripts/clickup_workspace_refresh.py`, then install (or repair)
    the executable `~/.local/bin/cu-clickup` wrapper and PATH link.
 12. Record a deterministic receipt with old/new commits, certified SHA,
-    runtime target, reconciliation receipt, review-gate smoke, source hash,
-    deployed hash, ref, event, and result detail.
+    promotion receipt ID, runtime target, reconciliation receipt, review-gate
+    smoke, source hash, deployed hash, ref, event, and result detail.
 13. On **any** verification, governed install, CLI install, hash, or receipt
     failure: **automatic rollback** of the runtime target, launchd snapshot, and
     governed refresh bytes, restart, re-verify, and exit non-zero.
@@ -197,6 +238,10 @@ diverged, so bootstrap is intentionally blocked until the branch is reconciled.
     descendant can cut; behind, diverged, or unresolvable ancestry fails closed.
 12. Receipt filenames are the SHA-256 of their canonical JSON payload. Repeated
     polls in identical state reuse the same immutable receipt.
+13. Every non-dry-run cut or preflight requires an exact full certified SHA and
+    a lowercase SHA-256 promotion receipt ID. The resolved target must equal
+    the certified SHA, and the immutable receipt must authorize that exact
+    target before any build or switch.
 
 ## Rollback
 
