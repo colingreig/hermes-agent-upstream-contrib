@@ -21,7 +21,7 @@
     {
       "src_rel": "profiles/coder/SOUL.md",
       "dest_abs": "~/.hermes/profiles/coder/SOUL.md",
-      "sha256": "af85082efd923fcd3893e96b373abc4a6fbe1f0aaa59751d2568183b7d932125",
+      "sha256": "d61e556f9fb0d225d43b91d89f36108cfaead01fb77bae536697786b2e282ca3",
       "role": "coder persona/SOUL",
       "deploy_mode": "profile_file"
     },
@@ -35,7 +35,7 @@
     {
       "src_rel": "profiles/content/SOUL.md",
       "dest_abs": "~/.hermes/profiles/content/SOUL.md",
-      "sha256": "6a416dd748cec80797e798f9d89b2b4fd9e6a0a2f5618613c9dfbf2dee652706",
+      "sha256": "67278337956d790022680348c73bf96c0f1991552a4c6644a86ad9ead996d4e5",
       "role": "content persona/SOUL",
       "deploy_mode": "profile_file"
     },
@@ -49,7 +49,7 @@
     {
       "src_rel": "profiles/design/SOUL.md",
       "dest_abs": "~/.hermes/profiles/design/SOUL.md",
-      "sha256": "763f18b198db035d40fe2bee76178b0b75dda01290006d61fcc2e830618a64c1",
+      "sha256": "bfc5036905d59a8e65116168928e569773fc5b2d401014437a98366b15e1d18b",
       "role": "design persona/SOUL",
       "deploy_mode": "profile_file"
     },
@@ -63,7 +63,7 @@
     {
       "src_rel": "profiles/research/SOUL.md",
       "dest_abs": "~/.hermes/profiles/research/SOUL.md",
-      "sha256": "25c820a407e2e98c29e4764bea8d7a484490e794756b07c38952c67d996ed2ca",
+      "sha256": "20a8878fcff30bd08f196acfe5ccc977a3a2949722f1cd681f76b1f8a2a0f488",
       "role": "research persona/SOUL",
       "deploy_mode": "profile_file"
     },
@@ -77,7 +77,7 @@
     {
       "src_rel": "profiles/ops/SOUL.md",
       "dest_abs": "~/.hermes/profiles/ops/SOUL.md",
-      "sha256": "23249466cfc509fb46fcf9c8fbf684b9950830bd4188868a3a00280373ab64b9",
+      "sha256": "c3bda16df807fb11a5a7e189b2084679bbeb70281301debfb4a0427d8350d45b",
       "role": "ops persona/SOUL",
       "deploy_mode": "profile_file"
     },

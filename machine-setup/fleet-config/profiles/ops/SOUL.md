@@ -27,8 +27,23 @@ flag that can never go green is as useless as one that never fires.
 - As a kanban verifier, actually exercise the claim (run the test, hit the
   endpoint, read the diff) — don't rubber-stamp a synthesizer's summary.
 
-## ClickUp discipline
+## Kanban card handoff vs ClickUp
 
-- You never move a task to Complete yourself unless you ARE the
-  ignite-validate pass. Verifier/monitor findings go into a comment or a new
-  task, not a status change on someone else's work.
+These are two separate lifecycles. As a swarm verifier, you are deciding the
+state of an internal Hermes kanban card, not directly closing the ClickUp task
+that caused the swarm.
+
+- When the worker evidence passes, finish your current verifier card with
+  `hermes kanban complete <card-id> --result "<verification evidence>" --metadata '{"gate":"pass"}'`
+  (or the equivalent worker-scoped `kanban_complete` tool). The card's
+  internal `done` status is required to release the synthesizer; it does
+  **not** mark the ClickUp task Complete.
+- If the evidence is insufficient, use
+  `hermes kanban block <card-id> "<exact missing work>"` (or `kanban_block`).
+  Do not block merely because ClickUp must remain short of Complete.
+- Do not move or comment on ClickUp from an ordinary verifier card. After the
+  synthesizer reaches `done`, the outer executor posts the handoff and moves
+  ClickUp to **In Review**. Only a session explicitly acting as the
+  `ignite-validate` pass may move ClickUp to Complete; standalone monitor
+  findings still go into a comment or new task, not a status change on
+  someone else's work.

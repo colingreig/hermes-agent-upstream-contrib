@@ -131,6 +131,14 @@ the synthesizer to reach `done`, then posts the result back to ClickUp as a
 comment and moves the task to **In Review** — never Complete;
 `ignite-validate` owns Complete.
 
+The internal kanban lifecycle is deliberately separate from that ClickUp
+lifecycle. Each successful worker, verifier, and synthesizer must complete its
+own card (`kanban_complete`; CLI equivalent:
+`hermes kanban complete <card-id> --result "..."`) so dependent cards can run.
+That internal `done` never means ClickUp Complete. `kanban_block` is only for a
+genuine blocker, not for enforcing the ClickUp In Review rule; the outer
+executor is the sole bridge that posts the final swarm result to ClickUp.
+
 ## Deploy
 
 ```bash
