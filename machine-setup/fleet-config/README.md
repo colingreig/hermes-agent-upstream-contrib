@@ -7,7 +7,7 @@ the mini:
 | Source | Destination | What it does |
 |---|---|---|
 | `config-overlay.yaml` | `~/.hermes/config.yaml` | Governed **overlay** (not a replacement) — deep-merges `model`, `fallback_providers`, `delegation`, `kanban` in. Every other section (platforms, secrets wiring, security, approvals, credential_pool_strategies, ...) is left untouched. |
-| `profiles/<name>/{config.yaml,SOUL.md}` | `~/.hermes/profiles/<name>/` | Five kanban-swarm profiles: `coder`, `content`, `design`, `research`, `ops`. Each gets its model config, its SOUL.md persona, and the full `_PROFILE_DIRS` bootstrap tree from `hermes_cli/profiles.py` (`memories`, `sessions`, `skills`, `skins`, `logs`, `plans`, `workspace`, `cron`, `home`). |
+| `profiles/<name>/{config.yaml,SOUL.md}` | `~/.hermes/profiles/<name>/` | Five kanban-swarm profiles: `coder`, `content`, `design`, `research`, `ops`. Each gets its model config, its SOUL.md persona, and the full `_PROFILE_DIRS` bootstrap tree from `hermes_cli/profiles.py` (`memories`, `sessions`, `skills`, `skins`, `logs`, `plans`, `workspace`, `cron`, `home`). The `home/` entry is a subprocess workspace, not the profile's Hermes root. |
 | `jobs.json` | `~/.hermes/cron/jobs.json` | Curated 16-job cron set (13 carried forward from the pre-freeze live config, 3 new consolidated hygiene/digest jobs). **Wholesale replace**, not a merge. |
 
 `fleet_config_manifest.json` sha256-pins every source file above.
@@ -54,6 +54,39 @@ cleared. **Never** re-introduce `delegation.base_url` + a named provider.
 **replace** the live value wholesale, they don't append. Never use provider
 `openai-api` (billed OpenAI) anywhere in this bundle; `openai-codex` (Codex
 OAuth, subscription-covered) is the only sanctioned OpenAI surface.
+
+## Profile credential placement
+
+A named profile's Hermes root is `~/.hermes/profiles/<name>/`. Its canonical
+provider credential store is therefore:
+
+```text
+~/.hermes/profiles/<name>/auth.json
+```
+
+The kanban dispatcher sets `HERMES_HOME` to that profile root before resolving
+model credentials. Do not put Hermes provider credentials in
+`~/.hermes/profiles/<name>/home/auth.json`: `home/` is a required
+`_PROFILE_DIRS` bootstrap directory used when a subprocess needs a
+profile-scoped `HOME`; it is not the Hermes auth root and must not be removed
+from the installer to work around credential placement.
+
+This distinction is fail-open at the profile boundary: when the canonical
+profile store is absent, the auth layer may read the global
+`~/.hermes/auth.json` as a fallback. A model call can therefore succeed while
+silently using the global account. Credential verification must inspect the
+safe `auth_store` and `source` fields from the runtime auth status and run a
+no-fallback completion from the actual profile root. For a dedicated coder
+account, the expected values are
+`auth_store=~/.hermes/profiles/coder/auth.json` and
+`source=pool:codex-pro-2`.
+
+Install a dedicated profile store as a mode-`600` regular file, using an
+atomic replace and a timestamped backup when a destination already exists.
+Receipts may record paths, credential IDs/labels, and before/after file
+metadata, but never tokens, token hashes, or fingerprints. Verify that the
+global auth file's identity, size, and modification time are unchanged across
+both installation and the profile-serving proof.
 
 ## Fallback chain
 
