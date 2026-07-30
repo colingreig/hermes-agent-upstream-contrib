@@ -138,6 +138,10 @@ def test_ensure_workspace_map_uses_fresh_cache_without_refresh(tmp_path, monkeyp
 
     assert result == cached
     assert not markdown_path.exists()
+    receipt = json.loads(refresh_mod._receipt_path_for(json_path).read_text(encoding="utf-8"))
+    assert receipt["outcome"] == "success"
+    assert receipt["cache_used"] is True
+    assert receipt["request_count"] == 0
 
 
 def test_ensure_workspace_map_fresh_cache_still_updates_brain_note(tmp_path, monkeypatch):
@@ -551,6 +555,32 @@ def test_get_retries_on_429_and_succeeds(monkeypatch):
     assert slept == [15, 30]  # 15 * 2^0, 15 * 2^1
 
 
+def test_get_honors_retry_after_and_reset_headers(monkeypatch):
+    responses = iter(
+        [
+            (429, None, {"Retry-After": "7"}),
+            (429, None, {"X-RateLimit-Reset": "11"}),
+            (200, {"ok": True}, {}),
+        ]
+    )
+    slept = []
+    monkeypatch.setattr(refresh_mod, "_req", lambda *_: next(responses))
+    monkeypatch.setattr(refresh_mod.time, "sleep", lambda seconds: slept.append(seconds))
+
+    assert refresh_mod._get("/test/path") == {"ok": True}
+    assert slept == [7, 11]
+
+
+def test_get_never_retries_earlier_than_long_provider_retry_after(monkeypatch):
+    responses = iter([(429, None, {"Retry-After": "120"}), (200, {"ok": True}, {})])
+    slept = []
+    monkeypatch.setattr(refresh_mod, "_req", lambda *_: next(responses))
+    monkeypatch.setattr(refresh_mod.time, "sleep", lambda seconds: slept.append(seconds))
+
+    assert refresh_mod._get("/test/path") == {"ok": True}
+    assert slept == [120]
+
+
 def test_get_raises_and_logs_after_exhausting_retries(monkeypatch):
     """_get() raises ClickUpApiError and logs a drift entry after max retries on 429."""
     monkeypatch.setattr(refresh_mod, "_req", lambda *_: (429, None))
@@ -563,3 +593,173 @@ def test_get_raises_and_logs_after_exhausting_retries(monkeypatch):
         refresh_mod._get("/test/path")
 
     assert any("rate_limit_exhausted" in entry for entry in logged)
+
+
+def _complete_workspace_map(team_id="team-1", generated_at=123000):
+    return {
+        "schema_version": refresh_mod.SCHEMA_VERSION,
+        "generated_at": generated_at,
+        "generated_at_iso": "1970-01-01T00:02:03+00:00",
+        "team_id": team_id,
+        "refresh_cadence_hours": 6,
+        "refresh_cadence_cron_expr": "0 */6 * * *",
+        "refresh_cadence_source": "cron_registration",
+        "spaces": [],
+        "folders": [],
+        "lists": [],
+        "task_tags": {"sampled_task_count": 0, "lookback_days": 7, "tags": []},
+        "assignment_patterns": [],
+        "write_boundaries": [],
+        "clients_aliases": {},
+    }
+
+
+def test_exhausted_quota_preserves_last_known_good_map(tmp_path, monkeypatch):
+    output_path = tmp_path / "clickup-map.json"
+    markdown_path = tmp_path / "clickup-workspace-map.md"
+    previous = _complete_workspace_map(generated_at=1)
+    output_path.write_text(json.dumps(previous), encoding="utf-8")
+    monkeypatch.setattr(refresh_mod, "_req", lambda *_: (429, None, {}))
+    monkeypatch.setattr(refresh_mod.time, "sleep", lambda _: None)
+
+    with pytest.raises(refresh_mod.ClickUpApiError):
+        refresh_mod.ensure_workspace_map(
+            team_id="team-1",
+            force=True,
+            output_path=output_path,
+            markdown_path=markdown_path,
+            write_brain_note=False,
+        )
+
+    assert json.loads(output_path.read_text(encoding="utf-8")) == previous
+    receipt = json.loads(refresh_mod._receipt_path_for(output_path).read_text(encoding="utf-8"))
+    assert receipt["outcome"] == "failed"
+    assert receipt["cache_retained"] is True
+    assert receipt["request_count"] == 4
+    assert receipt["rate_limit"]["count"] == 4
+    assert receipt["rate_limit"]["retry_delays_seconds"] == [15, 30, 60]
+
+
+def test_successful_refresh_replaces_cache_atomically_with_matching_receipt(tmp_path, monkeypatch):
+    output_path = tmp_path / "clickup-map.json"
+    markdown_path = tmp_path / "clickup-workspace-map.md"
+    previous = _complete_workspace_map(generated_at=1)
+    output_path.write_text(json.dumps(previous), encoding="utf-8")
+    refreshed = _complete_workspace_map(generated_at=123000)
+    monkeypatch.setattr(refresh_mod, "build_workspace_map", lambda _: refreshed)
+
+    assert refresh_mod.ensure_workspace_map(
+        team_id="team-1",
+        force=True,
+        output_path=output_path,
+        markdown_path=markdown_path,
+        write_brain_note=False,
+    ) == refreshed
+
+    assert json.loads(output_path.read_text(encoding="utf-8")) == refreshed
+    assert refresh_mod._receipt_matches_workspace_map(
+        refresh_mod._receipt_path_for(output_path), refreshed
+    )
+    receipt = json.loads(refresh_mod._receipt_path_for(output_path).read_text(encoding="utf-8"))
+    assert receipt["outcome"] == "success"
+    assert receipt["request_count"] == 0
+    assert receipt["cache_used"] is False
+
+
+def test_success_receipt_records_rate_limit_guidance_and_request_evidence(tmp_path, monkeypatch):
+    output_path = tmp_path / "clickup-map.json"
+    markdown_path = tmp_path / "clickup-workspace-map.md"
+    refreshed = _complete_workspace_map(generated_at=123000)
+    responses = iter([(429, None, {"Retry-After": "120"}), (200, {"ok": True}, {})])
+    slept = []
+    monkeypatch.setattr(refresh_mod, "_req", lambda *_: next(responses))
+    monkeypatch.setattr(refresh_mod.time, "sleep", lambda seconds: slept.append(seconds))
+
+    def _build(_team_id):
+        assert refresh_mod._get("/evidence") == {"ok": True}
+        return refreshed
+
+    monkeypatch.setattr(refresh_mod, "build_workspace_map", _build)
+    refresh_mod.ensure_workspace_map(
+        team_id="team-1",
+        force=True,
+        output_path=output_path,
+        markdown_path=markdown_path,
+        write_brain_note=False,
+    )
+
+    receipt = json.loads(refresh_mod._receipt_path_for(output_path).read_text(encoding="utf-8"))
+    assert receipt["outcome"] == "success"
+    assert receipt["request_count"] == 2
+    assert receipt["cache_present"] is False
+    assert receipt["cache_used"] is False
+    assert receipt["rate_limit"] == {
+        "count": 1,
+        "guidance": [{"retry-after": "120"}],
+        "retry_delays_seconds": [120],
+    }
+    assert slept == [120]
+
+
+def test_mismatched_receipt_forces_non_clean_refresh_without_replacing_cache(tmp_path, monkeypatch):
+    output_path = tmp_path / "clickup-map.json"
+    markdown_path = tmp_path / "clickup-workspace-map.md"
+    previous = _complete_workspace_map(generated_at=1)
+    output_path.write_text(json.dumps(previous), encoding="utf-8")
+    refresh_mod._receipt_path_for(output_path).write_text(
+        json.dumps({"map_sha256": "not-the-map"}), encoding="utf-8"
+    )
+    monkeypatch.setattr(refresh_mod, "_req", lambda *_: (429, None, {}))
+    monkeypatch.setattr(refresh_mod.time, "sleep", lambda _: None)
+
+    with pytest.raises(refresh_mod.ClickUpApiError):
+        refresh_mod.ensure_workspace_map(
+            team_id="team-1",
+            output_path=output_path,
+            markdown_path=markdown_path,
+            write_brain_note=False,
+        )
+
+    assert json.loads(output_path.read_text(encoding="utf-8")) == previous
+
+
+def test_partial_refresh_is_refused_without_replacing_last_known_good(tmp_path, monkeypatch):
+    output_path = tmp_path / "clickup-map.json"
+    markdown_path = tmp_path / "clickup-workspace-map.md"
+    previous = _complete_workspace_map(generated_at=1)
+    output_path.write_text(json.dumps(previous), encoding="utf-8")
+    partial = _complete_workspace_map(generated_at=123000)
+    partial.pop("lists")
+    monkeypatch.setattr(refresh_mod, "build_workspace_map", lambda _: partial)
+
+    with pytest.raises(refresh_mod.WorkspaceMapValidationError, match="complete lists"):
+        refresh_mod.ensure_workspace_map(
+            team_id="team-1",
+            force=True,
+            output_path=output_path,
+            markdown_path=markdown_path,
+            write_brain_note=False,
+        )
+
+    assert json.loads(output_path.read_text(encoding="utf-8")) == previous
+    receipt = json.loads(refresh_mod._receipt_path_for(output_path).read_text(encoding="utf-8"))
+    assert receipt["outcome"] == "failed"
+    assert receipt["cache_retained"] is True
+
+
+def test_field_discovery_is_paced_and_deduplicated(monkeypatch):
+    refresh_mod._LIST_FIELDS_CACHE = {}
+    refresh_mod._LAST_FIELD_DISCOVERY_AT = None
+    requests = []
+    clock = iter([0.0, 0.0, 0.0, 0.0, 0.25])
+    slept = []
+    monkeypatch.setattr(refresh_mod, "_get", lambda path: requests.append(path) or {"fields": []})
+    monkeypatch.setattr(refresh_mod.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(refresh_mod.time, "sleep", lambda seconds: slept.append(seconds))
+
+    refresh_mod.fetch_list_fields("list-1")
+    refresh_mod.fetch_list_fields("list-1")
+    refresh_mod.fetch_list_fields("list-2")
+
+    assert requests == ["/list/list-1/field", "/list/list-2/field"]
+    assert slept == [refresh_mod.FIELD_DISCOVERY_MIN_INTERVAL_SECONDS]
