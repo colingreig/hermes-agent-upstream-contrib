@@ -15,6 +15,14 @@ Resume this runbook when the Mac mini has power. Session context: Colin ordered 
   immutable promotion receipt ID via `--promotion-receipt-id`. Generic poller
   tooling remains in the repo only as an explicitly adopted contingency for
   other deployments.
+- **Shared Chrome CDP**: `com.colingreig.chrome-cdp` owns a visible Chrome
+  instance with profile `~/.hermes/chrome-cdp-profile`. Chrome listens only on
+  `127.0.0.1:9222`; Tailscale Serve forwards the mini's tailnet-only
+  `100.84.74.65:9222` endpoint to that loopback listener. Persistent Hermes
+  config uses `browser.cdp_url: http://127.0.0.1:9222` (the config equivalent
+  of `BROWSER_CDP_URL`). Canonical assets are
+  `machine-setup/mini-scripts/chrome_cdp_launch.sh` and
+  `machine-setup/mini-scripts/launchd/com.colingreig.chrome-cdp.plist`.
 
 ## Runbook
 1. **Preflight**: `ssh mini` reachable; snapshot dir exists; check gateway state (`launchctl list | grep -i hermes`; it will have auto-relaunched).
@@ -35,10 +43,29 @@ Resume this runbook when the Mac mini has power. Session context: Colin ordered 
 6. **Script deps check** (review finding): every script referenced by kept jobs must exist in `~/.hermes/scripts/` — sha-compare against the release copy before starting (clickup_closeout_audit.py, stalled_task_reconciler.py, staleness_sweep.py, orphan_unpushed_cron.sh, ignite-board-sync.sh, etc.). Scripts deploy by explicit name only, never rsync.
 7. **Restart gateway**: bootstrap the LaunchAgent — after bootout, poll `launchctl list` until the label clears before bootstrapping (EIO race); retry a lone EIO once.
 8. **Verify** (do not skip): gateway up; kanban dispatcher ticking (60s, `kanban.dispatch_in_gateway`); `hermes profile list` shows coder/content/design/research/ops; one throwaway swarm end-to-end (`hermes kanban swarm "smoke test" --worker coder:"say hi" --verifier ops --synthesizer coder --json`, poll `hermes kanban show <synthesizer_id> --json` until done); then ONE real code task and ONE real content task from ClickUp through swarm to In Review. Content task must run claude-sonnet-5 or fail — any substitution is a defect.
-9. **Rollback** (if needed): installer .baks restore config/jobs; `jobs.json.pre-freeze` restores the old cron fleet; snapshot tar restores everything else.
+9. **Install shared Chrome CDP** in the logged-in GUI session:
+
+   ```bash
+   install -m 0755 machine-setup/mini-scripts/chrome_cdp_launch.sh \
+     ~/.hermes/scripts/chrome_cdp_launch.sh
+   install -m 0644 \
+     machine-setup/mini-scripts/launchd/com.colingreig.chrome-cdp.plist \
+     ~/Library/LaunchAgents/com.colingreig.chrome-cdp.plist
+   launchctl bootstrap gui/$(id -u) \
+     ~/Library/LaunchAgents/com.colingreig.chrome-cdp.plist
+   ```
+
+   Verify `lsof -nP -iTCP:9222 -sTCP:LISTEN` reports only loopback,
+   `tailscale serve status` reports the TCP forward as `tailnet only`, local
+   Hermes can navigate with `browser.cdp_url=http://127.0.0.1:9222`, and a
+   different tailnet host can `connectOverCDP` to the browser WebSocket exposed
+   by `http://100.84.74.65:9222/json/version`. Use the Tailscale IP for CDP:
+   Chrome rejects the MagicDNS hostname in the DevTools `Host` header.
+10. **Rollback** (if needed): installer .baks restore config/jobs; `jobs.json.pre-freeze` restores the old cron fleet; snapshot tar restores everything else. To remove shared Chrome, `launchctl bootout gui/$(id -u)/com.colingreig.chrome-cdp`; the wrapper removes its Tailscale Serve TCP forward on exit.
 
 ## Follow-ups (ClickUp rebuild-0729 tasks)
 - REBUILD 5: Open Design headless (`od daemon --headless`, wrapper CLI over daemon API, Codex backend, loopback+OD_API_TOKEN). CLI-only per Colin — no MCP.
-- REBUILD 9: permanent shared Chrome on mini, CDP bound tailnet-only, other PCs connect via connectOverCDP.
+- REBUILD 9: permanent shared Chrome on mini — implemented; pending validator
+  confirmation of the live launchd/CDP/VNC evidence.
 - pr-staleness fold into ci-health-watch (deferred at review — script-level change).
 - NOUS_PORTAL_API_KEY provisioning (Colin).

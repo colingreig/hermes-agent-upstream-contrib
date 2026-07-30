@@ -1,14 +1,14 @@
 {
   "bundle": "fleet-config",
   "source_task": "kyiv-v1-fleet-rebuild-cutover",
-  "generated": "2026-07-29",
-  "description": "Declarative fleet-config bundle for the 2026-07-29 Hermes mini rebuild cutover: a governed OVERLAY for ~/.hermes/config.yaml (model/fallback/delegation/kanban dispatch only \u2014 every other config section is left untouched by the deep-merge), five kanban-swarm profiles under ~/.hermes/profiles/, and a curated ~/.hermes/cron/jobs.json (16 jobs: 13 carried forward from the pre-freeze live config, 3 new consolidated hygiene/digest jobs). install_fleet_config.py is the sole writer of all three destinations; sha256-pinned against this manifest, fails closed on any source drift or a config.yaml/jobs.json that doesn't parse.",
+  "generated": "2026-07-30",
+  "description": "Declarative fleet-config bundle for the 2026-07-29 Hermes mini rebuild cutover: a governed OVERLAY for ~/.hermes/config.yaml (model/fallback/delegation/browser CDP/kanban dispatch only \u2014 every other config section is left untouched by the deep-merge), five kanban-swarm profiles under ~/.hermes/profiles/, and a curated ~/.hermes/cron/jobs.json (16 jobs: 13 carried forward from the pre-freeze live config, 3 new consolidated hygiene/digest jobs). install_fleet_config.py is the sole writer of all three destinations; sha256-pinned against this manifest, fails closed on any source drift or a config.yaml/jobs.json that doesn't parse.",
   "files": [
     {
       "src_rel": "config-overlay.yaml",
       "dest_abs": "~/.hermes/config.yaml",
-      "sha256": "58d38ecdaee885fc057f69803a48a941f26167d5adc96508fff9081a7e710659",
-      "role": "governed overlay deep-merged into the live config.yaml (model/fallback_providers/delegation/kanban dispatch)",
+      "sha256": "a4f90153e095054a502a6b0bd580b0ee5c115b396d3666b613cae54af789d142",
+      "role": "governed overlay deep-merged into the live config.yaml (model/fallback_providers/delegation/browser CDP/kanban dispatch)",
       "deploy_mode": "config_overlay"
     },
     {
