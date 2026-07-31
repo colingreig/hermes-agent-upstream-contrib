@@ -106,6 +106,62 @@ def _log(msg: str) -> None:
     print(f"[{ts}] {msg}", flush=True)
 
 
+def _du_bytes(path: Path) -> int:
+    """Best-effort recursive size of *path* in bytes, via `du -sk` (fast, matches
+    macOS/BSD du). Returns 0 on any failure — this is reporting/visibility only,
+    never a deletion-safety input, so a failure here must never block or alter a
+    sweep decision."""
+    try:
+        proc = subprocess.run(
+            ["du", "-sk", str(path)],
+            capture_output=True, text=True, timeout=60, check=False,
+        )
+        if proc.returncode != 0:
+            return 0
+        kb = int(proc.stdout.split()[0])
+        return kb * 1024
+    except Exception:
+        return 0
+
+
+def _fmt_bytes(n: int) -> str:
+    size = float(n)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024 or unit == "TB":
+            return f"{size:.1f}{unit}"
+        size /= 1024
+    return f"{size:.1f}TB"
+
+
+def _effective_age_days(root: Path, default_days: int, min_free_gb: float, pressure_days: int) -> int:
+    """Return the age threshold to actually use for this run.
+
+    Disk-pressure-adaptive tuning (86e2k3ryc): when free space on the
+    filesystem backing *root* is at or below --min-free-gb, sweep much more
+    aggressively (--pressure-days, default short) instead of the normal
+    --days. This ONLY tightens the age gate — it never touches the dirty /
+    ahead / no-remote / claimed / deliverable safety checks, so a low-disk
+    run is more eager to reclaim genuinely-old, already-provably-safe
+    candidates, never less safe about what counts as safe. Disabled
+    (min_free_gb <= 0) by default; a `du`/statvfs failure fails toward the
+    NORMAL (less aggressive) threshold, never silently toward the tighter
+    one — visibility failures must not cause surprise deletions.
+    """
+    if min_free_gb <= 0:
+        return default_days
+    try:
+        free_gb = shutil.disk_usage(str(root)).free / (1024 ** 3)
+    except OSError:
+        return default_days
+    if free_gb <= min_free_gb:
+        _log(
+            f"DISK_PRESSURE: {free_gb:.1f}GB free <= {min_free_gb:.1f}GB threshold — "
+            f"tightening age gate to {pressure_days}d (normal {default_days}d)"
+        )
+        return min(default_days, pressure_days)
+    return default_days
+
+
 def _run_git_bytes(args, cwd, timeout=30):
     """Run git without decoding its output so status fingerprints are lossless."""
     try:
@@ -401,6 +457,18 @@ def main(argv=None) -> int:
     p.add_argument("--root", default=os.environ.get("HERMES_WORKTREE_ROOT", "~/.hermes/worktrees"),
                    help="scoped root to sweep (default ~/.hermes/worktrees — NEVER point this at ~/dev)")
     p.add_argument(
+        "--min-free-gb", type=float,
+        default=float(os.environ.get("HERMES_WORKTREE_BACKSTOP_MIN_FREE_GB", "0")),
+        help="disk-pressure trigger (86e2k3ryc): when free space on --root's filesystem is "
+             "<= this many GB, use --pressure-days instead of --days for the age gate. "
+             "0 (default) disables pressure-adaptive tightening.",
+    )
+    p.add_argument(
+        "--pressure-days", type=int,
+        default=int(os.environ.get("HERMES_WORKTREE_BACKSTOP_PRESSURE_DAYS", "2")),
+        help="age threshold used instead of --days once --min-free-gb is breached (default 2)",
+    )
+    p.add_argument(
         "--retire-manifest",
         default="~/.hermes/state/worktree-retire-approved.json",
         help="fingerprint-pinned approval manifest consumed before the age sweep",
@@ -444,8 +512,11 @@ def main(argv=None) -> int:
         root, retire_manifest, args.dry_run
     )
 
+    effective_days = _effective_age_days(root, args.days, args.min_free_gb, args.pressure_days)
+
     now = time.time()
     removed = 0
+    removed_bytes = 0
     skipped_dirty = 0
     skipped_ahead = 0
     skipped_deliverable = 0
@@ -531,9 +602,9 @@ def main(argv=None) -> int:
         except OSError:
             mtime = now
         age_days = (now - mtime) / 86400
-        if age_days < args.days:
+        if age_days < effective_days:
             skipped_recent += 1
-            _log(f"SKIP_RECENT: {name} | age_days={age_days:.1f}")
+            _log(f"SKIP_RECENT: {name} | age_days={age_days:.1f} threshold_days={effective_days}")
             continue
 
         # Linked worktrees (added via `git worktree add`) have .git as a FILE pointing
@@ -541,9 +612,18 @@ def main(argv=None) -> int:
         # a directory. Both shapes can coexist under root during the migration.
         is_linked = git_dir.is_file()
 
+        # Size is reporting-only (never a safety input, see _du_bytes) — computed once
+        # here, before any removal, so both the dry-run preview and the real removal
+        # log the same number and capacity planning can see where the bytes actually
+        # are (e.g. distinguishing a handful of huge stale clones from many small ones).
+        candidate_bytes = _du_bytes(wdir)
+
         if args.dry_run:
             kind = "worktree" if is_linked else "clone"
-            _log(f"WOULD_REMOVE {kind}: {name} | age_days={age_days:.1f}")
+            _log(
+                f"WOULD_REMOVE {kind}: {name} | age_days={age_days:.1f} "
+                f"size={_fmt_bytes(candidate_bytes)}"
+            )
             continue
 
         # Final belt-and-suspenders check right before the destructive call. Dirty is always
@@ -583,16 +663,19 @@ def main(argv=None) -> int:
                     _log(f"WORKTREE_REMOVE_FALLBACK_RMTREE: {name}: {rc.stderr.strip()[:160]}")
                     shutil.rmtree(wdir)
                 else:
-                    _log(f"REMOVED_WORKTREE: {name} | age_days={age_days:.1f}")
+                    _log(f"REMOVED_WORKTREE: {name} | age_days={age_days:.1f} size={_fmt_bytes(candidate_bytes)}")
             else:
                 shutil.rmtree(wdir)
-                _log(f"REMOVED_CLONE: {name} | age_days={age_days:.1f}")
+                _log(f"REMOVED_CLONE: {name} | age_days={age_days:.1f} size={_fmt_bytes(candidate_bytes)}")
             removed += 1
+            removed_bytes += candidate_bytes
         except Exception as exc:
             _log(f"ERROR_REMOVING: {name} | {exc}")
 
     _log(
         f"sweep-finish root={root} removed={removed + approved_removed} "
+        f"removed_bytes={removed_bytes} removed_size={_fmt_bytes(removed_bytes)} "
+        f"age_days={args.days} effective_age_days={effective_days} min_free_gb={args.min_free_gb} "
         f"approved_removed={approved_removed} approved_blocked={approved_blocked} "
         f"skipped_dirty={skipped_dirty} "
         f"skipped_ahead={skipped_ahead} landed_squash={landed_squash} "
