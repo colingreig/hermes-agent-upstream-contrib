@@ -337,6 +337,12 @@ proof packet:
   non-empty token, and never log the token or credentials. The gateway inner
   wrapper alone maps `OPENAI_API_KEY_HERMES` to `OPENAI_API_KEY` and exports
   the canonical LOW/MEDIUM/HIGH validator chain.
+- `thermal_github_app_probe.py` — body-suppressed GET/POST probes against
+  `colingreig/thermal` runner registration endpoints using the governed App
+  token minter. Emits JSON status codes only (`GET_runners`, `POST_registration_token`);
+  never logs registration tokens or response bodies. Run via
+  `op-run --env-file ~/.hermes/github-app.op-env -- python thermal_github_app_probe.py`
+  before provisioning `hermes-thermal`.
 - `clickup_workspace_refresh.py` — canonical source for the Mini's protected
   `~/.hermes/scripts/clickup_workspace_refresh.py`. Unlike legacy manual-copy
   entries, this file is installed by `scripts/mini-release-cut.sh`: source and

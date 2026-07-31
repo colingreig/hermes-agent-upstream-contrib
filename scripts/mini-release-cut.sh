@@ -1560,6 +1560,7 @@ PY
     "$LAUNCHD_SOURCE_ROOT/record_skill_pull_success.py" \
     "$LAUNCHD_SOURCE_ROOT/skill_pull_guard.py" \
     "$LAUNCHD_SOURCE_ROOT/github_app_token.py" \
+    "$LAUNCHD_SOURCE_ROOT/thermal_github_app_probe.py" \
     || die "build verify failed: governed launchd Python source does not compile"
   for wrapper in ignite-skills-pull.sh pull_anthropic_agent_skills.sh; do
     bash -n "$LAUNCHD_SOURCE_ROOT/$wrapper" \
