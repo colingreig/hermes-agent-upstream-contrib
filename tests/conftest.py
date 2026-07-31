@@ -460,6 +460,7 @@ def _hermetic_environment(tmp_path, monkeypatch):
     monkeypatch.delenv("GMI_BASE_URL", raising=False)
 
 
+
 # Backward-compat alias — old tests reference this fixture name. Keep it
 # as a no-op wrapper so imports don't break.
 @pytest.fixture(autouse=True)

@@ -25,7 +25,15 @@ def _load_script(name):
         sys.path.insert(0, str(MINI_SCRIPTS))
     spec = importlib.util.spec_from_file_location(name, MINI_SCRIPTS / f"{name}.py")
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    # Register in sys.modules BEFORE exec_module: dataclasses using
+    # ``from __future__ import annotations`` resolve stringized annotations
+    # by looking up the defining module in sys.modules, which raises
+    # AttributeError if the module isn't registered yet.
+    sys.modules[name] = module
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.modules.pop(name, None)
     return module
 
 

@@ -570,6 +570,13 @@ _SENSITIVE_PATH_PREFIXES = (
     "/etc/", "/boot/", "/usr/lib/systemd/",
     "/private/etc/", "/private/var/",
 )
+# macOS resolves /var/folders/ and /tmp to /private/var/folders/ and
+# /private/var/folders/.../T — both are user-writable temp dirs, not
+# sensitive system paths.
+_SENSITIVE_PATH_EXEMPTIONS = (
+    "/private/var/folders/",
+    "/private/var/tmp/",
+)
 _SENSITIVE_EXACT_PATHS = {"/var/run/docker.sock", "/run/docker.sock"}
 
 _hermes_config_resolved: str | None = None
@@ -606,6 +613,9 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
     )
     for prefix in _SENSITIVE_PATH_PREFIXES:
         if resolved.startswith(prefix) or normalized.startswith(prefix):
+            if any(resolved.startswith(ex) or normalized.startswith(ex)
+                   for ex in _SENSITIVE_PATH_EXEMPTIONS):
+                continue
             return _err
     if resolved in _SENSITIVE_EXACT_PATHS or normalized in _SENSITIVE_EXACT_PATHS:
         return _err

@@ -25,8 +25,8 @@ permissions:
   pull-requests: write # post/update the diff comment
 
 concurrency:
-  group: lockfile-diff-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: lockfile-diff-${{ github.event_name == 'push' && github.sha || github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   diff:
