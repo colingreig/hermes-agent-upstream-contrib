@@ -9,7 +9,8 @@ with source/deployed identity checks and rollback snapshots.
 sha256-pinned, fail-closed installer pattern established here
 (`self_report_manifest.json` + `install_self_report.py`,
 `spend_manifest.json` + `install_spend.py`,
-`disk_lifecycle_manifest.json` + `install_disk_lifecycle.py`) is also used for the
+`disk_lifecycle_manifest.json` + `install_disk_lifecycle.py`,
+`github_app_manifest.json` + `install_github_app.py`) is also used for the
 2026-07-29 rebuild's `fleet-config` bundle at `machine-setup/fleet-config/`,
 which governs three different destinations: a `config.yaml` **overlay**
 (deep-merge, not replace), the five kanban-swarm profiles under
@@ -342,7 +343,8 @@ proof packet:
   token minter. Emits JSON status codes only (`GET_runners`, `POST_registration_token`);
   never logs registration tokens or response bodies. Run via
   `op-run --env-file ~/.hermes/github-app.op-env -- python thermal_github_app_probe.py`
-  before provisioning `hermes-thermal`.
+  before provisioning `hermes-thermal`. Deploy via the governed bundle below
+  (ClickUp 86e2k42qu) — do not scp for routine deploys.
 - `clickup_workspace_refresh.py` — canonical source for the Mini's protected
   `~/.hermes/scripts/clickup_workspace_refresh.py`. Unlike legacy manual-copy
   entries, this file is installed by `scripts/mini-release-cut.sh`: source and
@@ -943,16 +945,44 @@ ONLY writer of these four files going forward.
 `scripts/mini-release-cut.sh`'s post-cut receipt now scans every file that
 changed in the cut release under `machine-setup/mini-scripts/` and warns by
 name if any changed file is not covered by `self_report_manifest.json`,
-`spend_manifest.json`, `disk_lifecycle_manifest.json`,
+`spend_manifest.json`, `disk_lifecycle_manifest.json`, `github_app_manifest.json`,
 `fleet_outcome_manifest.json`, `pr_pipeline/manifest.json`, or the three files it
 vendors directly (`clickup_workspace_refresh.py`,
 `reconcile_launchd_environment.py`, `reconcile_marketplace_skills.py`) —
 so an uncovered change is flagged instead of silently rolling up into
 "governed script deployment verified." Neither `install_self_report.py`,
-`install_spend.py`, nor `install_disk_lifecycle.py` is invoked automatically
+`install_spend.py`, `install_disk_lifecycle.py`, nor `install_github_app.py`
+is invoked automatically
 by the cut itself (they require an explicit, deliberate run — see each
 installer's usage above); the drift check only makes the receipt honest about
 what did and did not deploy.
+
+## GitHub App auth (GH-Cost Phase 1, ClickUp 86e2k42qu)
+
+Governed deploy bundle for the Hermes Dev Assistant GitHub App chain:
+`github_app_token.py` (installation-token minter), `github_app_cred.sh` (git
+credential wrapper wired via `~/.hermes/gitconfig`), and
+`thermal_github_app_probe.py` (body-suppressed thermal runner registration
+probes). `github_app_token.py` is also refreshed by
+`reconcile_launchd_environment.py` on release cut; this bundle is the explicit
+deploy path for all three GH-Cost Phase 1 artifacts and closes the same
+86e2hap1g-class gap for `github_app_cred.sh` and `thermal_github_app_probe.py`.
+
+```bash
+# preview: verify all source hashes, print the plan, write nothing
+python3 machine-setup/mini-scripts/install_github_app.py --dry-run
+
+# install scripts (default home = ~)
+python3 machine-setup/mini-scripts/install_github_app.py
+```
+
+The bundle is declared in `github_app_manifest.json` (ClickUp 86e2k42qu).
+It copies only the three declared scripts into `~/.hermes/scripts/` and
+touches nothing else. Requires `~/.hermes/github-app.op-env` to exist (the
+installer warns if missing but does not install it).
+
+Tests: `machine-setup/mini-scripts/tests/test_install_github_app.py` and
+`machine-setup/mini-scripts/tests/test_thermal_github_app_probe.py`.
 
 ## Disk lifecycle (worktrees / kanban / releases, ClickUp 86e2k3ryc)
 

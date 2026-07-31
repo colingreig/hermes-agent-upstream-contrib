@@ -1067,9 +1067,10 @@ prune_releases() {
 # ---------------------------------------------------------------------------
 # Ungoverned mini-scripts drift check.
 #
-# Four bundles (self_report_manifest.json + install_self_report.py,
+# Five bundles (self_report_manifest.json + install_self_report.py,
 # spend_manifest.json + install_spend.py,
-# disk_lifecycle_manifest.json + install_disk_lifecycle.py, and
+# disk_lifecycle_manifest.json + install_disk_lifecycle.py,
+# github_app_manifest.json + install_github_app.py, and
 # fleet_outcome_manifest.json + reconcile_fleet_outcomes.py) declare which
 # machine-setup/mini-scripts/ files are sha-pinned and governed; a fifth
 # (pr_pipeline/manifest.json) owns its whole subtree the same way. Every
@@ -1090,7 +1091,7 @@ prune_releases() {
 
 # Print the mirror-sourced dest paths (repo-relative, under $root) declared
 # by a self_report_manifest.json / spend_manifest.json /
-# disk_lifecycle_manifest.json -shaped bundle at the
+# disk_lifecycle_manifest.json / github_app_manifest.json -shaped bundle at the
 # resolved target commit. Prints nothing (not an error) if the manifest is
 # absent at that commit or fails to parse — an absent/malformed manifest is
 # itself surfaced as an uncovered change by the caller, not swallowed here.
@@ -1115,7 +1116,7 @@ for entry in manifest.get('files', []):
 # List (repo-relative paths, one per line) every machine-setup/mini-scripts/
 # file that changed between $ACTIVE_SHA and $SHA but is not accounted for by
 # self_report_manifest.json, spend_manifest.json,
-# disk_lifecycle_manifest.json, the whole pr_pipeline/
+# disk_lifecycle_manifest.json, github_app_manifest.json, the whole pr_pipeline/
 # subtree (owned wholesale by pr_pipeline/manifest.json), or the three files
 # this script vendors directly. tests/ and README.md are excluded — neither
 # is ever deployed to the mini.
@@ -1130,6 +1131,7 @@ find_uncovered_mini_scripts_changes() {
       covered_mini_scripts_paths "$root/self_report_manifest.json" "$root"
       covered_mini_scripts_paths "$root/spend_manifest.json" "$root"
       covered_mini_scripts_paths "$root/disk_lifecycle_manifest.json" "$root"
+      covered_mini_scripts_paths "$root/github_app_manifest.json" "$root"
       covered_mini_scripts_paths "$root/fleet_outcome_manifest.json" "$root"
       printf '%s\n' \
         "$VENDORED_REFRESH_REL" \
