@@ -460,6 +460,189 @@ def _hermetic_environment(tmp_path, monkeypatch):
     monkeypatch.delenv("GMI_BASE_URL", raising=False)
 
 
+@pytest.fixture(autouse=True)
+def _reset_module_state():
+    """Reset mutable module-level globals that leak state between test files.
+
+    Many production modules under ``agent/`` cache data (or memoize
+    "already logged this warning" keys) in module-level globals. When the
+    full suite runs in a single process (as opposed to CI's one-subprocess-
+    per-file model), these globals bleed across test files and cause order-
+    dependent failures. Reset everything here, before each test runs, so
+    every test starts from a known-clean slate regardless of execution order.
+    """
+    try:
+        import agent.auxiliary_client as _aux
+
+        _aux._OPENAI_CLS_CACHE = None
+        _aux._LOGGED_UNKNOWN_PROVIDER_KEYS.clear()
+        _aux._LOGGED_UNHANDLED_AUTHTYPE_KEYS.clear()
+        _aux._LOGGED_UNSUPPORTED_EXTPROC_KEYS.clear()
+        _aux._LOGGED_UNSUPPORTED_OAUTH_KEYS.clear()
+        _aux._VISION_EXHAUSTION_ALERT_KEYS.clear()
+        _aux._WARNED_KEEPALIVE_IMPORT_SKEW = False
+        _aux._stale_base_url_warned = False
+        _aux.auxiliary_is_nous = False
+        _aux._RUNTIME_MAIN_PROVIDER = ""
+        _aux._RUNTIME_MAIN_MODEL = ""
+        _aux._RUNTIME_MAIN_BASE_URL = ""
+        _aux._RUNTIME_MAIN_API_KEY = ""
+        _aux._RUNTIME_MAIN_API_MODE = ""
+        _aux._RUNTIME_MAIN_AUTH_MODE = ""
+        _aux._RUNTIME_MAIN_COMPAT_SNAPSHOT = ("", "", "", "", "", "")
+        _aux._reset_aux_unhealthy_cache()
+        _aux._client_cache.clear()
+    except ImportError:
+        pass
+
+    try:
+        import agent.model_metadata as _mm
+
+        _mm._model_metadata_cache.clear()
+        _mm._model_metadata_cache_time = 0
+        _mm._novita_metadata_cache.clear()
+        _mm._novita_metadata_cache_time = 0
+        _mm._endpoint_model_metadata_cache.clear()
+        _mm._endpoint_model_metadata_cache_time.clear()
+        _mm._endpoint_probe_path_cache.clear()
+        _mm._LOCAL_CTX_PROBE_CACHE.clear()
+        _mm._codex_oauth_context_cache.clear()
+        _mm._codex_oauth_context_cache_time = 0.0
+        _mm._TOOLS_TOKENS_CACHE.clear()
+    except ImportError:
+        pass
+
+    try:
+        import agent.credits_tracker as _ct
+
+        _ct._version_warning_emitted = False
+    except ImportError:
+        pass
+
+    try:
+        import tools.file_tools as _ft
+
+        _ft._hermes_config_resolved = None
+        _ft._hermes_config_resolved_loaded = False
+    except ImportError:
+        pass
+
+    try:
+        from agent.image_gen_registry import _reset_for_tests as _reset_image_gen
+
+        _reset_image_gen()
+    except ImportError:
+        pass
+
+    try:
+        from agent.video_gen_registry import _reset_for_tests as _reset_video_gen
+
+        _reset_video_gen()
+    except ImportError:
+        pass
+
+    try:
+        from agent.tts_registry import _reset_for_tests as _reset_tts
+
+        _reset_tts()
+    except ImportError:
+        pass
+
+    try:
+        from agent.transcription_registry import _reset_for_tests as _reset_transcription
+
+        _reset_transcription()
+    except ImportError:
+        pass
+
+    try:
+        from agent.browser_registry import _reset_for_tests as _reset_browser
+
+        _reset_browser()
+    except ImportError:
+        pass
+
+    try:
+        from agent.web_search_registry import _reset_for_tests as _reset_web_search
+
+        _reset_web_search()
+    except ImportError:
+        pass
+
+    try:
+        import agent.process_bootstrap as _pb
+
+        _pb._OPENAI_CLS_CACHE = None
+    except ImportError:
+        pass
+
+    try:
+        import agent.prompt_builder as _pbuild
+
+        _pbuild._SKILLS_PROMPT_CACHE.clear()
+        _pbuild._BACKEND_PROBE_CACHE.clear()
+    except ImportError:
+        pass
+
+    try:
+        import hermes_logging as _hl
+
+        _hl._stop_queue_listener()
+        _hl._queued_file_handlers.clear()
+        _hl._logging_initialized = False
+    except ImportError:
+        pass
+
+    try:
+        import agent.skill_utils as _su
+
+        _su._ENV_DETECT_CACHE.clear()
+        _su._RAW_CONFIG_CACHE.clear()
+        _su._EXTERNAL_DIRS_CACHE.clear()
+    except ImportError:
+        pass
+
+    try:
+        import agent.ops_alerts as _oa
+
+        _oa._ALERTED_SIGNATURES.clear()
+    except ImportError:
+        pass
+
+    try:
+        import agent.shell_hooks as _sh
+
+        _sh._registered.clear()
+    except ImportError:
+        pass
+
+    try:
+        import agent.lazy_secret_resolver as _lsr
+
+        _lsr._cache.clear()
+        _lsr._inflight.clear()
+    except ImportError:
+        pass
+
+    try:
+        import agent.skill_bundles as _sb
+
+        _sb._bundles_cache.clear()
+        _sb._bundles_cache_mtime = 0
+    except ImportError:
+        pass
+
+    try:
+        import agent.skill_commands as _sc
+
+        _sc._skill_commands.clear()
+        _sc._skill_commands_platform = None
+    except ImportError:
+        pass
+
+    yield
+
+
 # Backward-compat alias — old tests reference this fixture name. Keep it
 # as a no-op wrapper so imports don't break.
 @pytest.fixture(autouse=True)
