@@ -294,6 +294,7 @@ def test_cron_list_warns_when_gateway_not_running(monkeypatch, capsys):
                 "enabled": True,
                 "next_run_at": "2026-06-01T00:00:00Z",
                 "deliver": ["local"],
+                "lane_weights": {"code": 0.7, "content": 0.3},
             }
         ],
     )
@@ -305,6 +306,7 @@ def test_cron_list_warns_when_gateway_not_running(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "Gateway is not running" in out
     assert "Nightly docs" in out
+    assert "Lanes:     code=0.7, content=0.3" in out
 
 
 def test_cron_status_reports_running_gateway(monkeypatch, capsys):
@@ -402,3 +404,81 @@ def test_cron_create_failure_returns_nonzero(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert rc == 1
     assert "Failed to create job: boom" in out
+
+
+def test_cron_create_parses_lane_weights(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        cron_cli,
+        "_cron_api",
+        lambda **kwargs: calls.append(kwargs) or {
+            "success": True,
+            "job_id": "job-1",
+            "name": "Lane job",
+            "schedule": "every hour",
+            "next_run_at": "2026-06-01T00:00:00Z",
+            "job": {"lane_weights": {"code": 0.7, "content": 0.3}},
+        },
+    )
+    monkeypatch.setattr(cron_cli, "_warn_if_gateway_not_running", lambda: None)
+
+    args = SimpleNamespace(
+        schedule="every hour",
+        prompt="run {lane}",
+        name="Lane job",
+        deliver=None,
+        repeat=None,
+        skill=None,
+        skills=None,
+        script=None,
+        workdir=None,
+        no_agent=False,
+        lane_weights="code=0.7,content=0.3",
+    )
+
+    assert cron_cli.cron_create(args) == 0
+    assert calls[0]["lane_weights"] == {"code": 0.7, "content": 0.3}
+
+
+def test_cron_edit_clears_lane_weights(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        "cron.jobs.resolve_job_ref",
+        lambda job_id: {"id": job_id, "skills": [], "lane_weights": {"code": 0.7, "content": 0.3}},
+    )
+    monkeypatch.setattr(
+        cron_cli,
+        "_cron_api",
+        lambda **kwargs: calls.append(kwargs) or {
+            "success": True,
+            "job": {
+                "job_id": "job-1",
+                "name": "Lane job",
+                "schedule": "every hour",
+                "skills": [],
+            },
+        },
+    )
+
+    args = SimpleNamespace(
+        job_id="job-1",
+        schedule=None,
+        prompt=None,
+        name=None,
+        deliver=None,
+        repeat=None,
+        skill=None,
+        skills=None,
+        add_skills=None,
+        remove_skills=None,
+        clear_skills=False,
+        script=None,
+        workdir=None,
+        no_agent=None,
+        lane_weights=None,
+        clear_lane_weights=True,
+    )
+
+    assert cron_cli.cron_edit(args) == 0
+    assert calls[0]["clear_lane_weights"] is True
+    assert calls[0]["lane_weights"] is None

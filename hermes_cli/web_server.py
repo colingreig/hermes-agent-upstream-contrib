@@ -10445,6 +10445,7 @@ class CronJobCreate(BaseModel):
     enabled_toolsets: Optional[List[str]] = None
     workdir: Optional[str] = None
     no_agent: bool = False
+    lane_weights: Optional[Dict[str, Any]] = None
     skill_scope: Optional[str] = None
 
 
@@ -10768,6 +10769,7 @@ def _create_cron_job_sync(body: CronJobCreate, profile: str = "default"):
             enabled_toolsets=_cron_string_list(body.enabled_toolsets),
             workdir=_cron_optional_text(body.workdir),
             no_agent=no_agent,
+            lane_weights=body.lane_weights,
             skill_scope=body.skill_scope,
         )
     except HTTPException:

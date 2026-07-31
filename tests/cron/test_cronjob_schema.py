@@ -39,3 +39,13 @@ def test_cronjob_schema_required_array_unchanged():
     from tools.cronjob_tools import CRONJOB_SCHEMA
 
     assert CRONJOB_SCHEMA["parameters"]["required"] == ["action"]
+
+
+def test_cronjob_schema_exposes_lane_weights_and_clear_flag():
+    from tools.cronjob_tools import CRONJOB_SCHEMA
+
+    props = CRONJOB_SCHEMA["parameters"]["properties"]
+    assert props["lane_weights"]["type"] == "object"
+    assert set(props["lane_weights"]["properties"]) == {"code", "content"}
+    assert props["clear_lane_weights"]["type"] == "boolean"
+    assert "clear_lane_weights" in props["lane_weights"]["description"]

@@ -1,6 +1,7 @@
 """Tests for cron/jobs.py — schedule parsing, job CRUD, and due-job detection."""
 
 import threading
+from collections import Counter
 import pytest
 from datetime import datetime, timedelta, timezone
 
@@ -20,6 +21,7 @@ from cron.jobs import (
     mark_job_run,
     advance_next_run,
     claim_dispatch,
+    choose_weighted_lane,
     heartbeat_run_claim,
     get_due_jobs,
     save_job_output,
@@ -246,10 +248,122 @@ class TestJobCRUD:
         assert job["prompt"] == "Check server status"
         assert job["enabled"] is True
         assert job["schedule"]["kind"] == "once"
+        assert "lane_weights" not in job
+        assert "lane_state" not in job
 
         fetched = get_job(job["id"])
         assert fetched is not None
         assert fetched["prompt"] == "Check server status"
+
+    def test_create_weighted_lane_job_initializes_state(self, tmp_cron_dir):
+        job = create_job(
+            prompt="ignite-execute --lane code run policy",
+            schedule="every 1h",
+            lane_weights={"code": 0.7, "content": 0.3},
+        )
+
+        assert job["lane_weights"] == {"code": 0.7, "content": 0.3}
+        assert job["lane_state"] == {"counter": 0}
+
+    @pytest.mark.parametrize(
+        "lane_weights",
+        [
+            {"code": 0.7},
+            {"code": 0.7, "content": 0.3, "other": 1},
+            {"code": 0.0, "content": 1.0},
+            {"code": -1, "content": 2},
+            {"code": "many", "content": 1},
+            [0.7, 0.3],
+        ],
+    )
+    def test_create_rejects_invalid_lane_weights(self, tmp_cron_dir, lane_weights):
+        with pytest.raises(ValueError):
+            create_job(
+                prompt="ignite-execute --lane code run policy",
+                schedule="every 1h",
+                lane_weights=lane_weights,
+            )
+
+    def test_create_rejects_weighted_lane_without_prompt_contract(self, tmp_cron_dir):
+        with pytest.raises(ValueError, match="lane_weights requires"):
+            create_job(
+                prompt="run policy",
+                schedule="every 1h",
+                lane_weights={"code": 0.7, "content": 0.3},
+            )
+
+    def test_update_validates_and_clears_lane_weights(self, tmp_cron_dir):
+        job = create_job(prompt="run {lane} lane", schedule="every 1h")
+
+        updated = update_job(job["id"], {"lane_weights": {"code": 3, "content": 1}})
+
+        assert updated["lane_weights"] == {"code": 0.75, "content": 0.25}
+        assert updated["lane_state"] == {"counter": 0}
+
+        cleared = update_job(job["id"], {"lane_weights": None})
+        assert "lane_weights" not in cleared
+        assert "lane_state" not in cleared
+
+    def test_update_rejects_prompt_that_breaks_existing_lane_weights(self, tmp_cron_dir):
+        job = create_job(
+            prompt="run {lane} lane",
+            schedule="every 1h",
+            lane_weights={"code": 0.7, "content": 0.3},
+        )
+
+        with pytest.raises(ValueError, match="lane_weights requires"):
+            update_job(job["id"], {"prompt": "run one lane"})
+
+    def test_weighted_lane_converges_70_30_and_persists_counter(self, tmp_cron_dir):
+        job = create_job(
+            prompt="ignite-execute --lane code run policy",
+            schedule="every 1h",
+            lane_weights={"code": 0.7, "content": 0.3},
+        )
+
+        lanes = [choose_weighted_lane(job["id"]) for _ in range(10)]
+
+        assert Counter(lanes) == {"code": 7, "content": 3}
+        persisted = get_job(job["id"])
+        assert persisted["lane_state"] == {"counter": 10}
+
+    def test_weighted_lane_sequence_is_deterministic_across_loads(self, tmp_cron_dir):
+        job = create_job(
+            prompt="run {{lane}} lane",
+            schedule="every 1h",
+            lane_weights={"code": 0.7, "content": 0.3},
+        )
+
+        first = choose_weighted_lane(job["id"])
+        reloaded = get_job(job["id"])
+        second = choose_weighted_lane(reloaded["id"])
+        third = choose_weighted_lane(job["id"])
+
+        assert [first, second, third] == ["code", "content", "code"]
+        assert get_job(job["id"])["lane_state"] == {"counter": 3}
+
+    def test_weighted_lane_advancement_is_locked_against_lost_updates(self, tmp_cron_dir):
+        job = create_job(
+            prompt="ignite-execute --lane code run policy",
+            schedule="every 1h",
+            lane_weights={"code": 0.7, "content": 0.3},
+        )
+        lanes = []
+        lanes_lock = threading.Lock()
+
+        def choose():
+            lane = choose_weighted_lane(job["id"])
+            with lanes_lock:
+                lanes.append(lane)
+
+        threads = [threading.Thread(target=choose) for _ in range(20)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert Counter(lanes) == {"code": 14, "content": 6}
+        assert get_job(job["id"])["lane_state"] == {"counter": 20}
 
     def test_list_jobs(self, tmp_cron_dir):
         create_job(prompt="Job 1", schedule="every 1h")

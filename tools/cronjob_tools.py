@@ -602,6 +602,8 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         result["workdir"] = job["workdir"]
     if job.get("skill_scope"):
         result["skill_scope"] = job["skill_scope"]
+    if job.get("lane_weights"):
+        result["lane_weights"] = job["lane_weights"]
     return result
 
 
@@ -681,6 +683,8 @@ def cronjob(
     workdir: Optional[str] = None,
     no_agent: Optional[bool] = None,
     no_fallback: Optional[bool] = None,
+    lane_weights: Optional[Dict[str, Any]] = None,
+    clear_lane_weights: Optional[bool] = None,
     attach_to_session: Optional[bool] = None,
     skill_scope: Optional[str] = None,
     task_id: str = None,
@@ -756,6 +760,7 @@ def cronjob(
                 workdir=_normalize_optional_job_value(workdir),
                 no_agent=_no_agent,
                 no_fallback=bool(no_fallback),
+                lane_weights=lane_weights,
                 attach_to_session=attach_to_session,
                 skill_scope=skill_scope,
             )
@@ -937,6 +942,15 @@ def cronjob(
                 # Fail-closed pin (86e2bjac3): opt this job out of the global
                 # provider fallback chain so it fails closed on its pinned model.
                 updates["no_fallback"] = bool(no_fallback)
+            if clear_lane_weights and lane_weights is not None:
+                return tool_error(
+                    "Use either lane_weights or clear_lane_weights, not both.",
+                    success=False,
+                )
+            if clear_lane_weights:
+                updates["lane_weights"] = None
+            elif lane_weights is not None:
+                updates["lane_weights"] = lane_weights
             if workdir is not None:
                 # Empty string clears the field (restores old behaviour);
                 # otherwise pass raw — update_job() validates / normalizes.
@@ -1084,6 +1098,19 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
                     "WHEN TO USE False (default): resilience-first jobs where getting *some* answer from a backup model beats failing."
                 ),
             },
+            "lane_weights": {
+                "type": "object",
+                "description": "Optional per-job code/content lane mix for deterministic alternation. Use with prompts containing {lane} or {{lane}}. Example: {\"code\": 0.7, \"content\": 0.3}. Omit to leave unset/no-change on update; use clear_lane_weights=true to remove existing weights.",
+                "properties": {
+                    "code": {"type": "number"},
+                    "content": {"type": "number"},
+                },
+                "additionalProperties": False,
+            },
+            "clear_lane_weights": {
+                "type": "boolean",
+                "description": "For action=update only: set true to remove existing lane_weights. Do not combine with lane_weights.",
+            },
             "context_from": {
                 "type": "array",
                 "items": {"type": "string"},
@@ -1178,6 +1205,8 @@ registry.register(
         workdir=args.get("workdir"),
         no_agent=args.get("no_agent"),
         no_fallback=args.get("no_fallback"),
+        lane_weights=args.get("lane_weights"),
+        clear_lane_weights=args.get("clear_lane_weights"),
         attach_to_session=args.get("attach_to_session"),
         skill_scope=args.get("skill_scope"),
         task_id=kw.get("task_id"),

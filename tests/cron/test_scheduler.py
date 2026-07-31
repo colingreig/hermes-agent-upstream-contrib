@@ -11,9 +11,59 @@ from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
 
-from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt, _resolve_cron_enabled_toolsets, _merge_mcp_into_per_job_toolsets, _is_route_chain_exhausted_no_work, CronRequiredEnvironmentError, CronSkillRootConflict, CronSkillUnresolvable
+from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt, _resolve_cron_enabled_toolsets, _merge_mcp_into_per_job_toolsets, _is_route_chain_exhausted_no_work, CronRequiredEnvironmentError, CronSkillRootConflict, CronSkillUnresolvable, _apply_weighted_lane_to_job
 from tools.env_passthrough import clear_env_passthrough
 from tools.credential_files import clear_credential_files
+
+
+@pytest.fixture()
+def tmp_cron_dir(tmp_path, monkeypatch):
+    monkeypatch.setattr("cron.jobs.CRON_DIR", tmp_path / "cron")
+    monkeypatch.setattr("cron.jobs.JOBS_FILE", tmp_path / "cron" / "jobs.json")
+    monkeypatch.setattr("cron.jobs.OUTPUT_DIR", tmp_path / "cron" / "output")
+    return tmp_path
+
+
+class TestWeightedLaneDispatch:
+    def test_no_lane_weights_leaves_job_unchanged(self):
+        job = {"id": "abc123", "prompt": "run once"}
+
+        rendered, lane = _apply_weighted_lane_to_job(job)
+
+        assert rendered is job
+        assert lane is None
+
+    def test_dispatch_replaces_placeholder_and_persists_counter(self, tmp_cron_dir):
+        from cron.jobs import create_job, get_job
+
+        job = create_job(
+            prompt="run {lane} lane",
+            schedule="every 1h",
+            lane_weights={"code": 0.7, "content": 0.3},
+        )
+
+        rendered, lane = _apply_weighted_lane_to_job(job)
+
+        assert lane == "code"
+        assert rendered["prompt"] == "run code lane"
+        assert job["prompt"] == "run {lane} lane"
+        assert get_job(job["id"])["lane_state"] == {"counter": 1}
+
+    def test_dispatch_replaces_ignite_execute_lane_argument(self, tmp_cron_dir):
+        from cron.jobs import create_job, update_job
+
+        job = create_job(
+            prompt="ignite-execute --lane code run policy",
+            schedule="every 1h",
+            lane_weights={"code": 0.7, "content": 0.3},
+        )
+        update_job(job["id"], {"lane_state": {"counter": 1}})
+        job["lane_state"] = {"counter": 1}
+
+        rendered, lane = _apply_weighted_lane_to_job(job)
+
+        assert lane == "content"
+        assert rendered["prompt"] == "ignite-execute --lane content run policy"
 
 
 class TestPerJobToolsetMcpMerge:

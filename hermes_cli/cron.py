@@ -8,7 +8,7 @@ pause/resume/run/remove, status, and tick.
 import json
 import sys
 from pathlib import Path
-from typing import Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional
 
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -40,6 +40,27 @@ def _normalize_skills(single_skill=None, skills: Optional[Iterable[str]] = None)
         if text and text not in normalized:
             normalized.append(text)
     return normalized
+
+
+def _parse_lane_weights(value: Optional[str]) -> Optional[Dict[str, float]]:
+    if value is None:
+        return None
+    weights: Dict[str, float] = {}
+    for part in value.split(","):
+        item = part.strip()
+        if not item:
+            continue
+        if "=" not in item:
+            raise ValueError("lane weights must use code=0.7,content=0.3 format")
+        key, raw_weight = item.split("=", 1)
+        lane = key.strip()
+        if lane in weights:
+            raise ValueError(f"duplicate lane weight for {lane!r}")
+        try:
+            weights[lane] = float(raw_weight.strip())
+        except ValueError as exc:
+            raise ValueError(f"lane weight for {lane!r} must be a number") from exc
+    return weights
 
 
 def _cron_api(**kwargs):
@@ -163,6 +184,12 @@ def cron_list(show_all: bool = False):
         workdir = job.get("workdir")
         if workdir:
             print(f"    Workdir:   {workdir}")
+        lane_weights = job.get("lane_weights")
+        if lane_weights:
+            print(
+                "    Lanes:     "
+                f"code={lane_weights.get('code')}, content={lane_weights.get('content')}"
+            )
 
         route_health = job.get("route_health")
         if route_health:
@@ -332,6 +359,12 @@ def cron_create(args):
     # raises GatewayLifecycleBlocked, the `cronjob` tool wrapper catches it and
     # returns it as result["error"], and the `if not result.get("success")`
     # branch below prints it in red and exits 1 — same UX as before.
+    try:
+        lane_weights = _parse_lane_weights(getattr(args, "lane_weights", None))
+    except ValueError as exc:
+        print(color(f"Failed to create job: {exc}", Colors.RED))
+        return 1
+
     result = _cron_api(
         action="create",
         schedule=args.schedule,
@@ -344,6 +377,7 @@ def cron_create(args):
         script=getattr(args, "script", None),
         workdir=getattr(args, "workdir", None),
         no_agent=getattr(args, "no_agent", False) or None,
+        lane_weights=lane_weights,
     )
     if not result.get("success"):
         print(color(f"Failed to create job: {result.get('error', 'unknown error')}", Colors.RED))
@@ -360,6 +394,9 @@ def cron_create(args):
         print("  Mode: no-agent (script stdout delivered directly)")
     if job_data.get("workdir"):
         print(f"  Workdir: {job_data['workdir']}")
+    if job_data.get("lane_weights"):
+        weights = job_data["lane_weights"]
+        print(f"  Lane weights: code={weights.get('code')}, content={weights.get('content')}")
     print(f"  Next run: {result['next_run_at']}")
 
     # ``_format_job`` (the API-layer view in tools/cronjob_tools.py) doesn't
@@ -413,6 +450,16 @@ def cron_edit(args):
             if skill not in final_skills:
                 final_skills.append(skill)
 
+    clear_lane_weights = getattr(args, "clear_lane_weights", False)
+    try:
+        lane_weights = _parse_lane_weights(getattr(args, "lane_weights", None))
+    except ValueError as exc:
+        print(color(f"Failed to update job: {exc}", Colors.RED))
+        return 1
+    if clear_lane_weights and lane_weights is not None:
+        print(color("Failed to update job: use either --lane-weights or --clear-lane-weights, not both", Colors.RED))
+        return 1
+
     result = _cron_api(
         action="update",
         job_id=args.job_id,
@@ -425,6 +472,8 @@ def cron_edit(args):
         script=getattr(args, "script", None),
         workdir=getattr(args, "workdir", None),
         no_agent=getattr(args, "no_agent", None),
+        lane_weights=lane_weights,
+        clear_lane_weights=clear_lane_weights or None,
     )
     if not result.get("success"):
         print(color(f"Failed to update job: {result.get('error', 'unknown error')}", Colors.RED))
@@ -444,6 +493,9 @@ def cron_edit(args):
         print("  Mode: no-agent (script stdout delivered directly)")
     if updated.get("workdir"):
         print(f"  Workdir: {updated['workdir']}")
+    if updated.get("lane_weights"):
+        weights = updated["lane_weights"]
+        print(f"  Lane weights: code={weights.get('code')}, content={weights.get('content')}")
     return 0
 
 

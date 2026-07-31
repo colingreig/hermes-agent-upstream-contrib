@@ -429,6 +429,58 @@ class TestCronjobToolScript:
         assert list_result["jobs"][0]["script"] == "data_collector.py"
 
 
+class TestCronjobToolLaneWeights:
+    def test_create_update_and_clear_lane_weights(self, cron_env, monkeypatch):
+        monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+        from tools.cronjob_tools import cronjob
+
+        create_result = json.loads(cronjob(
+            action="create",
+            schedule="every 1h",
+            prompt="Run the {lane} lane",
+            lane_weights={"code": 0.7, "content": 0.3},
+        ))
+        assert create_result["success"] is True
+        assert create_result["job"]["lane_weights"] == {"code": 0.7, "content": 0.3}
+
+        job_id = create_result["job_id"]
+        update_result = json.loads(cronjob(
+            action="update",
+            job_id=job_id,
+            lane_weights={"code": 3, "content": 1},
+        ))
+        assert update_result["success"] is True
+        assert update_result["job"]["lane_weights"] == {"code": 0.75, "content": 0.25}
+
+        clear_result = json.loads(cronjob(
+            action="update",
+            job_id=job_id,
+            clear_lane_weights=True,
+        ))
+        assert clear_result["success"] is True
+        assert "lane_weights" not in clear_result["job"]
+
+    def test_update_rejects_ambiguous_lane_weights_clear(self, cron_env, monkeypatch):
+        monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+        from tools.cronjob_tools import cronjob
+
+        create_result = json.loads(cronjob(
+            action="create",
+            schedule="every 1h",
+            prompt="Run the {lane} lane",
+            lane_weights={"code": 0.7, "content": 0.3},
+        ))
+
+        result = json.loads(cronjob(
+            action="update",
+            job_id=create_result["job_id"],
+            lane_weights={"code": 0.8, "content": 0.2},
+            clear_lane_weights=True,
+        ))
+        assert result["success"] is False
+        assert "either lane_weights or clear_lane_weights" in result["error"]
+
+
 class TestScriptPathContainment:
     """Regression tests for path containment bypass in _run_job_script().
 
