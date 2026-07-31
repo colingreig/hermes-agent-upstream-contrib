@@ -95,7 +95,8 @@ which is not on a non-interactive ssh PATH — the script extends PATH itself.
 # Roll back to the previous release (no build):
 ~/.hermes/runtime-current/scripts/mini-release-cut.sh --rollback
 
-# Cut, then prune releases older than the newest 3:
+# Cut, then prune down to active + previous release only (disk lifecycle, 86e2k3ryc;
+# set MINI_RELEASE_KEEP_EXTRA=N to keep N additional older releases instead):
 ~/.hermes/runtime-current/scripts/mini-release-cut.sh \
   --ref <certified-full-sha> \
   --certified-sha <same-certified-full-sha> \
@@ -226,7 +227,9 @@ authority.
    prevents BSD `mv` from following an existing symlink-to-directory.
 7. `.previous` (under `releases/`) records the rollback target; failed
    verification auto-rolls-back to it.
-8. Pruning keeps the newest **3** releases and **only runs on explicit
+8. Pruning keeps only the **active (runtime-current target) + previous**
+   release by default (disk lifecycle, 86e2k3ryc; set `MINI_RELEASE_KEEP_EXTRA`
+   to retain N additional older releases) and **only runs on explicit
    `--prune`** — never by default, and never removes the active or previous
    release.
 9. `--dry-run` prints every mutating action and performs none.

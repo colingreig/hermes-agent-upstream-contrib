@@ -84,8 +84,8 @@
     {
       "src_rel": "jobs.json",
       "dest_abs": "~/.hermes/cron/jobs.json",
-      "sha256": "e9aa670ecd46eba7f3afe3d8eac7de35df088923c1ca33b9df532588158e02f9",
-      "role": "curated 16-job cron set (13 kept + 3 consolidated), wholesale-replaces the live jobs.json",
+      "sha256": "2cd3a3817bb90fc4db51feea831ed7a6900cca51225d130d024cd18c1a8f6bd0",
+      "role": "curated 16-job cron set (13 kept + 3 consolidated; hermes-pr-validate re-enabled 2026-07-31 per task 86e2k3qe1), wholesale-replaces the live jobs.json",
       "deploy_mode": "jobs_json"
     }
   ]

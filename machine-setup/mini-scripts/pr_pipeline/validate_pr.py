@@ -33,6 +33,7 @@ if __package__:
     from . import validator_model
     from . import validator_panel
     from . import validator_verdict
+    from . import adversarial_review as ar
 else:
     import risk_classify
     import validate_tripwires as vt
@@ -41,6 +42,7 @@ else:
     import validator_model
     import validator_panel
     import validator_verdict
+    import adversarial_review as ar
 
 
 def _log(msg):
@@ -299,7 +301,21 @@ def validate(
         # never bricks a non-vehicle or transient-error PR. No-op when the diff
         # touches no driven images. Reversibility: delete via import + this block.
         img = via.run(diff, repo=repo, head=head, pr=pr)
-        det_findings = list(tw["findings"]) + list(img.get("findings", []))
+        # adversarial review — missing-CI (86e2k3qe2): validate_tripwires'
+        # check_ci_green() only ever checked that the BASE branch (main) isn't
+        # red; nothing stopped a PASS being recorded here for a PR whose OWN
+        # head commit has a failing gating check (or hasn't gone green yet).
+        # That gap was previously closed only at MERGE time
+        # (autonomous_merge._merge_readiness), which is too late for a
+        # 'PASS'/'ignite-validate: PASS' marker a human or the closeout actor
+        # might already be reading. check_missing_ci() reuses the exact same
+        # gating-check classifier the merge gate trusts, so this call can
+        # never disagree with it — only surface the gap earlier.
+        # wrong-repo and stale-evidence are covered by tw["findings"]
+        # (validate_tripwires.run() delegates to adversarial_review too) and
+        # the head-sha fail-closed check just above, respectively.
+        ci_findings = ar.check_missing_ci(repo, pr)
+        det_findings = list(tw["findings"]) + list(img.get("findings", [])) + list(ci_findings)
         high_findings = [f for f in det_findings if f["severity"] == "high"]
         tier = tw["tier"]
 

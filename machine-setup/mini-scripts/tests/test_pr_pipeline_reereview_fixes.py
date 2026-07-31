@@ -94,6 +94,7 @@ class DegradedPanelIsAlwaysShadowTests(unittest.TestCase):
                 mock.patch.object(validate_pr.vt, "run",
                                    return_value={"tier": "medium", "findings": []}),
                 mock.patch.object(validate_pr.via, "run", return_value={"findings": []}),
+                mock.patch.object(validate_pr.ar, "check_missing_ci", return_value=[]),
                 mock.patch.object(validate_pr.validator_panel, "run",
                                    return_value=panel_result),
             ):

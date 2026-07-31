@@ -126,6 +126,56 @@ def test_dry_run_never_mutates_candidate_or_manifest(tmp_path, sweep):
     assert manifest_path.read_text(encoding="utf-8") == original
 
 
+def test_effective_age_disabled_by_default(tmp_path, sweep):
+    root = tmp_path / "worktrees"
+    root.mkdir()
+    assert sweep._effective_age_days(root, default_days=7, min_free_gb=0, pressure_days=2) == 7
+
+
+def test_effective_age_tightens_under_disk_pressure(tmp_path, sweep, monkeypatch):
+    root = tmp_path / "worktrees"
+    root.mkdir()
+
+    class _Usage:
+        free = 3 * 1024 ** 3  # 3GB free
+        total = 500 * 1024 ** 3
+
+    monkeypatch.setattr(sweep.shutil, "disk_usage", lambda _p: _Usage())
+    assert sweep._effective_age_days(root, default_days=7, min_free_gb=5, pressure_days=2) == 2
+
+
+def test_effective_age_normal_when_disk_healthy(tmp_path, sweep, monkeypatch):
+    root = tmp_path / "worktrees"
+    root.mkdir()
+
+    class _Usage:
+        free = 50 * 1024 ** 3  # 50GB free
+        total = 500 * 1024 ** 3
+
+    monkeypatch.setattr(sweep.shutil, "disk_usage", lambda _p: _Usage())
+    assert sweep._effective_age_days(root, default_days=7, min_free_gb=5, pressure_days=2) == 7
+
+
+def test_effective_age_fails_closed_toward_normal_on_stat_error(tmp_path, sweep, monkeypatch):
+    root = tmp_path / "worktrees"
+    root.mkdir()
+
+    def _raise(_p):
+        raise OSError("boom")
+
+    monkeypatch.setattr(sweep.shutil, "disk_usage", _raise)
+    # A failed disk-usage read must fall back to the NORMAL (less aggressive)
+    # threshold, never the tighter pressure one — a visibility failure must
+    # never cause a surprise deletion.
+    assert sweep._effective_age_days(root, default_days=7, min_free_gb=5, pressure_days=2) == 7
+
+
+def test_fmt_bytes_human_readable(sweep):
+    assert sweep._fmt_bytes(0) == "0.0B"
+    assert sweep._fmt_bytes(2048) == "2.0KB"
+    assert sweep._fmt_bytes(5 * 1024 ** 3) == "5.0GB"
+
+
 def test_broken_symlink_requires_explicit_classification(tmp_path, sweep):
     root = tmp_path / "worktrees"
     root.mkdir()

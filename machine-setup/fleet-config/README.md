@@ -145,11 +145,40 @@ Starting point: the pre-freeze snapshot at
 
 - **13 kept as-is** (config unchanged): `clickup-poll-gate`,
   `review-poll-gate`, `clickup-review-sla`, `hermes-pr-validate` (kept
-  disabled, matching its prior paused state), `spend-meter`,
-  `ci-health-watch`, `clickup-workspace-refresh`, `reap-stranded-claims`,
-  `ignite-board-sync`, `clickup-closeout-actor`, `Purelymail notify-me
-  poller`, plus `clickup-executor` and `content-lane-executor` (config kept,
-  **prompt modified** — see below).
+  disabled at cutover time, matching its prior paused state — see
+  "Re-enablement" below), `spend-meter`, `ci-health-watch`,
+  `clickup-workspace-refresh`, `reap-stranded-claims`, `ignite-board-sync`,
+  `clickup-closeout-actor`, `Purelymail notify-me poller`, plus
+  `clickup-executor` and `content-lane-executor` (config kept, **prompt
+  modified** — see below).
+
+### Re-enablement: hermes-pr-validate (2026-07-31, task `86e2k3qe1`)
+
+`hermes-pr-validate` was carried forward **disabled** at the 2026-07-29
+rebuild cutover, matching its pre-freeze paused state — it was not
+re-evaluated at that time, just preserved as-is. Its provider/model/skill
+config was already correct going into this fleet bundle: `skill:
+ignite-validate` (not the never-existent `hermes-pr-validate` skill),
+`max_turns: 200`, and `workdir: /Users/colingreig/dev/hermes-agent` (the
+RC1/RC2 2026-07-26 fixes documented in the job's own `prompt` field — see
+`jobs.json`). `provider: openai-codex` / `model: gpt-5.4-mini` are
+operator-set and were not touched.
+
+This bundle now flips it back on: `enabled: true`, `state: scheduled`,
+`paused_at: null`. No provider, model, skill, `max_turns`, or `workdir`
+field changed — only the enablement/scheduling fields. The matching
+`fleet_outcome_contracts.json` entry (id `5a76e290811d`) and
+[MONITOR_COVERAGE.md](MONITOR_COVERAGE.md) row were updated in the same
+change: the contract previously *asserted the job stays disabled*
+(`enabled: false`, `max_age_seconds: 0`) and would have alarmed
+`enabled_state_drift` the moment this job ran live. It now expects
+`enabled: true` with a 7200s freshness budget (matching the hourly `0 * *
+* *` schedule plus one missed-run allowance) and `cron_output`
+success/failure patterns modeled on the other LLM-orchestrated executor
+jobs (`ignite-validate`/`PASS`/`FAIL` markers as success, hard execution
+failures or the `validator_repo_guard.py` safety-guard `ABORT` output as
+failure).
+
 - **3 new consolidated jobs**: `clickup-lifecycle` (every 30m; folds
   clickup-closeout-audit + clickup-stalled-reconciler + clickup-reconciler +
   staleness-sweep), `fleet-health-digest` (every 6h; folds hermes-self-report

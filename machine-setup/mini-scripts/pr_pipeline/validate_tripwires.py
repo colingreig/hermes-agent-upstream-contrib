@@ -36,11 +36,11 @@ import sys
 if __package__:
     from . import risk_classify
     from . import validator_common as vc
-    from . import validator_verdict as vv
+    from . import adversarial_review as ar
 else:
     import risk_classify
     import validator_common as vc
-    import validator_verdict as vv
+    import adversarial_review as ar
 
 POLICY_PATH = os.path.expanduser("~/.hermes/scripts/validator_policy.json")
 
@@ -499,11 +499,15 @@ def run(diff_text: str, repo: str = "", pr=None, expected_repo: str = "") -> dic
     files = vc.parse_unified_diff(diff_text)
     risk = risk_classify.classify(diff_text)
     findings = []
-    actual_repo = vv.canonical_repo(repo)
-    target_repo = vv.canonical_repo(expected_repo or repo)
-    if actual_repo and target_repo and actual_repo != target_repo:
-        findings.append({"check": "wrong-repo", "severity": "high", "file": "(repo identity)",
-                         "detail": f"expected {target_repo} but validator was pointed at {actual_repo}"})
+    # wrong-repo: delegate to adversarial_review.check_wrong_repo(), which
+    # compares CANONICAL GitHub identity (rename-following, alias-aware) via
+    # validator_repo_guard.compare_refs() instead of a lowercased NAME-STRING
+    # compare. A naive string compare here would reintroduce the exact RC2
+    # false-positive class validator_repo_guard.py was built to fix — e.g.
+    # colingreig/hermes-agent renamed to .../hermes-agent-upstream-contrib on
+    # 2026-07-23 is ONE repository under two spellings, not a wrong-repo.
+    if expected_repo:
+        findings += ar.check_wrong_repo(repo, expected_repo)
     findings += check_secrets(files)
     findings += check_auth_on_dispatch(files)
     findings += check_governance(files, repo)

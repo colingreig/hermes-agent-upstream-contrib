@@ -515,6 +515,71 @@ def _rule_prose_phantom_refs(task, events, runs, now, cfg) -> list[Diagnostic]:
     )]
 
 
+def _rule_disk_exhausted(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """Task's most recent run ended with the ``disk_full`` outcome — the
+    worker bailed on ENOSPC (host out of disk space), not a task defect.
+
+    Distinguishes a full disk from a generic crash so the operator sees
+    "free the disk on the host", not "fix the task". This is purely
+    informational: ``detect_crashed_workers`` already skips
+    ``_record_task_failure`` for this outcome (no circuit-breaker hit) and
+    ``check_respawn_guard`` already re-probes live free disk space every
+    tick and lets the task through the instant space clears — no manual
+    unblock/reclaim is required. The signal exists so an operator watching
+    the board (or debugging a task that's been stuck longer than expected,
+    like t_df4f4196 during the 2026-07-31 incident) can immediately tell
+    the difference between "waiting on disk space" and "actually broken".
+
+    Auto-clears the moment a later run supersedes the disk-full one
+    (respawn succeeded once space cleared, or the task moved on to
+    running/done/archived).
+    """
+    if _task_field(task, "status") in ("running", "done", "archived"):
+        return []
+    ordered_runs = sorted(runs, key=lambda r: _task_field(r, "id", 0))
+    latest = ordered_runs[-1] if ordered_runs else None
+    if latest is None or _task_field(latest, "outcome") != "disk_full":
+        return []
+    ended_at = int(_task_field(latest, "ended_at", 0) or 0)
+    age_hours = max(0.0, (now - ended_at) / 3600.0) if ended_at else 0.0
+    severity = "critical" if age_hours >= 6 else ("error" if age_hours >= 1 else "warning")
+    task_id = _task_field(task, "id") or "<task_id>"
+    min_free_gb = cfg.get("disk_full_min_free_gb", 2.0)
+    age_label = f" {int(age_hours)}h ago" if age_hours >= 1 else ""
+    return [Diagnostic(
+        kind="disk_exhausted",
+        severity=severity,
+        title=f"Worker bailed on disk-full (ENOSPC){age_label}",
+        detail=(
+            "The last run ended because the host ran out of disk space, not "
+            "because the task itself is broken. It was requeued to ready "
+            "WITHOUT counting a failure, and the dispatcher will not "
+            f"respawn it until a live free-space check shows at least "
+            f"{min_free_gb:.1f}GB free. Free disk on the host (prune old "
+            "worktrees/releases, rotate logs) — the task resumes on its own "
+            "on the next dispatcher tick once space is available; no manual "
+            "unblock or reassign needed."
+        ),
+        actions=[
+            DiagnosticAction(
+                kind="cli_hint",
+                label="Check host free disk space",
+                payload={"command": "df -h ~/.hermes"},
+                suggested=True,
+            ),
+            DiagnosticAction(
+                kind="cli_hint",
+                label=f"Check task log: hermes kanban log {task_id}",
+                payload={"command": f"hermes kanban log {task_id}"},
+            ),
+        ],
+        first_seen_at=ended_at or now,
+        last_seen_at=ended_at or now,
+        count=1,
+        data={"ended_at": ended_at, "age_hours": round(age_hours, 1)},
+    )]
+
+
 def _rule_repeated_failures(task, events, runs, now, cfg) -> list[Diagnostic]:
     """Task's unified ``consecutive_failures`` counter is climbing —
     something about this task+profile combo is broken and each retry
@@ -1006,6 +1071,7 @@ _RULES: list[RuleFn] = [
     _rule_hallucinated_cards,
     _rule_triage_aux_unavailable,
     _rule_prose_phantom_refs,
+    _rule_disk_exhausted,
     _rule_repeated_failures,
     _rule_repeated_crashes,
     _rule_stuck_in_blocked,
@@ -1020,6 +1086,7 @@ DIAGNOSTIC_KINDS = (
     "hallucinated_cards",
     "triage_aux_unavailable",
     "prose_phantom_refs",
+    "disk_exhausted",
     "repeated_failures",
     "repeated_crashes",
     "stuck_in_blocked",
@@ -1040,6 +1107,11 @@ DEFAULT_CONFIG = {
     # signal is dominated by tasks that are about to be claimed on the
     # next dispatcher tick (default 60s) and would just be noise.
     "stranded_threshold_seconds": 30 * 60,
+    # Mirrors kanban_db.DEFAULT_DISK_FULL_MIN_FREE_GB — kept as a plain
+    # float here (not imported) so this module stays dependency-free of
+    # kanban_db for testability; callers that want it wired to the live
+    # dispatcher setting can pass it through ``config``.
+    "disk_full_min_free_gb": 2.0,
 }
 
 
@@ -1062,6 +1134,12 @@ def config_from_kanban_config(kanban_cfg: Optional[dict]) -> dict:
         and "spawn_failure_threshold" not in diag_cfg
     ):
         diag_cfg["failure_threshold"] = diag_cfg["failure_limit"]
+    diag_cfg.setdefault(
+        "disk_full_min_free_gb",
+        kanban_cfg.get(
+            "disk_full_min_free_gb", DEFAULT_CONFIG["disk_full_min_free_gb"]
+        ),
+    )
     return diag_cfg
 
 

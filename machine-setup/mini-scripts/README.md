@@ -124,6 +124,59 @@ The PR review/merge closure is the exception to the manual-copy convention:
 its canonical sources, deterministic manifest, and deployment reconciler live
 under `pr_pipeline/`. Do not compare or copy those files one at a time.
 
+## Adversarial review pass (`pr_pipeline/adversarial_review.py`, ClickUp 86e2k3qe2)
+
+Explicit, testable module tying together three failure classes an adversarial
+reviewer must actively hunt for in an in-review/needs-validation task, before
+a verdict can be finalized as PASS. Each reuses machinery this fleet already
+built and fixes a real gap where the reuse was missing:
+
+- **wrong-repo** — `check_wrong_repo()` delegates to
+  `validator_repo_guard.compare_refs()` (canonical GitHub node_id, rename-
+  following, alias-aware). It replaces a naive lowercased-name-string compare
+  that used to live inline in `validate_tripwires.run()` — exactly the RC2
+  bug class documented in "Validator repository identity" above (a rename
+  reads as two different repos and manufactures a spurious `wrong-repo`
+  BLOCK against real, merged work). `validate_tripwires.run()` now calls
+  `adversarial_review.check_wrong_repo()` instead of comparing strings
+  itself, so its `--expected-repo` CLI flag keeps working but can no longer
+  reintroduce that bug.
+- **stale-evidence** — `check_stale_evidence()` flags a diff/verdict whose
+  recorded head SHA no longer matches the PR's live head: the reviewed
+  snapshot was superseded by a newer commit. `validate_pr.py` already
+  enforces this for its own read (fail-closed BLOCK right after fetching the
+  diff); this function exposes the same guarantee as a standalone, reusable,
+  independently testable check for any other caller.
+- **missing-ci** — `check_missing_ci()` asks whether the PR's OWN head
+  commit has a green gating CI check, something `validate_tripwires.
+  check_ci_green()` never checked (that function only asks whether the BASE
+  branch is red). Previously nothing stopped a validator PASS being recorded
+  for a PR whose own CI never ran or is actively failing — that was only
+  caught later, at MERGE time, by `autonomous_merge._merge_readiness()`. This
+  check reuses that exact classifier (`autonomous_merge.pr_state()`, a public
+  wrapper added around the previously-private `_pr_state()` for this reuse)
+  so the validate-time and merge-time views of "is CI green" can never
+  disagree — it only surfaces the gap earlier, at validate time. A failing
+  gating check is a blocking "high" finding; no green gating check YET
+  (CI may simply still be running) is a visible, non-blocking "medium".
+
+Wired in at both integration points: `validate_tripwires.run()` calls
+`check_wrong_repo()` when `expected_repo` is supplied, and `validate_pr.
+validate()` calls `check_missing_ci()` and folds its findings into the same
+deterministic-findings list that already drives the early-BLOCK and
+fail-closed-override paths. **Fail-closed policy** throughout (mirrors
+`validator_repo_guard`'s documented rule): an inconclusive check — network
+error, unresolvable identity, no PR context — degrades to a non-blocking
+"medium" finding, never a fabricated "high"/BLOCK against real work, and
+never silent either.
+
+```bash
+# manual adversarial spot-check of an open PR
+python3 machine-setup/mini-scripts/pr_pipeline/adversarial_review.py \
+  --repo owner/repo --pr 123 --expected-repo owner/repo
+python3 machine-setup/mini-scripts/tests/test_adversarial_review.py  # hermetic
+```
+
 ## Hermes CI VM health and recovery (`pr_pipeline/ci_health_watch.py`)
 
 `ci_health_watch.py` is the canonical Hermes-hosted monitor for the `hermes-ci`
@@ -880,3 +933,103 @@ so an uncovered change is flagged instead of silently rolling up into
 `install_spend.py` is invoked automatically by the cut itself (they require an
 explicit, deliberate run — see each installer's usage above); the drift check
 only makes the receipt honest about what did and did not deploy.
+
+## Disk lifecycle (worktrees / kanban / releases, ClickUp 86e2k3ryc)
+
+Fix for the mini's 100%-disk incidents: ~101GB across 135 per-task worktrees,
+~26GB across 30 kanban scratch workspaces, and ~11GB across 5 un-pruned
+release dirs, none of which had a tight-enough automated retention policy or
+a trailing disk-free alarm. Four independent pieces, each safe standalone:
+
+- **`scripts/worktree_backstop_sweep.py` tuning** — unchanged safety model
+  (dirty/ahead/no-remote/claimed/deliverable checks still fully fail-closed;
+  never weakened), two additions: (1) `--min-free-gb`/`--pressure-days`
+  (env `HERMES_WORKTREE_BACKSTOP_MIN_FREE_GB` /
+  `HERMES_WORKTREE_BACKSTOP_PRESSURE_DAYS`) make the AGE gate
+  disk-pressure-adaptive — once free space on `--root`'s filesystem drops to
+  or below `--min-free-gb`, the effective age threshold tightens to
+  `--pressure-days` (default 2) instead of the normal `--days` (default 7),
+  so the backstop reclaims eligible space faster exactly when it matters
+  most, without ever touching what the dirty/ahead/claim checks protect. A
+  `disk_usage()` failure fails toward the NORMAL threshold, never the
+  tighter one. (2) every removed/would-remove candidate now logs its size
+  (`du -sk`, reporting-only, never a deletion input) and the sweep-finish
+  summary reports `removed_bytes`/`removed_size`, so an operator can see
+  where the bytes actually are instead of only skip-reason counts.
+- **`kanban_workspace_sweep.py` (new)** — per-board, age-based backstop for
+  kanban scratch workspaces, same philosophy as the worktree backstop above.
+  `hermes kanban gc` already reclaims scratch workspaces for `archived`
+  tasks, but only for whichever ONE board `get_current_board()` resolves to
+  in its process env, has no `--board` flag, and isn't wired to any
+  scheduler in this repo — a multi-board swarm (5 profiles live) can
+  silently accumulate `done`-but-never-archived workspaces board by board
+  indefinitely. This script is standalone (no hermes package import, same
+  design constraint as the worktree backstop so it survives launchd's
+  minimal env): it discovers every board's `kanban.db` +
+  `workspaces/` directory pair itself (the default board's
+  `kanban/workspaces/`, plus `kanban/boards/<slug>/workspaces/` for every
+  board dir present — mirrors `hermes_cli/kanban_db.py`'s
+  `_managed_scratch_path_info` root-enumeration convention), opens each
+  board's DB read-only, and removes a candidate only when: it is NOT a
+  symlink, the owning task's `workspace_kind` is `scratch` (never `dir`/
+  `worktree`), any `workspace_path` override resolves to that same
+  directory, the task's status is terminal (`done`/`archived` — never
+  `triage`/`todo`/`scheduled`/`ready`/`running`/`blocked`/`review`), and it
+  is older than `--days` (default 14). A directory whose id has no matching
+  task row at all (orphan) is swept by age alone. If a board's DB can't be
+  opened, that WHOLE board is skipped this run (fail closed) rather than
+  guessing from disk state. `--dry-run` supported; every decision is logged
+  with size (`du -sk`, reporting-only).
+  ```bash
+  python3 machine-setup/mini-scripts/kanban_workspace_sweep.py --dry-run --days 14
+  ```
+- **Release retention (`scripts/mini-release-cut.sh` `--prune`)** — standing
+  policy is now "keep the active (`runtime-current` target) + previous
+  release, prune everything else," replacing the previous
+  `KEEP_RELEASES=3` default. That old default actually kept **4** releases
+  (active + previous + 2 extra) because the prune loop only starts removing
+  once `kept >= KEEP_RELEASES`, i.e. it keeps `KEEP_RELEASES - 1` extras
+  before deleting the next one — an off-by-one baked into the variable's
+  name. `KEEP_RELEASES_EXTRA` (env `MINI_RELEASE_KEEP_EXTRA`, default `0`)
+  now names the ADDITIONAL count precisely: 0 means exactly 2 releases
+  survive a prune, matching the standing policy; set it explicitly for a
+  one-off wider retention window. Active and previous are still never
+  removed regardless of this value — unchanged from before.
+- **`disk_space_alert.py` (new)** — trailing safety net: retention alone is
+  a leading indicator and only helps if its age thresholds are tight enough
+  for whatever growth actually happens. This is a cheap, zero-LLM, cron-
+  friendly direct disk-free check (same design as `hermes_usage_alert.py`:
+  `hermes send --to slack:hermes`, JSON state file for cooldown, JSON
+  receipt file for external health checks) that alerts on Slack the moment
+  free space on the Hermes home's filesystem drops to or below
+  `HERMES_DISK_ALERT_MIN_FREE_GB` (default `5` GB). Stays silent while
+  healthy, re-alerts every `HERMES_DISK_ALERT_COOLDOWN_MIN` (default 60)
+  while still low rather than going silent after the first ping, and — the
+  `hermes-silent-monitor-failure-pattern` / `degraded-flag-unsatisfiable-
+  alarm` lessons applied here — treats a failed disk-free check itself as a
+  distinct, non-silent, non-zero-exit alert condition (own longer cooldown,
+  `HERMES_DISK_ALERT_ERROR_COOLDOWN_MIN` default 360) instead of ever
+  reading "couldn't check" as "healthy."
+  ```bash
+  python3 machine-setup/mini-scripts/disk_space_alert.py  # dry: HERMES_DISK_ALERT_DISABLE=1
+  ```
+
+Deploy all four by scp-by-name (manual-copy convention, same as every other
+script in this section):
+```bash
+scp machine-setup/mini-scripts/kanban_workspace_sweep.py mini:~/.hermes/scripts/kanban_workspace_sweep.py
+scp machine-setup/mini-scripts/disk_space_alert.py mini:~/.hermes/scripts/disk_space_alert.py
+scp scripts/worktree_backstop_sweep.py mini:~/.hermes/scripts/worktree_backstop_sweep.py
+scp machine-setup/mini-scripts/launchd/com.colingreig.hermes.{disk-space-alert,kanban-workspace-sweep,worktree-backstop-sweep}.plist \
+  mini:~/Library/LaunchAgents/
+```
+`disk_space_alert.py` needs `slack_msg_builder.py` (already deployed flat in
+`~/.hermes/scripts/` by the `pr_pipeline` bundle for `hermes_usage_alert.py`)
+present as a sibling file — no separate action needed if the usage-alert
+monitor is already live. New LaunchAgents load via `launchctl bootstrap
+gui/501 ~/Library/LaunchAgents/<label>.plist` (see the gateway-restart notes
+above for the bootout/bootstrap EIO-race caveat if reloading an existing one).
+
+Tests: `machine-setup/mini-scripts/tests/test_kanban_workspace_sweep.py`,
+`machine-setup/mini-scripts/tests/test_disk_space_alert.py`, and the pressure/
+size-reporting additions in `tests/scripts/test_worktree_backstop_sweep.py`.

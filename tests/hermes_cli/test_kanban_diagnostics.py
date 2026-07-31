@@ -272,6 +272,52 @@ def test_repeated_crashes_escalates_on_many_crashes():
     assert diags[0].severity == "critical"
 
 
+def test_disk_exhausted_fires_on_disk_full_outcome():
+    """A disk-full requeue must surface its own diagnostic, distinct from
+    the generic crash rules — the operator needs "free the disk" as the
+    signal, not "the task is broken"."""
+    task = _task(status="ready", assignee="df")
+    runs = [_run(outcome="disk_full", run_id=1, error="ENOSPC")]
+    diags = kd.compute_task_diagnostics(task, [], runs)
+    kinds = [d.kind for d in diags]
+    assert "disk_exhausted" in kinds
+    assert "repeated_crashes" not in kinds
+    assert "repeated_failures" not in kinds
+
+
+def test_disk_exhausted_clears_after_successful_respawn():
+    """Once a later run supersedes the disk-full one, the diagnostic clears
+    — the dispatcher already let the task through once space recovered."""
+    task = _task(status="done", assignee="df")
+    runs = [
+        _run(outcome="disk_full", run_id=1, error="ENOSPC"),
+        _run(outcome="completed", run_id=2),
+    ]
+    diags = kd.compute_task_diagnostics(task, [], runs)
+    assert "disk_exhausted" not in [d.kind for d in diags]
+
+
+def test_disk_exhausted_silent_while_running():
+    """A fresh attempt in flight (status=running) exempts the stale
+    disk-full banner, same as the other failure/crash rules."""
+    task = _task(status="running", assignee="df")
+    runs = [_run(outcome="disk_full", run_id=1, error="ENOSPC")]
+    diags = kd.compute_task_diagnostics(task, [], runs)
+    assert "disk_exhausted" not in [d.kind for d in diags]
+
+
+def test_disk_exhausted_escalates_with_age():
+    """A disk-full requeue that's sat unresolved for hours should read as
+    more urgent than one that just happened."""
+    task = _task(status="ready", assignee="df")
+    now = time.time()
+    stale_run = {"id": 1, "outcome": "disk_full", "error": "ENOSPC",
+                 "ended_at": int(now - 7 * 3600)}
+    diags = kd.compute_task_diagnostics(task, [], [stale_run], now=now)
+    assert diags[0].kind == "disk_exhausted"
+    assert diags[0].severity == "critical"
+
+
 def test_failure_rules_exempt_terminal_statuses():
     # A manual done (dashboard drag) ends no run, so the trailing crash
     # streak survives in run history — but done means done: neither

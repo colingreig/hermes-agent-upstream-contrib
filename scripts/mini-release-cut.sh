@@ -61,7 +61,15 @@ GATEWAY_PORT=8642
 DASHBOARD_PORT=9119
 MIN_PLATFORMS=2
 VERIFY_TIMEOUT="${MINI_RELEASE_VERIFY_TIMEOUT:-240}"          # seconds — observed real cold-boot (Slack connect + channel directory build) taking 150-180s under load; 60s caused spurious rollbacks on healthy releases
-KEEP_RELEASES=3
+# KEEP_RELEASES_EXTRA (86e2k3ryc, disk lifecycle): number of ADDITIONAL release dirs to
+# retain BEYOND the active (runtime-current target) and previous (.previous) releases,
+# which are always protected regardless of this value. Standing policy is "runtime-current
+# target + 1 previous release, prune the rest" -> 0 extra. Previously a bare KEEP_RELEASES=3
+# meant active+prev+2 extra (~4 releases, ~11GB at 5 items observed) because the prune loop
+# only starts removing once `kept >= KEEP_RELEASES`, i.e. it keeps KEEP_RELEASES-1 extras
+# before deleting the (KEEP_RELEASES)th one — that off-by-one is why the old default kept
+# more than its name implied. Overridable for an explicit one-off wider retention window.
+KEEP_RELEASES_EXTRA="${MINI_RELEASE_KEEP_EXTRA:-0}"
 
 # node/npm live in Homebrew, and uv lives at ~/.local/bin — neither is on a
 # non-interactive ssh PATH.
@@ -108,8 +116,10 @@ Usage: mini-release-cut.sh [--ref <branch-or-sha>] [--certified-sha <full-sha>] 
                 without building, switching, or writing a receipt.
   --rollback    Repoint runtime-current to the previous release and restart.
                 No build. Uses ~/.hermes/releases/.previous.
-  --prune       After a successful cut, delete releases older than the newest
-                3 (never the active or previous release). Off by default.
+  --prune       After a successful cut, delete every release except the active
+                (runtime-current target) and previous one (never removed).
+                Set MINI_RELEASE_KEEP_EXTRA to retain that many additional
+                older releases instead of 0. Off by default.
   --dry-run     Print every mutating action without performing it.
   --offline     Clone the new release from the local runtime-current clone
                 instead of the network origin. runtime-current is normally a
@@ -1018,10 +1028,14 @@ kickstart_after_switch() {
 }
 
 # ---------------------------------------------------------------------------
-# Prune: keep the newest KEEP_RELEASES; never remove active or previous.
+# Prune: keep the active (runtime-current target) + previous release, plus
+# KEEP_RELEASES_EXTRA additional releases beyond those two; delete the rest.
+# Standing policy (86e2k3ryc) is KEEP_RELEASES_EXTRA=0 -> exactly 2 releases
+# survive a prune. Active and previous are never removed regardless of
+# KEEP_RELEASES_EXTRA.
 # ---------------------------------------------------------------------------
 prune_releases() {
-  log "prune: keeping newest $KEEP_RELEASES release(s)"
+  log "prune: keeping active + previous + $KEEP_RELEASES_EXTRA extra release(s)"
   local active="" prev=""
   [ -L "$CURRENT_LINK" ] && active="$(readlink "$CURRENT_LINK")"
   [ -f "$PREV_FILE" ] && prev="$(cat "$PREV_FILE" 2>/dev/null || true)"
@@ -1037,15 +1051,16 @@ prune_releases() {
     if [ "$d" = "$active" ] || [ "$d" = "$prev" ]; then
       continue
     fi
-    kept=$((kept + 1))
-    if [ "$kept" -ge "$KEEP_RELEASES" ]; then
-      # `find` output is not trusted as a deletion target. Resolve and prove
-      # its parent immediately before rm so a traversal/symlink surprise
-      # cannot turn pruning into a live-state delete.
-      assert_release_target "$d"
-      log "prune: removing old release $d"
-      run rm -rf "$d"
+    if [ "$kept" -lt "$KEEP_RELEASES_EXTRA" ]; then
+      kept=$((kept + 1))
+      continue
     fi
+    # `find` output is not trusted as a deletion target. Resolve and prove
+    # its parent immediately before rm so a traversal/symlink surprise
+    # cannot turn pruning into a live-state delete.
+    assert_release_target "$d"
+    log "prune: removing old release $d"
+    run rm -rf "$d"
   done
 }
 
