@@ -1,0 +1,54 @@
+{
+  "bundle": "hermes-disk-lifecycle",
+  "source_task": "86e2k6j3c",
+  "generated": "2026-07-31",
+  "description": "Declared deploy bundle for PR #230 disk-lifecycle scripts and LaunchAgents: disk_space_alert.py, kanban_workspace_sweep.py, and the three com.colingreig.hermes.* sweep/alert plists. These files previously had no manifest, so mini-release-cut.sh could merge them to main while the live mini kept stale/missing copies (same defect class as 86e2hap1g / v0.18.2). This file IS the bundle install_disk_lifecycle.py copies; nothing outside its files list is written.",
+  "coexist_required": [
+    {
+      "dest_abs": "~/.hermes/scripts/slack_msg_builder.py",
+      "reason": "disk_space_alert.py imports slack_msg_builder for Slack delivery; owned by other bundles (e.g. hermes_usage_alert / pr_pipeline), never installed by this bundle"
+    }
+  ],
+  "files": [
+    {
+      "src_rel": "disk_space_alert.py",
+      "src_base": "mirror",
+      "dest_abs": "~/.hermes/scripts/disk_space_alert.py",
+      "sha256": "6f4fd3174688f96e61b510b645a9f835c652932b3bfae67e583b96f1691c1223",
+      "role": "trailing Slack alarm when mini free space drops below threshold; fail-closed on disk-free check errors",
+      "deploy_mode": "script"
+    },
+    {
+      "src_rel": "kanban_workspace_sweep.py",
+      "src_base": "mirror",
+      "dest_abs": "~/.hermes/scripts/kanban_workspace_sweep.py",
+      "sha256": "2508a79e0bb4b8d8388a98fc4128377ef4ea8210ee73029eb2967c938b17ba5f",
+      "role": "age-based backstop for terminal kanban scratch workspaces across all boards",
+      "deploy_mode": "script"
+    },
+    {
+      "src_rel": "launchd/com.colingreig.hermes.disk-space-alert.plist",
+      "src_base": "mirror",
+      "dest_abs": "~/Library/LaunchAgents/com.colingreig.hermes.disk-space-alert.plist",
+      "sha256": "f110a5996b41da14c2c2615544598d58aa9484cd2902d69ec996e6105b59a815",
+      "role": "launchd schedule for disk_space_alert.py",
+      "deploy_mode": "launch_agent"
+    },
+    {
+      "src_rel": "launchd/com.colingreig.hermes.kanban-workspace-sweep.plist",
+      "src_base": "mirror",
+      "dest_abs": "~/Library/LaunchAgents/com.colingreig.hermes.kanban-workspace-sweep.plist",
+      "sha256": "5c5b3b2ca2ef93b1669b7bd2b53591bcc6086e93209033dd10c2f8110d0979c6",
+      "role": "launchd schedule for kanban_workspace_sweep.py",
+      "deploy_mode": "launch_agent"
+    },
+    {
+      "src_rel": "launchd/com.colingreig.hermes.worktree-backstop-sweep.plist",
+      "src_base": "mirror",
+      "dest_abs": "~/Library/LaunchAgents/com.colingreig.hermes.worktree-backstop-sweep.plist",
+      "sha256": "5160e016ec100fceeb5adffe08d14977a6f805c6508ad300c87a9f7452ce6bd3",
+      "role": "launchd schedule for worktree_backstop_sweep.py (script deployed separately from scripts/)",
+      "deploy_mode": "launch_agent"
+    }
+  ]
+}
