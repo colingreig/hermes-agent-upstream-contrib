@@ -3,7 +3,6 @@
   "description": "Authoritative source manifest for the Hermes Mini PR pipeline.",
   "source_commit_required": true,
   "source_root_entrypoints": [
-    "review_poll_gate.py",
     "verify-hermes-patches.sh"
   ],
   "expected_local_patches": {
@@ -15,20 +14,16 @@
     }
   },
   "legacy_flat_entrypoints": [
-    "adversarial_review.py",
     "autonomous_merge.py",
     "ci_base_fix_exempt.json",
     "ci_health_topology.json",
     "ci_health_watch.py",
-    "hermes-runner-acquire.sh",
-    "hermes-runner-config.json",
-    "hermes-runner-loop.sh",
-    "hermes-runner-release.sh",
-    "hermes-runner@.service",
     "hermes_validate_ops.py",
     "merge_guard.py",
+    "pr_pipeline_event_driven.py",
     "pr_pipeline_no_pr_left_behind.py",
     "pr_wake_and_sweep.py",
+    "review_poll_gate.py",
     "risk_classify.py",
     "slack_msg_builder.py",
     "validate_pr.py",
@@ -42,17 +37,12 @@
     "validator_verdict.py"
   ],
   "package_glob": "*.py",
-  "package_files": [
-    "ci_health_topology.json"
-  ],
   "package_destination": "pr_pipeline",
   "managed_root_patterns": [
-    "adversarial_review.py",
     "autonomous_merge.py",
     "ci_base_fix_exempt.json",
     "ci_health_watch.py",
     "ci_health_topology.json",
-    "hermes-runner*",
     "hermes_validate_ops.py",
     "merge_guard.py",
     "pr_*.py",
@@ -64,42 +54,5 @@
   ],
   "unmanaged_root_exclusions": [
     "validator_autonomy.py"
-  ],
-  "runner_vm_assets": [
-    {
-      "destination": "/etc/systemd/system/hermes-runner@.service",
-      "group": "root",
-      "mode": "0644",
-      "owner": "root",
-      "source": "hermes-runner@.service"
-    },
-    {
-      "destination": "/home/colingreig/.hermes-ci/hooks/acquire.sh",
-      "group": "colingreig",
-      "mode": "0755",
-      "owner": "colingreig",
-      "source": "hermes-runner-acquire.sh"
-    },
-    {
-      "destination": "/home/colingreig/.hermes-ci/hooks/release.sh",
-      "group": "colingreig",
-      "mode": "0755",
-      "owner": "colingreig",
-      "source": "hermes-runner-release.sh"
-    },
-    {
-      "destination": "/home/colingreig/.hermes-ci/run-runner-loop.sh",
-      "group": "colingreig",
-      "mode": "0755",
-      "owner": "colingreig",
-      "source": "hermes-runner-loop.sh"
-    },
-    {
-      "destination": "/home/colingreig/.hermes-ci/runner-config.json",
-      "group": "colingreig",
-      "mode": "0600",
-      "owner": "colingreig",
-      "source": "hermes-runner-config.json"
-    }
   ]
 }
