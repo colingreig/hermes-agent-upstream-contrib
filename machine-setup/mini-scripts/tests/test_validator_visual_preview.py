@@ -310,6 +310,8 @@ class VisualPilotRunTests(unittest.TestCase):
         cleanup.assert_called_once()
 
     def test_auxiliary_wrapper_uses_supported_vision_task(self) -> None:
+        import sys
+
         response = object()
         content = [
             {"type": "text", "text": vvp._VISION_PROMPT},
@@ -318,25 +320,21 @@ class VisualPilotRunTests(unittest.TestCase):
                 "image_url": {"url": "data:image/png;base64,c2NyZWVuc2hvdA=="},
             },
         ]
-        with (
-            mock.patch(
-                "agent.auxiliary_client.call_llm",
-                return_value=response,
-            ) as call,
-            mock.patch(
-                "agent.auxiliary_client.extract_content_or_reasoning",
-                return_value='{"verdict":"PASS","reason":"rendered"}',
-            ) as extract,
-        ):
+        auxiliary_client = mock.MagicMock()
+        auxiliary_client.call_llm.return_value = response
+        auxiliary_client.extract_content_or_reasoning.return_value = (
+            '{"verdict":"PASS","reason":"rendered"}'
+        )
+        with mock.patch.dict(sys.modules, {"agent.auxiliary_client": auxiliary_client}):
             result = vvp.call_auxiliary_vision(content)
 
         self.assertEqual(result, '{"verdict":"PASS","reason":"rendered"}')
-        self.assertEqual(call.call_args.kwargs["task"], "vision")
+        self.assertEqual(auxiliary_client.call_llm.call_args.kwargs["task"], "vision")
         self.assertEqual(
-            call.call_args.kwargs["messages"],
+            auxiliary_client.call_llm.call_args.kwargs["messages"],
             [{"role": "user", "content": content}],
         )
-        extract.assert_called_once_with(response)
+        auxiliary_client.extract_content_or_reasoning.assert_called_once_with(response)
 
     def test_pass_is_normalized_to_info_and_cleans_up(self) -> None:
         fenced = json.dumps(
