@@ -8,7 +8,8 @@ with source/deployed identity checks and rollback snapshots.
 **Sibling bundle — `../fleet-config/`.** The manifest-verified,
 sha256-pinned, fail-closed installer pattern established here
 (`self_report_manifest.json` + `install_self_report.py`,
-`spend_manifest.json` + `install_spend.py`) is also used for the
+`spend_manifest.json` + `install_spend.py`,
+`disk_lifecycle_manifest.json` + `install_disk_lifecycle.py`) is also used for the
 2026-07-29 rebuild's `fleet-config` bundle at `machine-setup/fleet-config/`,
 which governs three different destinations: a `config.yaml` **overlay**
 (deep-merge, not replace), the five kanban-swarm profiles under
@@ -925,14 +926,16 @@ ONLY writer of these four files going forward.
 `scripts/mini-release-cut.sh`'s post-cut receipt now scans every file that
 changed in the cut release under `machine-setup/mini-scripts/` and warns by
 name if any changed file is not covered by `self_report_manifest.json`,
-`spend_manifest.json`, `pr_pipeline/manifest.json`, or the three files it
+`spend_manifest.json`, `disk_lifecycle_manifest.json`,
+`fleet_outcome_manifest.json`, `pr_pipeline/manifest.json`, or the three files it
 vendors directly (`clickup_workspace_refresh.py`,
 `reconcile_launchd_environment.py`, `reconcile_marketplace_skills.py`) —
 so an uncovered change is flagged instead of silently rolling up into
-"governed script deployment verified." Neither `install_self_report.py` nor
-`install_spend.py` is invoked automatically by the cut itself (they require an
-explicit, deliberate run — see each installer's usage above); the drift check
-only makes the receipt honest about what did and did not deploy.
+"governed script deployment verified." Neither `install_self_report.py`,
+`install_spend.py`, nor `install_disk_lifecycle.py` is invoked automatically
+by the cut itself (they require an explicit, deliberate run — see each
+installer's usage above); the drift check only makes the receipt honest about
+what did and did not deploy.
 
 ## Disk lifecycle (worktrees / kanban / releases, ClickUp 86e2k3ryc)
 
@@ -1014,8 +1017,31 @@ a trailing disk-free alarm. Four independent pieces, each safe standalone:
   python3 machine-setup/mini-scripts/disk_space_alert.py  # dry: HERMES_DISK_ALERT_DISABLE=1
   ```
 
-Deploy all four by scp-by-name (manual-copy convention, same as every other
-script in this section):
+Deploy via the governed bundle (preferred — closes the 86e2hap1g-class gap
+where CI-green main never reached the live mini):
+
+```bash
+# preview: verify all source hashes, print the plan, write nothing
+python3 machine-setup/mini-scripts/install_disk_lifecycle.py --dry-run
+
+# install scripts + LaunchAgent plists (default home = ~)
+python3 machine-setup/mini-scripts/install_disk_lifecycle.py
+```
+
+The bundle is declared in `disk_lifecycle_manifest.json` (ClickUp 86e2k6j3c).
+It copies only the five declared artifacts by name — two scripts into
+`~/.hermes/scripts/` and three plists into `~/Library/LaunchAgents/` — and
+touches nothing else. `worktree_backstop_sweep.py` itself still lives under
+`scripts/` and is deployed by release cut / a separate copy step; this bundle
+governs its LaunchAgent plist only.
+
+After the first install, load new LaunchAgents via
+`launchctl bootstrap gui/501 ~/Library/LaunchAgents/<label>.plist` (see the
+gateway-restart notes above for the bootout/bootstrap EIO-race caveat if
+reloading an existing one).
+
+Manual scp (legacy fallback only — do not use for routine deploys):
+
 ```bash
 scp machine-setup/mini-scripts/kanban_workspace_sweep.py mini:~/.hermes/scripts/kanban_workspace_sweep.py
 scp machine-setup/mini-scripts/disk_space_alert.py mini:~/.hermes/scripts/disk_space_alert.py
@@ -1025,11 +1051,10 @@ scp machine-setup/mini-scripts/launchd/com.colingreig.hermes.{disk-space-alert,k
 ```
 `disk_space_alert.py` needs `slack_msg_builder.py` (already deployed flat in
 `~/.hermes/scripts/` by the `pr_pipeline` bundle for `hermes_usage_alert.py`)
-present as a sibling file — no separate action needed if the usage-alert
-monitor is already live. New LaunchAgents load via `launchctl bootstrap
-gui/501 ~/Library/LaunchAgents/<label>.plist` (see the gateway-restart notes
-above for the bootout/bootstrap EIO-race caveat if reloading an existing one).
+present as a sibling file — the installer warns if it is missing but does not
+install it.
 
 Tests: `machine-setup/mini-scripts/tests/test_kanban_workspace_sweep.py`,
-`machine-setup/mini-scripts/tests/test_disk_space_alert.py`, and the pressure/
-size-reporting additions in `tests/scripts/test_worktree_backstop_sweep.py`.
+`machine-setup/mini-scripts/tests/test_disk_space_alert.py`,
+`machine-setup/mini-scripts/tests/test_install_disk_lifecycle.py`, and the
+pressure/size-reporting additions in `tests/scripts/test_worktree_backstop_sweep.py`.
