@@ -53,7 +53,7 @@ def test_healthy_disk_is_silent_and_no_slack_send(tmp_path):
             rc = module.main()
     assert rc == 0
     assert not send.called
-    receipt = json.loads(Path(module.RECEIPT_PATH).read_text())
+    receipt = json.loads(Path(module.RECEIPT_PATH).read_text(encoding="utf-8"))
     assert receipt["status"] == "ok"
 
 
@@ -67,7 +67,7 @@ def test_low_disk_sends_slack_alert(tmp_path):
     assert send.called
     sent_message = send.call_args[0][0]
     assert "disk space low" in sent_message.lower()
-    receipt = json.loads(Path(module.RECEIPT_PATH).read_text())
+    receipt = json.loads(Path(module.RECEIPT_PATH).read_text(encoding="utf-8"))
     assert receipt["status"] == "low"
     assert receipt["delivery"] == "confirmed"
 
@@ -101,7 +101,7 @@ def test_slack_delivery_failure_is_non_silent(tmp_path):
         with mock.patch.object(module, "_send_slack", return_value=_completed(1, "", "boom")):
             rc = module.main()
     assert rc == 2
-    receipt = json.loads(Path(module.RECEIPT_PATH).read_text())
+    receipt = json.loads(Path(module.RECEIPT_PATH).read_text(encoding="utf-8"))
     assert receipt["delivery"] == "failed"
 
 
@@ -113,7 +113,7 @@ def test_disk_usage_error_is_non_silent_and_alerts(tmp_path):
             rc = module.main()
     assert rc == 1
     assert send.called
-    receipt = json.loads(Path(module.RECEIPT_PATH).read_text())
+    receipt = json.loads(Path(module.RECEIPT_PATH).read_text(encoding="utf-8"))
     assert receipt["status"] == "check_error"
 
 
