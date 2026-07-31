@@ -32,6 +32,7 @@ if __package__:
     from . import validator_image_authenticity as via
     from . import validator_model
     from . import validator_panel
+    from . import validator_visual_preview as vvp
     from . import validator_verdict
     from . import adversarial_review as ar
 else:
@@ -41,6 +42,7 @@ else:
     import validator_image_authenticity as via
     import validator_model
     import validator_panel
+    import validator_visual_preview as vvp
     import validator_verdict
     import adversarial_review as ar
 
@@ -291,6 +293,18 @@ def validate(
             return 2, {"verdict": "BLOCK", "tier": "unknown",
                        "reason": "PR head changed after immutable identity acquisition (fail-closed)"}
 
+        # Pilot visual gate: source-disabled and a no-op outside the exact
+        # jdmbuysell repository. Once enabled, every operational failure is
+        # normalized to a HIGH finding so this validator cannot persist PASS
+        # without inspecting the successfully deployed preview.
+        try:
+            visual = vvp.run(repo=repo, pr=pr, head=head)
+        except Exception as exc:
+            visual = vvp.operational_failure(
+                "visual-validator-crash",
+                f"unexpected visual preview validator failure: {exc}",
+            )
+
         content_result = None   # set in the tier=="low" branch; None elsewhere
         tw = vt.run(diff, repo=repo, expected_repo=expected_repo)
         # image authenticity: a vision BACKSTOP over added /images/driven/ vehicle
@@ -315,12 +329,17 @@ def validate(
         # (validate_tripwires.run() delegates to adversarial_review too) and
         # the head-sha fail-closed check just above, respectively.
         ci_findings = ar.check_missing_ci(repo, pr)
-        det_findings = list(tw["findings"]) + list(img.get("findings", [])) + list(ci_findings)
+        det_findings = (
+            list(tw["findings"])
+            + list(img.get("findings", []))
+            + list(ci_findings)
+            + list(visual.get("findings", []))
+        )
         high_findings = [f for f in det_findings if f["severity"] == "high"]
         tier = tw["tier"]
 
         if high_findings:
-            verdict, model_used = "BLOCK", "tripwires+vision"
+            verdict, model_used = "BLOCK", "tripwires+vision+visual-preview"
             panel = None
             _log(f"[validate_pr] {repo}#{pr} BLOCK on {len(high_findings)} deterministic "
                  "finding(s): "
@@ -400,6 +419,7 @@ def validate(
             "model_used": model_used, "shadow": shadow,
             "tripwire_findings": tw["findings"],
             "image_findings": img.get("findings", []),
+            "visual_preview": visual,
             "panel": panel, "findings": findings,
         }
 

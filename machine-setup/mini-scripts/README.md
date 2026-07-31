@@ -815,6 +815,43 @@ reviewed change. `verify` is read-only on the deployed scripts (apart from its
 temporary, removed source staging directory) and fails on a missing file,
 hash mismatch, recorded-commit mismatch, or unmanifested pipeline extra.
 
+### Deployed-preview visual validation pilot
+
+`pr_pipeline/validator_visual_preview.py` is a source-gated pilot for
+`colingreig/jdmbuysell-v4`. It is disabled by default and is a no-op for every
+other repository. Enable the behavioral switch in `~/.hermes/config.yaml`:
+
+```yaml
+content_pipeline:
+  visual_validation:
+    enabled: true
+```
+
+This switch is not ready to enable yet. `jdmbuysell-v4` does not currently
+publish GitHub Deployments, and the Mini still needs its Browserbase
+credentials/configuration. A separate target-repo prerequisite must first
+publish a completed successful `Hermes PR Preview` check run for every PR head,
+authored by the Hermes Dev Assistant GitHub App (App `4053083`). Its output
+must contain exactly:
+
+```text
+HERMES_VISUAL_PREVIEW_V1 {"head_sha":"<exact-pr-head>","url":"https://<preview>"}
+```
+
+The validator trusts only that App-authenticated, GitHub head-bound contract.
+It does not fall back to the main site, PR prose/comments, provider dashboards,
+or other checks. Until the producer exists, enabling the switch returns a HIGH
+`missing-preview` finding.
+
+Once those prerequisites exist, the validator opens the preview through the
+configured Browserbase-backed `browser_navigate` and evaluates the screenshot
+through `browser_vision`. If `browser_vision` returns a native multimodal
+envelope instead of textual analysis, the validator sends that screenshot
+through the existing `call_llm(task="vision")` auxiliary route before requiring
+an explicit PASS/BLOCK. A missing preview, navigation/vision error, unparseable
+verdict, or visible BLOCK becomes a HIGH finding and cannot produce a final
+PASS. The browser session is cleaned up after every enabled attempt.
+
 **WARNING — do NOT rsync `~/.hermes/scripts/` wholesale.** That directory is
 hand-maintained on the mini and holds ~203 live-only scripts with no git
 backing (see the top of this file). Only ever `scp` the exact file(s) named

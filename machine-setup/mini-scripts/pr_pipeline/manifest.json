@@ -34,7 +34,8 @@
     "validator_panel.py",
     "validator_policy.json",
     "validator_repo_guard.py",
-    "validator_verdict.py"
+    "validator_verdict.py",
+    "validator_visual_preview.py"
   ],
   "package_glob": "*.py",
   "package_destination": "pr_pipeline",
