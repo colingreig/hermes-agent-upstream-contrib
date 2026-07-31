@@ -300,11 +300,6 @@ def setup_logging(
         The ``logs/`` directory where files are written.
     """
     global _logging_initialized
-
-    if _logging_initialized and not force:
-        home = hermes_home or get_hermes_home()
-        return home / "logs"
-
     home = hermes_home or get_hermes_home()
     log_dir = home / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -322,25 +317,26 @@ def setup_logging(
 
     root = logging.getLogger()
 
-    # --- agent.log (INFO+) — the main activity log -------------------------
-    _add_rotating_handler(
-        root,
-        log_dir / "agent.log",
-        level=level,
-        max_bytes=max_bytes,
-        backup_count=backups,
-        formatter=RedactingFormatter(_LOG_FORMAT),
-    )
+    if not _logging_initialized or force:
+        # --- agent.log (INFO+) — the main activity log --------------------
+        _add_rotating_handler(
+            root,
+            log_dir / "agent.log",
+            level=level,
+            max_bytes=max_bytes,
+            backup_count=backups,
+            formatter=RedactingFormatter(_LOG_FORMAT),
+        )
 
-    # --- errors.log (WARNING+) — quick triage log --------------------------
-    _add_rotating_handler(
-        root,
-        log_dir / "errors.log",
-        level=logging.WARNING,
-        max_bytes=2 * 1024 * 1024,
-        backup_count=2,
-        formatter=RedactingFormatter(_LOG_FORMAT),
-    )
+        # --- errors.log (WARNING+) — quick triage log ---------------------
+        _add_rotating_handler(
+            root,
+            log_dir / "errors.log",
+            level=logging.WARNING,
+            max_bytes=2 * 1024 * 1024,
+            backup_count=2,
+            formatter=RedactingFormatter(_LOG_FORMAT),
+        )
 
     # --- gateway.log (INFO+, gateway component only) ------------------------
     if mode == "gateway":
@@ -365,6 +361,9 @@ def setup_logging(
             formatter=RedactingFormatter(_LOG_FORMAT),
             log_filter=_ComponentFilter(COMPONENT_PREFIXES["gui"]),
         )
+
+    if _logging_initialized and not force:
+        return log_dir
 
     # Ensure root logger level is low enough for the handlers to fire.
     if root.level == logging.NOTSET or root.level > level:
