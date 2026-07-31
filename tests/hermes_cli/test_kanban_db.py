@@ -1063,6 +1063,247 @@ def test_resolve_rate_limit_cooldown_handles_bad_env(monkeypatch):
         )
 
 
+# ---------------------------------------------------------------------------
+# Disk-full requeue: a worker that bails on ENOSPC (host out of disk space)
+# must be released back to ``ready`` WITHOUT counting a failure — same
+# reasoning as the rate-limit carve-out above, but gated on a live free-space
+# check instead of a fixed cooldown, since disk space doesn't refill on a
+# timer. Regression coverage for the stuck-task-after-disk-full incident
+# (t_df4f4196, 2026-07-31).
+# ---------------------------------------------------------------------------
+
+
+def test_classify_worker_exit_recognizes_disk_full_sentinel(kanban_home):
+    import hermes_cli.kanban_db as _kb
+
+    pid = 41337
+    _kb._record_worker_exit(pid, _exited_status(_kb.KANBAN_DISK_FULL_EXIT_CODE))
+    kind, code = _kb._classify_worker_exit(pid)
+    assert kind == "disk_full"
+    assert code == _kb.KANBAN_DISK_FULL_EXIT_CODE
+
+    # Plain non-zero exit is still a normal crash, not disk-full.
+    _kb._record_worker_exit(pid + 1, _exited_status(1))
+    assert _kb._classify_worker_exit(pid + 1) == ("nonzero_exit", 1)
+
+
+def test_disk_full_exit_requeues_without_counting_failure(kanban_home, monkeypatch):
+    """A disk-full sentinel exit releases the task to ``ready`` and leaves
+    ``consecutive_failures`` untouched — the breaker must never trip while
+    the host is simply out of disk space, even across many hits."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="df", assignee="a")
+
+        # Simulate FAR more disk-full hits than DEFAULT_FAILURE_LIMIT (2).
+        # If any of these counted as a failure the task would be blocked.
+        for i in range(6):
+            pid = 80000 + i
+            kb.claim_task(conn, tid, claimer=f"{host}:w{i}")
+            conn.execute(
+                "UPDATE tasks SET worker_pid=?, consecutive_failures=? "
+                "WHERE id=?",
+                (pid, 0, tid),
+            )
+            conn.commit()
+            _kb._record_worker_exit(
+                pid, _exited_status(_kb.KANBAN_DISK_FULL_EXIT_CODE)
+            )
+
+            crashed = kb.detect_crashed_workers(conn)
+            # Disk-full requeues are NOT crashes.
+            assert tid not in crashed
+            df = getattr(_kb.detect_crashed_workers, "_last_disk_full", [])
+            assert tid in df
+
+            task = kb.get_task(conn, tid)
+            assert task.status == "ready", (
+                f"hit {i}: should requeue ready, got {task.status}"
+            )
+            assert task.consecutive_failures == 0, (
+                f"hit {i}: disk-full must not count a failure, "
+                f"got {task.consecutive_failures}"
+            )
+
+        # Last failure error stamped so the respawn guard recognizes the
+        # disk-full outcome.
+        assert task.last_failure_error and "disk_full" in task.last_failure_error
+
+        # A ``disk_full`` run outcome was recorded (not ``crashed``).
+        outcomes = [
+            r["outcome"] for r in conn.execute(
+                "SELECT outcome FROM task_runs WHERE task_id=?", (tid,),
+            ).fetchall()
+        ]
+        assert "disk_full" in outcomes
+        assert "crashed" not in outcomes
+
+
+def test_respawn_guard_defers_disk_full_while_space_still_low(
+    kanban_home, monkeypatch,
+):
+    """While the host is still reporting low free space, the guard defers
+    the respawn — retrying blind would just repeat the same ENOSPC crash."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_host_disk_free_gb", lambda _conn=None: 0.5)
+    monkeypatch.setenv("HERMES_KANBAN_DISK_FULL_MIN_FREE_GB", "2")
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="df-guard", assignee="a")
+        kb.claim_task(conn, tid)
+        run_id = kb.get_task(conn, tid).current_run_id
+        conn.execute(
+            "UPDATE task_runs SET outcome='disk_full', status='disk_full', "
+            "ended_at=? WHERE id=?",
+            (int(_kb.time.time()), run_id),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='ready', current_run_id=NULL, "
+            "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
+            "last_failure_error=? WHERE id=?",
+            ("pid 1 exited disk_full (ENOSPC) — requeued", tid),
+        )
+        conn.commit()
+
+        assert kb.check_respawn_guard(conn, tid) == "disk_full_low_space"
+
+
+def test_respawn_guard_allows_disk_full_respawn_once_space_recovers(
+    kanban_home, monkeypatch,
+):
+    """The instant a live free-space check clears the configured floor, the
+    guard lets the task through — no fixed cooldown, unlike rate limits."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_host_disk_free_gb", lambda _conn=None: 50.0)
+    monkeypatch.setenv("HERMES_KANBAN_DISK_FULL_MIN_FREE_GB", "2")
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="df-guard-clear", assignee="a")
+        kb.claim_task(conn, tid)
+        run_id = kb.get_task(conn, tid).current_run_id
+        conn.execute(
+            "UPDATE task_runs SET outcome='disk_full', status='disk_full', "
+            "ended_at=? WHERE id=?",
+            (int(_kb.time.time()), run_id),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='ready', current_run_id=NULL, "
+            "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
+            "last_failure_error=? WHERE id=?",
+            ("pid 1 exited disk_full (ENOSPC) — requeued", tid),
+        )
+        conn.commit()
+
+        assert kb.check_respawn_guard(conn, tid) is None
+
+
+def test_respawn_guard_disk_full_fails_open_when_free_space_unknown(
+    kanban_home, monkeypatch,
+):
+    """A broken disk_usage() probe (returns None) must not permanently park
+    the task — fail open and let it respawn rather than strand it forever."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_host_disk_free_gb", lambda _conn=None: None)
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="df-guard-unknown", assignee="a")
+        kb.claim_task(conn, tid)
+        run_id = kb.get_task(conn, tid).current_run_id
+        conn.execute(
+            "UPDATE task_runs SET outcome='disk_full', status='disk_full', "
+            "ended_at=? WHERE id=?",
+            (int(_kb.time.time()), run_id),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='ready', current_run_id=NULL, "
+            "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL "
+            "WHERE id=?",
+            (tid,),
+        )
+        conn.commit()
+
+        assert kb.check_respawn_guard(conn, tid) is None
+
+
+def test_resolve_disk_full_min_free_gb_handles_bad_env(monkeypatch):
+    import hermes_cli.kanban_db as _kb
+
+    for bad_val in ("notanumber", "-5", ""):
+        monkeypatch.setenv("HERMES_KANBAN_DISK_FULL_MIN_FREE_GB", bad_val)
+        assert (
+            _kb._resolve_disk_full_min_free_gb()
+            == _kb.DEFAULT_DISK_FULL_MIN_FREE_GB
+        )
+
+
+def test_host_disk_free_gb_uses_db_path_when_available(kanban_home, monkeypatch):
+    """The free-space probe should stat the filesystem holding the actual
+    kanban.db file (resolved via PRAGMA database_list), not an arbitrary
+    default path."""
+    import hermes_cli.kanban_db as _kb
+    import shutil as _shutil
+    from collections import namedtuple
+
+    _Usage = namedtuple("_Usage", ["total", "used", "free"])
+    seen_paths = []
+
+    def _fake_disk_usage(path):
+        seen_paths.append(path)
+        return _Usage(total=100 * 1024**3, used=90 * 1024**3, free=10 * 1024**3)
+
+    monkeypatch.setattr(_shutil, "disk_usage", _fake_disk_usage)
+
+    with kb.connect() as conn:
+        free_gb = _kb._host_disk_free_gb(conn)
+        assert free_gb == pytest.approx(10.0)
+        assert seen_paths, "disk_usage should have been called with a real path"
+
+
+def test_disk_full_outcome_surfaces_in_diagnostics(kanban_home, monkeypatch):
+    """End-to-end sanity: a disk-full requeue's run outcome + stamped error
+    are the same shape the diagnostics rule (`_rule_disk_exhausted`) reads,
+    so the board can distinguish it from a generic crash."""
+    from hermes_cli import kanban_diagnostics as diag
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="df-diag", assignee="a")
+        kb.claim_task(conn, tid, claimer=f"{host}:w0")
+        pid = 90001
+        conn.execute(
+            "UPDATE tasks SET worker_pid=? WHERE id=?", (pid, tid),
+        )
+        conn.commit()
+        _kb._record_worker_exit(pid, _exited_status(_kb.KANBAN_DISK_FULL_EXIT_CODE))
+        kb.detect_crashed_workers(conn)
+
+        task = kb.get_task(conn, tid)
+        runs = conn.execute(
+            "SELECT * FROM task_runs WHERE task_id=? ORDER BY id", (tid,),
+        ).fetchall()
+        events = conn.execute(
+            "SELECT * FROM task_events WHERE task_id=? ORDER BY id", (tid,),
+        ).fetchall()
+
+        diagnostics = diag.compute_task_diagnostics(task, events, runs)
+        kinds = [d.kind for d in diagnostics]
+        assert "disk_exhausted" in kinds
+        # And must NOT also fire the generic crash rules for this run.
+        assert "repeated_crashes" not in kinds
+
+
 def test_max_runtime_uses_current_run_start_after_retry(kanban_home, monkeypatch):
     """A retry should get a fresh max-runtime window.
 

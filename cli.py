@@ -15804,6 +15804,45 @@ def main(
                             _emit_interrupted_session_end(cli, reason="keyboard_interrupt")
                             print(f"\nsession_id: {cli.session_id}", file=sys.stderr)
                             sys.exit(130)
+                        except OSError as _os_exc:
+                            # A kanban worker whose host ran out of disk mid-run
+                            # (session/checkpoint writes, a spawned build tool
+                            # like pnpm) raises ENOSPC here uncaught. Previously
+                            # this fell through to Python's default handler —
+                            # traceback + exit 1 — which the dispatcher's reap
+                            # classifier can only see as a generic ``crashed``
+                            # exit. That misclassification is exactly what
+                            # stranded t_df4f4196 on 2026-07-31: the task kept
+                            # burning its circuit-breaker budget retrying a
+                            # crash that couldn't resolve until the disk was
+                            # freed, with no signal telling the operator why.
+                            #
+                            # Kanban workers get a dedicated sentinel exit
+                            # instead, mirroring the rate-limit sentinel below:
+                            # the dispatcher's ``_classify_worker_exit`` maps it
+                            # to a ``disk_full`` outcome, released back to
+                            # ``ready`` WITHOUT counting a failure, and gated
+                            # from respawning until ``check_respawn_guard``
+                            # confirms real free space again. Non-kanban runs
+                            # re-raise unchanged — no behavior change outside
+                            # the dispatcher-spawned worker path.
+                            if (
+                                getattr(_os_exc, "errno", None) == errno.ENOSPC
+                                and os.environ.get("HERMES_KANBAN_TASK")
+                            ):
+                                print(
+                                    f"Error: disk full (ENOSPC): {_os_exc}",
+                                    file=sys.stderr,
+                                )
+                                print(f"\nsession_id: {cli.session_id}", file=sys.stderr)
+                                try:
+                                    from hermes_cli.kanban_db import (
+                                        KANBAN_DISK_FULL_EXIT_CODE as _DF_CODE,
+                                    )
+                                except Exception:
+                                    _DF_CODE = 28
+                                sys.exit(_DF_CODE)
+                            raise
                         # Sync session_id if mid-run compression created a
                         # continuation session. The exit line below reports
                         # session_id to stderr for automation wrappers; without

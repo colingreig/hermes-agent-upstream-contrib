@@ -283,6 +283,20 @@ DEFAULT_CRASH_GRACE_SECONDS = 30
 # 0/1/2 codes the worker uses for success / generic failure / usage error.
 KANBAN_RATE_LIMIT_EXIT_CODE = 75
 
+# Sentinel exit code a kanban worker uses to signal "I bailed because the
+# host ran out of disk space (ENOSPC), not because the task itself is
+# broken." The dispatcher's reap classifier maps this to a ``disk_full``
+# exit kind so ``detect_crashed_workers`` can release the task back to
+# ``ready`` WITHOUT counting a failure — a full disk is an infrastructure
+# problem, not a task defect, and retrying blind while it's still full would
+# just repeat the identical crash and burn the circuit-breaker budget on an
+# unwinnable loop (the failure mode that stranded task t_df4f4196 during the
+# 2026-07-31 disk-full incident). 28 == ``errno.ENOSPC`` on Linux and macOS —
+# reusing the errno itself as the sentinel keeps the two numbers
+# self-documenting side by side, and it's well clear of 0/1/2 (success /
+# generic failure / usage error) and 75 (the rate-limit sentinel above).
+KANBAN_DISK_FULL_EXIT_CODE = 28
+
 
 def _resolve_crash_grace_seconds() -> int:
     """Return the crash-detection grace period in seconds.
@@ -323,6 +337,62 @@ def _resolve_rate_limit_cooldown_seconds() -> int:
         if parsed >= 0:
             return parsed
     return DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS
+
+
+# Free-space floor (GB) a disk_full task must see before the dispatcher will
+# respawn it. Deliberately small: the goal isn't "plenty of headroom", just
+# "enough that the exact same build/write that just failed on ENOSPC has a
+# realistic chance of completing this time".
+DEFAULT_DISK_FULL_MIN_FREE_GB = 2.0
+
+
+def _resolve_disk_full_min_free_gb() -> float:
+    """Return the free-space floor (GB) required before a disk_full task may respawn.
+
+    Reads ``HERMES_KANBAN_DISK_FULL_MIN_FREE_GB`` from the environment; falls
+    back to ``DEFAULT_DISK_FULL_MIN_FREE_GB`` when absent, empty, non-numeric,
+    or negative.
+    """
+    raw = os.environ.get("HERMES_KANBAN_DISK_FULL_MIN_FREE_GB", "").strip()
+    if raw:
+        try:
+            parsed = float(raw)
+        except ValueError:
+            parsed = -1.0
+        if parsed >= 0:
+            return parsed
+    return DEFAULT_DISK_FULL_MIN_FREE_GB
+
+
+def _host_disk_free_gb(conn: Optional[sqlite3.Connection] = None) -> Optional[float]:
+    """Return free disk space (GB) on the filesystem backing the kanban DB.
+
+    Best-effort: resolves the board's sqlite file path via ``PRAGMA
+    database_list`` (the same trick ``_check_file_length_invariant`` uses) so
+    the check lands on the actual volume that fills up — worktrees,
+    kanban.db, and Hermes releases are typically all on the same disk. Falls
+    back to ``HERMES_HOME`` (or ``~/.hermes``) when the DB path can't be
+    resolved (e.g. an in-memory DB in tests).
+
+    Returns ``None`` when free space can't be determined at all, so callers
+    can treat "unknown" distinctly from "known-low" and fail open rather than
+    parking a task forever on a broken stat() call.
+    """
+    path = None
+    if conn is not None:
+        try:
+            row = conn.execute("PRAGMA database_list").fetchone()
+            if row is not None and row[2]:
+                path = row[2]
+        except Exception:
+            path = None
+    check_path = path or os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")
+    try:
+        probe_dir = os.path.dirname(check_path) if path else check_path
+        usage = shutil.disk_usage(probe_dir or check_path)
+        return usage.free / (1024 ** 3)
+    except Exception:
+        return None
 
 
 # Worker-context caps so build_worker_context() stays bounded on
@@ -6291,6 +6361,14 @@ class DispatchResult:
     (EX_TEMPFAIL sentinel exit) and were released back to ``ready`` WITHOUT
     counting a failure. These never trip the circuit breaker — a long quota
     window just makes the task bounce cheaply until the window clears."""
+    disk_full: list[str] = field(default_factory=list)
+    """Task ids whose workers bailed because the host was out of disk space
+    (``KANBAN_DISK_FULL_EXIT_CODE`` sentinel exit, or a plain crash while the
+    live free-space check was already low) and were released back to
+    ``ready`` WITHOUT counting a failure. ``check_respawn_guard`` defers
+    their respawn until a live ``shutil.disk_usage()`` check shows real
+    headroom again, so the dispatcher can't loop-crash into the same full
+    disk."""
     skipped_locked: bool = False
     """True when this tick was skipped because another process already held
     the board's dispatch lock (issue #35240). A losing dispatcher does no
@@ -6349,6 +6427,13 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
       provider rate-limited / exhausted quota, NOT because the task failed.
       ``detect_crashed_workers`` releases the task back to ``ready`` without
       counting a failure, so a long quota window can't trip the breaker.
+    * ``"disk_full"`` — ``WIFEXITED`` with status
+      ``KANBAN_DISK_FULL_EXIT_CODE``. The worker bailed because the host ran
+      out of disk (ENOSPC), NOT because the task failed. Like
+      ``rate_limited``, ``detect_crashed_workers`` releases the task back to
+      ``ready`` without counting a failure — but ``check_respawn_guard`` also
+      gates the actual respawn on a live free-space check, so the dispatcher
+      doesn't blindly retry into the same full disk.
     * ``"nonzero_exit"`` — ``WIFEXITED`` with non-zero status. Real error.
     * ``"signaled"`` — ``WIFSIGNALED`` (OOM killer, SIGKILL, etc). Real crash.
     * ``"unknown"`` — pid was not in the reap registry (either reaped by
@@ -6356,8 +6441,8 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
       back to existing crashed-counter behavior.
 
     ``code`` is the exit status (for ``clean_exit`` / ``rate_limited`` /
-    ``nonzero_exit``) or the signal number (for ``signaled``), or ``None``
-    for ``unknown``.
+    ``disk_full`` / ``nonzero_exit``) or the signal number (for
+    ``signaled``), or ``None`` for ``unknown``.
     """
     entry = _recent_worker_exits.get(int(pid))
     if entry is None:
@@ -6370,6 +6455,8 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
                 return ("clean_exit", 0)
             if code == KANBAN_RATE_LIMIT_EXIT_CODE:
                 return ("rate_limited", code)
+            if code == KANBAN_DISK_FULL_EXIT_CODE:
+                return ("disk_full", code)
             return ("nonzero_exit", code)
         if os.WIFSIGNALED(raw):
             return ("signaled", os.WTERMSIG(raw))
@@ -6994,9 +7081,18 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     ``check_respawn_guard`` defers their respawn until the window clears.
     The ids are returned via the ``_last_rate_limited`` function attribute
     (the public return stays the crashed-only ``list[str]``).
+
+    When the reap registry shows the worker exited with the disk-full
+    sentinel (``KANBAN_DISK_FULL_EXIT_CODE``), the host was out of disk
+    (ENOSPC), NOT a task failure. Handled the same way as a rate limit —
+    released back to ``ready`` without counting a failure, stamped with a
+    disk-full marker so ``check_respawn_guard`` defers the respawn until a
+    live free-space check shows real headroom again. The ids are returned
+    via the ``_last_disk_full`` function attribute.
     """
     crashed: list[str] = []
     rate_limited: list[str] = []
+    disk_full: list[str] = []
     # Per-crash details collected inside the main txn, used after it
     # closes to run ``_record_task_failure`` (which needs its own
     # write_txn so can't nest). ``protocol_violation`` flags the
@@ -7030,6 +7126,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             pid = int(row["worker_pid"])
             kind, code = _classify_worker_exit(pid)
             rate_limited_exit = False
+            disk_full_exit = False
             if kind == "clean_exit":
                 # Worker subprocess returned 0 but its task is still
                 # ``running`` in the DB — it exited without calling
@@ -7077,6 +7174,31 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     "claimer": row["claim_lock"],
                     "exit_code": code,
                 }
+            elif kind == "disk_full":
+                # Worker bailed because the host was out of disk space
+                # (ENOSPC sentinel). This is NOT a task failure — the disk
+                # is the thing that's broken, and it typically fills the
+                # exact same way on every retry, so counting it against the
+                # circuit breaker would just auto-block a perfectly fine
+                # task the moment the breaker's threshold is reached, with
+                # no signal telling the operator WHY. Release it back to
+                # ``ready`` without counting a failure; ``check_respawn_guard``
+                # gates the actual respawn on a live disk_usage() check so
+                # the dispatcher doesn't loop-crash into the same full disk.
+                protocol_violation = False
+                disk_full_exit = True
+                error_text = (
+                    f"pid {pid} exited disk_full (ENOSPC) — requeued "
+                    f"without counting a failure; will not respawn until "
+                    f"free disk space clears "
+                    f"{_resolve_disk_full_min_free_gb():.1f}GB"
+                )
+                event_kind = "disk_full"
+                event_payload = {
+                    "pid": pid,
+                    "claimer": row["claim_lock"],
+                    "exit_code": code,
+                }
             else:
                 protocol_violation = False
                 if kind == "nonzero_exit":
@@ -7099,10 +7221,15 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 (row["id"], pid, row["claim_lock"]),
             )
             if cur.rowcount == 1:
-                # Rate-limited requeues are a clean release, not a crash —
-                # record the run outcome as ``rate_limited`` so the board
-                # history doesn't show a phantom crash for a quota wall.
-                _run_outcome = "rate_limited" if rate_limited_exit else "crashed"
+                # Rate-limited / disk-full requeues are a clean release, not
+                # a crash — record the run outcome accordingly so the board
+                # history doesn't show a phantom crash for an infra blip.
+                if rate_limited_exit:
+                    _run_outcome = "rate_limited"
+                elif disk_full_exit:
+                    _run_outcome = "disk_full"
+                else:
+                    _run_outcome = "crashed"
                 run_id = _end_run(
                     conn, row["id"],
                     outcome=_run_outcome, status=_run_outcome,
@@ -7125,6 +7252,16 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                         (error_text[:500], row["id"]),
                     )
                     rate_limited.append(row["id"])
+                elif disk_full_exit:
+                    # Same reasoning as rate_limited above: stamp the error
+                    # so ``check_respawn_guard`` recognizes the disk-full
+                    # outcome and defers the respawn until a live free-space
+                    # check clears — WITHOUT touching ``consecutive_failures``.
+                    conn.execute(
+                        "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+                        (error_text[:500], row["id"]),
+                    )
+                    disk_full.append(row["id"])
                 else:
                     if protocol_violation:
                         # Stamp the failure error now: a below-budget
@@ -7234,6 +7371,9 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # Same side-channel for rate-limited requeues — these did NOT count a
     # failure and are NOT crashes, so they stay out of the ``crashed`` return.
     detect_crashed_workers._last_rate_limited = rate_limited  # type: ignore[attr-defined]
+    # Same side-channel for disk-full requeues — these did NOT count a
+    # failure and are NOT crashes, so they stay out of the ``crashed`` return.
+    detect_crashed_workers._last_disk_full = disk_full  # type: ignore[attr-defined]
     return crashed
 
 
@@ -7471,6 +7611,19 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
 
     Checks in priority order:
 
+    ``"disk_full_low_space"``
+        The task's most recent run ended with the ``disk_full`` outcome (a
+        worker bailed on ENOSPC via the disk-full sentinel exit) and a live
+        ``shutil.disk_usage()`` check against the board's filesystem still
+        shows less than ``_resolve_disk_full_min_free_gb()`` GB free.
+        Retrying blind here would just repeat the identical crash, so this
+        guard checks REAL headroom every tick instead of a fixed cooldown —
+        the moment the disk is freed (mini-side cleanup, log rotation, an
+        old worktree pruned), the very next tick lets the task respawn.
+        Checked FIRST, before ``rate_limit_cooldown``, purely because a
+        stuck-disk incident is the more urgent operator-visible condition;
+        the two never overlap in practice (a run has exactly one outcome).
+
     ``"rate_limit_cooldown"``
         The task's most recent run ended with the ``rate_limited`` outcome
         (a worker bailed on a provider quota wall via the EX_TEMPFAIL
@@ -7519,23 +7672,43 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
 
     now = int(time.time())
 
-    # 1. Rate-limit cooldown. The most recent run ended ``rate_limited``
-    #    (quota wall) — defer while inside the cooldown window, then allow a
-    #    cheap probe. Must run BEFORE the blocker_auth regex check, because a
-    #    rate-limit requeue stamps a quota-flavored last_failure_error that
-    #    the regex would otherwise match → defer forever (no failure counter
-    #    increment on this path means the breaker can never free it).
-    #
-    #    We look at the LATEST run only (ORDER BY ended_at DESC LIMIT 1): if a
-    #    newer crash/completion superseded the rate-limit run, this guard
-    #    no longer applies and the normal paths take over.
-    rl_cooldown = _resolve_rate_limit_cooldown_seconds()
+    # We look at the LATEST run only (ORDER BY ended_at DESC LIMIT 1): if a
+    # newer crash/completion superseded the disk-full/rate-limit run, these
+    # guards no longer apply and the normal paths take over.
     latest_run = conn.execute(
         "SELECT outcome, ended_at FROM task_runs "
         "WHERE task_id = ? AND ended_at IS NOT NULL "
         "ORDER BY ended_at DESC LIMIT 1",
         (task_id,),
     ).fetchone()
+
+    # 0. Disk-full recheck. The most recent run bailed on ENOSPC — defer
+    #    the respawn until a live free-space check on the board's
+    #    filesystem shows real headroom again. Unlike the rate-limit
+    #    cooldown below, this isn't time-based: disk space doesn't refill
+    #    on a timer, so we just re-probe ``shutil.disk_usage()`` every tick
+    #    and let the task through the instant space is actually available.
+    #    ``free_gb is None`` (stat() failed) fails OPEN — better to let a
+    #    single bad probe respawn than park the task forever on a broken
+    #    disk_usage() call.
+    if (
+        latest_run is not None
+        and latest_run["outcome"] == "disk_full"
+    ):
+        free_gb = _host_disk_free_gb(conn)
+        min_free_gb = _resolve_disk_full_min_free_gb()
+        if free_gb is not None and free_gb < min_free_gb:
+            return "disk_full_low_space"
+        # Headroom confirmed (or unknown) — fall through and respawn.
+        return None
+
+    # 1. Rate-limit cooldown. The most recent run ended ``rate_limited``
+    #    (quota wall) — defer while inside the cooldown window, then allow a
+    #    cheap probe. Must run BEFORE the blocker_auth regex check, because a
+    #    rate-limit requeue stamps a quota-flavored last_failure_error that
+    #    the regex would otherwise match → defer forever (no failure counter
+    #    increment on this path means the breaker can never free it).
+    rl_cooldown = _resolve_rate_limit_cooldown_seconds()
     if (
         latest_run is not None
         and latest_run["outcome"] == "rate_limited"
@@ -7788,6 +7961,14 @@ def _dispatch_once_locked(
     )
     if _crash_rate_limited:
         result.rate_limited.extend(_crash_rate_limited)
+    # Disk-full requeues (ENOSPC sentinel, no failure counted) — surface for
+    # telemetry / tests. These tasks went back to ``ready`` and the respawn
+    # guard will defer them until a live free-space check clears.
+    _crash_disk_full = getattr(
+        detect_crashed_workers, "_last_disk_full", []
+    )
+    if _crash_disk_full:
+        result.disk_full.extend(_crash_disk_full)
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 
