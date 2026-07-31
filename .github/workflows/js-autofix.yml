@@ -8,10 +8,18 @@ name: auto-fix lint issues & formatting
 # check in typecheck.yml fails only when un-fixable errors remain.
 #
 # NOTE: AUTOFIX_BOT_PAT pushes DO trigger further workflow runs (unlike
-# secrets.GITHUB_TOKEN). The concurrency group (ts-autofix-${{ github.ref }})
-# with cancel-in-progress: true prevents an infinite loop — a re-triggered
-# run cancels the in-flight one, and since the second run finds no new fixes
-# (the first run already applied them), it exits with an empty patch.
+# secrets.GITHUB_TOKEN) — the bot's squash-merge of the auto-fix PR is itself
+# a push to main and re-triggers this workflow while the original run is
+# still alive (in "Wait for merge, auto-close on failure or stale").
+#
+# The concurrency group is scoped per-commit-sha for push events (not just
+# `github.ref`), so an unrelated human merge landing seconds later can never
+# cancel this run's in-flight patch/PR — that used to be possible when every
+# push to main shared one `ts-autofix-${{ github.ref }}` group with
+# cancel-in-progress: true. No infinite-loop risk from removing that shared
+# cancellation: the re-triggered run (at the bot's own merge sha) finds no
+# new diff and exits immediately with has-fixes=false, while the original
+# run's own polling loop notices the PR is MERGED within ~15s and exits too.
 #
 # ── Security model: two-job split ───────────────────────────────────────────
 #
@@ -51,8 +59,8 @@ permissions:
   contents: read # default; apply-patch job overrides to write
 
 concurrency:
-  group: ts-autofix-${{ github.ref }}
-  cancel-in-progress: true
+  group: ts-autofix-${{ github.event_name == 'push' && github.sha || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'push' }}
 
 jobs:
   generate-patch:
