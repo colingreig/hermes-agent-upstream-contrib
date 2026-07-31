@@ -802,6 +802,10 @@ Connect setup on Hermes.
 
 Treat mini operations as remote state. Verify the target host and paths before
 changing services, launch agents, credentials, or configuration.
+Governed mini-bundle work (`install_*.py` under `machine-setup/mini-scripts/`)
+must be verified on `mini` via `ssh mini` before handoff — staged copy +
+installer run, or `/ignite-ship`; do not defer with post-merge TODOs.
+See `machine-setup/mini-scripts/README.md` for bundle-specific commands.
 
 ## Ignite And Board Work
 
