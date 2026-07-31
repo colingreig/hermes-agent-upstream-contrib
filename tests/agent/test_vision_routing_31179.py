@@ -29,6 +29,7 @@ import os
 import shutil
 import sys
 import tempfile
+from contextlib import contextmanager
 
 import pytest
 
@@ -60,13 +61,53 @@ def _write_config(home: str, text: str) -> None:
         fp.write(text)
 
 
+_FRESH_MODULE_PREFIXES = (
+    "agent.auxiliary_client",
+    "agent.image_routing",
+    "tools.vision_tools",
+    "tools.browser_tool",
+    "hermes_cli.config",
+)
+
+
+def _is_fresh_module_target(mod_name: str) -> bool:
+    return mod_name.startswith(_FRESH_MODULE_PREFIXES)
+
+
+def _restore_fresh_modules(saved_modules: dict) -> None:
+    """Restore pre-purge module objects and re-bind parent package attributes."""
+    for mod_name in list(sys.modules):
+        if _is_fresh_module_target(mod_name):
+            del sys.modules[mod_name]
+    sys.modules.update(saved_modules)
+    for name, mod in saved_modules.items():
+        if "." not in name:
+            continue
+        parent_name, leaf = name.rsplit(".", 1)
+        parent = sys.modules.get(parent_name)
+        if parent is not None:
+            setattr(parent, leaf, mod)
+
+
+@contextmanager
 def _fresh_modules():
-    """Drop cached hermes modules so each test reloads against current env."""
-    for mod in list(sys.modules.keys()):
-        if mod.startswith(("agent.auxiliary_client", "agent.image_routing",
-                           "tools.vision_tools", "tools.browser_tool",
-                           "hermes_cli.config")):
+    """Drop cached hermes modules so each test reloads against current env.
+
+    Saves and restores the purged entries so later tests that imported these
+    modules at collection time (e.g. ``import agent.auxiliary_client as ac``)
+    keep referring to the same module objects — otherwise patch() targets the
+    reimported copy in sys.modules while stale references call unpatched code.
+    """
+    saved_modules = {
+        k: v for k, v in sys.modules.items() if _is_fresh_module_target(k)
+    }
+    for mod in list(sys.modules):
+        if _is_fresh_module_target(mod):
             del sys.modules[mod]
+    try:
+        yield
+    finally:
+        _restore_fresh_modules(saved_modules)
 
 
 # ---------------------------------------------------------------------------
@@ -85,13 +126,12 @@ auxiliary:
     model: gpt-4o-mini
 """)
         monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
-        _fresh_modules()
-
-        from agent.auxiliary_client import _resolve_task_provider_model
-        provider, model, base_url, _key, _mode = _resolve_task_provider_model("vision")
-        assert provider == "custom"
-        assert model == "gpt-4o-mini"
-        assert base_url == "https://api.openai.com/v1"
+        with _fresh_modules():
+            from agent.auxiliary_client import _resolve_task_provider_model
+            provider, model, base_url, _key, _mode = _resolve_task_provider_model("vision")
+            assert provider == "custom"
+            assert model == "gpt-4o-mini"
+            assert base_url == "https://api.openai.com/v1"
 
     def test_provider_openai_with_explicit_base_url_preserves_user_endpoint(
         self, isolated_home, monkeypatch
@@ -106,12 +146,11 @@ auxiliary:
     base_url: https://my-proxy.example.com/v1
 """)
         monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
-        _fresh_modules()
-
-        from agent.auxiliary_client import _resolve_task_provider_model
-        provider, _model, base_url, _key, _mode = _resolve_task_provider_model("vision")
-        assert provider == "custom"
-        assert base_url == "https://my-proxy.example.com/v1"
+        with _fresh_modules():
+            from agent.auxiliary_client import _resolve_task_provider_model
+            provider, _model, base_url, _key, _mode = _resolve_task_provider_model("vision")
+            assert provider == "custom"
+            assert base_url == "https://my-proxy.example.com/v1"
 
     def test_provider_openai_resolves_to_working_client(self, isolated_home, monkeypatch):
         """End-to-end: the resolved client points at api.openai.com."""
@@ -122,17 +161,16 @@ auxiliary:
     model: gpt-4o-mini
 """)
         monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
-        _fresh_modules()
-
-        from agent.auxiliary_client import resolve_vision_provider_client
-        from urllib.parse import urlparse
-        provider, client, model = resolve_vision_provider_client()
-        assert client is not None, "openai alias should produce a usable client"
-        # Exact hostname comparison (not substring) — defends against URLs
-        # like ``api.openai.com.evil.example`` and keeps CodeQL happy.
-        host = urlparse(str(getattr(client, "base_url", ""))).hostname or ""
-        assert host == "api.openai.com", f"expected api.openai.com host, got {host!r}"
-        assert model == "gpt-4o-mini"
+        with _fresh_modules():
+            from agent.auxiliary_client import resolve_vision_provider_client
+            from urllib.parse import urlparse
+            provider, client, model = resolve_vision_provider_client()
+            assert client is not None, "openai alias should produce a usable client"
+            # Exact hostname comparison (not substring) — defends against URLs
+            # like ``api.openai.com.evil.example`` and keeps CodeQL happy.
+            host = urlparse(str(getattr(client, "base_url", ""))).hostname or ""
+            assert host == "api.openai.com", f"expected api.openai.com host, got {host!r}"
+            assert model == "gpt-4o-mini"
 
 
 # ---------------------------------------------------------------------------
@@ -155,15 +193,14 @@ model:
   default: deepseek-v4-pro
 """)
         monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
-        _fresh_modules()
-
-        from agent.auxiliary_client import resolve_vision_provider_client
-        provider, client, _model = resolve_vision_provider_client(provider="auto")
-        assert client is None, (
-            f"Vision auto-detect must skip text-only main {provider!r} when "
-            "no vision-capable aggregator is available, not return a client "
-            "that will fail at API time"
-        )
+        with _fresh_modules():
+            from agent.auxiliary_client import resolve_vision_provider_client
+            provider, client, _model = resolve_vision_provider_client(provider="auto")
+            assert client is None, (
+                f"Vision auto-detect must skip text-only main {provider!r} when "
+                "no vision-capable aggregator is available, not return a client "
+                "that will fail at API time"
+            )
 
     def test_vision_capable_main_used(self, isolated_home, monkeypatch):
         """Vision-capable main provider should be returned by auto chain."""
@@ -173,12 +210,11 @@ model:
   default: claude-sonnet-4-6
 """)
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
-        _fresh_modules()
-
-        from agent.auxiliary_client import resolve_vision_provider_client
-        provider, client, _model = resolve_vision_provider_client(provider="auto")
-        assert client is not None
-        assert provider == "anthropic"
+        with _fresh_modules():
+            from agent.auxiliary_client import resolve_vision_provider_client
+            provider, client, _model = resolve_vision_provider_client(provider="auto")
+            assert client is not None
+            assert provider == "anthropic"
 
     def test_unknown_capability_does_not_block(self, isolated_home, monkeypatch):
         """When models.dev has no entry, fall back to permissive (attempt the call).
@@ -186,10 +222,10 @@ model:
         This keeps new/custom providers working — only providers we have
         cataloged as text-only are skipped.
         """
-        _fresh_modules()
-        from agent.auxiliary_client import _main_model_supports_vision
-        # Bogus provider/model — capability lookup returns None → permissive.
-        assert _main_model_supports_vision("nonexistent-provider", "nonexistent-model") is True
+        with _fresh_modules():
+            from agent.auxiliary_client import _main_model_supports_vision
+            # Bogus provider/model — capability lookup returns None → permissive.
+            assert _main_model_supports_vision("nonexistent-provider", "nonexistent-model") is True
 
 
 # ---------------------------------------------------------------------------
@@ -210,10 +246,9 @@ auxiliary:
     model: gpt-4o-mini
 """)
         monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
-        _fresh_modules()
-
-        from tools.vision_tools import check_vision_requirements
-        assert check_vision_requirements() is True
+        with _fresh_modules():
+            from tools.vision_tools import check_vision_requirements
+            assert check_vision_requirements() is True
 
     def test_check_vision_falls_back_to_auto(self, isolated_home, monkeypatch):
         """Bad explicit provider doesn't hide the tool when auto fallback works.
@@ -229,10 +264,9 @@ auxiliary:
     provider: not-a-real-provider
 """)
         monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
-        _fresh_modules()
-
-        from tools.vision_tools import check_vision_requirements
-        assert check_vision_requirements() is True
+        with _fresh_modules():
+            from tools.vision_tools import check_vision_requirements
+            assert check_vision_requirements() is True
 
     def test_check_vision_false_with_text_only_main_and_no_aggregator(
         self, isolated_home, monkeypatch
@@ -243,10 +277,9 @@ model:
   default: deepseek-v4-pro
 """)
         monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
-        _fresh_modules()
-
-        from tools.vision_tools import check_vision_requirements
-        assert check_vision_requirements() is False
+        with _fresh_modules():
+            from tools.vision_tools import check_vision_requirements
+            assert check_vision_requirements() is False
 
     def test_browser_vision_requires_both_browser_and_vision(self, isolated_home, monkeypatch):
         """``browser_vision`` must not be advertised when vision is unavailable."""
@@ -258,12 +291,11 @@ model:
   default: deepseek-v4-pro
 """)
         monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
-        _fresh_modules()
-
-        import tools.browser_tool
-        # Force the browser side to True so we exercise the vision-gating part.
-        with patch.object(tools.browser_tool, "check_browser_requirements", return_value=True):
-            assert tools.browser_tool.check_browser_vision_requirements() is False
+        with _fresh_modules():
+            import tools.browser_tool
+            # Force the browser side to True so we exercise the vision-gating part.
+            with patch.object(tools.browser_tool, "check_browser_requirements", return_value=True):
+                assert tools.browser_tool.check_browser_vision_requirements() is False
 
     def test_browser_vision_false_when_browser_missing(self, isolated_home, monkeypatch):
         from unittest.mock import patch
@@ -274,12 +306,11 @@ model:
   default: anthropic/claude-sonnet-4
 """)
         monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
-        _fresh_modules()
-
-        import tools.browser_tool
-        with patch.object(tools.browser_tool, "check_browser_requirements", return_value=False):
-            # Vision available but browser missing → still False.
-            assert tools.browser_tool.check_browser_vision_requirements() is False
+        with _fresh_modules():
+            import tools.browser_tool
+            with patch.object(tools.browser_tool, "check_browser_requirements", return_value=False):
+                # Vision available but browser missing → still False.
+                assert tools.browser_tool.check_browser_vision_requirements() is False
 
     def test_browser_vision_true_when_both_available(self, isolated_home, monkeypatch):
         from unittest.mock import patch
@@ -290,8 +321,7 @@ model:
   default: anthropic/claude-sonnet-4
 """)
         monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
-        _fresh_modules()
-
-        import tools.browser_tool
-        with patch.object(tools.browser_tool, "check_browser_requirements", return_value=True):
-            assert tools.browser_tool.check_browser_vision_requirements() is True
+        with _fresh_modules():
+            import tools.browser_tool
+            with patch.object(tools.browser_tool, "check_browser_requirements", return_value=True):
+                assert tools.browser_tool.check_browser_vision_requirements() is True

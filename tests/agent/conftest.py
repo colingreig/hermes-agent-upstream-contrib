@@ -106,7 +106,21 @@ def _reset_module_state():
     except ImportError:
         pass
 
+    try:
+        from agent import portal_tags as _pt
+
+        _pt._conversation_id.set(None)
+    except ImportError:
+        pass
+
     yield
+
+    try:
+        from agent import portal_tags as _pt
+
+        _pt._conversation_id.set(None)
+    except ImportError:
+        pass
 
 
 @pytest.fixture(autouse=True)
