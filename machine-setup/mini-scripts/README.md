@@ -605,6 +605,17 @@ proof packet:
   `spend['error']` field threaded through the subject line, headline, HTML
   render, text render, and JSON summary so an unreadable ledger renders as
   "spend UNKNOWN (ledger unreadable)" and never as a silent zero.
+- `hermes_report_build.py` fix (ClickUp 86e2gczqw, 2026-07-28): the digest's
+  review queue now uses a paginated, deduplicated ClickUp `team/{id}/task`
+  query for `in review` and `ready for review` with `subtasks=true`, rather
+  than per-board discovery or the stale queue snapshot. The documented default
+  backlog alert threshold is 25 tasks (`--review-backlog-alert-threshold`, or
+  `HERMES_REVIEW_BACKLOG_ALERT_THRESHOLD` for emergency tuning); at or above
+  that threshold the report renders a prominent `REVIEW BACKLOG ALERT`, and
+  `postmark_send_report.py` prepends `[ALERT]` if alert body content is sent
+  with an ordinary subject. Spend is labeled as two separate, non-comparable
+  sources: guard-tracked daily spend from `spend_guard.py` and writer-served
+  receipts from `writer-served.jsonl`; no combined total is reported.
 - `mcp_serve_reaper.py` (task 86e2hap4g) — standalone, redundant, age-based
   safety net (same philosophy as `worktree_backstop_sweep.py`) that reaps
   orphaned per-session `hermes mcp serve` stdio subprocesses left behind by a

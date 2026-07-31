@@ -1,8 +1,8 @@
 {
   "bundle": "hermes-self-report",
-  "source_task": "86e2gnz60",
+  "source_task": "86e2gczqw",
   "generated": "2026-07-28",
-  "description": "Declared deploy bundle for the hermes-self-report cron. This file IS the bundle the installer copies; nothing outside its 'files' list is written. Canon bytes are the live mini copies (RC4) except postmark_send_report.py and hermes_self_report_delivery_probe.py, whose canon is the hermes-agent deploy mirror (live behavior + encoding=utf-8 on file opens). SKILL.md is authored in Brain and installed only with --include-skill --brain-path.",
+  "description": "Declared deploy bundle for the hermes-self-report cron. This file IS the bundle the installer copies; nothing outside its 'files' list is written. Canon bytes are the live mini copies (RC4) plus ClickUp 86e2gczqw review-queue/spend/alert updates in this deploy mirror. SKILL.md is authored in Brain and installed only with --include-skill --brain-path.",
   "coexist_required": [
     {
       "dest_abs": "~/.hermes/scripts/claim_store.py",
@@ -22,8 +22,8 @@
       "src_rel": "hermes_report_build.py",
       "src_base": "mirror",
       "dest_abs": "~/.hermes/scripts/hermes_report_build.py",
-      "sha256": "593b35a88cd74002e2447b429cb96e3b22310699f0e1127c01a7a603173e42d4",
-      "role": "report builder (HTML+text+subject+JSON); imports hermes_report_build_v1lib + claim_store",
+      "sha256": "179ffdf865618df5c72a8eccf782c81e0893fe638f4aa2058c0e8a4c7c163e84",
+      "role": "report builder (HTML+text+subject+JSON); imports hermes_report_build_v1lib + claim_store; owns team-wide ClickUp review queue and separated spend labels",
       "deploy_mode": "script"
     },
     {
@@ -54,8 +54,8 @@
       "src_rel": "postmark_send_report.py",
       "src_base": "mirror",
       "dest_abs": "~/.hermes/scripts/postmark_send_report.py",
-      "sha256": "388195cd7f4830f5162494aabf10e2976ddccc7df5f481afe9d105a2d7c53924",
-      "role": "RC4 delivery contract: venv re-exec, lazy token resolve, Postmark POST with in-code hermes-send fallback, receipt, nonzero-exit-on-total-failure. Canon = deploy mirror bytes (live behavior + encoding=utf-8)",
+      "sha256": "f98c5e2bcaa43dd9a44231c96a32f4eb54aca6bc53c4430804c690bd216a0d61",
+      "role": "RC4 delivery contract plus 86e2gczqw alert subject flagging: venv re-exec, lazy token resolve, Postmark POST with in-code hermes-send fallback, receipt, nonzero-exit-on-total-failure. Canon = deploy mirror bytes (live behavior + encoding=utf-8)",
       "deploy_mode": "script"
     },
     {

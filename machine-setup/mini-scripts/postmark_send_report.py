@@ -84,6 +84,7 @@ RECEIPT_PATH = os.path.join(HERMES, "logs", "hermes-self-report-last-send.json")
 REEXEC_GUARD_ENV = "POSTMARK_SEND_REPORT_REEXEC"
 
 FALLBACK_BODY_MAX_CHARS = 3500
+ALERT_SUBJECT_PREFIX = "[ALERT] "
 
 
 def _maybe_reexec_under_venv():
@@ -200,6 +201,16 @@ def _send_hermes_fallback(target, subject, note, text_body):
     return True, None
 
 
+def flag_subject_for_alert(subject, text_body, html_body=None):
+    """Make backlog/alert reports visually obvious even with a stale subject file."""
+    haystack = "\n".join([subject or "", text_body or "", html_body or ""])
+    if "REVIEW BACKLOG ALERT" not in haystack and "🚨 REVIEW BACKLOG" not in haystack:
+        return subject
+    if (subject or "").startswith(ALERT_SUBJECT_PREFIX):
+        return subject
+    return ALERT_SUBJECT_PREFIX + (subject or "Hermes report")
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--to", required=True)
@@ -226,6 +237,8 @@ def main():
     if args.html_file:
         with open(args.html_file, "r", encoding="utf-8") as f:
             html_body = f.read()
+
+    args.subject = flag_subject_for_alert(args.subject, text_body, html_body)
 
     token = _resolve_token()
     postmark_ok = False
