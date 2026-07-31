@@ -24,6 +24,8 @@ install_mod = importlib.util.module_from_spec(_spec)
 sys.modules[_spec.name] = install_mod
 _spec.loader.exec_module(install_mod)
 
+PROFILE_NAMES = ("coder", "content", "design", "research", "ops")
+
 
 def _sha(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
@@ -40,11 +42,32 @@ def bundle(tmp_path):
     overlay_data = yaml.safe_dump({"model": "synthetic-model"}).encode()
     (bundle_root / "config-overlay.yaml").write_bytes(overlay_data)
 
-    profile_cfg = b"# synthetic profile config\n"
-    profile_soul = b"# synthetic SOUL\n"
-    (bundle_root / "profiles" / "ops").mkdir(parents=True)
-    (bundle_root / "profiles" / "ops" / "config.yaml").write_bytes(profile_cfg)
-    (bundle_root / "profiles" / "ops" / "SOUL.md").write_bytes(profile_soul)
+    profile_files = []
+    for profile in PROFILE_NAMES:
+        profile_cfg = f"# synthetic {profile} profile config\n".encode()
+        profile_soul = f"# synthetic {profile} SOUL\n".encode()
+        profile_dir = bundle_root / "profiles" / profile
+        profile_dir.mkdir(parents=True)
+        (profile_dir / "config.yaml").write_bytes(profile_cfg)
+        (profile_dir / "SOUL.md").write_bytes(profile_soul)
+        profile_files.extend(
+            [
+                {
+                    "src_rel": f"profiles/{profile}/config.yaml",
+                    "dest_abs": f"~/.hermes/profiles/{profile}/config.yaml",
+                    "sha256": _sha(profile_cfg),
+                    "role": "synthetic profile config",
+                    "deploy_mode": "profile_file",
+                },
+                {
+                    "src_rel": f"profiles/{profile}/SOUL.md",
+                    "dest_abs": f"~/.hermes/profiles/{profile}/SOUL.md",
+                    "sha256": _sha(profile_soul),
+                    "role": "synthetic profile soul",
+                    "deploy_mode": "profile_file",
+                },
+            ]
+        )
 
     jobs_data = json.dumps({"jobs": [{"id": "1", "name": "synthetic-job"}]}).encode()
     (bundle_root / "jobs.json").write_bytes(jobs_data)
@@ -60,20 +83,7 @@ def bundle(tmp_path):
                 "role": "synthetic overlay",
                 "deploy_mode": "config_overlay",
             },
-            {
-                "src_rel": "profiles/ops/config.yaml",
-                "dest_abs": "~/.hermes/profiles/ops/config.yaml",
-                "sha256": _sha(profile_cfg),
-                "role": "synthetic profile config",
-                "deploy_mode": "profile_file",
-            },
-            {
-                "src_rel": "profiles/ops/SOUL.md",
-                "dest_abs": "~/.hermes/profiles/ops/SOUL.md",
-                "sha256": _sha(profile_soul),
-                "role": "synthetic profile soul",
-                "deploy_mode": "profile_file",
-            },
+            *profile_files,
             {
                 "src_rel": "jobs.json",
                 "dest_abs": "~/.hermes/cron/jobs.json",
@@ -120,8 +130,10 @@ def test_real_install_writes_all_three_destinations(bundle):
     assert rc == 0
     cfg = yaml.safe_load((bundle["home"] / ".hermes" / "config.yaml").read_text())
     assert cfg["model"] == "synthetic-model"
-    assert (bundle["home"] / ".hermes" / "profiles" / "ops" / "config.yaml").is_file()
-    assert (bundle["home"] / ".hermes" / "profiles" / "ops" / "SOUL.md").is_file()
+    for profile in PROFILE_NAMES:
+        profile_dir = bundle["home"] / ".hermes" / "profiles" / profile
+        assert (profile_dir / "config.yaml").is_file()
+        assert (profile_dir / "SOUL.md").is_file()
     jobs = json.loads((bundle["home"] / ".hermes" / "cron" / "jobs.json").read_text())
     assert jobs["jobs"][0]["name"] == "synthetic-job"
     # profile bootstrap dirs got created too
@@ -178,3 +190,65 @@ def test_forced_failure_mid_step_rolls_back_and_reraises(bundle, monkeypatch):
     receipt = json.loads((install_dirs[0] / "install-receipt.json").read_text())
     assert receipt["result"] == "failed"
     assert "simulated disk failure" in receipt["failure_detail"]
+
+
+def test_late_failure_restores_every_distinct_profile_snapshot(bundle, monkeypatch):
+    """A post-journal jobs failure restores all 12 non-aliasing snapshots."""
+    home = bundle["home"]
+    hermes_dir = home / ".hermes"
+    original_cfg = b"model: original-main\n"
+    (hermes_dir / "config.yaml").write_bytes(original_cfg)
+    original_jobs = b'{"jobs":[{"id":"old","name":"original-job"}]}\n'
+    jobs_dest = hermes_dir / "cron" / "jobs.json"
+    jobs_dest.parent.mkdir(parents=True)
+    jobs_dest.write_bytes(original_jobs)
+
+    originals = {}
+    for profile in PROFILE_NAMES:
+        profile_dir = hermes_dir / "profiles" / profile
+        profile_dir.mkdir(parents=True)
+        config_bytes = f"model: original-{profile}\n".encode()
+        soul_bytes = f"# Original {profile} soul\n".encode()
+        (profile_dir / "config.yaml").write_bytes(config_bytes)
+        (profile_dir / "SOUL.md").write_bytes(soul_bytes)
+        originals[profile] = (config_bytes, soul_bytes)
+
+    real_sha256 = install_mod._sha256
+
+    def fail_after_jobs_replace(path):
+        if path == jobs_dest:
+            raise OSError("simulated late failure after jobs replacement")
+        return real_sha256(path)
+
+    monkeypatch.setattr(install_mod, "_sha256", fail_after_jobs_replace)
+
+    with pytest.raises(OSError, match="simulated late failure after jobs replacement"):
+        install_mod.install(
+            bundle["manifest"],
+            home=home,
+            bundle_root=bundle["bundle_root"],
+            manifest_path=bundle["manifest_path"],
+            dry_run=False,
+        )
+
+    assert (hermes_dir / "config.yaml").read_bytes() == original_cfg
+    for profile, (config_bytes, soul_bytes) in originals.items():
+        profile_dir = hermes_dir / "profiles" / profile
+        assert (profile_dir / "config.yaml").read_bytes() == config_bytes
+        assert (profile_dir / "SOUL.md").read_bytes() == soul_bytes
+    assert jobs_dest.read_bytes() == original_jobs
+
+    install_dirs = list((hermes_dir / "logs" / "fleet-config-installs").iterdir())
+    assert len(install_dirs) == 1
+    receipt = json.loads((install_dirs[0] / "install-receipt.json").read_text())
+    assert receipt["result"] == "failed"
+    assert "simulated late failure after jobs replacement" in receipt["failure_detail"]
+    snapshot_steps = [
+        step
+        for step in receipt["steps"]
+        if step["step"] in {"config_overlay", "profile_file", "jobs_json"}
+    ]
+    snapshot_paths = [step["snapshot"] for step in snapshot_steps]
+    assert len(snapshot_paths) == 12
+    assert len(set(snapshot_paths)) == 12
+    assert all(step["status"] == "rolled-back" for step in snapshot_steps)

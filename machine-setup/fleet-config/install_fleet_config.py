@@ -311,10 +311,23 @@ def _print_jobs_plan(item: dict) -> None:
         print(f"  (no existing jobs.json; installing {len(new_jobs)} jobs)")
 
 
-def _backup(dest: Path, snapshot_dir: Path, tag: str, stamp: str) -> Path | None:
+def _snapshot_path(dest: Path, snapshot_dir: Path, destination_root: Path) -> Path:
+    """Return a collision-free central snapshot path derived from ``dest``."""
+    relative_dest = dest.relative_to(destination_root)
+    return snapshot_dir / "destinations" / relative_dest
+
+
+def _backup(
+    dest: Path,
+    snapshot_dir: Path,
+    destination_root: Path,
+    tag: str,
+    stamp: str,
+) -> Path | None:
     if not dest.exists():
         return None
-    snapshot = snapshot_dir / dest.name
+    snapshot = _snapshot_path(dest, snapshot_dir, destination_root)
+    snapshot.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(dest, snapshot)
     shutil.copy2(dest, dest.with_name(dest.name + f".bak-{tag}-install-{stamp}"))
     return snapshot
@@ -347,7 +360,8 @@ def install(
         return 0
 
     stamp = _utc_stamp()
-    snapshot_dir = home / ".hermes" / "logs" / "fleet-config-installs" / stamp
+    destination_root = home / ALLOWED_DEST_SUBPATH
+    snapshot_dir = destination_root / "logs" / "fleet-config-installs" / stamp
     snapshot_dir.mkdir(parents=True, exist_ok=True)
     shutil.copy2(manifest_path, snapshot_dir / manifest_path.name)
 
@@ -382,25 +396,41 @@ def install(
         reparsed = yaml.safe_load(rendered)
         if reparsed != merged:
             raise InstallError("rendered config.yaml did not round-trip through YAML parse — refusing to write")
-        snapshot = _backup(dest, snapshot_dir, "fleet-config", stamp)
+        snapshot = _backup(dest, snapshot_dir, destination_root, "fleet-config", stamp)
+        step = {
+            "step": "config_overlay",
+            "dest": str(dest),
+            "snapshot": str(snapshot) if snapshot else None,
+            "diff": _diff_keys(current, merged),
+            "status": "installing",
+        }
+        receipt["steps"].append(step)
         _atomic_write(dest, rendered.encode("utf-8"))
         # Re-verify the deployed bytes parse cleanly.
         deployed = yaml.safe_load(dest.read_text(encoding="utf-8"))
         if deployed != merged:
             raise InstallError(f"deployed {dest} did not match the intended merge after write — restoring snapshot")
-        receipt["steps"].append({
-            "step": "config_overlay",
-            "dest": str(dest),
-            "snapshot": str(snapshot) if snapshot else None,
-            "diff": _diff_keys(current, merged),
-            "status": "installed",
-        })
+        step["status"] = "installed"
 
         # --- Step 2: profiles/ ---
         for item in plan["profiles"]:
             pdest = item["dest"]
-            psnapshot = _backup(pdest, snapshot_dir, f"fleet-config-profile-{pdest.parent.name}", stamp)
+            psnapshot = _backup(
+                pdest,
+                snapshot_dir,
+                destination_root,
+                f"fleet-config-profile-{pdest.parent.name}",
+                stamp,
+            )
             data = item["src"].read_bytes()
+            step = {
+                "step": "profile_file",
+                "dest": str(pdest),
+                "snapshot": str(psnapshot) if psnapshot else None,
+                "sha256": None,
+                "status": "installing",
+            }
+            receipt["steps"].append(step)
             _atomic_write(pdest, data)
             deployed_sha = _sha256(pdest)
             if deployed_sha != item["sha256"]:
@@ -408,13 +438,8 @@ def install(
                     f"deployed bytes for {pdest} sha256 {deployed_sha} != manifest "
                     f"{item['sha256']} — restoring snapshot"
                 )
-            receipt["steps"].append({
-                "step": "profile_file",
-                "dest": str(pdest),
-                "snapshot": str(psnapshot) if psnapshot else None,
-                "sha256": deployed_sha,
-                "status": "installed",
-            })
+            step["sha256"] = deployed_sha
+            step["status"] = "installed"
 
         profile_names = sorted({Path(i["dest_abs"]).parts[-2] for i in plan["profiles"]})
         for name in profile_names:
@@ -438,7 +463,15 @@ def install(
             raise InstallError(f"bundled jobs.json is not valid JSON: {exc}") from exc
         if "jobs" not in parsed or not isinstance(parsed["jobs"], list):
             raise InstallError("bundled jobs.json has no top-level 'jobs' list — refusing")
-        jsnapshot = _backup(jdest, snapshot_dir, "fleet-config-jobs", stamp)
+        jsnapshot = _backup(jdest, snapshot_dir, destination_root, "fleet-config-jobs", stamp)
+        step = {
+            "step": "jobs_json",
+            "dest": str(jdest),
+            "snapshot": str(jsnapshot) if jsnapshot else None,
+            "job_count": len(parsed["jobs"]),
+            "status": "installing",
+        }
+        receipt["steps"].append(step)
         _atomic_write(jdest, new_bytes)
         deployed_sha = _sha256(jdest)
         if deployed_sha != jobs_item["sha256"]:
@@ -446,13 +479,7 @@ def install(
                 f"deployed bytes for {jdest} sha256 {deployed_sha} != manifest "
                 f"{jobs_item['sha256']} — restoring snapshot"
             )
-        receipt["steps"].append({
-            "step": "jobs_json",
-            "dest": str(jdest),
-            "snapshot": str(jsnapshot) if jsnapshot else None,
-            "job_count": len(parsed["jobs"]),
-            "status": "installed",
-        })
+        step["status"] = "installed"
 
     except InstallError as exc:
         receipt["result"] = "failed"
