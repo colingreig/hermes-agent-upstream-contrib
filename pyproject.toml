@@ -212,6 +212,9 @@ honcho = ["honcho-ai==2.2.0"]
 # can't break fresh installs.
 supermemory = ["supermemory==3.50.0"]
 mem0 = ["mem0ai==2.0.10"]
+# Local Postgres client used by release/runtime verification and opt-in
+# memory backends; keep it separate from lazy-installed mem0 itself.
+postgres = ["psycopg2-binary==2.9.12"]
 # Image resize recovery for the vision tools. Pillow is now a CORE dependency
 # (see the main `dependencies` list) since the byte/pixel shrink paths are on
 # the default vision-embed path and the mid-session lazy install deadlocked the
@@ -246,7 +249,7 @@ acp = ["agent-client-protocol==0.9.0"]
 # installs (see [all] policy comment below).
 mistral = ["mistralai==2.4.8"]
 bedrock = ["boto3==1.42.89"]
-vertex = ["google-auth==2.55.1"]
+vertex = ["google-auth==2.56.2"]
 azure-identity = ["azure-identity==1.25.3"]
 termux = [
   # Baseline Android / Termux path for reliable fresh installs.
@@ -277,6 +280,7 @@ google = [
   # the [all] extra and users don't hit runtime `pip install` paths that fail
   # in environments without pip (e.g. Nix-managed Python).
   "google-api-python-client==2.194.0",
+  "google-genai==2.14.0",
   "google-auth-oauthlib==1.3.1",
   "google-auth-httplib2==0.3.1",
 ]
@@ -321,6 +325,7 @@ all = [
   "hermes-agent[sms]",
   "hermes-agent[acp]",
   "hermes-agent[google]",
+  "hermes-agent[postgres]",
   "hermes-agent[web]",
   "hermes-agent[youtube]",
 ]

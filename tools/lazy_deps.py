@@ -101,8 +101,8 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     "provider.bedrock": ("boto3==1.42.89",),
     # Google Vertex AI provider — OAuth2 token minting for the Gemini
     # OpenAI-compatible endpoint. Only loaded when provider=vertex is selected;
-    # google-auth is NOT in [all] so plain installs don't carry it.
-    "provider.vertex": ("google-auth==2.55.1",),
+    # keep this pin explicit so lazy Vertex installs match the Google extra.
+    "provider.vertex": ("google-auth==2.56.2",),
     # Microsoft Foundry — Entra ID auth (managed identity, workload identity,
     # service principal, az login, VS Code, azd, PowerShell). Only loaded
     # when model.auth_mode=entra_id is selected; key-based azure-foundry
