@@ -175,6 +175,7 @@ class RuntimeWiringTests(unittest.TestCase):
                 mock.patch.object(validate_pr.vc, "pr_head_sha", return_value=trusted.head_sha),
                 mock.patch.object(validate_pr.vt, "run", return_value={"tier": "low", "findings": []}),
                 mock.patch.object(validate_pr.via, "run", return_value={"findings": []}),
+                mock.patch.object(validate_pr.ar, "check_missing_ci", return_value=[]),
                 mock.patch.object(
                     validate_pr,
                     "_run_content_lens",
@@ -349,6 +350,7 @@ class VerdictForgeryTests(unittest.TestCase):
                 mock.patch.object(validate_pr.vc, "pr_head_sha", return_value=trusted.head_sha),
                 mock.patch.object(validate_pr.vt, "run", return_value={"tier": "low", "findings": []}),
                 mock.patch.object(validate_pr.via, "run", return_value={"findings": []}),
+                mock.patch.object(validate_pr.ar, "check_missing_ci", return_value=[]),
                 mock.patch.object(
                     validate_pr,
                     "_run_content_lens",
@@ -376,6 +378,7 @@ class VerdictForgeryTests(unittest.TestCase):
                 mock.patch.object(validate_pr.vc, "pr_head_sha", return_value=trusted.head_sha),
                 mock.patch.object(validate_pr.vt, "run", return_value={"tier": "medium", "findings": []}),
                 mock.patch.object(validate_pr.via, "run", return_value={"findings": []}),
+                mock.patch.object(validate_pr.ar, "check_missing_ci", return_value=[]),
             ):
                 code, result = validate_pr.validate(
                     "acme/widget", 7, task="86e2gh04e", shadow=False,

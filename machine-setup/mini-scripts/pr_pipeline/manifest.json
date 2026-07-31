@@ -15,6 +15,7 @@
     }
   },
   "legacy_flat_entrypoints": [
+    "adversarial_review.py",
     "autonomous_merge.py",
     "ci_base_fix_exempt.json",
     "ci_health_topology.json",
@@ -46,6 +47,7 @@
   ],
   "package_destination": "pr_pipeline",
   "managed_root_patterns": [
+    "adversarial_review.py",
     "autonomous_merge.py",
     "ci_base_fix_exempt.json",
     "ci_health_watch.py",

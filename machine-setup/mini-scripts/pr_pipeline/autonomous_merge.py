@@ -306,6 +306,16 @@ def _pr_state(repo, pr):
     }, None
 
 
+def pr_state(repo, pr):
+    """Public entrypoint for _pr_state() — the gating-vs-non-gating PR head
+    CI classification other modules should reuse (e.g.
+    adversarial_review.check_missing_ci()) rather than reaching into the
+    underscore-prefixed internal, so the validate-time and merge-time views
+    of 'is this PR's own CI green' can never silently drift apart. Read-only;
+    same (info, err) contract as _pr_state()."""
+    return _pr_state(repo, pr)
+
+
 def evaluate(repo, pr, verdict, allowlist):
     """Pure-ish decision: return (action, detail). action in
     {'merge','skip','blocked'}. Network only via _pr_state (read-only)."""
