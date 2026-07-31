@@ -66,13 +66,14 @@
     {
       "id": "5a76e290811d",
       "name": "hermes-pr-validate",
-      "enabled": false,
-      "max_age_seconds": 0,
+      "enabled": true,
+      "max_age_seconds": 7200,
       "outcome": {
         "kind": "cron_output",
-        "max_age_seconds": 1,
-        "success_patterns": [],
-        "failure_patterns": []
+        "max_age_seconds": 7200,
+        "response_only": true,
+        "success_patterns": ["ignite-validate", "PASS", "FAIL", "no.*(?:review|actionable)", "validated"],
+        "failure_patterns": ["\\(FAILED\\)", "\\(No response generated\\)", "Status: .*failed", "Traceback", "ABORT"]
       }
     },
     {

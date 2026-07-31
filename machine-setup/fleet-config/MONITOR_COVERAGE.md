@@ -37,7 +37,7 @@ two scheduling planes therefore cross-watch rather than self-monitor.
 | `9dca144ff19b` | clickup-poll-gate | enabled | fresh `wakeAgent`/semantic-silent gate document | credential, scan, stale, or failed gate |
 | `8d3b1d53470d` | review-poll-gate | enabled | fresh `wakeAgent`/semantic-silent gate document | credential, scan, stale, or failed gate |
 | `ad0ae6b717e2` | clickup-review-sla | enabled | fresh SLA/review scan document | scan, stale, or failed result |
-| `5a76e290811d` | hermes-pr-validate | disabled | disabled-state assertion | unexpected enablement |
+| `5a76e290811d` | hermes-pr-validate | enabled (2026-07-31, task `86e2k3qe1`) | fresh `ignite-validate` PASS/FAIL result document | error, missing, stale result, or safety-guard ABORT |
 | `b0c4c5cc70c1` | spend-meter | enabled | fresh under-cap or spend evaluation document | unreadable spend data, stale, or failure |
 | `e835c614cfb2` | ci-health-watch | enabled | fresh parsed CI state: stable lifecycle, VM available, no resource drift | unavailable/drifted/missing/stale state |
 | `bcf275768661` | clickup-workspace-refresh | enabled | fresh parsed `clickup-map.json` topology artifact | missing/stale/invalid artifact |

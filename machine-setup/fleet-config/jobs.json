@@ -239,8 +239,8 @@
         "kind": "cron"
       },
       "schedule_display": "0 * * * *",
-      "enabled": false,
-      "state": "paused",
+      "enabled": true,
+      "state": "scheduled",
       "no_agent": false,
       "deliver": "local",
       "workdir": "/Users/colingreig/dev/hermes-agent",
@@ -276,7 +276,7 @@
       "last_status": null,
       "last_error": null,
       "last_delivery_error": null,
-      "paused_at": "2026-07-29T00:00:00-07:00",
+      "paused_at": null,
       "paused_reason": null
     },
     {
