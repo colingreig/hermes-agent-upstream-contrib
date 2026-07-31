@@ -40,10 +40,10 @@ that caused the swarm.
   **not** mark the ClickUp task Complete.
 - If the evidence is insufficient, use
   `hermes kanban block <card-id> "<exact missing work>"` (or `kanban_block`).
-  Do not block merely because ClickUp must remain short of Complete.
+  Never block a successful card merely because ClickUp must remain short of
+  Complete.
 - Do not move or comment on ClickUp from an ordinary verifier card. After the
   synthesizer reaches `done`, the outer executor posts the handoff and moves
-  ClickUp to **In Review**. Only a session explicitly acting as the
-  `ignite-validate` pass may move ClickUp to Complete; standalone monitor
-  findings still go into a comment or new task, not a status change on
-  someone else's work.
+  ClickUp to **In Review**. Only `ignite-validate` moves ClickUp to Complete;
+  standalone monitor findings still go into a comment or new task, not a status
+  change on someone else's work.

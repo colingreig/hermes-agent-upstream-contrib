@@ -77,7 +77,7 @@
     {
       "src_rel": "profiles/ops/SOUL.md",
       "dest_abs": "~/.hermes/profiles/ops/SOUL.md",
-      "sha256": "c3bda16df807fb11a5a7e189b2084679bbeb70281301debfb4a0427d8350d45b",
+      "sha256": "9a0738e64fbac9b6449387009af5b0c42e67e346dc900036ebbede702899908f",
       "role": "ops persona/SOUL",
       "deploy_mode": "profile_file"
     },
