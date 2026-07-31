@@ -747,6 +747,92 @@ def test_partial_refresh_is_refused_without_replacing_last_known_good(tmp_path, 
     assert receipt["cache_retained"] is True
 
 
+def test_req_always_returns_headers_regardless_of_helper(monkeypatch):
+    """_req always uses the header-aware fallback so Retry-After is never lost."""
+    monkeypatch.setattr(refresh_mod, "_HELPER_MODULE_ATTEMPTED", False)
+    monkeypatch.setattr(refresh_mod, "_HELPER_MODULE", None)
+    responses = iter([(429, None, {"Retry-After": "5"}), (200, {"ok": True}, {})])
+    slept = []
+    monkeypatch.setattr(refresh_mod, "_fallback_req", lambda *_: next(responses))
+    monkeypatch.setattr(refresh_mod.time, "sleep", lambda s: slept.append(s))
+
+    assert refresh_mod._get("/test/path") == {"ok": True}
+    assert slept == [5]
+
+
+def test_brain_note_failure_does_not_publish_new_map(tmp_path, monkeypatch):
+    """A brain-note write error must not leave a new map with a stale receipt."""
+    output_path = tmp_path / "clickup-map.json"
+    markdown_path = tmp_path / "clickup-workspace-map.md"
+    receipt_path = refresh_mod._receipt_path_for(output_path)
+    previous = _complete_workspace_map(generated_at=1)
+    output_path.write_text(json.dumps(previous), encoding="utf-8")
+    refreshed = _complete_workspace_map(generated_at=2)
+    monkeypatch.setattr(refresh_mod, "build_workspace_map", lambda _: refreshed)
+    monkeypatch.setattr(
+        refresh_mod,
+        "write_workspace_map_note",
+        _raise_workspace_map_note_error,
+    )
+
+    with pytest.raises(refresh_mod.WorkspaceMapNoteError):
+        refresh_mod.ensure_workspace_map(
+            team_id="team-1",
+            force=True,
+            output_path=output_path,
+            markdown_path=markdown_path,
+            write_brain_note=True,
+            brain_note_path=tmp_path / "brain.md",
+        )
+
+    on_disk = json.loads(output_path.read_text(encoding="utf-8"))
+    assert on_disk["generated_at"] == 1, "old map must survive a brain-note failure"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["outcome"] == "failed"
+    assert receipt["generated_at"] == 1, "failed receipt must reference the map on disk"
+
+
+def test_post_map_write_failure_receipt_matches_published_map(tmp_path, monkeypatch):
+    """If a write fails AFTER the map is published, the failed receipt must reference the new map."""
+    output_path = tmp_path / "clickup-map.json"
+    markdown_path = tmp_path / "clickup-workspace-map.md"
+    receipt_path = refresh_mod._receipt_path_for(output_path)
+    previous = _complete_workspace_map(generated_at=1)
+    output_path.write_text(json.dumps(previous), encoding="utf-8")
+    refreshed = _complete_workspace_map(generated_at=2)
+    monkeypatch.setattr(refresh_mod, "build_workspace_map", lambda _: refreshed)
+
+    orig_write_markdown = refresh_mod._write_markdown
+    calls = []
+
+    def exploding_markdown(path, body):
+        calls.append(path.name)
+        if path.name == "clickup-workspace-map.md":
+            raise OSError("disk full")
+        orig_write_markdown(path, body)
+
+    monkeypatch.setattr(refresh_mod, "_write_markdown", exploding_markdown)
+
+    with pytest.raises(OSError, match="disk full"):
+        refresh_mod.ensure_workspace_map(
+            team_id="team-1",
+            force=True,
+            output_path=output_path,
+            markdown_path=markdown_path,
+            write_brain_note=False,
+        )
+
+    on_disk = json.loads(output_path.read_text(encoding="utf-8"))
+    assert on_disk["generated_at"] == 2, "new map is already published"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["outcome"] == "failed"
+    assert receipt["generated_at"] == 2, "failed receipt must match the published map"
+
+
+def _raise_workspace_map_note_error(*_args, **_kwargs):
+    raise refresh_mod.WorkspaceMapNoteError("simulated brain-note failure")
+
+
 def test_field_discovery_is_paced_and_deduplicated(monkeypatch):
     refresh_mod._LIST_FIELDS_CACHE = {}
     refresh_mod._LAST_FIELD_DISCOVERY_AT = None

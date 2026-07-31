@@ -284,9 +284,6 @@ def _fallback_req(
 
 
 def _req(method: str, path: str, body: dict[str, Any] | None = None) -> Any:
-    helper = _load_clickup_helper()
-    if helper is not None and hasattr(helper, "_req"):
-        return helper._req(method, path, body)
     return _fallback_req(method, path, body)
 
 
@@ -1343,19 +1340,19 @@ def ensure_workspace_map(
             if prior_markdown is not None:
                 _write_markdown(markdown_path.with_name(PRIOR_MARKDOWN_PATH.name), prior_markdown)
 
-            # These are all prepared from a fully validated in-memory map.
-            # Publish receipt then map under the same lock; a process death in
-            # between creates a mismatched receipt that the next reader marks
-            # red rather than calling the retained map fresh.
+            # Complete all required writes before publishing the map so a
+            # failure in any of them never leaves a new map on disk paired
+            # with a stale or failed receipt.
+            if write_brain_note:
+                write_workspace_map_note(markdown, brain_note_path)
             _write_refresh_receipt(receipt_path, workspace_map, evidence, outcome="success")
             _write_json(output_path, workspace_map)
+            lock.record_failure_context(receipt_path, evidence, workspace_map)
             _write_markdown(markdown_path, markdown)
             if prior_markdown is not None:
                 diff_lines = detect_markdown_drift(prior_markdown, markdown)
                 if diff_lines:
                     _log_drift(diff_lines)
-            if write_brain_note:
-                write_workspace_map_note(markdown, brain_note_path)
             return workspace_map
     except Exception as exc:
         _log_failure(f"refresh_failed error={type(exc).__name__}: {exc}")
