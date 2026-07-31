@@ -1,0 +1,38 @@
+{
+  "bundle": "hermes-github-app",
+  "source_task": "86e2k42qu",
+  "generated": "2026-07-31",
+  "description": "Declared deploy bundle for GH-Cost Phase 1 GitHub App auth: github_app_token.py (installation-token minter), github_app_cred.sh (git credential wrapper wired via ~/.hermes/gitconfig), and thermal_github_app_probe.py (body-suppressed thermal runner registration probes). github_app_token.py is also refreshed by reconcile_launchd_environment.py on release cut; github_app_cred.sh and thermal_github_app_probe.py previously had no manifest, so mini-release-cut.sh could merge changes while the live mini kept stale/missing copies (same defect class as 86e2hap1g / v0.18.2). This file IS the bundle install_github_app.py copies; nothing outside its files list is written.",
+  "coexist_required": [
+    {
+      "dest_abs": "~/.hermes/github-app.op-env",
+      "reason": "github_app_cred.sh and thermal_github_app_probe.py resolve GH App credentials via op-run --env-file; owned outside this bundle, never installed by it"
+    }
+  ],
+  "files": [
+    {
+      "src_rel": "github_app_token.py",
+      "src_base": "mirror",
+      "dest_abs": "~/.hermes/scripts/github_app_token.py",
+      "sha256": "d4f7dfffced398b0f01d61b2516671d245a87ae05e284543aae8ec79f8821e0c",
+      "role": "mints a short-lived GitHub App installation token to stdout; exit 77 = permanent credential failure, 75 = transient; never logs credentials or the minted token",
+      "deploy_mode": "script"
+    },
+    {
+      "src_rel": "github_app_cred.sh",
+      "src_base": "mirror",
+      "dest_abs": "~/.hermes/scripts/github_app_cred.sh",
+      "sha256": "0176ef26360a499527bf9deca1b85fb2a3a7510865c9da69d2df45e6cd9dbff2",
+      "role": "git credential helper for the Hermes Dev Assistant GitHub App; mints a fresh installation token per request via op-run + github_app_token.py; never stores one",
+      "deploy_mode": "script"
+    },
+    {
+      "src_rel": "thermal_github_app_probe.py",
+      "src_base": "mirror",
+      "dest_abs": "~/.hermes/scripts/thermal_github_app_probe.py",
+      "sha256": "4fbb71bc6ac052e7a4b42393f8b3952d9affd207b7b69171e032fcfa11cfce18",
+      "role": "body-suppressed GET/POST probes against colingreig/thermal runner registration endpoints; emits JSON status codes only, never logs registration tokens or response bodies",
+      "deploy_mode": "script"
+    }
+  ]
+}
