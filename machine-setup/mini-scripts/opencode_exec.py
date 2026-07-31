@@ -209,6 +209,8 @@ def resolve_writer_cascade(content=False):
     """Ordered list of ENABLED models (for runtime failover). Returns (models, cascade_str)."""
     table = CONTENT_CASCADE if content else WRITER_CASCADE
     models = [m for (m, p) in table if _provider_enabled(p)]
+    if content and not models:
+        return [], "content:<no enabled Sonnet tier>"
     if not models:
         models = ["openai/gpt-5"]  # belt-and-suspenders floor
     return models, ("content:" if content else "code:") + " > ".join(models)
@@ -598,7 +600,7 @@ def main():
     ap.add_argument("--model", default=DEFAULT_MODEL)
     ap.add_argument("--content", action="store_true",
                     default=_truthy(os.environ.get("OPENCODE_CONTENT"), default=False),
-                    help="file-based content task (.md/.mdx/.astro, blog) -> Sonnet>GLM>Gemini cascade.")
+                    help="file-based content task (.md/.mdx/.astro, blog) -> Sonnet-only, fail-closed route.")
     ap.add_argument("--variant", default=os.environ.get("OPENCODE_VARIANT", ""), help="reasoning effort: high|max|minimal (optional).")
     ap.add_argument("--timeout", type=int, default=int(os.environ.get("OPENCODE_TIMEOUT", DEFAULT_TIMEOUT)))
     ap.add_argument("--opencode-bin", default=os.environ.get("OPENCODE_BIN", os.path.expanduser("~/.hermes/bin/opencode")))
@@ -614,8 +616,9 @@ def main():
     # e.g. HERMES_CONTENT_SONNET=0, set to drop the Anthropic-exhausted Sonnet content
     # primary until it regains access 2026-07-01 (verified dead via live APIError 400
     # on tasks 86e1z6adt/86e1z6adr), was silently ignored, so every content task still
-    # burned a failed Sonnet call + ~8s before failing over to GLM. Re-resolve the
-    # WHOLE set from 1Password BEFORE resolve_writer_cascade() reads the gates. An
+    # burned a failed Sonnet call + ~8s before reaching the then-configured fallback
+    # tail. Re-resolve the WHOLE set from 1Password BEFORE resolve_writer_cascade()
+    # reads the gates. An
     # EXPLICIT env value (incl. "0" to disable) always wins — we only fill a flag when
     # it is absent/empty. Item-unset → flag stays absent → hardcoded default.
     #
@@ -651,7 +654,7 @@ def main():
     _writer_armed = _truthy(os.environ.get("HERMES_WRITER_CODEX"), default=False)
 
     # Resolve the ordered writer CASCADE (for runtime failover) unless an explicit
-    # --model was passed. --content selects the prose cascade (Sonnet>GLM>Gemini).
+    # --model was passed. --content selects Sonnet only and fails closed if disabled.
     explicit_model = bool(args.model and args.model != "auto")
     explicit_variant = bool(args.variant)
     if explicit_model:
@@ -659,6 +662,9 @@ def main():
         writer_cascade = f"explicit:{args.model}"
     else:
         cascade_models, writer_cascade = resolve_writer_cascade(content=args.content)
+        if not cascade_models:
+            print(json.dumps({"ok": False, "error": "content route has no enabled Sonnet tier; fail-closed", "writer_cascade": writer_cascade}))
+            return 3
         args.model = cascade_models[0]
 
     workdir = os.path.abspath(os.path.expanduser(args.workdir))
@@ -769,7 +775,7 @@ def main():
         pass
     if not gh_token:
         gh_token = os.environ.get("GH_TOKEN", "") or _op_secret("GH_API_KEY_HERMES") or os.environ.get("GH_API_KEY_HERMES", "")
-    # GLM-4.7 code-writer (zai-coding provider) + Gemini content fallback.
+    # GLM-4.7 code-writer (zai-coding provider) plus Gemini for non-content routes.
     zai_key       = (_op_secret("ZAI_API_KEY_HERMES") or os.environ.get("ZAI_API_KEY_HERMES", "")
                      or os.environ.get("ZAI_API_KEY", ""))
     gemini_key    = _op_secret("GEMINI_API_KEY")          or os.environ.get("GEMINI_API_KEY", "")

@@ -9,7 +9,7 @@
   "expected_local_patches": {
     "verify-hermes-patches.sh": {
       "sync": false,
-      "source_sha256": "2593e8a3f24a4340aff0999cc79a3abb19db8e58939d1d18882ef3a1f4317d09",
+      "source_sha256": "3e232dd43bbe3dc7d3563ed941794260d9fd1891d999aed470308d4dea6bc3fc",
       "deployed_sha256": "ce51ca818e1d127a83b61694545c0fb673e749688a72dd7b0ae909522431aff5",
       "reason": "Mini-local hand patch for verify-hermes-patches.sh is intentionally excluded from PR-pipeline release sync; resyncing the repo copy would reintroduce the stale Slack patch-05 MPIM/DM regression."
     }
