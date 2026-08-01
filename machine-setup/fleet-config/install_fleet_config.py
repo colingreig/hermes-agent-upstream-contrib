@@ -630,6 +630,73 @@ def _validate_installed_skill(path: Path, expected_name: str) -> None:
         )
 
 
+def _bundled_target_is_active(
+    path: Path,
+    expected_name: str,
+    source_path: Path,
+) -> bool:
+    """Validate one installed bundled target and report whether it is active.
+
+    Hermes skill sync suppresses a pruned bundled ``SKILL.md`` tree, but its
+    category-metadata pass still restores ``DESCRIPTION.md`` files.  A bundled
+    skill that is also a category directory can therefore legitimately remain
+    as an inactive, metadata-only directory.  Accept only that exact
+    source-identical residue; every other incomplete target remains a hard
+    failure.
+    """
+    if path.is_symlink():
+        raise InstallError(f"refusing to archive symlinked skill path: {path}")
+    if not path.is_dir():
+        raise InstallError(f"skill policy target is not a skill directory: {path}")
+
+    skill_md = path / "SKILL.md"
+    if skill_md.is_file():
+        _validate_installed_skill(path, expected_name)
+        return True
+
+    try:
+        nested_manifests = sorted(
+            candidate for candidate in path.rglob("SKILL.md")
+            if candidate != skill_md
+        )
+        entries = sorted(path.iterdir(), key=lambda candidate: candidate.name)
+    except OSError as exc:
+        raise InstallError(
+            f"could not inspect bundled skill residue {path}: {exc}"
+        ) from exc
+    if nested_manifests:
+        raise InstallError(
+            f"bundled skill residue contains nested skill manifests: {path}"
+        )
+    if [entry.name for entry in entries] != ["DESCRIPTION.md"]:
+        raise InstallError(
+            f"bundled skill residue must contain only DESCRIPTION.md: {path}"
+        )
+
+    installed_description = entries[0]
+    source_description = source_path / "DESCRIPTION.md"
+    if (
+        installed_description.is_symlink()
+        or not installed_description.is_file()
+    ):
+        raise InstallError(
+            "bundled skill residue DESCRIPTION.md is not a regular file: "
+            f"{installed_description}"
+        )
+    if source_description.is_symlink() or not source_description.is_file():
+        raise InstallError(
+            f"bundled skill residue has no regular source DESCRIPTION.md: {source_description}"
+        )
+    installed_sha = _sha256(installed_description)
+    source_sha = _sha256(source_description)
+    if installed_sha != source_sha:
+        raise InstallError(
+            f"bundled skill residue DESCRIPTION.md does not match source: "
+            f"{installed_description} sha256 {installed_sha} != {source_sha}"
+        )
+    return False
+
+
 def _load_hub_lock(lock_path: Path) -> dict[str, Any]:
     if not lock_path.exists():
         return {"version": 1, "installed": {}}
@@ -661,8 +728,14 @@ def build_skill_policy_plan(policy: dict[str, Any], *, home: Path) -> list[dict[
             path = skills_dir / rel
             _check_dest_in_bounds(path, str(path), destination_root)
             if path.exists() or path.is_symlink():
-                _validate_installed_skill(path, name)
-                target_rows.append({"name": name, "rel": rel, "path": path, "kind": "bundled"})
+                source_path = policy["_source_root"] / rel
+                if _bundled_target_is_active(path, name, source_path):
+                    target_rows.append({
+                        "name": name,
+                        "rel": rel,
+                        "path": path,
+                        "kind": "bundled",
+                    })
 
         if profile == "default":
             for name, rel in policy["local_remove"].items():
