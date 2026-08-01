@@ -34,6 +34,13 @@ matches all three policy-pinned provenance fields: `install_path`, `source`,
 and `identifier`. A same-name directory or same-path lock entry from any other
 hub source fails closed.
 
+Hermes skill sync may leave a suppressed bundled skill's category
+`DESCRIPTION.md` behind even though its `SKILL.md` and scripts are no longer
+active. The installer treats that path as already inactive only when it is a
+real directory containing exactly that one regular file and its bytes match
+the bundled source. Symlinks, extra files, nested manifests, missing source
+metadata, and byte drift all fail closed.
+
 The default home's obsolete `sentry-monitor` skill path is also archived. Its
 `SKILL.md` may be a symlink into `~/.hermes/repos/ignite-sentinel`; moving the
 wrapper directory preserves that link in the recoverable archive and does not

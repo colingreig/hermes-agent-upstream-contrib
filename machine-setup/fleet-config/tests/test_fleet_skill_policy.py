@@ -90,6 +90,18 @@ def _seed_home(tmp_path: Path, policy: dict) -> tuple[Path, Path]:
     return home, external
 
 
+def _replace_with_description_residue(home: Path, policy: dict) -> Path:
+    rel = policy["bundled"]["remove"]["ocr-and-documents"]
+    target = home / ".hermes" / "skills" / rel
+    shutil.rmtree(target)
+    target.mkdir(parents=True)
+    shutil.copy2(
+        policy["_source_root"] / rel / "DESCRIPTION.md",
+        target / "DESCRIPTION.md",
+    )
+    return target
+
+
 def test_policy_exactly_classifies_current_bundled_catalog():
     policy = _load_policy()
     remove = policy["bundled"]["remove"]
@@ -278,6 +290,115 @@ def test_policy_dry_run_reports_plan_without_mutation(tmp_path, capsys, monkeypa
     assert "default: archive 56, consolidate 2, suppress +52, active 79 -> 23" in out
     assert "design: archive 0, consolidate 0, suppress +73, active 0 -> 0" in out
     assert "broad .no-bundled-skills marker: untouched" in out
+
+
+def test_policy_accepts_exact_bundled_description_only_residue(tmp_path):
+    policy = _load_policy()
+    home, _external = _seed_home(tmp_path, policy)
+    residue = _replace_with_description_residue(home, policy)
+
+    actions = install_mod.build_skill_policy_plan(policy, home=home)
+    default = next(action for action in actions if action["profile"] == "default")
+    expected_current = (
+        len(policy["bundled"]["remove"])
+        + len(policy["bundled"]["keep"])
+        - 1  # metadata-only residue has no active manifest
+        + len(policy["local_remove"])
+        + len(policy["required_local_keep"])
+        + len(policy["hub_shadow_remove"])
+    )
+
+    assert residue not in {row["path"] for row in default["targets"]}
+    assert default["current_count"] == expected_current
+    assert default["predicted_count"] == default["expected_count"] == 23
+
+
+def test_policy_refuses_symlinked_bundled_residue(tmp_path):
+    policy = _load_policy()
+    home, _external = _seed_home(tmp_path, policy)
+    residue = _replace_with_description_residue(home, policy)
+    shutil.rmtree(residue)
+    symlink_target = home / ".hermes" / "symlink-target"
+    symlink_target.mkdir()
+    residue.symlink_to(symlink_target)
+
+    with pytest.raises(install_mod.InstallError, match="symlinked skill path"):
+        install_mod.build_skill_policy_plan(policy, home=home)
+
+
+def test_policy_refuses_non_directory_bundled_residue(tmp_path):
+    policy = _load_policy()
+    home, _external = _seed_home(tmp_path, policy)
+    residue = _replace_with_description_residue(home, policy)
+    shutil.rmtree(residue)
+    residue.write_text("not a directory\n", encoding="utf-8")
+
+    with pytest.raises(install_mod.InstallError, match="not a skill directory"):
+        install_mod.build_skill_policy_plan(policy, home=home)
+
+
+def test_policy_refuses_symlinked_bundled_residue_description(tmp_path):
+    policy = _load_policy()
+    home, _external = _seed_home(tmp_path, policy)
+    residue = _replace_with_description_residue(home, policy)
+    description = residue / "DESCRIPTION.md"
+    description.unlink()
+    description.symlink_to(
+        policy["_source_root"]
+        / policy["bundled"]["remove"]["ocr-and-documents"]
+        / "DESCRIPTION.md"
+    )
+
+    with pytest.raises(
+        install_mod.InstallError,
+        match="DESCRIPTION.md is not a regular file",
+    ):
+        install_mod.build_skill_policy_plan(policy, home=home)
+
+
+def test_policy_refuses_extra_bundled_residue_bytes(tmp_path):
+    policy = _load_policy()
+    home, _external = _seed_home(tmp_path, policy)
+    residue = _replace_with_description_residue(home, policy)
+    (residue / "unexpected.txt").write_text("unexpected\n", encoding="utf-8")
+
+    with pytest.raises(install_mod.InstallError, match="contain only DESCRIPTION.md"):
+        install_mod.build_skill_policy_plan(policy, home=home)
+
+
+def test_policy_refuses_nested_skill_in_bundled_residue(tmp_path):
+    policy = _load_policy()
+    home, _external = _seed_home(tmp_path, policy)
+    residue = _replace_with_description_residue(home, policy)
+    _write_skill(residue / "nested", "unexpected-nested-skill")
+
+    with pytest.raises(install_mod.InstallError, match="nested skill manifests"):
+        install_mod.build_skill_policy_plan(policy, home=home)
+
+
+def test_policy_refuses_tampered_bundled_description_residue(tmp_path):
+    policy = _load_policy()
+    home, _external = _seed_home(tmp_path, policy)
+    residue = _replace_with_description_residue(home, policy)
+    (residue / "DESCRIPTION.md").write_text("tampered\n", encoding="utf-8")
+
+    with pytest.raises(install_mod.InstallError, match="does not match source"):
+        install_mod.build_skill_policy_plan(policy, home=home)
+
+
+def test_policy_refuses_bundled_residue_without_source_metadata(tmp_path):
+    policy = _load_policy()
+    home, _external = _seed_home(tmp_path, policy)
+    _replace_with_description_residue(home, policy)
+    replacement_source = tmp_path / "source"
+    replacement_source.mkdir()
+    policy["_source_root"] = replacement_source
+
+    with pytest.raises(
+        install_mod.InstallError,
+        match="no regular source DESCRIPTION.md",
+    ):
+        install_mod.build_skill_policy_plan(policy, home=home)
 
 
 def test_policy_refuses_local_vehicle_skill_without_matching_hub_provenance(tmp_path):
