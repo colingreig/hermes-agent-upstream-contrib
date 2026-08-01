@@ -2,3 +2,11 @@
 model:
   provider: zai
   default: glm-4.7
+fallback_providers:
+  - provider: nous
+    model: deepseek/deepseek-v4-pro
+    key_env: NOUS_PORTAL_API_KEY
+
+agent:
+  reasoning_overrides:
+    deepseek/deepseek-v4-pro: high

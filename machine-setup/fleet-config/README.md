@@ -93,7 +93,7 @@ both installation and the profile-serving proof.
 ```
 primary   openai-codex / gpt-5.5            (Codex OAuth, subscription-covered)
 tier 2    zai / glm-4.7                     (GLM_API_KEY/ZAI_API_KEY, already live)
-tier 3    nous / moonshotai/kimi-k2.6       (Nous Research Portal, key PENDING)
+tier 3    nous / deepseek/deepseek-v4-pro   (Nous Research Portal, effort high)
 ```
 
 - **google/gemini-2.5-flash is removed** from the chain (2026-07-29). Its
@@ -107,27 +107,33 @@ tier 3    nous / moonshotai/kimi-k2.6       (Nous Research Portal, key PENDING)
   first-class Hermes provider — the base URL is baked into
   `PROVIDER_REGISTRY`, so the fallback entry needs no `base_url` (and per
   the delegation credential-leak lesson we don't set one next to a named
-  provider). Model choice, from live catalog pricing:
-  - **`moonshotai/kimi-k2.6`** (chosen, in-chain): $0.5168/M in, $2.176/M
-    out, 262k ctx, tool-calling supported — the cheapest current-gen Kimi
-    that can actually run the agent loop (k2.5 is $0.456/$2.28 but older
-    gen; kimi-k3 is $2.40/$12.00).
+  provider). Model choice, from live catalog pricing and Artificial Analysis
+  benchmarks (2026-07-31):
+  - **`deepseek/deepseek-v4-pro`**, effort **`high`** (chosen, in-chain):
+    $0.348/M in, $0.696/M out, 1M ctx, tool-calling + structured output,
+    named reasoning efforts `high`/`xhigh` — ~54% cheaper input and ~78%
+    cheaper output vs the prior Kimi K2.6 rung, with comparable intelligence
+    (43.1 / 58.7 coding / 34.4 agentic on AA). DeepSeek explicitly supports
+    `high`, so Hermes can set effort without the unsupported-`medium` failure
+    mode that blocks MiniMax M3 today.
+  - **`moonshotai/kimi-k2.6`** (prior rung, superseded): $0.5168/M in,
+    $2.176/M out — retained here only as the documented prior choice.
   - **`nousresearch/hermes-4-70b`** (recorded secondary, NOT in-chain):
     $0.05/M in, $0.20/M out — cheapest on the Portal, but it does not
     support tool-calling and Nous' own docs say Hermes-4 is not
     recommended for agent work, so it must not sit in an agent fallback
     chain.
-- **PENDING: `NOUS_PORTAL_API_KEY` is not yet provisioned.** The fallback
-  entry sources its key via `key_env: NOUS_PORTAL_API_KEY`
-  (`hermes_cli/fallback_config.py::resolve_entry_api_key` → passed as
-  `explicit_api_key`; no OAuth needed). NEVER hardcode the key, and never
-  write it as a `${VAR}` reference inside a `.env`-style value —
-  `load_env` does not interpolate and a literal `${...}` poisons the
-  credential pool (the gemini-400 incident). Until the key lands in the
-  gateway secret env (1Password → launchd wrap), tier 3 falls through to
-  the (also unprovisioned) nous OAuth store and the chain effectively
-  ends after zai — same coverage as before this change, minus the gemini
-  false-alarm surface.
+- **`NOUS_PORTAL_API_KEY` is provisioned in 1Password** at
+  `op://hermes-agent/nous_portal_api_key/password` (secure note in the
+  `hermes-agent` vault). The fallback entry sources it via
+  `key_env: NOUS_PORTAL_API_KEY` (`hermes_cli/fallback_config.py::
+  resolve_entry_api_key` → passed as `explicit_api_key`; no OAuth needed).
+  Add this line to the live `~/.hermes/scripts/op-secrets.env` manifest on
+  the mini (lazy resolution — not boot-exported):
+  `NOUS_PORTAL_API_KEY=op://hermes-agent/nous_portal_api_key/password`.
+  NEVER hardcode the key, and never write it as a `${VAR}` reference inside
+  a `.env`-style value — `load_env` does not interpolate and a literal
+  `${...}` poisons the credential pool (the gemini-400 incident).
 - Do **not** add a `providers:`/`custom_providers:` entry named `nous`:
   `runtime_provider.py::_get_named_custom_provider` defers canonical
   built-in names to the built-in provider, so such an entry is dead

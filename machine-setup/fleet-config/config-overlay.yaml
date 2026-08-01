@@ -32,10 +32,9 @@
 # below is the sanctioned key-injection path: the fallback runtime resolves
 # it (hermes_cli/fallback_config.py::resolve_entry_api_key) and passes it as
 # explicit_api_key to resolve_runtime_provider, bypassing the Portal OAuth
-# flow. NOUS_PORTAL_API_KEY is NOT yet provisioned — until it lands in the
-# gateway env, tier 3 falls through to normal nous credential resolution
-# (OAuth store; also unprovisioned on the mini), so the chain effectively
-# ends after zai. See README "Fallback chain".
+# flow. NOUS_PORTAL_API_KEY is provisioned in 1Password at
+# op://hermes-agent/nous_portal_api_key/password and resolved lazily via
+# ~/.hermes/scripts/op-secrets.env (see README "Fallback chain").
 
 model:
   provider: openai-codex
@@ -45,8 +44,12 @@ fallback_providers:
   - provider: zai
     model: glm-4.7
   - provider: nous
-    model: moonshotai/kimi-k2.6
+    model: deepseek/deepseek-v4-pro
     key_env: NOUS_PORTAL_API_KEY
+
+agent:
+  reasoning_overrides:
+    deepseek/deepseek-v4-pro: high
 
 # Cleared — profile-based kanban routing (profiles/) replaces delegation-based
 # subagent routing. See the merge-rule note above: this empty dict REPLACES

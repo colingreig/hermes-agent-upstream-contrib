@@ -38,3 +38,16 @@ class TestResolveEntryApiKey:
         monkeypatch.setenv("FB_KEY", "env-key")
         entry = {"api_key": "   ", "key_env": "FB_KEY"}
         assert resolve_entry_api_key(entry) == "env-key"
+
+    def test_key_env_falls_back_to_lazy_resolver(self, monkeypatch):
+        monkeypatch.delenv("NOUS_PORTAL_API_KEY", raising=False)
+
+        def _fake_lazy(key: str):
+            assert key == "NOUS_PORTAL_API_KEY"
+            return "lazy-op-key"
+
+        monkeypatch.setattr(
+            "hermes_cli.config._lazy_secret_fallback",
+            _fake_lazy,
+        )
+        assert resolve_entry_api_key({"key_env": "NOUS_PORTAL_API_KEY"}) == "lazy-op-key"

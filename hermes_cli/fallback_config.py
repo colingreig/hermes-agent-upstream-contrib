@@ -27,7 +27,18 @@ def resolve_entry_api_key(entry: dict[str, Any] | None) -> str | None:
         return inline
     key_env = str(entry.get("key_env") or entry.get("api_key_env") or "").strip()
     if key_env:
-        return os.getenv(key_env, "").strip() or None
+        value = os.getenv(key_env, "").strip()
+        if value:
+            return value
+        try:
+            from hermes_cli.config import _lazy_secret_fallback
+
+            lazy = _lazy_secret_fallback(key_env)
+            if lazy:
+                return lazy.strip() or None
+        except Exception:
+            pass
+        return None
     return None
 
 
