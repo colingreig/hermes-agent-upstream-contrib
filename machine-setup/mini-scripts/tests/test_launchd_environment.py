@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -37,6 +38,9 @@ class LaunchdEnvironmentTests(unittest.TestCase):
         self.home = self.home.resolve()
         self.hermes = self.home / ".hermes"
         self.launch_agents = self.home / "Library" / "LaunchAgents"
+        release = self.hermes / "releases" / "v-test-default"
+        (release / "venv").mkdir(parents=True)
+        (self.hermes / "runtime-current").symlink_to(release)
         wrapper = self.hermes / "scripts" / "gateway_secrets_wrap.sh"
         (self.hermes / "config.yaml").write_text(
             f"gateway:\n  launchd_secrets_wrapper: {wrapper}\n",
@@ -142,6 +146,15 @@ class LaunchdEnvironmentTests(unittest.TestCase):
                 ["/bin/bash", str(self.hermes / "scripts" / wrapper_name)],
             )
             self.assertEqual(payload["KeepAlive"], {"SuccessfulExit": False})
+            self.assertEqual(payload["WorkingDirectory"], str(self.hermes))
+            self.assertEqual(
+                payload["EnvironmentVariables"]["VIRTUAL_ENV"],
+                str((self.hermes / "runtime-current" / "venv").resolve()),
+            )
+            self.assertEqual(
+                payload["LimitLoadToSessionType"], ["Aqua", "Background"]
+            )
+            self.assertEqual(payload["ExitTimeOut"], 25)
             serialized = plist_path.read_text(encoding="utf-8")
             for forbidden in (
                 "github_app_token.py",
@@ -153,8 +166,121 @@ class LaunchdEnvironmentTests(unittest.TestCase):
                 self.assertNotIn(forbidden, serialized)
 
         receipt_payload = json.loads(receipt.read_text(encoding="utf-8"))
+        desired = self.reconciler.desired()
         for record in receipt_payload["files"]:
+            target = Path(record["target"])
+            expected = desired[target][0]
+            digest = hashlib.sha256(expected).hexdigest()
+            self.assertEqual(record["source_sha256"], digest)
+            self.assertEqual(record["deployed_sha256"], digest)
             self.assertEqual(record["source_sha256"], record["deployed_sha256"])
+
+    def test_gateway_plist_matches_current_core_contract_for_active_release(self):
+        release = self.hermes / "releases" / "v-test-active"
+        active_venv = release / "venv"
+        active_venv.mkdir(parents=True)
+        runtime = self.hermes / "runtime-current"
+        runtime.unlink()
+        runtime.symlink_to(release)
+
+        receipt = self.reconciler.install()
+        installed = plistlib.loads(self.reconciler.gateway_plist.read_bytes())
+
+        import hermes_cli.gateway as gateway
+
+        with (
+            mock.patch.object(
+                gateway,
+                "read_raw_config",
+                return_value={
+                    "gateway": {
+                        "launchd_secrets_wrapper": str(self.reconciler.gateway_wrapper)
+                    }
+                },
+            ),
+            mock.patch.object(gateway, "get_hermes_home", return_value=self.hermes),
+            mock.patch.object(gateway, "get_launchd_label", return_value=module.GATEWAY_LABEL),
+            mock.patch.object(gateway, "_profile_arg", return_value=""),
+            mock.patch.object(
+                gateway, "_stable_service_working_dir", return_value=str(self.hermes)
+            ),
+            mock.patch.object(gateway, "_detect_venv_dir", return_value=active_venv),
+            mock.patch.object(gateway, "_build_service_path_dirs", return_value=[]),
+            mock.patch.object(gateway.shutil, "which", return_value=None),
+            mock.patch.object(
+                gateway,
+                "get_launchd_plist_path",
+                return_value=self.reconciler.gateway_plist,
+            ),
+            mock.patch.dict(os.environ, {"PATH": "/usr/bin:/bin"}, clear=False),
+        ):
+            canonical = plistlib.loads(gateway.generate_launchd_plist().encode("utf-8"))
+            self.assertTrue(gateway.launchd_plist_is_current())
+
+        # PATH is deliberately shell-derived in the core generator and fixed
+        # for the headless Mini reconciler.  Hermes' own stale check normalizes
+        # it out; every other parsed field is the service behavior contract.
+        installed["EnvironmentVariables"].pop("PATH")
+        canonical["EnvironmentVariables"].pop("PATH")
+        self.assertEqual(installed, canonical)
+
+        receipt_payload = json.loads(receipt.read_text(encoding="utf-8"))
+        gateway_record = next(
+            record
+            for record in receipt_payload["files"]
+            if record["target"] == str(self.reconciler.gateway_plist)
+        )
+        installed_digest = hashlib.sha256(
+            self.reconciler.gateway_plist.read_bytes()
+        ).hexdigest()
+        self.assertEqual(gateway_record["source"], "generated-plist")
+        self.assertEqual(gateway_record["source_sha256"], installed_digest)
+        self.assertEqual(gateway_record["deployed_sha256"], installed_digest)
+
+    def test_runtime_current_symlink_cannot_escape_profile_release_root(self):
+        outside = self.root / "foreign-release"
+        (outside / "venv").mkdir(parents=True)
+        runtime = self.hermes / "runtime-current"
+        runtime.unlink()
+        runtime.symlink_to(outside)
+
+        with self.assertRaisesRegex(RuntimeError, "escapes the profile release root"):
+            self.reconciler.install()
+
+    def test_active_runtime_must_exist_and_be_a_directory(self):
+        runtime = self.hermes / "runtime-current"
+        runtime.unlink()
+        with self.assertRaisesRegex(RuntimeError, "runtime-current"):
+            self.reconciler.install()
+
+        runtime.write_text("not a runtime directory\n", encoding="utf-8")
+        with self.assertRaisesRegex(RuntimeError, "active runtime is not a directory"):
+            self.reconciler.install()
+
+    def test_active_venv_must_exist_and_be_a_directory(self):
+        venv = self.hermes / "runtime-current" / "venv"
+        shutil.rmtree(venv)
+        with self.assertRaisesRegex(RuntimeError, "active release venv is missing"):
+            self.reconciler.install()
+
+        venv.write_text("not a venv directory\n", encoding="utf-8")
+        with self.assertRaisesRegex(
+            RuntimeError, "active release venv is not a directory"
+        ):
+            self.reconciler.install()
+
+    def test_active_venv_symlink_cannot_escape_active_release(self):
+        active_runtime = self.hermes / "runtime-current"
+        venv = active_runtime / "venv"
+        outside = self.root / "foreign-venv"
+        outside.mkdir()
+        shutil.rmtree(venv)
+        venv.symlink_to(outside)
+
+        with self.assertRaisesRegex(
+            RuntimeError, "active release venv escapes the profile runtime root"
+        ):
+            self.reconciler.install()
 
     def test_both_wrappers_mint_nonempty_token_and_gateway_only_exports(self):
         self.reconciler.install()
@@ -210,7 +336,7 @@ class LaunchdEnvironmentTests(unittest.TestCase):
             (self.hermes / "logs" / "gateway.error.log").read_text(),
         )
 
-        shutil.rmtree(self.hermes / "runtime-current")
+        (self.hermes / "runtime-current").unlink()
         self._install_fake_runtime(resolver_status=75)
         transient = self._run_wrapper("gateway_secrets_wrap.sh")
         self.assertEqual(transient.returncode, 75)

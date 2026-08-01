@@ -318,7 +318,10 @@ proof packet:
   `config.yaml` whose `gateway.launchd_secrets_wrapper` is not the canonical
   installed gateway wrapper. Plists point only to wrappers and use
   `KeepAlive.SuccessfulExit=false`: permanent authentication errors exit
-  cleanly and park, while transient exhaustion remains nonzero/retryable.
+  cleanly and park, while transient exhaustion remains nonzero/retryable. The
+  generated definitions share the core gateway lifecycle contract: a stable
+  profile `HERMES_HOME` working directory, the concrete active-release venv,
+  Aqua/Background session eligibility, and a 25-second graceful exit timeout.
 - `reconcile_marketplace_skills.py` — governed installer for the canonical
   external-skill roots, `skills.index_floor`, the ignite/Anthropic pull
   wrappers, and their LaunchAgent plists. It retires only the exact legacy

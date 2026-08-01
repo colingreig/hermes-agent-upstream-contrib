@@ -59,7 +59,10 @@ deployment that explicitly adopts polling.
   source-identical wrappers/minter/resolver, a governed reference-only secret
   file merged from the complete validated `op-secrets.env` inventory plus
   required source-controlled keys, and generated gateway/dashboard plists.
-  Its content-addressed snapshot restores exact prior bytes on rollback.
+  Those plists use the stable profile home as their working directory, pin the
+  concrete active-release venv, and retain the core Aqua/Background plus
+  25-second exit contract. Its content-addressed snapshot restores exact prior
+  bytes on rollback.
 - `.mini-release-last-receipt.json` is the stable latest receipt; immutable
   `.mini-release-receipt-<sha256>.json` siblings are addressed by their exact
   payload bytes.
