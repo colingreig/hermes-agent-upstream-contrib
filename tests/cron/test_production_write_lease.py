@@ -95,3 +95,10 @@ def test_database_symlink_is_rejected(monkeypatch, tmp_path):
     database.symlink_to(target)
     with pytest.raises(leases.ProductionWriteLeaseError, match="must not be a symlink"):
         leases.status()
+
+
+def test_missing_posix_uid_api_fails_closed(monkeypatch, tmp_path):
+    leases = _store(monkeypatch, tmp_path)
+    monkeypatch.delattr(leases.os, "getuid", raising=False)
+    with pytest.raises(leases.ProductionWriteLeaseError, match="POSIX user ID API is unavailable"):
+        leases.status()

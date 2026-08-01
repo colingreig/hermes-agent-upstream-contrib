@@ -77,7 +77,12 @@ def _safe_path(path: Path, *, kind: str) -> None:
         raise ProductionWriteLeaseError(f"cannot inspect production write lease {kind}: {exc}") from exc
     if path.is_symlink():
         raise ProductionWriteLeaseError(f"production write lease {kind} must not be a symlink: {path}")
-    if info.st_uid != os.getuid():
+    getuid = getattr(os, "getuid", None)
+    if not callable(getuid):
+        raise ProductionWriteLeaseError(
+            "production write lease ownership cannot be verified because the POSIX user ID API is unavailable"
+        )
+    if info.st_uid != getuid():
         raise ProductionWriteLeaseError(f"production write lease {kind} is not owned by the current user: {path}")
     if info.st_mode & 0o022:
         raise ProductionWriteLeaseError(f"production write lease {kind} is group/world-writable: {path}")
