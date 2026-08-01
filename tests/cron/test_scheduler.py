@@ -4344,6 +4344,8 @@ class TestBuildJobPromptChildEnvironment:
     def test_derives_plugin_root_and_injects_only_declared_scoped_secret(
         self, tmp_path, monkeypatch
     ):
+        from pathlib import Path
+
         from agent.secret_scope import reset_secret_scope, set_secret_scope
         from tools.env_passthrough import clear_env_passthrough
         from tools.environments.local import _make_run_env
@@ -4351,6 +4353,16 @@ class TestBuildJobPromptChildEnvironment:
         plugin_root = tmp_path / "ignite"
         skill_dir = plugin_root / "skills" / "clickup"
         skill_dir.mkdir(parents=True)
+        configured_root_modules = (
+            "skills/ignite-state/scripts/sync-project-plugins.mjs",
+            "skills/ignite-state/scripts/blocklist-sync.mjs",
+            "skills/clickup/clickup.mjs",
+            "skills/ignite-state/scripts/target-repo.mjs",
+        )
+        for relative_path in configured_root_modules:
+            module_path = plugin_root / relative_path
+            module_path.parent.mkdir(parents=True, exist_ok=True)
+            module_path.write_text("// fixture\n", encoding="utf-8")
         declared = "THERMAL_TEST_DATABASE_URL"
         undeclared = "UNDECLARED_CRON_SECRET"
         monkeypatch.delenv("CLAUDE_PLUGIN_ROOT", raising=False)
@@ -4371,13 +4383,19 @@ class TestBuildJobPromptChildEnvironment:
         }
         try:
             with patch("tools.skills_tool.skill_view", return_value=json.dumps(loaded)):
-                _build_job_prompt({"skills": ["clickup"], "prompt": "go"})
+                prompt = _build_job_prompt({"skills": ["clickup"], "prompt": "go"})
             child_env = _make_run_env({})
         finally:
             reset_secret_scope(scope_token)
             clear_env_passthrough()
 
+        assert "Execute." in prompt
         assert child_env["CLAUDE_PLUGIN_ROOT"] == str(plugin_root.resolve())
+        child_plugin_root = Path(child_env["CLAUDE_PLUGIN_ROOT"])
+        assert all(
+            (child_plugin_root / relative_path).is_file()
+            for relative_path in configured_root_modules
+        )
         assert child_env[declared] == "postgresql://user:scoped-secret@db/test"
         assert undeclared not in child_env
         assert "CLAUDE_PLUGIN_ROOT" not in os.environ

@@ -49,12 +49,12 @@ two scheduling planes therefore cross-watch rather than self-monitor.
 | `f23a03e9d1b2` | fleet-health-digest | enabled | fresh parsed delivery receipt with `status=sent` | missing/stale/failed delivery |
 | `59bdd8ebc468` | repo-maintenance | enabled | fresh non-empty maintenance response | empty/failed/stale maintenance pass |
 
-## LaunchAgent fleet: 18 active + 1 retired
+## LaunchAgent fleet: 20 active + 1 retired
 
 | Label | Expected | Outcome proof (not exit-only) | Alarm condition |
 |---|---:|---|---|
 | `ai.hermes.codex-proxy` | loaded | live TCP connect to loopback `:8646` | unavailable endpoint or unloaded agent |
-| `ai.hermes.gateway` | loaded | fresh gateway activity log without fatal credential markers | stale/fatal log or unloaded agent |
+| `ai.hermes.gateway` | loaded | semantic HTTP `127.0.0.1:8642/health` response with `status=ok` and `platform=hermes-agent` | endpoint/semantic failure or unloaded agent |
 | `com.colingreig.hermes-dashboard` | loaded | semantic HTTP `:9119/health` response | endpoint failure or unloaded agent |
 | `com.colingreig.hermes.daily-spend-alert` | loaded | fresh explicit OK/alert evaluation log | stale/fatal/delivery failure |
 | `com.colingreig.hermes.degraded-secrets-monitor` | loaded | fresh healthy/alerted/recovered result; delivery-aware dedupe | stale result or incomplete alarm delivery |
@@ -71,6 +71,8 @@ two scheduling planes therefore cross-watch rather than self-monitor.
 | `com.colingreig.chrome-cdp` | loaded | semantic `/json/version` response with CDP WebSocket URL | endpoint failure or unloaded agent |
 | `com.colingreig.hermes.usage-alert` | loaded | fresh durable receipt proving a clean scan, deduped alert, or confirmed Slack delivery | stale/missing receipt or failed delivery |
 | `com.colingreig.hermes.fleet-outcome-probe` | loaded | current process execution plus CI-wrapper heartbeat cross-watch | unloaded agent or stale probe receipt |
+| `com.colingreig.hermes.disk-space-alert` | loaded | fresh durable receipt with `status=ok` | low disk, check error, failed delivery, or stale/missing receipt |
+| `com.colingreig.hermes.kanban-workspace-sweep` | loaded | fresh complete `sweep-finish` summary with `errors=0` | missing/unusable board DB, unlistable workspace root, non-zero errors, traceback, or stale/incomplete summary |
 | `com.colingreig.hermes.release-poll` | retired | plist absent and `launchctl print` fails | any plist/load resurrection |
 
 The legacy `com.ignite.skills-sync` label remains retired. If its plist
@@ -82,7 +84,8 @@ even though the label is not part of the active contract.
 Repository tests prove semantic failures are distinguishable from scheduler
 success, unknown enabled jobs and monitored plists fail closed, a failed Slack
 send does not advance dedupe, confirmed delivery dedupes a repeat, and the
-drill emits exactly one finding per contract by executing its real predicate.
+drill emits exactly one finding for each of the 37 declared contracts by
+executing its real predicate.
 The content-addressed `fleet_outcome_manifest.json` and
 `reconcile_fleet_outcomes.py` deploy the scripts, contracts, two LaunchAgents,
 and CI cron wrapper field as one scheduler-locked, snapshot-backed transaction.

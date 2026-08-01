@@ -22,7 +22,7 @@
       "src_rel": "kanban_workspace_sweep.py",
       "src_base": "mirror",
       "dest_abs": "~/.hermes/scripts/kanban_workspace_sweep.py",
-      "sha256": "2508a79e0bb4b8d8388a98fc4128377ef4ea8210ee73029eb2967c938b17ba5f",
+      "sha256": "2628e11f56a58804304b3b32778d6bada83764cb3f17eeecda2d3d17ae5a9ed8",
       "role": "age-based backstop for terminal kanban scratch workspaces across all boards",
       "deploy_mode": "script"
     },
@@ -38,7 +38,7 @@
       "src_rel": "launchd/com.colingreig.hermes.kanban-workspace-sweep.plist",
       "src_base": "mirror",
       "dest_abs": "~/Library/LaunchAgents/com.colingreig.hermes.kanban-workspace-sweep.plist",
-      "sha256": "5c5b3b2ca2ef93b1669b7bd2b53591bcc6086e93209033dd10c2f8110d0979c6",
+      "sha256": "658e5376e29d8e26060b7665e4e960848f5303ae5d4840c73856b2b96872a8e9",
       "role": "launchd schedule for kanban_workspace_sweep.py",
       "deploy_mode": "launch_agent"
     },

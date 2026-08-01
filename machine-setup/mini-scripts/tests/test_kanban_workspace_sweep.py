@@ -121,7 +121,7 @@ def test_dry_run_never_mutates(tmp_path, mod):
     assert stats["removed"] == 0
 
 
-def test_board_skipped_when_db_missing(tmp_path, mod):
+def test_board_skipped_when_db_missing(tmp_path, mod, capsys):
     root = tmp_path
     ws_root = root / "kanban" / "boards" / "content" / "workspaces"
     ws = ws_root / "t_x"
@@ -133,10 +133,186 @@ def test_board_skipped_when_db_missing(tmp_path, mod):
 
     assert ws.exists()
     assert stats == {
-        "removed": 0, "removed_bytes": 0, "orphan_removed": 0, "errors": 0,
+        "removed": 0, "removed_bytes": 0, "orphan_removed": 0, "errors": 1,
         "skipped_active": 0, "skipped_non_scratch": 0, "skipped_path_mismatch": 0,
         "skipped_recent": 0,
     }
+    assert "BOARD_SKIP_NO_DB: content" in capsys.readouterr().out
+
+    rc = mod.main(["--root", str(root), "--days", "1"])
+    output = capsys.readouterr().out
+    assert rc == 1
+    assert ws.exists()
+    assert "BOARD_SKIP_NO_DB: content" in output
+    assert "sweep-finish" in output
+    assert "errors=1" in output
+
+
+@pytest.mark.parametrize("failure", ["is_dir", "listdir"])
+def test_unlistable_board_fails_closed(tmp_path, mod, monkeypatch, capsys, failure):
+    root = tmp_path
+    db_path = root / "kanban.db"
+    _make_db(db_path, [("t_done", "done", "scratch", None)])
+    ws_root = root / "kanban" / "workspaces"
+    ws = ws_root / "t_done"
+    _touch_dir(ws, age_days=999)
+    if failure == "is_dir":
+        real_is_dir = mod.Path.is_dir
+
+        def uninspectable(path):
+            if path == ws_root:
+                raise OSError("permission denied")
+            return real_is_dir(path)
+
+        monkeypatch.setattr(mod.Path, "is_dir", uninspectable)
+    else:
+        real_listdir = mod.os.listdir
+
+        def unlistable(path):
+            if Path(path) == ws_root:
+                raise OSError("permission denied")
+            return real_listdir(path)
+
+        monkeypatch.setattr(mod.os, "listdir", unlistable)
+
+    rc = mod.main(["--root", str(root), "--days", "1"])
+    output = capsys.readouterr().out
+    assert rc == 1
+    assert ws.exists()
+    assert "BOARD_SKIP_UNLISTABLE: default" in output
+    assert "sweep-finish" in output
+    assert "errors=1" in output
+
+
+def test_task_directory_inspection_error_fails_closed(tmp_path, mod, monkeypatch, capsys):
+    root = tmp_path
+    db_path = root / "kanban.db"
+    _make_db(db_path, [("t_done", "done", "scratch", None)])
+    ws = root / "kanban" / "workspaces" / "t_done"
+    _touch_dir(ws, age_days=999)
+    real_is_dir = mod.Path.is_dir
+
+    def uninspectable(path):
+        if path == ws:
+            raise OSError("permission denied")
+        return real_is_dir(path)
+
+    monkeypatch.setattr(mod.Path, "is_dir", uninspectable)
+
+    rc = mod.main(["--root", str(root), "--days", "1"])
+    output = capsys.readouterr().out
+
+    assert rc == 1
+    assert ws.exists()
+    assert "BOARD_SKIP_UNLISTABLE: default/t_done" in output
+    assert "sweep-finish" in output
+    assert "errors=1" in output
+
+
+@pytest.mark.parametrize("row", [None, ("t_done", "done", "scratch", None)])
+def test_task_stat_error_fails_closed(tmp_path, mod, monkeypatch, capsys, row):
+    root = tmp_path
+    db_path = root / "kanban.db"
+    _make_db(db_path, [] if row is None else [row])
+    task_id = "t_orphan" if row is None else row[0]
+    ws = root / "kanban" / "workspaces" / task_id
+    _touch_dir(ws, age_days=999)
+    real_is_dir = mod.Path.is_dir
+    real_stat = mod.Path.stat
+
+    def inspectable_directory(path):
+        if path == ws:
+            return True
+        return real_is_dir(path)
+
+    def uninspectable(path, *args, **kwargs):
+        if path == ws:
+            raise OSError("permission denied")
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(mod.Path, "is_dir", inspectable_directory)
+    monkeypatch.setattr(mod.Path, "stat", uninspectable)
+
+    rc = mod.main(["--root", str(root), "--days", "1"])
+    output = capsys.readouterr().out
+
+    assert rc == 1
+    assert real_stat(ws)
+    assert f"BOARD_SKIP_UNLISTABLE: default/{task_id}" in output
+    assert "sweep-finish" in output
+    assert "errors=1" in output
+
+
+def test_task_lookup_schema_error_fails_closed(tmp_path, mod, capsys):
+    root = tmp_path
+    db_path = root / "kanban.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT NOT NULL)")
+    conn.execute("INSERT INTO tasks VALUES (?, ?)", ("t_done", "done"))
+    conn.commit()
+    conn.close()
+    ws_root = root / "kanban" / "workspaces"
+    ws = ws_root / "t_done"
+    _touch_dir(ws, age_days=999)
+
+    stats = mod.sweep_board(
+        "default", db_path, ws_root, days=1, dry_run=False,
+    )
+
+    assert ws.exists()
+    assert stats["errors"] == 1
+    assert stats["removed"] == 0
+    assert stats["orphan_removed"] == 0
+    assert "BOARD_SKIP_TASK_LOOKUP_ERROR: default/t_done" in capsys.readouterr().out
+
+    rc = mod.main(["--root", str(root), "--days", "1"])
+    output = capsys.readouterr().out
+    assert rc == 1
+    assert ws.exists()
+    assert "BOARD_SKIP_TASK_LOOKUP_ERROR: default/t_done" in output
+    assert "sweep-finish" in output
+    assert "errors=1" in output
+
+
+@pytest.mark.parametrize("failure", ["parent_is_dir", "listdir", "nested_is_dir"])
+def test_named_board_discovery_error_fails_closed(tmp_path, mod, monkeypatch, capsys, failure):
+    root = tmp_path
+    db_path = root / "kanban.db"
+    _make_db(db_path, [("t_done", "done", "scratch", None)])
+    ws = root / "kanban" / "workspaces" / "t_done"
+    _touch_dir(ws, age_days=999)
+    boards_parent = root / "kanban" / "boards"
+    named_board = boards_parent / "content"
+    named_board.mkdir(parents=True)
+    if failure == "listdir":
+        real_listdir = mod.os.listdir
+
+        def unlistable(path):
+            if Path(path) == boards_parent:
+                raise OSError("permission denied")
+            return real_listdir(path)
+
+        monkeypatch.setattr(mod.os, "listdir", unlistable)
+    else:
+        target = boards_parent if failure == "parent_is_dir" else named_board
+        real_is_dir = mod.Path.is_dir
+
+        def uninspectable(path):
+            if path == target:
+                raise OSError("permission denied")
+            return real_is_dir(path)
+
+        monkeypatch.setattr(mod.Path, "is_dir", uninspectable)
+
+    rc = mod.main(["--root", str(root), "--days", "1"])
+    output = capsys.readouterr().out
+
+    assert rc == 1
+    assert ws.exists()
+    assert "BOARD_DISCOVERY_UNLISTABLE:" in output
+    assert "sweep-finish" in output
+    assert "boards_swept=0" in output
+    assert "errors=1" in output
 
 
 def test_path_mismatch_is_protected(tmp_path, mod):
@@ -151,6 +327,39 @@ def test_path_mismatch_is_protected(tmp_path, mod):
 
     assert ws.exists()
     assert stats["skipped_path_mismatch"] == 1
+
+
+def test_workspace_path_resolution_error_fails_closed(tmp_path, mod, monkeypatch, capsys):
+    root = tmp_path
+    db_path = root / "kanban.db"
+    ws = root / "kanban" / "workspaces" / "t_done"
+    _make_db(db_path, [("t_done", "done", "scratch", str(ws))])
+    _touch_dir(ws, age_days=30)
+    real_resolve = mod.Path.resolve
+
+    def unresolvable(path, *args, **kwargs):
+        if path == ws:
+            raise OSError("permission denied")
+        return real_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(mod.Path, "resolve", unresolvable)
+
+    stats = mod.sweep_board(
+        "default", db_path, root / "kanban" / "workspaces", days=14, dry_run=False,
+    )
+    direct_output = capsys.readouterr().out
+    assert ws.exists()
+    assert stats["removed"] == 0
+    assert stats["errors"] == 1
+    assert "BOARD_SKIP_UNLISTABLE: default/t_done" in direct_output
+
+    rc = mod.main(["--root", str(root), "--days", "14"])
+    output = capsys.readouterr().out
+    assert rc == 1
+    assert ws.exists()
+    assert "BOARD_SKIP_UNLISTABLE: default/t_done" in output
+    assert "sweep-finish" in output
+    assert "errors=1" in output
 
 
 def test_discover_boards_finds_default_and_named_boards(tmp_path, mod):
