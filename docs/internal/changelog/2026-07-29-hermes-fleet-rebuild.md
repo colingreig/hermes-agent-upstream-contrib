@@ -6,7 +6,7 @@ doc_type: fleet-changelog
 
 # 2026-07-29 Hermes fleet rebuild
 
-On 2026-07-29 we completed a gut-and-rebuild of the Hermes Mac mini fleet. The old configuration had grown into thirty-six overlapping cron jobs, duplicated monitors, and delegation-based subagent routing that once leaked a parent credential to a third-party endpoint. The rebuild replaces that sprawl with a curated sixteen-job cron set, five kanban-swarm profiles, and a governed installer that pins every source file before it writes anything to the mini.
+On 2026-07-29 we completed a gut-and-rebuild of the Hermes Mac mini fleet. The old configuration had grown into thirty-six overlapping cron jobs, duplicated monitors, and delegation-based subagent routing that once leaked a parent credential to a third-party endpoint. The rebuild replaces that sprawl with a curated fifteen-job cron set, five direct-execution profiles, and a governed installer that pins every source file before it writes anything to the mini.
 
 ## Why we rebuilt
 
@@ -14,7 +14,7 @@ The pre-freeze fleet mixed one-off experiments, retired email triage, duplicate 
 
 ## Profiles and routing
 
-Hermes now runs five kanban-swarm profiles under `~/.hermes/profiles/`: `coder`, `content`, `design`, `research`, and `ops`. Each profile gets its own model config, SOUL persona, and bootstrap tree. Profile-based kanban routing replaces delegation-based subagent routing. The overlay deliberately clears the live `delegation` block so a named provider can never again sit beside a stray `delegation.base_url`. The `clickup-executor` and `content-lane-executor` jobs no longer implement tasks in-session; they claim a ClickUp task, launch `hermes kanban swarm`, poll the synthesizer to `done`, post the result as a comment, and move the task to **In Review**. Only `ignite-validate` may mark work Complete.
+Hermes runs five direct-execution profiles under `~/.hermes/profiles/`: `coder`, `content`, `design`, `research`, and `ops`. Each profile gets its own model config, SOUL persona, and bootstrap tree. The overlay deliberately clears the live `delegation` block so a named provider can never again sit beside a stray `delegation.base_url`. The `clickup-executor` and `content-lane-executor` jobs implement ClickUp work directly through their governed skills, post their handoff, and move the task to **In Review**. Only `ignite-validate` may mark work Complete. Hermes kanban remains available independently as a product feature.
 
 ## Model fallback and billing surfaces
 
@@ -26,4 +26,4 @@ The default agent fallback chain is now openai-codex `gpt-5.5` (Codex OAuth, sub
 
 ## What operators should expect
 
-Day to day, you should see fewer cron entries firing independently, more work routed through kanban swarms, and ClickUp tasks stopping at In Review until validation clears them. Consolidated jobs such as `clickup-lifecycle`, `fleet-health-digest`, and `repo-maintenance` batch what used to be separate one-off scripts. Monitor coverage is contract-driven via `fleet_outcome_probe.py` and `MONITOR_COVERAGE.md`. Tier-three Nous fallback uses DeepSeek V4 Pro high via `NOUS_PORTAL_API_KEY`. If something fails mid-install, the installer rolls back every step from its snapshot rather than leaving a half-written fleet behind.
+Day to day, you should see fewer cron entries firing independently, direct ClickUp work stopping at In Review until validation clears it, and the separate Hermes kanban feature available when explicitly needed. Consolidated jobs such as `clickup-lifecycle`, `fleet-health-digest`, and `repo-maintenance` batch what used to be separate one-off scripts. Monitor coverage is contract-driven via `fleet_outcome_probe.py` and `MONITOR_COVERAGE.md`. Tier-three Nous fallback uses DeepSeek V4 Pro high via `NOUS_PORTAL_API_KEY`. If something fails mid-install, the installer rolls back every step from its snapshot rather than leaving a half-written fleet behind.

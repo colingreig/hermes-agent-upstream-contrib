@@ -653,9 +653,84 @@ class LaunchdEnvironmentTests(unittest.TestCase):
             module.LAUNCHCTL_STATE_POLL_ATTEMPTS - 1,
         )
 
+    def test_launchd_domain_prefers_existing_gui_registration(self):
+        gui_domain = f"gui/{os.getuid()}"
+        user_domain = f"user/{os.getuid()}"
+        with mock.patch.object(
+            self.reconciler,
+            "_registered",
+            side_effect=lambda domain, _label: domain == gui_domain,
+        ) as registered:
+            self.assertEqual(
+                self.reconciler._resolve_launchd_domain(module.GATEWAY_LABEL),
+                gui_domain,
+            )
+        self.assertEqual(
+            [call.args[0] for call in registered.call_args_list],
+            [gui_domain],
+        )
+        self.assertNotEqual(gui_domain, user_domain)
+
+    def test_launchd_domain_finds_existing_user_registration_from_ssh(self):
+        gui_domain = f"gui/{os.getuid()}"
+        user_domain = f"user/{os.getuid()}"
+        with mock.patch.object(
+            self.reconciler,
+            "_registered",
+            side_effect=lambda domain, _label: domain == user_domain,
+        ) as registered:
+            self.assertEqual(
+                self.reconciler._resolve_launchd_domain(module.GATEWAY_LABEL),
+                user_domain,
+            )
+        self.assertEqual(
+            [call.args[0] for call in registered.call_args_list],
+            [gui_domain, user_domain],
+        )
+
+    def test_launchd_domain_uses_manager_session_only_when_unloaded(self):
+        gui_domain = f"gui/{os.getuid()}"
+        user_domain = f"user/{os.getuid()}"
+        for manager, expected in (("Aqua\n", gui_domain), ("Background\n", user_domain)):
+            with self.subTest(manager=manager.strip()):
+                with (
+                    mock.patch.object(
+                        self.reconciler,
+                        "_registered",
+                        return_value=False,
+                    ),
+                    mock.patch.object(
+                        module.subprocess,
+                        "run",
+                        return_value=subprocess.CompletedProcess(
+                            ["launchctl", "managername"],
+                            0,
+                            stdout=manager,
+                        ),
+                    ) as run,
+                ):
+                    self.assertEqual(
+                        self.reconciler._resolve_launchd_domain(module.GATEWAY_LABEL),
+                        expected,
+                    )
+                run.assert_called_once_with(
+                    ["launchctl", "managername"],
+                    check=False,
+                    timeout=module.LAUNCHCTL_TIMEOUT_SECONDS,
+                    capture_output=True,
+                    text=True,
+                )
+
     def test_reload_verifies_gateway_and_dashboard_registration(self):
         self.reconciler.install()
+        gui_domain = f"gui/{os.getuid()}"
+        user_domain = f"user/{os.getuid()}"
         with (
+            mock.patch.object(
+                self.reconciler,
+                "_resolve_launchd_domain",
+                side_effect=(user_domain, gui_domain),
+            ) as resolve_domain,
             mock.patch.object(self.reconciler, "_bootout") as bootout,
             mock.patch.object(
                 self.reconciler,
@@ -670,9 +745,13 @@ class LaunchdEnvironmentTests(unittest.TestCase):
         self.assertEqual(
             [call.args[:2] for call in wait_absent.call_args_list],
             [
-                (f"gui/{os.getuid()}", module.GATEWAY_LABEL),
-                (f"gui/{os.getuid()}", module.DASHBOARD_LABEL),
+                (user_domain, module.GATEWAY_LABEL),
+                (gui_domain, module.DASHBOARD_LABEL),
             ],
+        )
+        self.assertEqual(
+            [call.args[0] for call in resolve_domain.call_args_list],
+            [module.GATEWAY_LABEL, module.DASHBOARD_LABEL],
         )
         self.assertEqual(bootout.call_count, 2)
         self.assertEqual(bootstrap.call_count, 2)

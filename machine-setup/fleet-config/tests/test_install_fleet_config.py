@@ -140,12 +140,99 @@ def test_real_install_writes_all_three_destinations(bundle):
     for profile in PROFILE_NAMES:
         profile_dir = bundle["home"] / ".hermes" / "profiles" / profile
         assert (profile_dir / "config.yaml").is_file()
+        assert (profile_dir / "config.yaml").stat().st_mode & 0o777 == 0o600
         assert (profile_dir / "SOUL.md").is_file()
     jobs = json.loads((bundle["home"] / ".hermes" / "cron" / "jobs.json").read_text())
     assert jobs["jobs"][0]["name"] == "synthetic-job"
     # profile bootstrap dirs got created too
     for sub in install_mod.PROFILE_BOOTSTRAP_DIRS:
         assert (bundle["home"] / ".hermes" / "profiles" / "ops" / sub).is_dir()
+
+
+def test_atomic_write_replaces_existing_file_privately(tmp_path):
+    dest = tmp_path / "private" / "config.yaml"
+    dest.parent.mkdir()
+    dest.write_text("old\n", encoding="utf-8")
+    dest.chmod(0o644)
+
+    install_mod._atomic_write(dest, b"new\n")
+
+    assert dest.read_bytes() == b"new\n"
+    assert dest.stat().st_mode & 0o777 == 0o600
+    assert not list(dest.parent.glob(".config.yaml.tmp-*"))
+
+
+def test_atomic_write_skips_hostile_temp_symlink(tmp_path, monkeypatch):
+    dest = tmp_path / "private" / "config.yaml"
+    dest.parent.mkdir()
+    outside = tmp_path / "outside-secret.yaml"
+    outside.write_text("outside\n", encoding="utf-8")
+    hostile = dest.parent / ".config.yaml.tmp-taken"
+    hostile.symlink_to(outside)
+    names = iter(("taken", "safe"))
+    monkeypatch.setattr(install_mod.secrets, "token_hex", lambda _bytes: next(names))
+
+    install_mod._atomic_write(dest, b"safe\n")
+
+    assert dest.read_bytes() == b"safe\n"
+    assert dest.stat().st_mode & 0o777 == 0o600
+    assert hostile.is_symlink()
+    assert outside.read_text(encoding="utf-8") == "outside\n"
+
+
+def test_snapshot_dir_disambiguates_repeated_same_second_receipts(tmp_path):
+    destination_root = tmp_path / ".hermes"
+    destination_root.mkdir()
+
+    first = install_mod._create_snapshot_dir(destination_root, "20260801T010101Z")
+    second = install_mod._create_snapshot_dir(destination_root, "20260801T010101Z")
+
+    assert first.name == "20260801T010101Z"
+    assert second.name == "20260801T010101Z-01"
+    assert first.is_dir()
+    assert second.is_dir()
+
+
+def test_same_second_full_installs_keep_distinct_sibling_backup_bytes(bundle, monkeypatch):
+    config_path = bundle["home"] / ".hermes" / "config.yaml"
+    config_path.write_bytes(b"model: before-first\n")
+    stamp = "20260801T010101Z"
+    stamps = iter((stamp, stamp))
+    monkeypatch.setattr(install_mod, "_utc_stamp", lambda: next(stamps))
+
+    assert install_mod.install(
+        bundle["manifest"],
+        home=bundle["home"],
+        bundle_root=bundle["bundle_root"],
+        manifest_path=bundle["manifest_path"],
+        dry_run=False,
+    ) == 0
+    config_path.write_bytes(b"model: before-second\n")
+    assert install_mod.install(
+        bundle["manifest"],
+        home=bundle["home"],
+        bundle_root=bundle["bundle_root"],
+        manifest_path=bundle["manifest_path"],
+        dry_run=False,
+    ) == 0
+
+    first = config_path.with_name(f"config.yaml.bak-fleet-config-install-{stamp}")
+    second = config_path.with_name(f"config.yaml.bak-fleet-config-install-{stamp}-01")
+    assert first.read_bytes() == b"model: before-first\n"
+    assert second.read_bytes() == b"model: before-second\n"
+
+
+def test_direct_clickup_contract_rejects_synthetic_or_drifted_jobs_before_writing(bundle):
+    bundle["manifest"]["fleet_contract"] = install_mod.FLEET_JOBS_CONTRACT
+
+    with pytest.raises(install_mod.InstallError, match="missing 'clickup-executor'"):
+        install_mod.build_plan(
+            bundle["manifest"],
+            home=bundle["home"],
+            bundle_root=bundle["bundle_root"],
+        )
+
+    assert not (bundle["home"] / ".hermes" / "config.yaml").exists()
 
 
 def test_existing_config_and_its_install_backups_are_repaired_to_0600(bundle):

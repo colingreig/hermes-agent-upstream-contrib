@@ -1,7 +1,8 @@
 {
   "bundle": "fleet-config",
   "source_task": "86e2kkj69",
-  "generated_at": "2026-08-01T16:13:22Z",
+  "fleet_contract": "direct-clickup-v1",
+  "generated_at": "2026-08-01T16:35:00Z",
   "description": "Governed Hermes Mini fleet bundle for the 86e2kkj69 skill-surface hardening rollout. install_fleet_config.py is the sole writer of four surfaces: the deep-merged ~/.hermes/config.yaml overlay, five direct-execution profiles under ~/.hermes/profiles/, the curated 15-job ~/.hermes/cron/jobs.json, and the manifest-pinned skill policy across the default plus five profile homes. ClickUp executor jobs use direct skill paths while upstream Hermes kanban remains available independently. Every source, including the installer itself, is SHA-256 verified before mutation; config, root legacy config-backup modes, jobs, skill provenance, archive-copy bytes, and hub identity fail closed, with snapshots, recoverable archives, rollback, and receipts.",
   "files": [
     {
@@ -42,7 +43,7 @@
     {
       "src_rel": "profiles/design/config.yaml",
       "dest_abs": "~/.hermes/profiles/design/config.yaml",
-      "sha256": "65da98d91b542b5355d70473b02461a6cdecc4d6d821436869e6ab78089897fd",
+      "sha256": "462cbc4f0f8d2ed10b9d3a6178adc4ae0c4247dbeef76d64f1dc8cbc22608824",
       "role": "designer profile \u2014 openai-codex/gpt-5.5, drives Open Design headless via the od CLI/daemon",
       "deploy_mode": "profile_file"
     },
@@ -96,7 +97,7 @@
     },
     {
       "src_rel": "install_fleet_config.py",
-      "sha256": "b67bddba1e14be87b62352ee82e9a74348d09d73d3aea94c8392c12e5ae58bff",
+      "sha256": "8709ba81733220e5e8dcf0630027261d0e67f97244b5935a53d7bac6ec897f32",
       "role": "source-only pin for the governed fleet installer, including private legacy root config-backup remediation and exact-mode rollback",
       "deploy_mode": "installer_source"
     }
