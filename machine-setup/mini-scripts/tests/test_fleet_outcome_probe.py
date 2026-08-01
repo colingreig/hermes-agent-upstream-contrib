@@ -737,3 +737,50 @@ def test_drill_trips_one_real_predicate_per_contract():
     assert all(item["detail"].startswith("SYNTHETIC DRILL:") for item in findings)
     assert module.DEFAULT_DRILL_STATE != module.DEFAULT_STATE
     assert module.DEFAULT_DRILL_RECEIPT != module.DEFAULT_RECEIPT
+
+
+def test_alert_message_is_human_action_summary_not_machine_dump():
+    module = _load_module()
+    findings = [
+        module._finding(
+            "cron",
+            "52f27be1b549",
+            "uncovered_enabled_job",
+            "repo-hygiene-daily",
+            name="repo-hygiene-daily",
+        ),
+        module._finding(
+            "launchd",
+            "com.colingreig.hermes.degraded-secrets-monitor",
+            "failure_marker",
+            "/tmp/degraded-secrets-monitor.launchd.log contains a failure marker",
+            name="degraded-secrets-monitor",
+        ),
+        module._finding(
+            "launchd",
+            "com.colingreig.hermes.degraded-secrets-monitor",
+            "success_marker_missing",
+            "/tmp/degraded-secrets-monitor.launchd.log has none of the declared semantic success markers",
+            name="degraded-secrets-monitor",
+        ),
+        module._finding(
+            "launchd",
+            "com.colingreig.hermes.kanban-workspace-sweep",
+            "run_incomplete",
+            "/tmp/kanban-workspace-sweep.launchd.log has evidence after its latest completed-run marker",
+            name="kanban-workspace-sweep",
+        ),
+    ]
+    message = module._alert_message(findings, drill=False)
+    assert message.startswith("🚨 Action needed:")
+    assert "degraded-secrets-monitor" in message
+    assert "is failing" in message
+    assert "didn't finish cleanly" in message
+    assert "52f27be1b549" not in message
+    assert "[failure_marker]" not in message
+    assert "/tmp/" not in message
+    # One bullet per job, not one per raw finding
+    assert message.count("• degraded-secrets-monitor") == 1
+    assert "Open the latest logs for degraded-secrets-monitor" in message
+    recovery = module._recovery_message("abcdef1234567890")
+    assert recovery.startswith("✅ No action needed")

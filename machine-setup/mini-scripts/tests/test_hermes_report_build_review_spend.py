@@ -169,6 +169,9 @@ def test_verdict_subject_is_human_not_metric_dump():
     assert subject == "Hermes: all clear — 3 completed · $1.25"
     assert "validator-completed" not in subject
     assert "action required" not in subject
+    verdict = report.build_verdict(scoreboard, spend, alert_summary)
+    assert verdict["summary"].startswith("No action needed")
+    assert "3 completed" in verdict["summary"]
 
 
 def test_stalled_verdict_outranks_other_signals():
@@ -195,7 +198,8 @@ def test_stalled_verdict_outranks_other_signals():
     assert model["verdict"]["level"] == "stalled"
     assert model["subject"].startswith("Hermes: stalled")
     assert "ready=5 completed=0" not in model["headline"]
-    assert "Ready work isn't moving" in model["verdict"]["summary"]
+    assert "Action needed" in model["verdict"]["summary"]
+    assert "stalled" in model["verdict"]["summary"].lower()
     text = report.build_text_view(model)
     assert "NEEDS YOU" in text
     assert "SYSTEM" in text
@@ -203,7 +207,7 @@ def test_stalled_verdict_outranks_other_signals():
     assert "validator-completed" not in text
     assert "WORTH WATCHING" not in text
     html = report.render_html_view(model)
-    assert "Ready work isn" in html
+    assert "Action needed" in html
     assert "At a glance" in html
     assert "Needs you" in html
 

@@ -686,12 +686,16 @@ def build_verdict(scoreboard, spend, alert_summary, header=None):
     signal_n = alert_summary.get("system_signals", 0)
     review_n = alert_summary.get("review_backlog", 0)
     in_review = scoreboard.get("in_review", 0)
+    ready = scoreboard.get("ready", 0)
 
     if stop_verdict == "STALLED":
         return {
             "level": "stalled",
             "label": "Stalled",
-            "summary": humanize_work_stoppage(raw_stop),
+            "summary": (
+                "Action needed: Hermes looks stalled — check executor claims and why "
+                f"ready work isn't completing ({ready} ready, {completed} completed this window)."
+            ),
             "subject": "Hermes: stalled — ready work isn't moving",
         }
     if review_n:
@@ -699,7 +703,10 @@ def build_verdict(scoreboard, spend, alert_summary, header=None):
         return {
             "level": "alert",
             "label": "Review backlog",
-            "summary": f"{count} tasks are waiting on review (over the alert threshold).",
+            "summary": (
+                f"Action needed: clear the ClickUp review backlog — {count} tasks waiting "
+                "(over the alert threshold)."
+            ),
             "subject": f"Hermes: review backlog — {count} waiting",
         }
     if action_n:
@@ -707,18 +714,22 @@ def build_verdict(scoreboard, spend, alert_summary, header=None):
         return {
             "level": "attention",
             "label": "Needs you",
-            "summary": f"{action_n} blocked {noun} waiting on a human decision.",
+            "summary": (
+                f"Action needed: unblock {action_n} blocked {noun} in ClickUp "
+                "(details below)."
+            ),
             "subject": f"Hermes: needs you — {action_n} blocked",
         }
     if stop_verdict == "UNKNOWN" or signal_n:
+        detail = (
+            humanize_work_stoppage(raw_stop)
+            if stop_verdict == "UNKNOWN"
+            else f"{signal_n} system signal{'s' if signal_n != 1 else ''} need a look."
+        )
         return {
             "level": "attention",
             "label": "Check signals",
-            "summary": (
-                humanize_work_stoppage(raw_stop)
-                if stop_verdict == "UNKNOWN"
-                else f"{signal_n} system signal{'s' if signal_n != 1 else ''} need a look."
-            ),
+            "summary": f"Action needed: {detail[0].lower() + detail[1:] if detail else 'check system signals.'}",
             "subject": "Hermes: check signals",
         }
     if watch_n:
@@ -726,13 +737,19 @@ def build_verdict(scoreboard, spend, alert_summary, header=None):
         return {
             "level": "watch",
             "label": "Worth watching",
-            "summary": f"{watch_n} in-progress {noun} went quiet for 2h+.",
+            "summary": (
+                f"No urgent action — {watch_n} in-progress {noun} went quiet for 2h+ "
+                f"({completed} completed this window)."
+            ),
             "subject": f"Hermes: watching — {watch_n} quiet {noun}",
         }
     return {
         "level": "ok",
         "label": "All clear",
-        "summary": f"{completed} completed this window · {spend_bit} writer spend · {scoreboard.get('ready', 0)} ready.",
+        "summary": (
+            f"No action needed — {completed} completed this window, "
+            f"{spend_bit} writer spend, {ready} ready."
+        ),
         "subject": f"Hermes: all clear — {completed} completed · {spend_bit}",
     }
 

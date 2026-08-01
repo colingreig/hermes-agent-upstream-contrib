@@ -123,13 +123,223 @@ def _age_seconds(path: Path, now: datetime) -> float:
     return max(0.0, now.timestamp() - path.stat().st_mtime)
 
 
-def _finding(surface: str, identifier: str, code: str, detail: str) -> dict[str, str]:
-    return {
+def _finding(surface: str, identifier: str, code: str, detail: str, *, name: str | None = None) -> dict[str, str]:
+    out = {
         "surface": surface,
         "id": identifier,
         "code": code,
         "detail": detail,
     }
+    if name:
+        out["name"] = name
+    return out
+
+
+_CODE_PRIORITY = {
+    "failure_marker": 10,
+    "run_incomplete": 20,
+    "success_marker_missing": 30,
+    "required_marker_missing": 35,
+    "scheduler_not_ok": 40,
+    "last_run_stale": 45,
+    "evidence_stale": 45,
+    "output_missing": 50,
+    "evidence_missing": 50,
+    "uncovered_enabled_job": 60,
+    "declared_job_missing": 65,
+    "uncovered_plist": 70,
+    "agent_not_loaded": 75,
+}
+
+
+_CODE_HUMAN = {
+    "failure_marker": "is failing",
+    "success_marker_missing": "didn't record a clean success",
+    "required_marker_missing": "is missing a required success marker",
+    "run_incomplete": "didn't finish cleanly",
+    "run_boundary_missing": "has no completed-run marker",
+    "uncovered_enabled_job": "is enabled with no outcome contract",
+    "declared_job_missing": "is in contracts but missing from the live scheduler",
+    "uncovered_plist": "LaunchAgent is present but not contracted",
+    "agent_not_loaded": "LaunchAgent isn't loaded",
+    "active_plist_missing": "LaunchAgent plist is missing",
+    "retired_agent_loaded": "retired LaunchAgent is still loaded",
+    "retired_plist_present": "retired LaunchAgent plist is still installed",
+    "scheduler_not_ok": "last scheduler status wasn't ok",
+    "last_run_missing": "has no valid last-run timestamp",
+    "last_run_stale": "hasn't run within its allowed age",
+    "last_run_future": "has a last-run timestamp in the future",
+    "output_missing": "has no cron output to prove the run",
+    "evidence_missing": "evidence file is missing",
+    "evidence_stale": "evidence is stale",
+    "evidence_unreadable": "evidence couldn't be read",
+    "name_drift": "live name doesn't match the contract",
+    "enabled_state_drift": "enabled state doesn't match the contract",
+    "endpoint_failed": "health endpoint failed",
+    "http_status": "health endpoint returned a bad status",
+    "http_semantic_failure": "health endpoint reported failure",
+}
+
+
+def _short_launchd_name(label: str) -> str:
+    prefix = "com.colingreig.hermes."
+    if label.startswith(prefix):
+        return label[len(prefix) :]
+    return label
+
+
+def _display_name(item: dict[str, str]) -> str:
+    if item.get("name"):
+        return item["name"]
+    if item["code"] in {"uncovered_enabled_job", "declared_job_missing"}:
+        return item.get("detail") or item["id"]
+    if item["surface"] == "launchd":
+        return _short_launchd_name(item["id"])
+    return item["id"]
+
+
+def _human_issue(item: dict[str, str]) -> str:
+    return _CODE_HUMAN.get(item["code"], item["code"].replace("_", " "))
+
+
+def _attach_display_names(
+    findings: list[dict[str, str]],
+    contracts: dict[str, Any],
+) -> list[dict[str, str]]:
+    cron_names = {
+        str(contract["id"]): str(contract.get("name") or contract["id"])
+        for contract in (contracts.get("cron_jobs") or [])
+        if isinstance(contract, dict) and contract.get("id")
+    }
+    for item in findings:
+        if item.get("name"):
+            continue
+        if item["surface"] == "cron":
+            if item["code"] in {"uncovered_enabled_job", "declared_job_missing"}:
+                item["name"] = item.get("detail") or item["id"]
+            else:
+                item["name"] = cron_names.get(item["id"], item["id"])
+        else:
+            item["name"] = _short_launchd_name(item["id"])
+    return findings
+
+
+def _group_findings(findings: list[dict[str, str]]) -> list[tuple[str, list[dict[str, str]]]]:
+    """Group findings by job, ordered by worst issue then name."""
+    buckets: dict[tuple[str, str], list[dict[str, str]]] = {}
+    for item in findings:
+        key = (item["surface"], item["id"])
+        buckets.setdefault(key, []).append(item)
+
+    def sort_key(pair: tuple[tuple[str, str], list[dict[str, str]]]):
+        items = pair[1]
+        worst = min(_CODE_PRIORITY.get(i["code"], 200) for i in items)
+        return (worst, _display_name(items[0]).lower())
+
+    grouped: list[tuple[str, list[dict[str, str]]]] = []
+    for _, items in sorted(buckets.items(), key=sort_key):
+        items_sorted = sorted(items, key=lambda i: _CODE_PRIORITY.get(i["code"], 200))
+        grouped.append((_display_name(items_sorted[0]), items_sorted))
+    return grouped
+
+
+def _primary_issue(items: list[dict[str, str]]) -> str:
+    return _human_issue(items[0])
+
+
+def _summary_sentence(grouped: list[tuple[str, list[dict[str, str]]]]) -> str:
+    n = len(grouped)
+    if n == 0:
+        return "No action needed — all declared fleet outcomes look healthy."
+    if n == 1:
+        name, items = grouped[0]
+        return f"Action needed: {name} {_primary_issue(items)}."
+    names = [name for name, _ in grouped[:3]]
+    if n > 3:
+        names.append(f"+{n - 3} more")
+    return f"Action needed: {n} jobs aren't proving healthy — {', '.join(names)}."
+
+
+def _next_step_for(grouped: list[tuple[str, list[dict[str, str]]]]) -> str:
+    codes = {item["code"] for _, items in grouped for item in items}
+
+    def names_with(*wanted: str) -> str:
+        matched = [
+            name
+            for name, items in grouped
+            if any(item["code"] in wanted for item in items)
+        ]
+        if not matched:
+            return "the failed jobs"
+        if len(matched) == 1:
+            return matched[0]
+        if len(matched) == 2:
+            return f"{matched[0]} and {matched[1]}"
+        return f"{matched[0]}, {matched[1]}, and {len(matched) - 2} more"
+
+    if codes & {"failure_marker", "success_marker_missing", "run_incomplete", "required_marker_missing"}:
+        return (
+            f"Open the latest logs for {names_with('failure_marker', 'success_marker_missing', 'run_incomplete', 'required_marker_missing')}, "
+            "fix the failure, and confirm the next run records success."
+        )
+    if codes & {"agent_not_loaded", "active_plist_missing", "retired_agent_loaded", "retired_plist_present"}:
+        return (
+            f"Fix LaunchAgent state for {names_with('agent_not_loaded', 'active_plist_missing', 'retired_agent_loaded', 'retired_plist_present')} "
+            "(`launchctl print` / plist install)."
+        )
+    if "uncovered_enabled_job" in codes:
+        return (
+            f"Add an outcome contract for {names_with('uncovered_enabled_job')}, "
+            "or disable the job if it shouldn't run."
+        )
+    if "declared_job_missing" in codes:
+        return (
+            f"Restore {names_with('declared_job_missing')} in the live scheduler, "
+            "or remove it from fleet_outcome_contracts.json."
+        )
+    names = [name for name, _ in grouped[:2]]
+    name_bit = ", ".join(names) if names else "the failed jobs"
+    return f"Inspect {name_bit} in ~/.hermes/state/fleet-outcome-probe.json and repair the failed outcome."
+
+
+def _alert_fact_lines(grouped: list[tuple[str, list[dict[str, str]]]]) -> list[str]:
+    """One bullet per job — collapse multiple codes into one readable line."""
+    facts: list[str] = []
+    for name, items in grouped[:12]:
+        issues = []
+        seen = set()
+        for item in items:
+            phrase = _human_issue(item)
+            if phrase not in seen:
+                seen.add(phrase)
+                issues.append(phrase)
+        # Prefer the primary issue; mention a second only if distinct and useful
+        if len(issues) == 1:
+            facts.append(f"{name}: {issues[0]}")
+        else:
+            facts.append(f"{name}: {issues[0]} (also {'; '.join(issues[1:3])})")
+    if len(grouped) > 12:
+        facts.append(f"+{len(grouped) - 12} more jobs in the probe receipt")
+    return facts
+
+
+def _alert_message(findings: list[dict[str, str]], *, drill: bool) -> str:
+    grouped = _group_findings(findings)
+    prefix = "SYNTHETIC DRILL — " if drill else ""
+    headline = f"{prefix}{_summary_sentence(grouped)}"
+    lines = [f"🚨 {headline}"]
+    for fact in _alert_fact_lines(grouped):
+        lines.append(f"• {fact}")
+    lines.append(f"Next: {_next_step_for(grouped)}")
+    return "\n".join(lines)
+
+
+def _recovery_message(previous_signature: str) -> str:
+    return (
+        "✅ No action needed — fleet outcome coverage recovered.\n"
+        "All declared cron and LaunchAgent contracts are proving healthy again.\n"
+        f"Cleared alert {previous_signature[:12]}"
+    )
 
 
 def _patterns_match(text: str, patterns: list[str]) -> bool:
@@ -780,34 +990,13 @@ def evaluate(
         launchctl=launchctl,
         loaded_inventory=launch_inventory(),
     )
-    return cron_findings + launch_findings, cron_evidence + launch_evidence
+    findings = _attach_display_names(cron_findings + launch_findings, contracts)
+    return findings, cron_evidence + launch_evidence
 
 
 def _signature(findings: list[dict[str, str]]) -> str:
     keys = sorted(f"{item['surface']}:{item['id']}:{item['code']}" for item in findings)
     return hashlib.sha256("\n".join(keys).encode("utf-8")).hexdigest()
-
-
-def _alert_message(findings: list[dict[str, str]], *, drill: bool) -> str:
-    prefix = "SYNTHETIC DRILL — " if drill else ""
-    lines = [
-        f"🚨 {prefix}Hermes fleet outcome coverage alarm",
-        f"{len(findings)} contract failure(s); every listed job lacks current outcome proof.",
-    ]
-    for item in findings[:40]:
-        lines.append(f"• {item['surface']} {item['id']} [{item['code']}]: {item['detail']}")
-    if len(findings) > 40:
-        lines.append(f"• … {len(findings) - 40} additional finding(s) in the probe receipt")
-    lines.append("Next: inspect ~/.hermes/state/fleet-outcome-probe.json and repair the failed outcome.")
-    return "\n".join(lines)
-
-
-def _recovery_message(previous_signature: str) -> str:
-    return (
-        "✅ Hermes fleet outcome coverage recovered\n"
-        "All declared cron and LaunchAgent outcome contracts are currently satisfied.\n"
-        f"Previous signature: {previous_signature[:12]}"
-    )
 
 
 def _send_slack(message: str) -> subprocess.CompletedProcess[str]:
@@ -931,6 +1120,7 @@ def _inject_contract_failures(
                 raise ProbeError(f"drill could not trip cron contract {job_id}")
             selected = dict(matching[0])
             selected["detail"] = f"SYNTHETIC DRILL: {selected['detail']}"
+            selected["name"] = str(contract["name"])
             injected.append(selected)
 
         for contract in contracts["launch_agents"]:
@@ -958,6 +1148,7 @@ def _inject_contract_failures(
                 raise ProbeError(f"drill could not trip LaunchAgent contract {label}")
             selected = dict(matching[0])
             selected["detail"] = f"SYNTHETIC DRILL: {selected['detail']}"
+            selected["name"] = _short_launchd_name(label)
             injected.append(selected)
     return injected
 

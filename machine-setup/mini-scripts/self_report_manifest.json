@@ -22,7 +22,7 @@
       "src_rel": "hermes_report_build.py",
       "src_base": "mirror",
       "dest_abs": "~/.hermes/scripts/hermes_report_build.py",
-      "sha256": "43a1b3e70e18aed32a188b48ad523b1956cf5f930a83aa473b6e5e41e37163eb",
+      "sha256": "b2447dbd4dd6fe016a17a412bef2082cd7835e3f564d8d20c97da7fcfb5d11db",
       "role": "human-first report builder (HTML+text+subject+JSON); imports hermes_report_build_v1lib + claim_store; owns team-wide ClickUp review queue and separated spend labels",
       "deploy_mode": "script"
     },
