@@ -2,7 +2,7 @@
   "bundle": "hermes-self-report",
   "source_task": "86e2gczqw",
   "generated": "2026-07-28",
-  "description": "Declared deploy bundle for the hermes-self-report cron. This file IS the bundle the installer copies; nothing outside its 'files' list is written. Canon bytes are the live mini copies (RC4) plus ClickUp 86e2gczqw review-queue/spend/alert updates in this deploy mirror. SKILL.md is authored in Brain and installed only with --include-skill --brain-path.",
+  "description": "Declared deploy bundle for the hermes-self-report digest. Canon bytes live in this deploy mirror. Production cron is no_agent hermes_self_report_run.py (build+probe+send). SKILL.md is Brain-authored debug docs only, installed with --include-skill --brain-path.",
   "coexist_required": [
     {
       "dest_abs": "~/.hermes/scripts/claim_store.py",
@@ -18,6 +18,14 @@
     }
   ],
   "files": [
+    {
+      "src_rel": "hermes_self_report_run.py",
+      "src_base": "mirror",
+      "dest_abs": "~/.hermes/scripts/hermes_self_report_run.py",
+      "sha256": "a3c4f29442195c107bd9e0740a1c59d375175f6d1c824f4123ea806bcf92416d",
+      "role": "no_agent fleet-health-digest entrypoint: hermes_report_build + probe fold-in + postmark_send; never LLM-composed",
+      "deploy_mode": "script"
+    },
     {
       "src_rel": "hermes_report_build.py",
       "src_base": "mirror",
@@ -70,8 +78,8 @@
       "src_rel": "hermes/skills/hermes-self-report/SKILL.md",
       "src_base": "brain",
       "dest_abs": "~/.hermes/skills/hermes-self-report/SKILL.md",
-      "sha256": "f251b3c0825704a02eb235b2ba70853b7b31759a5a71d6837d6da9cff4696efc",
-      "role": "authored cron contract (Brain source of truth); installed only with --include-skill --brain-path <brain checkout>",
+      "sha256": "a6fc6cb719bb19c07a5d5cddf5aa223d1a8ceb11a7df483fa973b040e0d72a9d",
+      "role": "debug/manual skill docs only; production digest is no_agent hermes_self_report_run.py. Installed only with --include-skill --brain-path",
       "deploy_mode": "skill"
     }
   ]

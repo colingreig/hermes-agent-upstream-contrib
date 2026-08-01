@@ -46,7 +46,7 @@ two scheduling planes therefore cross-watch rather than self-monitor.
 | `2ff001bea4b5` | clickup-closeout-actor | enabled | fresh PR and DB closeout count documents | error, failed flip, missing/stale counts |
 | `6139465f559f` | Purelymail notify-me poller | enabled | fresh poll/cursor/semantic-silent document | IMAP/SMTP failure or stale/missing poll |
 | `777876d3eb16` | clickup-lifecycle | enabled | fresh non-empty lifecycle response | empty/failed/stale lifecycle pass |
-| `f23a03e9d1b2` | fleet-health-digest | enabled | fresh parsed delivery receipt with `status=sent` | missing/stale/failed delivery |
+| `f23a03e9d1b2` | fleet-health-digest | enabled | fresh parsed delivery receipt with `status=sent` (no_agent `hermes_self_report_run.py`) | missing/stale/failed delivery |
 | `59bdd8ebc468` | repo-maintenance | enabled | fresh non-empty maintenance response | empty/failed/stale maintenance pass |
 
 ## LaunchAgent fleet: 18 active + 1 retired

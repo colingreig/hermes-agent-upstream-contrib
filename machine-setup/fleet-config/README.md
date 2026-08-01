@@ -187,7 +187,8 @@ failure).
 
 - **3 new consolidated jobs**: `clickup-lifecycle` (every 30m; folds
   clickup-closeout-audit + clickup-stalled-reconciler + clickup-reconciler +
-  staleness-sweep), `fleet-health-digest` (every 6h; folds hermes-self-report
+  staleness-sweep), `fleet-health-digest` (every 6h; no_agent `hermes_self_report_run.py`
+  builds+sends the status email via Postmark — never LLM-composed),
   + delivery-probe + skill-size-monitor + model-deprecation-check +
   supabase-rls-guard + hermes-usage-alert), `repo-maintenance` (daily 04:00;
   folds repo-worktree-gc + cleanup-hermes-baks + orphan-unpushed-monitor).
