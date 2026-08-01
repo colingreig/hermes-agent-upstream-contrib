@@ -34,13 +34,20 @@ matches all three policy-pinned provenance fields: `install_path`, `source`,
 and `identifier`. A same-name directory or same-path lock entry from any other
 hub source fails closed.
 
+The default home's obsolete `sentry-monitor` skill path is also archived. Its
+`SKILL.md` may be a symlink into `~/.hermes/repos/ignite-sentinel`; moving the
+wrapper directory preserves that link in the recoverable archive and does not
+move or modify the operational Ignite Sentinel checkout or its launchd jobs.
+
 An installer failure restores moved skills and metadata automatically. For a
 later operator-directed recovery, copy the desired archived directory back to
 its original relative path under that profile's `skills/` directory, remove
 the skill's line from `.curator_suppressed` when restoring a bundled skill,
 and run `hermes skills sync` for that profile. Restoring the local
 `vehicle-image-qc` shadow is normally wrong: the canonical Ignite external
-skill should remain the only resolver winner.
+skill should remain the only resolver winner. Restoring the old
+`sentry-monitor` wrapper is likewise unnecessary while Ignite Sentinel remains
+operational through its governed repository and launchd paths.
 
 Never recover this policy by adding `.no-bundled-skills`, copying the Ignite
 tree into a profile, or deleting the governed archives.

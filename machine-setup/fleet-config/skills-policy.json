@@ -88,7 +88,8 @@
   },
   "local_remove": {
     "clickup-queue-poller-merged-before-claim": "autonomous-ai-agents/clickup-queue-poller-merged-before-claim",
-    "clickup-task-capture": "operations/clickup-task-capture"
+    "clickup-task-capture": "operations/clickup-task-capture",
+    "sentry-monitor": "sentry-monitor"
   },
   "local_reference_consolidations": [
     {

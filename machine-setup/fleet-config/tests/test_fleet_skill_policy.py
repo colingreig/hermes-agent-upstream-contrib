@@ -34,6 +34,12 @@ def _seed_home(tmp_path: Path, policy: dict) -> tuple[Path, Path]:
     home = tmp_path / "home"
     external = tmp_path / "ignite-skills" / "vehicle-image-qc"
     _write_skill(external, "vehicle-image-qc")
+    sentry_repo_skill = home / ".hermes" / "repos" / "ignite-sentinel" / "hermes" / "SKILL.md"
+    sentry_repo_skill.parent.mkdir(parents=True, exist_ok=True)
+    sentry_repo_skill.write_text(
+        "---\nname: sentry-monitor\n---\noperational monitor wrapper\n",
+        encoding="utf-8",
+    )
 
     all_bundled = {**policy["bundled"]["remove"], **policy["bundled"]["keep"]}
     for profile in install_mod.SKILL_POLICY_PROFILES:
@@ -47,7 +53,12 @@ def _seed_home(tmp_path: Path, policy: dict) -> tuple[Path, Path]:
 
     default_skills = home / ".hermes" / "skills"
     for name, rel in {**policy["local_remove"], **policy["required_local_keep"]}.items():
-        _write_skill(default_skills / rel, name)
+        path = default_skills / rel
+        if name == "sentry-monitor":
+            path.mkdir(parents=True, exist_ok=True)
+            (path / "SKILL.md").symlink_to(sentry_repo_skill)
+        else:
+            _write_skill(path, name)
     for index, row in enumerate(policy["local_reference_consolidations"]):
         data = f"historical reference fixture {index}\n".encode("utf-8")
         row["source_sha256"] = hashlib.sha256(data).hexdigest()
@@ -90,6 +101,17 @@ def test_policy_exactly_classifies_current_bundled_catalog():
     assert set(remove) | set(keep) == {
         install_mod._frontmatter_name(path)
         for path in policy["_source_root"].rglob("SKILL.md")
+    }
+    assert policy["local_remove"] == {
+        "clickup-queue-poller-merged-before-claim": (
+            "autonomous-ai-agents/clickup-queue-poller-merged-before-claim"
+        ),
+        "clickup-task-capture": "operations/clickup-task-capture",
+        "sentry-monitor": "sentry-monitor",
+    }
+    assert policy["required_local_keep"] == {
+        "clickup-queue-poller": "clickup-queue-poller",
+        "hermes-self-report": "hermes-self-report",
     }
     assert policy["profiles"]["default"]["expected_active_manifests"] == 23
     assert policy["profiles"]["coder"]["expected_active_manifests"] == 21
@@ -137,9 +159,27 @@ def test_policy_apply_is_recoverable_idempotent_and_keeps_external_skill(tmp_pat
         assert not (action["home"] / ".no-bundled-skills").exists()
 
     default_skills = destination_root / "skills"
+    sentry_repo_skill = destination_root / "repos" / "ignite-sentinel" / "hermes" / "SKILL.md"
+    sentry_repo_sha = install_mod._sha256(sentry_repo_skill)
     assert (default_skills / "clickup-queue-poller" / "SKILL.md").is_file()
     assert (default_skills / "hermes-self-report" / "SKILL.md").is_file()
     assert not (default_skills / policy["local_remove"]["clickup-task-capture"]).exists()
+    assert not (default_skills / policy["local_remove"]["sentry-monitor"]).exists()
+    sentry_archive = (
+        destination_root
+        / "archives"
+        / "fleet-skill-policy"
+        / policy["policy_id"]
+        / "20260801T120000Z"
+        / "default"
+        / "local"
+        / "sentry-monitor"
+        / "SKILL.md"
+    )
+    assert sentry_archive.is_symlink()
+    assert sentry_archive.readlink() == sentry_repo_skill
+    assert sentry_repo_skill.is_file(), "ignite-sentinel operational monitor must remain installed"
+    assert install_mod._sha256(sentry_repo_skill) == sentry_repo_sha
     vehicle_path = policy["hub_shadow_remove"]["vehicle-image-qc"]["install_path"]
     assert not (default_skills / vehicle_path).exists()
     for row in policy["local_reference_consolidations"]:
@@ -153,7 +193,14 @@ def test_policy_apply_is_recoverable_idempotent_and_keeps_external_skill(tmp_pat
     assert "vehicle-image-qc" not in lock["installed"]
     assert (external / "SKILL.md").is_file(), "canonical external skill must be untouched"
     assert len([step for step in steps if step["step"] == "skill_policy_backup"]) == 6
-    assert len([step for step in steps if step["step"] == "skill_policy_archive"]) == 211
+    assert len([step for step in steps if step["step"] == "skill_policy_archive"]) == 212
+    sentry_step = next(
+        step
+        for step in steps
+        if step["step"] == "skill_policy_archive" and step["name"] == "sentry-monitor"
+    )
+    assert sentry_step["kind"] == "local"
+    assert Path(sentry_step["archive_dest"]) == sentry_archive.parent
     consolidations = [
         step for step in steps if step["step"] == "skill_policy_reference_consolidation"
     ]
@@ -176,13 +223,21 @@ def test_policy_apply_is_recoverable_idempotent_and_keeps_external_skill(tmp_pat
         receipt_steps=second_steps,
     )
     assert second_steps == []
+    assert sentry_archive.is_symlink()
+    assert sentry_repo_skill.is_file()
+    assert install_mod._sha256(sentry_repo_skill) == sentry_repo_sha
 
     # Installer rollback restores all active skills and hub/suppression metadata.
     install_mod._rollback(steps)
-    assert len(install_mod._active_skill_manifests(default_skills)) == 78
+    assert len(install_mod._active_skill_manifests(default_skills)) == 79
     restored_lock = json.loads((default_skills / ".hub" / "lock.json").read_text(encoding="utf-8"))
     assert "vehicle-image-qc" in restored_lock["installed"]
     assert install_mod._read_suppressed(default_skills / ".curator_suppressed") == {"legacy-suppression"}
+    restored_sentry = default_skills / policy["local_remove"]["sentry-monitor"] / "SKILL.md"
+    assert restored_sentry.is_symlink()
+    assert restored_sentry.readlink() == sentry_repo_skill
+    assert sentry_repo_skill.is_file()
+    assert install_mod._sha256(sentry_repo_skill) == sentry_repo_sha
     for row in policy["local_reference_consolidations"]:
         source = (
             default_skills
@@ -220,7 +275,7 @@ def test_policy_dry_run_reports_plan_without_mutation(tmp_path, capsys, monkeypa
     assert not (home / ".hermes" / "config.yaml").exists()
     assert not (home / ".hermes" / "cron" / "jobs.json").exists()
     out = capsys.readouterr().out
-    assert "default: archive 55, consolidate 2, suppress +52, active 78 -> 23" in out
+    assert "default: archive 56, consolidate 2, suppress +52, active 79 -> 23" in out
     assert "design: archive 0, consolidate 0, suppress +73, active 0 -> 0" in out
     assert "broad .no-bundled-skills marker: untouched" in out
 
