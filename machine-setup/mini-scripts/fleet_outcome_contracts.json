@@ -169,18 +169,6 @@
       }
     },
     {
-      "id": "6139465f559f",
-      "name": "Purelymail notify-me poller",
-      "enabled": true,
-      "max_age_seconds": 3600,
-      "outcome": {
-        "kind": "cron_output",
-        "max_age_seconds": 3600,
-        "success_patterns": ["Status:\\*\\* silent", "purelymail", "messages", "notified", "cursor"],
-        "failure_patterns": ["\\(FAILED\\)", "Status: .*failed", "Traceback", "IMAP.*(?:fail|error)", "SMTP.*(?:fail|error)"]
-      }
-    },
-    {
       "id": "777876d3eb16",
       "name": "clickup-lifecycle",
       "enabled": true,

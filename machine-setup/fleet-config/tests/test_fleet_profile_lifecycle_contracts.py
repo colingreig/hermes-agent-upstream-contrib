@@ -10,7 +10,16 @@ from pathlib import Path
 FLEET_CONFIG_ROOT = Path(__file__).resolve().parents[1]
 MANIFEST_PATH = FLEET_CONFIG_ROOT / "fleet_config_manifest.json"
 JOBS_PATH = FLEET_CONFIG_ROOT / "jobs.json"
+OUTCOME_CONTRACTS_PATH = (
+    FLEET_CONFIG_ROOT.parent / "mini-scripts" / "fleet_outcome_contracts.json"
+)
+COVERAGE_PATH = FLEET_CONFIG_ROOT / "MONITOR_COVERAGE.md"
 PROFILES = ("coder", "content", "design", "research", "ops")
+RETIRED_POLLER_MARKERS = (
+    "6139465f559f",
+    "Purelymail notify-me poller",
+    "purelymail-notify-poller.py",
+)
 
 
 def _load_manifest() -> dict:
@@ -115,6 +124,21 @@ def test_pr_validator_uses_only_the_canonical_ignite_root():
     ):
         assert home_local_root not in prompt
     assert "Do not probe, copy, symlink, or fall back" in prompt
+
+
+def test_retired_purelymail_poller_is_absent_from_fleet_surfaces():
+    surfaces = {
+        "fleet jobs": json.dumps(json.loads(JOBS_PATH.read_text(encoding="utf-8"))),
+        "outcome contracts": json.dumps(
+            json.loads(OUTCOME_CONTRACTS_PATH.read_text(encoding="utf-8"))
+        ),
+        "monitor coverage": COVERAGE_PATH.read_text(encoding="utf-8"),
+    }
+
+    for surface, content in surfaces.items():
+        normalized = content.casefold()
+        for marker in RETIRED_POLLER_MARKERS:
+            assert marker.casefold() not in normalized, f"{marker!r} returned in {surface}"
 
 
 def test_all_souls_are_direct_profile_personas():

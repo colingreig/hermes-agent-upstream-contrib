@@ -2,7 +2,7 @@
 """Verify real outcomes for the rebuilt Mini cron and LaunchAgent fleet.
 
 This monitor intentionally runs outside Hermes cron.  It validates the
-source-controlled contract inventory against the live 16-job jobs.json, then
+source-controlled contract inventory against the live 15-job jobs.json, then
 checks two independent signals for each enabled cron job:
 
 * the scheduler's persisted status/cadence; and

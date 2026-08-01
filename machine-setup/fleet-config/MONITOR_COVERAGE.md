@@ -28,7 +28,7 @@ state. It does not change live cron or launchd state. The five-minute
 while the probe verifies CI health's semantic `"health": "OK"` result. These
 two scheduling planes therefore cross-watch rather than self-monitor.
 
-## Cron fleet: 16/16 declared
+## Cron fleet: 15/15 declared
 
 | ID | Job | Expected | Outcome proof (not exit-only) | Alarm condition |
 |---|---|---:|---|---|
@@ -44,7 +44,6 @@ two scheduling planes therefore cross-watch rather than self-monitor.
 | `dd73a5e578e4` | reap-stranded-claims | enabled | fresh claim/reap result document | error, missing, or stale result |
 | `542fca8d839f` | ignite-board-sync | enabled | fresh sync/complete result document | failed/missing/stale sync |
 | `2ff001bea4b5` | clickup-closeout-actor | enabled | fresh PR and DB closeout count documents | error, failed flip, missing/stale counts |
-| `6139465f559f` | Purelymail notify-me poller | enabled | fresh poll/cursor/semantic-silent document | IMAP/SMTP failure or stale/missing poll |
 | `777876d3eb16` | clickup-lifecycle | enabled | fresh non-empty lifecycle response | empty/failed/stale lifecycle pass |
 | `f23a03e9d1b2` | fleet-health-digest | enabled | fresh parsed delivery receipt with `status=sent` | missing/stale/failed delivery |
 | `59bdd8ebc468` | repo-maintenance | enabled | fresh non-empty maintenance response | empty/failed/stale maintenance pass |
