@@ -2649,9 +2649,14 @@ class TestRunJobConfigEnvVarExpansion:
             / "jobs.json"
         )
         jobs = json.loads(jobs_path.read_text(encoding="utf-8"))["jobs"]
-        job = next(
-            item for item in jobs if item["name"] == "content-lane-executor"
+        job = dict(
+            next(
+                item
+                for item in jobs
+                if item["name"] == "content-lane-executor"
+            )
         )
+        job["workdir"] = str(tmp_path)
         (tmp_path / "config.yaml").write_text(
             "model:\n"
             "  provider: openai-codex\n"
@@ -2744,9 +2749,14 @@ class TestRunJobConfigEnvVarExpansion:
             / "jobs.json"
         )
         jobs = json.loads(jobs_path.read_text(encoding="utf-8"))["jobs"]
-        job = next(
-            item for item in jobs if item["name"] == "content-lane-executor"
+        job = dict(
+            next(
+                item
+                for item in jobs
+                if item["name"] == "content-lane-executor"
+            )
         )
+        job["workdir"] = str(tmp_path)
         (tmp_path / "config.yaml").write_text(
             "model:\n"
             "  provider: openai-codex\n"
