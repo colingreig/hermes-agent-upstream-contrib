@@ -270,24 +270,28 @@ its snapshot.
 ## Rollback
 
 Every run writes timestamped snapshots to
-`~/.hermes/logs/fleet-config-installs/<UTC-ts>/` (a copy of the manifest
+`~/.hermes/logs/fleet-config-installs/<UTC-ts>[-NN]/` (a copy of the manifest
 plus every destination's pre-install snapshot) and drops a
-`<dest>.bak-fleet-config[-<detail>]-install-<UTC-ts>` sibling next to each
+`<dest>.bak-fleet-config[-<detail>]-install-<receipt-id>` sibling next to each
 destination file it touched. To roll back by hand:
 
 ```bash
-cp ~/.hermes/config.yaml.bak-fleet-config-install-<ts>              ~/.hermes/config.yaml
-cp ~/.hermes/cron/jobs.json.bak-fleet-config-jobs-install-<ts>      ~/.hermes/cron/jobs.json
-cp ~/.hermes/profiles/<name>/config.yaml.bak-fleet-config-profile-<name>-install-<ts> \
+cp ~/.hermes/config.yaml.bak-fleet-config-install-<receipt-id>              ~/.hermes/config.yaml
+cp ~/.hermes/cron/jobs.json.bak-fleet-config-jobs-install-<receipt-id>      ~/.hermes/cron/jobs.json
+cp ~/.hermes/profiles/<name>/config.yaml.bak-fleet-config-profile-<name>-install-<receipt-id> \
    ~/.hermes/profiles/<name>/config.yaml
 ```
 
 The full receipt (`install-receipt.json` in the same snapshot dir) records
 every destination touched, its snapshot path, and the exact diff applied —
-use it to find the right timestamp/paths rather than guessing.
+use its directory name as the `<receipt-id>` rather than guessing. The first
+install in a UTC second uses the bare timestamp; a sequential same-second run
+uses `-01`, then `-02`, and so on, so it never overwrites an earlier sibling
+backup.
 
 The installer also discovers only root-level legacy siblings matching
-`~/.hermes/config.yaml.bak-fleet-config-install-<YYYYMMDDTHHMMSSZ>` and
+`~/.hermes/config.yaml.bak-fleet-config-install-<YYYYMMDDTHHMMSSZ>` with an
+optional collision suffix such as `-01`, and
 normalizes those regular files to mode `0600`. Dry-run reports every planned
 mode transition. The receipt journals each file's exact prior mode and inode,
 and an interrupted install restores that mode during rollback. Re-running is

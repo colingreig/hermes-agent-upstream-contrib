@@ -411,6 +411,39 @@ def test_policy_refuses_local_vehicle_skill_without_matching_hub_provenance(tmp_
         install_mod.build_skill_policy_plan(policy, home=home)
 
 
+def test_policy_refuses_symlinked_local_skill_manifest_except_sentry_wrapper(tmp_path):
+    policy = _load_policy()
+    home, _external = _seed_home(tmp_path, policy)
+    skill_dir = (
+        home
+        / ".hermes"
+        / "skills"
+        / policy["local_remove"]["clickup-task-capture"]
+    )
+    manifest = skill_dir / "SKILL.md"
+    manifest.unlink()
+    outside_manifest = tmp_path / "outside-skill.md"
+    outside_manifest.write_text(
+        "---\nname: clickup-task-capture\n---\noutside\n",
+        encoding="utf-8",
+    )
+    manifest.symlink_to(outside_manifest)
+
+    with pytest.raises(install_mod.InstallError, match="symlinked manifest"):
+        install_mod.build_skill_policy_plan(policy, home=home)
+
+    # The separately governed Sentry wrapper is intentionally different: it
+    # is a recoverable wrapper around the operational Sentinel checkout.
+    sentry_manifest = (
+        home
+        / ".hermes"
+        / "skills"
+        / policy["local_remove"]["sentry-monitor"]
+        / "SKILL.md"
+    )
+    assert sentry_manifest.is_symlink()
+
+
 @pytest.mark.parametrize("field", ["source", "identifier"])
 def test_policy_refuses_vehicle_shadow_with_wrong_hub_identity(tmp_path, field):
     policy = _load_policy()

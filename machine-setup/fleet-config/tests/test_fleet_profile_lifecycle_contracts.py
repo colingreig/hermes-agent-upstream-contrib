@@ -57,6 +57,7 @@ def test_manifest_source_hashes_match():
 
 def test_manifest_pins_governed_installer_as_source_only():
     manifest = _load_manifest()
+    assert manifest["fleet_contract"] == "direct-clickup-v1"
     installer = next(entry for entry in manifest["files"] if entry["src_rel"] == "install_fleet_config.py")
     assert installer["deploy_mode"] == "installer_source"
     assert "dest_abs" not in installer
@@ -86,6 +87,15 @@ def test_clickup_executor_jobs_use_direct_paths_with_stable_scheduling():
             "kind": "cron",
         }
         assert job["schedule_display"] == "*/30 * * * *"
+
+
+def test_clickup_executor_contract_uses_direct_skills_without_kanban_routing():
+    jobs = _jobs_by_name()
+    for name in ("clickup-executor", "content-lane-executor"):
+        prompt = jobs[name]["prompt"].casefold()
+        assert "kanban" not in prompt
+        assert "swarm" not in prompt
+        assert "synthesizer" not in prompt
 
 
 def test_clickup_executor_jobs_have_no_fleet_swarm_handoff_contract():
@@ -173,3 +183,11 @@ def test_content_soul_fail_closed_model_policy():
     assert "no fallback providers, on purpose" in norm
     assert "fail the task closed" in norm
     assert "is a defect" in norm
+
+
+def test_design_profile_uses_only_sanctioned_fallbacks():
+    config = (FLEET_CONFIG_ROOT / "profiles" / "design" / "config.yaml").read_text(
+        encoding="utf-8"
+    ).casefold()
+    assert "google" not in config
+    assert "gemini" not in config
