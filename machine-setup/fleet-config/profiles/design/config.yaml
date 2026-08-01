@@ -5,5 +5,3 @@ model:
 fallback_providers:
   - provider: zai
     model: glm-4.7
-  - provider: google
-    model: gemini-2.5-flash

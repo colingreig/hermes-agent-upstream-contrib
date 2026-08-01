@@ -49,10 +49,13 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import errno
+import fcntl
 import hashlib
 import json
 import os
 import re
+import secrets
 import shutil
 import stat
 import sys
@@ -88,8 +91,11 @@ PROFILE_BOOTSTRAP_DIRS = [
 
 SKILL_POLICY_PROFILES = ("default", "coder", "content", "ops", "design", "research")
 SKILL_POLICY_CONFIG_MODE = 0o600
+FLEET_JOBS_CONTRACT = "direct-clickup-v1"
+INSTALL_LOCK_NAME = ".fleet-config-install.lock"
+TEMP_WRITE_ATTEMPTS = 64
 LEGACY_CONFIG_BACKUP_NAME_RE = re.compile(
-    r"^config\.yaml\.bak-fleet-config-install-\d{8}T\d{6}Z$"
+    r"^config\.yaml\.bak-fleet-config-install-\d{8}T\d{6}Z(?:-\d{2})?$"
 )
 
 
@@ -199,9 +205,11 @@ def _open_regular_file_no_follow(path: Path, *, expected: os.stat_result | None 
 def _discover_legacy_config_backups(destination_root: Path) -> list[dict[str, Any]]:
     """Return safe, root-level legacy config backups governed by this installer.
 
-    Only the installer's exact historical UTC-stamped sibling naming contract
-    is recognized.  Profile backups, nested files, loose prefix matches, and
-    any symlink/non-regular entry are deliberately outside this remediation.
+    Only the installer's exact UTC-stamped sibling naming contract is
+    recognized, including its collision-safe ``-NN`` suffix for repeated
+    same-second installs. Profile backups, nested files, loose prefix matches,
+    and any symlink/non-regular entry are deliberately outside this
+    remediation.
     """
     if not destination_root.is_dir():
         return []
@@ -357,6 +365,12 @@ def build_plan(manifest: dict, *, home: Path, bundle_root: Path) -> dict:
     if not plan["profiles"]:
         raise InstallError("manifest has no profile_file entries")
 
+    fleet_contract = manifest.get("fleet_contract")
+    if fleet_contract is not None and fleet_contract != FLEET_JOBS_CONTRACT:
+        raise InstallError(f"unknown fleet jobs contract {fleet_contract!r}")
+    if fleet_contract == FLEET_JOBS_CONTRACT:
+        _validate_direct_clickup_jobs(_load_jobs_payload(plan["jobs_json"]))
+
     return plan
 
 
@@ -429,6 +443,88 @@ def _print_jobs_plan(item: dict) -> None:
         print(f"  (no existing jobs.json; installing {len(new_jobs)} jobs)")
 
 
+def _load_jobs_payload(item: dict) -> dict[str, Any]:
+    """Read one bundled jobs payload and reject malformed scheduler input."""
+    try:
+        payload = json.loads(item["src"].read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise InstallError(f"bundled jobs.json is not valid JSON: {exc}") from exc
+    if not isinstance(payload, dict) or not isinstance(payload.get("jobs"), list):
+        raise InstallError("bundled jobs.json has no top-level 'jobs' list — refusing")
+    return payload
+
+
+def _validate_direct_clickup_jobs(payload: dict[str, Any]) -> None:
+    """Enforce the Mini's direct ClickUp and canonical Ignite runtime contract.
+
+    Hermes kanban remains a supported product surface.  This guard applies
+    only to the fleet bundle's two scheduled ClickUp executors, which must
+    enter their skills directly instead of starting a kanban swarm.  It also
+    keeps the validator's Ignite helpers rooted exclusively at the
+    operator-provided ``IGNITE_SKILLS_ROOT``.
+    """
+    jobs = payload["jobs"]
+    by_name: dict[str, dict[str, Any]] = {}
+    for job in jobs:
+        if not isinstance(job, dict) or not isinstance(job.get("name"), str):
+            raise InstallError("governed fleet jobs must be objects with unique names")
+        if job["name"] in by_name:
+            raise InstallError(f"governed fleet jobs has duplicate name {job['name']!r}")
+        by_name[job["name"]] = job
+
+    expected_executors = {
+        "clickup-executor": {
+            "skill": "clickup-queue-poller",
+            "skills": ["clickup-queue-poller"],
+            "skill_scope": "dev-executor",
+            "prompt": "Work the ClickUp queue now — follow the clickup-queue-poller skill.",
+        },
+        "content-lane-executor": {
+            "skill": "ignite-execute",
+            "skills": ["ignite-execute"],
+            "skill_scope": "content-executor",
+            "prompt": "/ignite-execute --lane content",
+        },
+    }
+    for name, expected in expected_executors.items():
+        job = by_name.get(name)
+        if job is None:
+            raise InstallError(f"governed fleet jobs is missing {name!r}")
+        for key, value in expected.items():
+            if job.get(key) != value:
+                raise InstallError(
+                    f"governed fleet job {name!r} must keep direct {key}={value!r}"
+                )
+        prompt = job["prompt"].casefold()
+        if any(marker in prompt for marker in ("kanban", "swarm", "synthesizer")):
+            raise InstallError(f"governed fleet job {name!r} must not route ClickUp work through kanban")
+
+    validator = by_name.get("hermes-pr-validate")
+    if validator is None:
+        raise InstallError("governed fleet jobs is missing 'hermes-pr-validate'")
+    required_env = validator.get("required_environment_variables")
+    if not isinstance(required_env, list) or "IGNITE_SKILLS_ROOT" not in required_env:
+        raise InstallError("hermes-pr-validate must require IGNITE_SKILLS_ROOT")
+    prompt = validator.get("prompt")
+    if not isinstance(prompt, str):
+        raise InstallError("hermes-pr-validate must provide a canonical Ignite runtime prompt")
+    required_modules = (
+        "$IGNITE_SKILLS_ROOT/clickup/clickup.mjs",
+        "$IGNITE_SKILLS_ROOT/ignite-state/scripts/blocklist-sync.mjs",
+        "$IGNITE_SKILLS_ROOT/ignite-state/scripts/sync-project-plugins.mjs",
+        "$IGNITE_SKILLS_ROOT/ignite-state/scripts/target-repo.mjs",
+    )
+    missing = [module for module in required_modules if module not in prompt]
+    if missing:
+        raise InstallError(
+            "hermes-pr-validate is missing canonical Ignite module paths: "
+            + ", ".join(missing)
+        )
+    forbidden_roots = ("~/.hermes/skills", "~/.claude/skills", "~/.codex/skills")
+    if any(root in prompt for root in forbidden_roots):
+        raise InstallError("hermes-pr-validate must not fall back to a home-local Ignite tree")
+
+
 def _snapshot_path(dest: Path, snapshot_dir: Path, destination_root: Path) -> Path:
     """Return a collision-free central snapshot path derived from ``dest``."""
     relative_dest = dest.relative_to(destination_root)
@@ -458,10 +554,119 @@ def _backup(
 
 
 def _atomic_write(dest: Path, data: bytes) -> None:
+    """Replace ``dest`` with private, durable bytes without following links.
+
+    The parent is opened as a directory descriptor with ``O_NOFOLLOW`` and
+    the temporary file is created relative to that verified descriptor using
+    exclusive creation.  A hostile pre-created temp symlink therefore cannot
+    redirect writes, and a stale temp name is retried rather than overwritten.
+    """
     dest.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dest.with_name(dest.name + ".tmp")
-    tmp.write_bytes(data)
-    os.replace(tmp, dest)
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    directory = getattr(os, "O_DIRECTORY", None)
+    if nofollow is None or directory is None:  # pragma: no cover - Mini targets support both
+        raise InstallError("platform lacks secure directory-descriptor write support")
+
+    parent_flags = os.O_RDONLY | directory | nofollow | getattr(os, "O_CLOEXEC", 0)
+    try:
+        parent_fd = os.open(dest.parent, parent_flags)
+    except OSError as exc:
+        raise InstallError(f"cannot securely open destination parent {dest.parent}: {exc}") from exc
+
+    temp_name: str | None = None
+    temp_fd: int | None = None
+    try:
+        if not stat.S_ISDIR(os.fstat(parent_fd).st_mode):
+            raise InstallError(f"destination parent is not a directory: {dest.parent}")
+        temp_flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | nofollow
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        for _ in range(TEMP_WRITE_ATTEMPTS):
+            candidate = f".{dest.name}.tmp-{secrets.token_hex(16)}"
+            try:
+                temp_fd = os.open(candidate, temp_flags, 0o600, dir_fd=parent_fd)
+            except FileExistsError:
+                continue
+            temp_name = candidate
+            break
+        if temp_fd is None or temp_name is None:
+            raise InstallError(f"could not reserve a private temporary file beside {dest}")
+
+        os.fchmod(temp_fd, SKILL_POLICY_CONFIG_MODE)
+        with os.fdopen(temp_fd, "wb", closefd=False) as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.close(temp_fd)
+        temp_fd = None
+        os.replace(temp_name, dest.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        temp_name = None
+        try:
+            os.fsync(parent_fd)
+        except OSError as exc:
+            # macOS filesystems may reject directory fsync. The file itself
+            # was already fsynced above, so retain the durable-write guarantee
+            # where supported without rejecting an otherwise safe replacement.
+            if exc.errno not in {errno.EINVAL, errno.EBADF}:
+                raise
+    finally:
+        if temp_fd is not None:
+            os.close(temp_fd)
+        if temp_name is not None:
+            try:
+                os.unlink(temp_name, dir_fd=parent_fd)
+            except FileNotFoundError:
+                pass
+        os.close(parent_fd)
+
+
+def _acquire_install_lock(destination_root: Path) -> int:
+    """Return an exclusive, no-symlink lock for one governed install run."""
+    destination_root.mkdir(parents=True, exist_ok=True)
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:  # pragma: no cover - Mini targets support it
+        raise InstallError("platform lacks O_NOFOLLOW; refusing concurrent installer lock")
+    flags = os.O_RDWR | os.O_CREAT | nofollow | getattr(os, "O_CLOEXEC", 0)
+    lock_path = destination_root / INSTALL_LOCK_NAME
+    try:
+        fd = os.open(lock_path, flags, SKILL_POLICY_CONFIG_MODE)
+    except OSError as exc:
+        raise InstallError(f"cannot securely open installer lock {lock_path}: {exc}") from exc
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise InstallError(f"installer lock is not a regular file: {lock_path}")
+        os.fchmod(fd, SKILL_POLICY_CONFIG_MODE)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        return fd
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def _release_install_lock(fd: int) -> None:
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def _create_snapshot_dir(destination_root: Path, stamp: str) -> Path:
+    """Reserve a unique receipt directory, including repeated same-second runs."""
+    receipts_root = destination_root / "logs" / "fleet-config-installs"
+    receipts_root.mkdir(parents=True, exist_ok=True)
+    for index in range(TEMP_WRITE_ATTEMPTS):
+        suffix = "" if index == 0 else f"-{index:02d}"
+        candidate = receipts_root / f"{stamp}{suffix}"
+        try:
+            candidate.mkdir(mode=0o700)
+        except FileExistsError:
+            continue
+        return candidate
+    raise InstallError(f"could not reserve a unique fleet install receipt for {stamp}")
 
 
 def _frontmatter_name(skill_md: Path) -> str | None:
@@ -713,12 +918,19 @@ def _read_suppressed(path: Path) -> set[str]:
         raise InstallError(f"could not read suppression file {path}: {exc}") from exc
 
 
-def _validate_installed_skill(path: Path, expected_name: str) -> None:
+def _validate_installed_skill(
+    path: Path,
+    expected_name: str,
+    *,
+    allow_manifest_symlink: bool = False,
+) -> None:
     if path.is_symlink():
         raise InstallError(f"refusing to archive symlinked skill path: {path}")
     skill_md = path / "SKILL.md"
     if not path.is_dir() or not skill_md.is_file():
         raise InstallError(f"skill policy target is not a skill directory: {path}")
+    if skill_md.is_symlink() and not allow_manifest_symlink:
+        raise InstallError(f"refusing to archive skill with symlinked manifest: {skill_md}")
     actual_name = _frontmatter_name(skill_md)
     if actual_name != expected_name:
         raise InstallError(
@@ -838,7 +1050,14 @@ def build_skill_policy_plan(policy: dict[str, Any], *, home: Path) -> list[dict[
                 path = skills_dir / rel
                 _check_dest_in_bounds(path, str(path), destination_root)
                 if path.exists() or path.is_symlink():
-                    _validate_installed_skill(path, name)
+                    _validate_installed_skill(
+                        path,
+                        name,
+                        # The obsolete Sentry wrapper intentionally points at
+                        # its governed checkout; archive that wrapper without
+                        # touching the operational Ignite Sentinel tree.
+                        allow_manifest_symlink=name == "sentry-monitor",
+                    )
                     target_rows.append({"name": name, "rel": rel, "path": path, "kind": "local"})
 
             consolidation_rows: list[dict[str, Any]] = []
@@ -1146,15 +1365,14 @@ def _config_mode(path: Path) -> int | None:
         return None
 
 
-def install(
+def _prepare_install_inputs(
     manifest: dict,
     *,
     home: Path,
     bundle_root: Path,
-    manifest_path: Path,
-    dry_run: bool,
-    skill_policy_path: Path | None = None,
-) -> int:
+    skill_policy_path: Path | None,
+) -> tuple[dict[str, Any], Path, list[dict[str, Any]], dict[str, Any] | None, list[dict[str, Any]]]:
+    """Resolve all read-only install inputs from one consistent filesystem view."""
     plan = build_plan(manifest, home=home, bundle_root=bundle_root)
     destination_root = home / ALLOWED_DEST_SUBPATH
     legacy_config_backups = _discover_legacy_config_backups(destination_root)
@@ -1174,6 +1392,24 @@ def install(
             )
         skill_policy = load_skill_policy(skill_policy_path, bundle_root=bundle_root)
         skill_actions = build_skill_policy_plan(skill_policy, home=home)
+    return plan, destination_root, legacy_config_backups, skill_policy, skill_actions
+
+
+def install(
+    manifest: dict,
+    *,
+    home: Path,
+    bundle_root: Path,
+    manifest_path: Path,
+    dry_run: bool,
+    skill_policy_path: Path | None = None,
+) -> int:
+    plan, destination_root, legacy_config_backups, skill_policy, skill_actions = _prepare_install_inputs(
+        manifest,
+        home=home,
+        bundle_root=bundle_root,
+        skill_policy_path=skill_policy_path,
+    )
 
     if dry_run:
         _print_config_plan(plan["config_overlay"], home)
@@ -1189,10 +1425,24 @@ def install(
         print("\ndry-run: verified all source hashes; wrote nothing.")
         return 0
 
-    stamp = _utc_stamp()
-    snapshot_dir = destination_root / "logs" / "fleet-config-installs" / stamp
-    snapshot_dir.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(manifest_path, snapshot_dir / manifest_path.name)
+    lock_fd = _acquire_install_lock(destination_root)
+    try:
+        # Another installer may have finished while this run waited for the
+        # lock, so re-plan after acquisition. In particular, skill-policy
+        # archive targets must never be computed from pre-lock state.
+        plan, destination_root, legacy_config_backups, skill_policy, skill_actions = _prepare_install_inputs(
+            manifest,
+            home=home,
+            bundle_root=bundle_root,
+            skill_policy_path=skill_policy_path,
+        )
+        stamp = _utc_stamp()
+        snapshot_dir = _create_snapshot_dir(destination_root, stamp)
+        backup_stamp = snapshot_dir.name
+        shutil.copy2(manifest_path, snapshot_dir / manifest_path.name)
+    except Exception:
+        _release_install_lock(lock_fd)
+        raise
 
     receipt: dict[str, Any] = {
         "bundle": manifest.get("bundle", "fleet-config"),
@@ -1232,7 +1482,7 @@ def install(
             snapshot_dir,
             destination_root,
             "fleet-config",
-            stamp,
+            backup_stamp,
             private=True,
         )
         step = {
@@ -1288,12 +1538,14 @@ def install(
         # --- Step 2: profiles/ ---
         for item in plan["profiles"]:
             pdest = item["dest"]
+            is_profile_config = pdest.name == "config.yaml"
             psnapshot = _backup(
                 pdest,
                 snapshot_dir,
                 destination_root,
                 f"fleet-config-profile-{pdest.parent.name}",
-                stamp,
+                backup_stamp,
+                private=is_profile_config,
             )
             data = item["src"].read_bytes()
             step = {
@@ -1302,16 +1554,22 @@ def install(
                 "snapshot": str(psnapshot) if psnapshot else None,
                 "created": psnapshot is None,
                 "sha256": None,
+                "mode": "0600" if is_profile_config else None,
                 "status": "installing",
             }
             receipt["steps"].append(step)
-            _atomic_write(pdest, data)
+            if is_profile_config:
+                _write_private(pdest, data)
+            else:
+                _atomic_write(pdest, data)
             deployed_sha = _sha256(pdest)
             if deployed_sha != item["sha256"]:
                 raise InstallError(
                     f"deployed bytes for {pdest} sha256 {deployed_sha} != manifest "
                     f"{item['sha256']} — restoring snapshot"
                 )
+            if is_profile_config and _config_mode(pdest) != SKILL_POLICY_CONFIG_MODE:
+                raise InstallError(f"deployed profile config {pdest} mode is not 0600 — restoring snapshot")
             step["sha256"] = deployed_sha
             step["status"] = "installed"
 
@@ -1337,7 +1595,7 @@ def install(
             raise InstallError(f"bundled jobs.json is not valid JSON: {exc}") from exc
         if "jobs" not in parsed or not isinstance(parsed["jobs"], list):
             raise InstallError("bundled jobs.json has no top-level 'jobs' list — refusing")
-        jsnapshot = _backup(jdest, snapshot_dir, destination_root, "fleet-config-jobs", stamp)
+        jsnapshot = _backup(jdest, snapshot_dir, destination_root, "fleet-config-jobs", backup_stamp)
         step = {
             "step": "jobs_json",
             "dest": str(jdest),
@@ -1392,6 +1650,7 @@ def install(
             fh.write("\n")
         print(f"receipt: {receipt_path}")
         print(f"install FAILED and was rolled back where possible: {receipt['failure_detail']}", file=sys.stderr)
+        _release_install_lock(lock_fd)
         raise
 
     receipt_path = snapshot_dir / "install-receipt.json"
@@ -1402,8 +1661,10 @@ def install(
     print(f"receipt: {receipt_path}")
     if receipt["result"] != "success":
         print(f"install FAILED and was rolled back where possible: {receipt['failure_detail']}", file=sys.stderr)
+        _release_install_lock(lock_fd)
         return 1
     print("install complete; config.yaml merged, profiles installed, jobs.json replaced, skill policy applied.")
+    _release_install_lock(lock_fd)
     return 0
 
 
