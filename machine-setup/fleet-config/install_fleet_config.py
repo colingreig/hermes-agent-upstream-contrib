@@ -483,6 +483,7 @@ def _validate_direct_clickup_jobs(payload: dict[str, Any]) -> None:
             "skill": "ignite-execute",
             "skills": ["ignite-execute"],
             "skill_scope": "content-executor",
+            "workdir": "/Users/colingreig/dev/hermes-agent",
             "prompt": "/ignite-execute --lane content",
         },
     }

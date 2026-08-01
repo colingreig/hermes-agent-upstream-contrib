@@ -228,10 +228,12 @@ content-lane-executor: /ignite-execute --lane content
 The root-scheduled content job does not inherit the root profile's inference
 route. It is explicitly pinned through the cron job contract to
 `provider: anthropic`, `model: claude-sonnet-5`, and `no_fallback: true`, and
-loads `ignite-execute` under `skill_scope: content-executor`. This preserves
-the content profile's Sonnet-only, fail-closed behavior while keeping the
-approved direct `/ignite-execute --lane content` path in the governed root
-cron store.
+loads `ignite-execute` under `skill_scope: content-executor`. Its governed
+`workdir` is `/Users/colingreig/dev/hermes-agent`, so repo-to-board resolution
+starts from the Hermes checkout instead of the Mini user's home directory.
+This preserves the content profile's Sonnet-only, fail-closed behavior while
+keeping the approved direct `/ignite-execute --lane content` path in the
+governed root cron store.
 
 The invoked skills own claiming, implementation, validation, handoff comments,
 and the move to **In Review**. They never move tasks to Complete;
