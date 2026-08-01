@@ -504,6 +504,39 @@ class Reconciler:
         except (subprocess.TimeoutExpired, OSError):
             return False
 
+    def _resolve_launchd_domain(self, label: str) -> str:
+        """Return the domain that owns ``label``, or the current session domain.
+
+        LaunchAgents whose ``LimitLoadToSessionType`` includes both Aqua and
+        Background can be registered in either ``gui/<uid>`` or
+        ``user/<uid>``.  Release cuts run over SSH, so assuming the GUI domain
+        can leave the real user-domain generation loaded and make every
+        bootstrap fail with EIO.  Match the core gateway manager: prefer an
+        existing GUI registration, then an existing user registration, then
+        use ``launchctl managername`` only as the unloaded-service heuristic.
+        """
+        uid = os.getuid()
+        gui_domain = f"gui/{uid}"
+        user_domain = f"user/{uid}"
+        if self._registered(gui_domain, label):
+            return gui_domain
+        if self._registered(user_domain, label):
+            return user_domain
+        try:
+            result = subprocess.run(
+                ["launchctl", "managername"],
+                check=False,
+                timeout=LAUNCHCTL_TIMEOUT_SECONDS,
+                capture_output=True,
+                text=True,
+            )
+            manager_name = (result.stdout or "").strip().casefold()
+            if result.returncode == 0 and manager_name == "aqua":
+                return gui_domain
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+        return user_domain
+
     def _wait_for_registration_state(
         self,
         domain: str,
@@ -591,11 +624,11 @@ class Reconciler:
         raise RuntimeError(message)
 
     def reload(self) -> None:
-        domain = f"gui/{os.getuid()}"
         for label, plist in (
             (GATEWAY_LABEL, self.gateway_plist),
             (DASHBOARD_LABEL, self.dashboard_plist),
         ):
+            domain = self._resolve_launchd_domain(label)
             self._bootout(domain, label)
             self._wait_until_unregistered(domain, label)
             if not plist.is_file():
