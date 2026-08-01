@@ -319,6 +319,56 @@ grep -Fq "reconcile_marketplace_skills.py rollback" \
   || fail "release rollback did not invoke marketplace skills snapshot restore"
 rm "$CURRENT_LINK"
 
+# Release cuts run over SSH, but each service may already be registered in a
+# different launchd domain.  Resolve labels independently, preferring gui,
+# then user, and only consult managername for an unloaded label.
+DOMAIN_PROBE_LOG="$TEST_ROOT/launchd-domain-probes.log"
+(
+  : > "$DOMAIN_PROBE_LOG"
+  # shellcheck disable=SC2329 # invoked indirectly by launchd_target.
+  launchctl() {
+    printf '%s\n' "$*" >> "$DOMAIN_PROBE_LOG"
+    case "${1:-}:${2:-}" in
+      print:"$GUI_DOMAIN/$GATEWAY_LABEL") return 1 ;;
+      print:"$USER_DOMAIN/$GATEWAY_LABEL") return 0 ;;
+      print:"$GUI_DOMAIN/$DASHBOARD_LABEL") return 0 ;;
+      managername:*) printf 'Background\n'; return 0 ;;
+      *) return 1 ;;
+    esac
+  }
+  [ "$(launchd_target "$GATEWAY_LABEL")" = "$USER_DOMAIN/$GATEWAY_LABEL" ] \
+    || fail 'gateway did not resolve its existing user-domain registration'
+  [ "$(launchd_target "$DASHBOARD_LABEL")" = "$GUI_DOMAIN/$DASHBOARD_LABEL" ] \
+    || fail 'dashboard did not resolve its existing gui-domain registration'
+  ! grep -q '^managername' "$DOMAIN_PROBE_LOG" \
+    || fail 'managername was consulted for a loaded service'
+  gateway_probes="$(grep "$GATEWAY_LABEL" "$DOMAIN_PROBE_LOG")"
+  [ "$gateway_probes" = "print $GUI_DOMAIN/$GATEWAY_LABEL
+print $USER_DOMAIN/$GATEWAY_LABEL" ] \
+    || fail 'launchd domain resolver did not probe gui before user'
+)
+
+for manager_fixture in Aqua Background; do
+  (
+    # shellcheck disable=SC2329 # invoked indirectly by resolve_launchd_domain.
+    launchctl() {
+      case "${1:-}" in
+        print) return 1 ;;
+        managername) printf '%s\n' "$manager_fixture"; return 0 ;;
+        *) return 1 ;;
+      esac
+    }
+    expected_domain="$USER_DOMAIN"
+    [ "$manager_fixture" = Aqua ] && expected_domain="$GUI_DOMAIN"
+    [ "$(resolve_launchd_domain "$GATEWAY_LABEL")" = "$expected_domain" ] \
+      || fail "managername $manager_fixture selected the wrong unloaded-service domain"
+  )
+done
+
+# Keep the remaining rollback fixtures independent of the host's launchd
+# state; the resolver behavior itself is covered above.
+resolve_launchd_domain() { printf '%s\n' "$GUI_DOMAIN"; }
+
 # A rollback whose gateway is healthy but dashboard remains unhealthy must
 # terminate nonzero; a warning-only rollback would make this subshell succeed.
 PREVIOUS_RELEASE="$RELEASES_DIR/v1.2.3-123456789abc"
@@ -327,11 +377,20 @@ printf '#!/usr/bin/env bash\nprintf previous\n' > "$PREVIOUS_RELEASE/scripts/cu-
 chmod 0755 "$PREVIOUS_RELEASE/scripts/cu-clickup"
 printf '#!/usr/bin/env python3\nprint("previous")\n' > "$PREVIOUS_RELEASE/$VENDORED_REFRESH_REL"
 printf '%s\n' "$PREVIOUS_RELEASE" > "$PREV_FILE"
+ROLLBACK_KICKSTART_LOG="$TEST_ROOT/rollback-kickstarts.log"
+: > "$ROLLBACK_KICKSTART_LOG"
 if (
   # shellcheck disable=SC2329 # invoked indirectly by rollback_to_previous.
   repoint_symlink() { :; }
+  # Prove rollback resolves each label at the point of restart instead of
+  # reusing one session-derived domain for both services.
+  # shellcheck disable=SC2329 # invoked indirectly by launchd_target.
+  resolve_launchd_domain() {
+    [ "${1:-}" = "$GATEWAY_LABEL" ] && printf '%s\n' "$USER_DOMAIN" \
+      || printf '%s\n' "$GUI_DOMAIN"
+  }
   # shellcheck disable=SC2329 # invoked indirectly by rollback_to_previous.
-  kickstart() { :; }
+  kickstart() { printf '%s\n' "${1:-}" >> "$ROLLBACK_KICKSTART_LOG"; }
   # shellcheck disable=SC2329 # invoked indirectly by rollback_to_previous.
   verify_gateway() { return 0; }
   # shellcheck disable=SC2329 # invoked indirectly by rollback_to_previous.
@@ -340,6 +399,9 @@ if (
 ) >/dev/null 2>&1; then
   fail 'rollback returned success despite dashboard health failure'
 fi
+[ "$(cat "$ROLLBACK_KICKSTART_LOG")" = "$USER_DOMAIN/$GATEWAY_LABEL
+$GUI_DOMAIN/$DASHBOARD_LABEL" ] \
+  || fail 'rollback did not resolve gateway and dashboard kickstarts independently'
 
 # Either service can fail to kickstart immediately after runtime-current is
 # switched. Both failures must restore the recorded previous target and still
@@ -348,8 +410,8 @@ NEW_RELEASE="$RELEASES_DIR/v1.2.4-abcdef123456"
 mkdir "$NEW_RELEASE"
 for failed_service in gateway dashboard; do
   repoint_symlink "$NEW_RELEASE" >/dev/null
-  failed_target="$GATEWAY_TARGET"
-  [ "$failed_service" = dashboard ] && failed_target="$DASHBOARD_TARGET"
+  failed_target="$GUI_DOMAIN/$GATEWAY_LABEL"
+  [ "$failed_service" = dashboard ] && failed_target="$GUI_DOMAIN/$DASHBOARD_LABEL"
   if (
     kickstart_calls=0
     # Fail only the post-switch restart; rollback restarts then succeed.

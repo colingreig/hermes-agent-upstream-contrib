@@ -52,10 +52,9 @@ PROMOTION_CERTIFIER_REL="scripts/certify_prod_live_patches.py"
 
 UID_NUM="$(id -u)"
 GUI_DOMAIN="gui/${UID_NUM}"
+USER_DOMAIN="user/${UID_NUM}"
 GATEWAY_LABEL="ai.hermes.gateway"
 DASHBOARD_LABEL="com.colingreig.hermes-dashboard"
-GATEWAY_TARGET="${GUI_DOMAIN}/${GATEWAY_LABEL}"
-DASHBOARD_TARGET="${GUI_DOMAIN}/${DASHBOARD_LABEL}"
 
 GATEWAY_PORT=8642
 DASHBOARD_PORT=9119
@@ -862,6 +861,39 @@ kickstart() {
   run launchctl kickstart -k "$target"
 }
 
+# LaunchAgents that allow Aqua and Background sessions can be registered in
+# either domain.  Release cuts normally run over SSH, so the caller's session
+# is not evidence of where an already-loaded service lives.  Resolve each
+# label independently: prefer its existing GUI registration, then its existing
+# user registration, and consult managername only when the label is unloaded.
+resolve_launchd_domain() {
+  local label="${1:-}" manager_name=""
+  [ -n "$label" ] || die "resolve_launchd_domain: missing service label"
+  if launchctl print "${GUI_DOMAIN}/${label}" >/dev/null 2>&1; then
+    printf '%s\n' "$GUI_DOMAIN"
+    return 0
+  fi
+  if launchctl print "${USER_DOMAIN}/${label}" >/dev/null 2>&1; then
+    printf '%s\n' "$USER_DOMAIN"
+    return 0
+  fi
+  manager_name="$(launchctl managername 2>/dev/null || true)"
+  case "$(printf '%s' "$manager_name" | tr '[:upper:]' '[:lower:]')" in
+    aqua) printf '%s\n' "$GUI_DOMAIN" ;;
+    *) printf '%s\n' "$USER_DOMAIN" ;;
+  esac
+}
+
+launchd_target() {
+  local label="${1:-}"
+  printf '%s/%s\n' "$(resolve_launchd_domain "$label")" "$label"
+}
+
+kickstart_label() {
+  local label="${1:-}"
+  kickstart "$(launchd_target "$label")"
+}
+
 # mkdir is atomic, unlike checking then creating a pid file. The lock covers
 # cuts, explicit rollbacks, and pruning so two operators cannot race the
 # runtime-current switch or delete one another's release.
@@ -992,9 +1024,9 @@ rollback_to_previous() {
     || die "rollback could not restore governed marketplace skills — MANUAL INTERVENTION REQUIRED"
   rollback_governed_launchd_environment "$reason" \
     || die "rollback could not restore governed launchd environment — MANUAL INTERVENTION REQUIRED"
-  kickstart "$GATEWAY_TARGET"
+  kickstart_label "$GATEWAY_LABEL"
   if verify_gateway "$prev" "$offset"; then
-    kickstart "$DASHBOARD_TARGET"
+    kickstart_label "$DASHBOARD_LABEL"
     verify_dashboard || die "rollback dashboard did NOT verify healthy — MANUAL INTERVENTION REQUIRED (release: $prev)"
     ok "rollback complete → $prev"
     return 0
