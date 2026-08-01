@@ -143,6 +143,8 @@ def test_offline_cli_writes_only_the_requested_atomic_snapshot(tmp_path):
             "--once",
             "--fixture",
             str(FIXTURE),
+            "--observed-at",
+            NOW.isoformat(),
             "--config",
             str(config),
             "--output",
@@ -160,6 +162,28 @@ def test_offline_cli_writes_only_the_requested_atomic_snapshot(tmp_path):
     assert summary["task_count"] == 4
     assert json.loads(output.read_text(encoding="utf-8"))["schema"] == producer.SCHEMA
     assert list(output.parent.iterdir()) == [output]
+
+
+def test_fixed_observation_time_is_fixture_only(tmp_path, capsys):
+    config = tmp_path / "config.json"
+    output = tmp_path / "snapshot.json"
+    config.write_text(json.dumps({"delivery_snapshot": _config()}), encoding="utf-8")
+
+    result = producer.main(
+        [
+            "--once",
+            "--observed-at",
+            NOW.isoformat(),
+            "--config",
+            str(config),
+            "--output",
+            str(output),
+        ]
+    )
+
+    assert result == 2
+    assert "only allowed with --fixture" in capsys.readouterr().out
+    assert not output.exists()
 
 
 def test_live_commands_are_shell_free_and_remote_queries_are_fixed(monkeypatch):

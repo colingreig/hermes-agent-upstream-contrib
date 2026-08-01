@@ -1280,6 +1280,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--fixture", type=Path, help="offline source fixture; no live commands")
     parser.add_argument(
+        "--observed-at",
+        help="fixed ISO-8601 observation time for deterministic fixture runs",
+    )
+    parser.add_argument(
         "--run-watcher",
         action="store_true",
         help="evaluate the just-written snapshot with the installed watcher",
@@ -1291,11 +1295,21 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     args = _parser().parse_args(list(argv) if argv is not None else None)
     try:
         config = _load_config(args.config)
+        observed_at: Optional[datetime] = None
+        if args.observed_at:
+            if not args.fixture:
+                raise SnapshotError("--observed-at is only allowed with --fixture")
+            try:
+                observed_at = datetime.fromisoformat(args.observed_at.replace("Z", "+00:00"))
+            except ValueError as exc:
+                raise SnapshotError("--observed-at must be a valid ISO-8601 timestamp") from exc
+            if observed_at.tzinfo is None:
+                raise SnapshotError("--observed-at must include a timezone offset")
         backend: Union[LiveBackend, FixtureBackend]
         backend = FixtureBackend(args.fixture) if args.fixture else LiveBackend(
             mini_host=config["mini_host"]
         )
-        snapshot = build_snapshot(backend, config)
+        snapshot = build_snapshot(backend, config, now=observed_at)
         _atomic_json(args.output, snapshot)
         if args.run_watcher:
             return _run_watcher(args.config, args.output)
