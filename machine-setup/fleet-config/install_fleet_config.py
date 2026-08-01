@@ -907,6 +907,48 @@ def _active_skill_manifests(skills_dir: Path) -> list[Path]:
     ]
 
 
+def _allowed_skill_relpaths(policy: dict[str, Any]) -> set[str]:
+    """Relative install paths the fleet skill policy may manage under skills/."""
+    allowed: set[str] = set()
+    for section in (
+        policy["bundled"]["remove"],
+        policy["bundled"]["keep"],
+        policy["local_remove"],
+        policy["required_local_keep"],
+    ):
+        allowed.update(section.values())
+    for spec in policy["hub_shadow_remove"].values():
+        allowed.add(spec["install_path"])
+    return allowed
+
+
+def _find_unmanaged_skill_manifests(skills_dir: Path, policy: dict[str, Any]) -> list[Path]:
+    allowed = _allowed_skill_relpaths(policy)
+    return [
+        manifest
+        for manifest in _active_skill_manifests(skills_dir)
+        if manifest.parent.relative_to(skills_dir).as_posix() not in allowed
+    ]
+
+
+def _validate_no_unmanaged_skill_manifests(skills_dir: Path, policy: dict[str, Any]) -> None:
+    unmanaged = _find_unmanaged_skill_manifests(skills_dir, policy)
+    if not unmanaged:
+        return
+    sample_paths = sorted({m.parent.relative_to(skills_dir).as_posix() for m in unmanaged})
+    shown = ", ".join(sample_paths[:8])
+    extra = len(sample_paths) - min(len(sample_paths), 8)
+    suffix = f" (+{extra} more)" if extra > 0 else ""
+    raise InstallError(
+        f"found {len(unmanaged)} unmanaged skill manifest(s) under {skills_dir} "
+        f"(likely local Ignite copies; sample: {shown}{suffix}). "
+        "Ignite skills belong in skills.external_dirs (~/dev/ignite-skills-live), "
+        "not ~/.hermes/skills. Run "
+        "python3 machine-setup/mini-scripts/cleanup_hermes_local_ignite_shadows.py "
+        "(--apply) before fleet install."
+    )
+
+
 def _read_suppressed(path: Path) -> set[str]:
     if not path.exists():
         return set()
@@ -1047,6 +1089,7 @@ def build_skill_policy_plan(policy: dict[str, Any], *, home: Path) -> list[dict[
                     })
 
         if profile == "default":
+            _validate_no_unmanaged_skill_manifests(skills_dir, policy)
             for name, rel in policy["local_remove"].items():
                 path = skills_dir / rel
                 _check_dest_in_bounds(path, str(path), destination_root)

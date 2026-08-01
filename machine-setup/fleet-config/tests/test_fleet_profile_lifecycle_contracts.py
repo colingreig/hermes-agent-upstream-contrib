@@ -15,11 +15,8 @@ OUTCOME_CONTRACTS_PATH = (
 )
 COVERAGE_PATH = FLEET_CONFIG_ROOT / "MONITOR_COVERAGE.md"
 PROFILES = ("coder", "content", "design", "research", "ops")
-RETIRED_POLLER_MARKERS = (
-    "6139465f559f",
-    "Purelymail notify-me poller",
-    "purelymail-notify-poller.py",
-)
+RETIRED_POLLER_JOB_ID = "6139465f559f"
+PURELYMAIL_POLLER_JOB_ID = "6e25865a22a4"
 
 
 def _load_manifest() -> dict:
@@ -146,7 +143,7 @@ def test_pr_validator_uses_only_the_canonical_ignite_root():
     assert "Do not probe, copy, symlink, or fall back" in prompt
 
 
-def test_retired_purelymail_poller_is_absent_from_fleet_surfaces():
+def test_retired_purelymail_poller_job_id_is_absent_from_fleet_surfaces():
     surfaces = {
         "fleet jobs": json.dumps(json.loads(JOBS_PATH.read_text(encoding="utf-8"))),
         "outcome contracts": json.dumps(
@@ -156,9 +153,23 @@ def test_retired_purelymail_poller_is_absent_from_fleet_surfaces():
     }
 
     for surface, content in surfaces.items():
-        normalized = content.casefold()
-        for marker in RETIRED_POLLER_MARKERS:
-            assert marker.casefold() not in normalized, f"{marker!r} returned in {surface}"
+        assert RETIRED_POLLER_JOB_ID.casefold() not in content.casefold(), (
+            f"{RETIRED_POLLER_JOB_ID!r} returned in {surface}"
+        )
+
+
+def test_purelymail_poller_uses_true_interval_schedule():
+    job = _jobs_by_name()["Purelymail notify-me poller"]
+
+    assert job["id"] == PURELYMAIL_POLLER_JOB_ID
+    assert job["script"] == "purelymail-notify-poller.py"
+    assert job["no_agent"] is True
+    assert job["schedule"] == {
+        "display": "every 45m",
+        "kind": "interval",
+        "minutes": 45,
+    }
+    assert job["schedule_display"] == "every 45m"
 
 
 def test_all_souls_are_direct_profile_personas():

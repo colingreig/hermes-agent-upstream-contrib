@@ -472,6 +472,15 @@ def test_policy_refuses_historical_reference_hash_drift(tmp_path):
         install_mod.build_skill_policy_plan(policy, home=home)
 
 
+def test_policy_refuses_unmanaged_ignite_shadows(tmp_path):
+    policy = _load_policy()
+    home, _external = _seed_home(tmp_path, policy)
+    _write_skill(home / ".hermes" / "skills" / "ignite-execute", "ignite-execute")
+
+    with pytest.raises(install_mod.InstallError, match="unmanaged skill manifest"):
+        install_mod.build_skill_policy_plan(policy, home=home)
+
+
 def test_supplied_policy_requires_matching_manifest_entry_before_mutation(tmp_path):
     manifest = install_mod.load_manifest(FLEET_ROOT / "fleet_config_manifest.json")
     manifest["files"] = [

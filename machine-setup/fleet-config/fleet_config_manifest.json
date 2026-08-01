@@ -3,7 +3,7 @@
   "source_task": "86e2kkj69",
   "fleet_contract": "direct-clickup-v1",
   "generated_at": "2026-08-01T16:35:00Z",
-  "description": "Governed Hermes Mini fleet bundle for the 86e2kkj69 skill-surface hardening rollout. install_fleet_config.py is the sole writer of four surfaces: the deep-merged ~/.hermes/config.yaml overlay, five direct-execution profiles under ~/.hermes/profiles/, the curated 15-job ~/.hermes/cron/jobs.json, and the manifest-pinned skill policy across the default plus five profile homes. ClickUp executor jobs use direct skill paths while upstream Hermes kanban remains available independently. Every source, including the installer itself, is SHA-256 verified before mutation; config, root legacy config-backup modes, jobs, skill provenance, archive-copy bytes, and hub identity fail closed, with snapshots, recoverable archives, rollback, and receipts.",
+  "description": "Governed Hermes Mini fleet bundle for the 86e2kkj69 skill-surface hardening rollout. install_fleet_config.py is the sole writer of four surfaces: the deep-merged ~/.hermes/config.yaml overlay, five direct-execution profiles under ~/.hermes/profiles/, the curated 16-job ~/.hermes/cron/jobs.json (canonical Hermes schedules from origin/main plus Purelymail poller every 45m), and the manifest-pinned skill policy across the default plus five profile homes. ClickUp executor jobs use direct skill paths while upstream Hermes kanban remains available independently. Every source, including the installer itself, is SHA-256 verified before mutation; config, root legacy config-backup modes, jobs, skill provenance, archive-copy bytes, and hub identity fail closed, with snapshots, recoverable archives, rollback, and receipts.",
   "files": [
     {
       "src_rel": "config-overlay.yaml",
@@ -85,8 +85,8 @@
     {
       "src_rel": "jobs.json",
       "dest_abs": "~/.hermes/cron/jobs.json",
-      "sha256": "443917b27bcf03a4b23bb4787ebaedcf7d12d960cc3c8c378be1e4bf183fde23",
-      "role": "curated 15-job cron set (12 kept + 3 consolidated; direct ClickUp executor prompts; hermes-pr-validate re-enabled 2026-07-31 and pinned to IGNITE_SKILLS_ROOT), wholesale-replaces the live jobs.json",
+      "sha256": "196b1115324f6298470b578cbb361d1ea704353f46aa1db522305f50e5d6e69e",
+      "role": "curated 16-job cron set (canonical Hermes schedules plus Purelymail poller every 45m; direct ClickUp executor prompts; hermes-pr-validate pinned to IGNITE_SKILLS_ROOT), wholesale-replaces the live jobs.json",
       "deploy_mode": "jobs_json"
     },
     {
@@ -97,7 +97,7 @@
     },
     {
       "src_rel": "install_fleet_config.py",
-      "sha256": "06bb5f7665f2a71dcfb1a7160300819a56de9c389122854b4ed347fb52c11fa5",
+      "sha256": "2485c6a89a173b0427ff8f0a5f571bf4aac2de72246fb10dbc4cd565f53f2fb6",
       "role": "source-only pin for the governed fleet installer, including private legacy root config-backup remediation and exact-mode rollback",
       "deploy_mode": "installer_source"
     }

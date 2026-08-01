@@ -58,3 +58,24 @@ operational through its governed repository and launchd paths.
 
 Never recover this policy by adding `.no-bundled-skills`, copying the Ignite
 tree into a profile, or deleting the governed archives.
+
+## Ignite skills are external — never copy into `~/.hermes/skills`
+
+The default `~/.hermes/skills` tree is fleet-governed (~23 active manifests).
+Ignite operational skills belong in `~/dev/ignite-skills-live` and are pulled by
+`ignite-skills-pull.sh`. Hermes discovers them through `skills.external_dirs`
+(wired by `reconcile_marketplace_skills.py`).
+
+Copying Ignite skills into `~/.hermes/skills` breaks fleet install manifest
+counting, shadows the canonical external tree, and makes cron jobs resolve
+`IGNITE_SKILLS_ROOT` to the wrong home-local path.
+
+If local Ignite copies exist:
+
+```bash
+python3 machine-setup/mini-scripts/cleanup_hermes_local_ignite_shadows.py --apply
+bash ~/.hermes/scripts/sync_ignite_skills_to_hermes.sh
+python3 machine-setup/fleet-config/install_fleet_config.py --dry-run
+```
+
+Recoverable archives land under `~/.hermes/archives/ignite-local-shadow/`.
