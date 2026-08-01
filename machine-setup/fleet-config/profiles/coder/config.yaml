@@ -7,5 +7,10 @@ model:
 fallback_providers:
   - provider: zai
     model: glm-4.7
-  - provider: google
-    model: gemini-2.5-flash
+  - provider: nous
+    model: deepseek/deepseek-v4-pro
+    key_env: NOUS_PORTAL_API_KEY
+
+agent:
+  reasoning_overrides:
+    deepseek/deepseek-v4-pro: high

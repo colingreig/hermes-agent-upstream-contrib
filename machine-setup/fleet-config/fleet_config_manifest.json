@@ -7,14 +7,14 @@
     {
       "src_rel": "config-overlay.yaml",
       "dest_abs": "~/.hermes/config.yaml",
-      "sha256": "a4f90153e095054a502a6b0bd580b0ee5c115b396d3666b613cae54af789d142",
+      "sha256": "cc0b3c57fb1d2b0a6a8d5e05196e6327ec134f949192c361d5b5a6520cfc3037",
       "role": "governed overlay deep-merged into the live config.yaml (model/fallback_providers/delegation/browser CDP/kanban dispatch)",
       "deploy_mode": "config_overlay"
     },
     {
       "src_rel": "profiles/coder/config.yaml",
       "dest_abs": "~/.hermes/profiles/coder/config.yaml",
-      "sha256": "1b213d0b8159feaeceea1f0c0895c1eecb4bfa629ef10cfced57906fc8cd7533",
+      "sha256": "c26e7d8da621e4eec20ffdff9ec973308e691a94fdd22d659676cb3cf0919710",
       "role": "senior engineer profile \u2014 openai-codex/gpt-5.5, works ClickUp code tasks via kanban swarm",
       "deploy_mode": "profile_file"
     },
@@ -56,7 +56,7 @@
     {
       "src_rel": "profiles/research/config.yaml",
       "dest_abs": "~/.hermes/profiles/research/config.yaml",
-      "sha256": "2c9163b98ac4e00a59cfa1aa089cee5540cd6e34a372bc369991f913498a9c58",
+      "sha256": "d71c56ca38758e03c9cce373bdfdea8a3751075cf17cafe2f18d8c6df41c3c72",
       "role": "researcher profile \u2014 zai/glm-4.7, grounded findings feeding other profiles",
       "deploy_mode": "profile_file"
     },
@@ -70,7 +70,7 @@
     {
       "src_rel": "profiles/ops/config.yaml",
       "dest_abs": "~/.hermes/profiles/ops/config.yaml",
-      "sha256": "85f6a01b1c1ff64ecdd7bccdbfdfcfbeadfd7e0a945eb3ded1f03805bf5132f7",
+      "sha256": "4bf8eaf5e0bbbe3e93804126cb73bbac55ff0511474a02a6305f6a455311d940",
       "role": "fleet operator profile \u2014 zai/glm-4.7, monitors + lifecycle hygiene + truthful reporting",
       "deploy_mode": "profile_file"
     },

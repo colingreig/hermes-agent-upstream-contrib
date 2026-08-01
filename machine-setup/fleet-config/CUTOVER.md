@@ -6,7 +6,7 @@ Resume this runbook when the Mac mini has power. Session context: Colin ordered 
 - **PR #210 merged to main**: this `machine-setup/fleet-config/` bundle — 5 profiles, 16-job jobs.json, config-overlay.yaml, sha256-pinned `install_fleet_config.py` (+ tests), README. Survived opus adversarial review; polling flow / content synthesizer / rollback scope all fixed and test-proven.
 - **Mini**: all 36 old crons frozen (`enabled=false`); full snapshot at `~/hermes-archive-20260729/` (hermes-state.tgz = config.yaml, cron, scripts, LaunchAgents, opencode.jsonc; plus jobs.json.pre-freeze). The OLD gateway was still running when power died — after power restore, auto-login will relaunch it via LaunchAgent. Shut it down before anything else.
 - **ClickUp** (list 901714465284): board cleared (108 old tasks closed); 10 REBUILD tasks tagged `rebuild-0729` (86e2jbbey…86e2jbbtv); 3 preserved non-hermes tasks.
-- **Fallback chain**: openai-codex/gpt-5.5 → zai/glm-4.7 → nous/moonshotai/kimi-k2.6 (`inference-api.nousresearch.com/v1`). NOUS_PORTAL_API_KEY not yet provisioned — tier 3 inert until Colin adds it to 1Password + gateway secret env (guard with `${NOUS_PORTAL_API_KEY:-}` — wrapper runs `set -u`).
+- **Fallback chain**: openai-codex/gpt-5.5 → zai/glm-4.7 → nous/deepseek/deepseek-v4-pro (effort `high`, `inference-api.nousresearch.com/v1`). `NOUS_PORTAL_API_KEY` lives in 1Password at `op://hermes-agent/nous_portal_api_key/password`; wire into `~/.hermes/scripts/op-secrets.env` on the mini for lazy resolution.
 - **Hard rules**: codex-oauth is the only OpenAI surface (billed openai-api banned everywhere); content = anthropic/claude-sonnet-5 fail-closed, NO fallback (verified: profile sessions do not inherit root fallback_providers); ClickUp is the sole board — kanban swarm is internal execution only; tasks go to In Review, never Complete (ignite-validate owns Complete).
 - **Production release path**: the rebuilt fleet uses manual governed release
   cuts only. `com.colingreig.hermes.release-poll` is retired for this fleet and
@@ -68,4 +68,4 @@ Resume this runbook when the Mac mini has power. Session context: Colin ordered 
 - REBUILD 9: permanent shared Chrome on mini — implemented; pending validator
   confirmation of the live launchd/CDP/VNC evidence.
 - pr-staleness fold into ci-health-watch (deferred at review — script-level change).
-- NOUS_PORTAL_API_KEY provisioning (Colin).
+- NOUS_PORTAL_API_KEY provisioning — done (1Password + mini op-secrets.env); tier-3 model is DeepSeek V4 Pro high (86e2jzv2j).
