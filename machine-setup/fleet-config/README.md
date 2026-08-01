@@ -9,7 +9,7 @@ mini:
 |---|---|---|
 | `config-overlay.yaml` | `~/.hermes/config.yaml` | Governed **overlay** (not a replacement) — deep-merges `model`, `fallback_providers`, `delegation`, `kanban` in. Every other section (platforms, secrets wiring, security, approvals, credential_pool_strategies, ...) is left untouched. |
 | `profiles/<name>/{config.yaml,SOUL.md}` | `~/.hermes/profiles/<name>/` | Five direct-execution profiles: `coder`, `content`, `design`, `research`, `ops`. Each gets its model config, its SOUL.md persona, and the full `_PROFILE_DIRS` bootstrap tree from `hermes_cli/profiles.py` (`memories`, `sessions`, `skills`, `skins`, `logs`, `plans`, `workspace`, `cron`, `home`). The `home/` entry is a subprocess workspace, not the profile's Hermes root. |
-| `jobs.json` | `~/.hermes/cron/jobs.json` | Curated 16-job cron set (13 carried forward from the pre-freeze live config, 3 new consolidated hygiene/digest jobs). **Wholesale replace**, not a merge. |
+| `jobs.json` | `~/.hermes/cron/jobs.json` | Curated 15-job cron set (12 carried forward from the pre-freeze live config, 3 new consolidated hygiene/digest jobs). **Wholesale replace**, not a merge. |
 | `skills-policy.json` | Default plus five profile-local `skills/` trees | SHA-pinned allowlist/cull policy. Preserves allowed bundled skills, archives and suppresses removals, consolidates two historical ClickUp poller references, removes the obsolete local `sentry-monitor` wrapper without touching the operational Ignite Sentinel checkout, and removes the local hub shadow of `vehicle-image-qc` only with exact hub provenance. |
 
 `fleet_config_manifest.json` sha256-pins every source file above.
@@ -151,13 +151,13 @@ tier 3    nous / deepseek/deepseek-v4-pro   (Nous Research Portal, effort high)
 Starting point: the pre-freeze snapshot at
 `~/hermes-archive-20260729/jobs.json.pre-freeze` on the mini (36 jobs).
 
-- **13 carried forward by stable job ID and schedule**: `clickup-poll-gate`,
+- **12 carried forward by stable job ID and schedule**: `clickup-poll-gate`,
   `review-poll-gate`, `clickup-review-sla`, `hermes-pr-validate` (kept
   disabled at cutover time, matching its prior paused state — see
   "Re-enablement" below), `spend-meter`, `ci-health-watch`,
   `clickup-workspace-refresh`, `reap-stranded-claims`, `ignite-board-sync`,
-  `clickup-closeout-actor`, `Purelymail notify-me poller`, plus
-  `clickup-executor` and `content-lane-executor` (config kept, **prompt
+  `clickup-closeout-actor`, plus `clickup-executor` and
+  `content-lane-executor` (config kept, **prompt
   modified** — see below).
 
 ### Re-enablement: hermes-pr-validate (2026-07-31, task `86e2k3qe1`)
@@ -315,6 +315,6 @@ use it to find the right timestamp/paths rather than guessing.
   `last_error`, `last_delivery_error`, and `repeat.completed` are reset to
   null/0 for every job (not carried over from the pre-freeze snapshot) since
   this is a rebuild cutover, not an in-place patch. Original job `id`s are
-  preserved for the 13 kept jobs (some tooling — e.g.
+  preserved for the 12 kept jobs (some tooling — e.g.
   `validator_repo_guard` callers — references `hermes-pr-validate`'s id
   `5a76e290811d` by value); the 3 new jobs get freshly generated ids.

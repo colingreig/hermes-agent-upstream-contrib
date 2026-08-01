@@ -467,6 +467,16 @@ def test_kanban_sweep_contract_requires_complete_clean_summary(tmp_path):
 
     assert check() == []
 
+    rewrite(full_summary.replace("root=/tmp/hermes", "root=/tmp/errors=7/Error:"))
+    assert check() == []
+
+    rewrite(full_summary.replace("dry_run=False", "dry_run=True"))
+    findings = check()
+    assert {(item["id"], item["code"]) for item in findings} == {
+        (label, "required_marker_missing"),
+        (label, "success_marker_missing"),
+    }
+
     rewrite(full_summary.replace("errors=0", "errors=1"))
     findings = check()
     assert {(item["id"], item["code"]) for item in findings} == {
@@ -505,6 +515,57 @@ def test_kanban_sweep_contract_requires_complete_clean_summary(tmp_path):
         assert {(item["id"], item["code"]) for item in findings} == {
             (label, "failure_marker")
         }
+
+
+def test_sentinel_contract_uses_structured_terminal_errors_not_issue_titles(tmp_path):
+    module = _load_module()
+    label = "com.colingreig.hermes.ignite-sentinel"
+    outcome = _canonical_contract(launch_label=label)["outcome"]
+    start = "2026-08-01T15:06:07Z sentinel_run: secrets resolved, running monitor.py\n"
+    artifact = _fresh_artifact(
+        tmp_path,
+        start
+        + json.dumps(
+            {
+                "mode": "live",
+                "verdicts": [
+                    {
+                        "title": "Error: embedded application issue title",
+                        "reason": "Sentry GET diagnostic failed inside issue prose",
+                    }
+                ],
+                "errors": [],
+            },
+            indent=2,
+        )
+        + "\n",
+    )
+
+    def check():
+        return module._check_text_evidence(
+            surface="launchd",
+            identifier=label,
+            path=artifact,
+            outcome=outcome,
+            now=NOW,
+        )
+
+    assert check() == []
+
+    payload = {
+        "mode": "live",
+        "verdicts": [],
+        "errors": [{"stage": "handle", "message": "ClickUp list deleted"}],
+    }
+    artifact.write_text(start + json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    import os
+
+    os.utime(artifact, (NOW.timestamp(), NOW.timestamp()))
+    findings = check()
+    assert {(item["id"], item["code"]) for item in findings} == {
+        (label, "failure_marker"),
+        (label, "required_marker_missing"),
+    }
 
 
 def test_launchctl_inventory_ignores_enabled_overrides_outside_services():
@@ -929,4 +990,7 @@ def test_kanban_sweep_stderr_shares_canonical_semantic_evidence_log():
     stdout_path = plist["StandardOutPath"]
     assert plist["StandardErrorPath"] == stdout_path
     assert Path(stdout_path).expanduser() == Path(contract["outcome"]["path"]).expanduser()
-    assert "Traceback" in contract["outcome"]["failure_patterns"]
+    assert any(
+        pattern.startswith("^Traceback")
+        for pattern in contract["outcome"]["failure_patterns"]
+    )

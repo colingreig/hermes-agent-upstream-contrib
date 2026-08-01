@@ -2,7 +2,7 @@
   "bundle": "fleet-config",
   "source_task": "86e2kkj69",
   "generated_at": "2026-08-01T15:01:41Z",
-  "description": "Governed Hermes Mini fleet bundle for the 86e2kkj69 skill-surface hardening rollout. install_fleet_config.py is the sole writer of four surfaces: the deep-merged ~/.hermes/config.yaml overlay, five direct-execution profiles under ~/.hermes/profiles/, the curated 16-job ~/.hermes/cron/jobs.json, and the manifest-pinned skill policy across the default plus five profile homes. ClickUp executor jobs use direct skill paths while upstream Hermes kanban remains available independently. Every source is SHA-256 verified before mutation; config, jobs, skill provenance, archive-copy bytes, and hub identity fail closed, with snapshots, recoverable archives, rollback, and receipts.",
+  "description": "Governed Hermes Mini fleet bundle for the 86e2kkj69 skill-surface hardening rollout. install_fleet_config.py is the sole writer of four surfaces: the deep-merged ~/.hermes/config.yaml overlay, five direct-execution profiles under ~/.hermes/profiles/, the curated 15-job ~/.hermes/cron/jobs.json, and the manifest-pinned skill policy across the default plus five profile homes. ClickUp executor jobs use direct skill paths while upstream Hermes kanban remains available independently. Every source is SHA-256 verified before mutation; config, jobs, skill provenance, archive-copy bytes, and hub identity fail closed, with snapshots, recoverable archives, rollback, and receipts.",
   "files": [
     {
       "src_rel": "config-overlay.yaml",
@@ -84,8 +84,8 @@
     {
       "src_rel": "jobs.json",
       "dest_abs": "~/.hermes/cron/jobs.json",
-      "sha256": "e23e6974eaccdb0852647c6b628154fed6f57e85afc3846e2d2b85ec1970c654",
-      "role": "curated 16-job cron set (13 kept + 3 consolidated; direct ClickUp executor prompts; hermes-pr-validate re-enabled 2026-07-31 and pinned to IGNITE_SKILLS_ROOT), wholesale-replaces the live jobs.json",
+      "sha256": "447706c3eafcb70cd55578b7a396ca41a66671e1d7dcd66a50b60c2b0d71542a",
+      "role": "curated 15-job cron set (12 kept + 3 consolidated; direct ClickUp executor prompts; hermes-pr-validate re-enabled 2026-07-31 and pinned to IGNITE_SKILLS_ROOT), wholesale-replaces the live jobs.json",
       "deploy_mode": "jobs_json"
     },
     {
