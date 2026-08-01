@@ -1,0 +1,498 @@
+{
+  "$schema": "./production_mutation_registry.schema.json",
+  "schema_version": "1.0",
+  "registry_kind": "hermes-production-mutation-registry",
+  "unknown_path_policy": {
+    "default": "fail-closed",
+    "rule": "A production mutation is unsupported unless its actor, target resource, lock or transaction boundary, and rollback surface are present in this registry. Callers must reject an unknown path before it writes.",
+    "enforcement_status": "This inventory is authoritative now; runtime admission enforcement is intentionally deferred to the bounded follow-on tasks below.",
+    "follow_on_hook_points": [
+      {
+        "task": "86e2kmucr",
+        "hook": "production mutation admission check at governed installer and deploy entry points",
+        "purpose": "Reject a requested resource mutation that has no registry actor/resource mapping."
+      },
+      {
+        "task": "86e2kmuct",
+        "hook": "shared executor-dispatch lease admission",
+        "purpose": "Enforce the one logical executor dispatch surface named by this registry."
+      }
+    ]
+  },
+  "resources": [
+    {
+      "id": "fleet-config",
+      "path": "~/.hermes/config.yaml and ~/.hermes/profiles/*",
+      "description": "Fleet overlay and managed profile configuration.",
+      "concurrency_model": "single installer transaction with pre-write snapshots"
+    },
+    {
+      "id": "cron-jobs",
+      "path": "~/.hermes/cron/jobs.json and ~/.hermes/cron/.jobs.lock",
+      "description": "Cron definitions and scheduler lifecycle metadata.",
+      "concurrency_model": "atomic replacement plus the cron jobs advisory lock"
+    },
+    {
+      "id": "skills-policy",
+      "path": "~/.hermes/skills/, ~/.hermes/profiles/*/skills/, and ~/.hermes/state/skill-pulls/",
+      "description": "Curated skill trees, suppression policy, and skill-pull evidence.",
+      "concurrency_model": "installer transaction or named skill-pull/catalog locks"
+    },
+    {
+      "id": "runtime-release",
+      "path": "~/.hermes/releases/ and ~/.hermes/runtime-current",
+      "description": "Immutable release directories, current-release pointer, cut receipts, and prior-release pointer.",
+      "concurrency_model": "single mini release-cut directory lock and atomic symlink swap"
+    },
+    {
+      "id": "governed-mini-scripts",
+      "path": "~/.hermes/scripts/ and ~/Library/LaunchAgents/",
+      "description": "Hash-pinned operational scripts, wrappers, and launchd configuration installed by the release cut.",
+      "concurrency_model": "release-cut serialization with per-file hash verification"
+    },
+    {
+      "id": "executor-admission",
+      "path": "~/.hermes/state/executor-admission.sqlite3",
+      "description": "Fenced lease and pending-wake state shared by both executor cron jobs.",
+      "concurrency_model": "SQLite BEGIN IMMEDIATE transaction with fencing token"
+    },
+    {
+      "id": "session-db",
+      "path": "~/.hermes/state.db (including WAL sidecars)",
+      "description": "Hermes sessions and dashboard-visible conversation state.",
+      "concurrency_model": "SQLite WAL multi-writer tolerant; lifecycle contract follows task 86e2kmud2"
+    },
+    {
+      "id": "kanban-dispatcher",
+      "path": "~/.hermes/kanban/kanban/.dispatcher.lock and board databases",
+      "description": "Gateway-owned Kanban dispatch and board state.",
+      "concurrency_model": "machine-global advisory dispatcher lock plus SQLite transactions"
+    },
+    {
+      "id": "clickup-remote-state",
+      "path": "ClickUp tasks, comments, statuses, and dependency records",
+      "description": "Remote task lifecycle state changed by governed executor, validator, and lifecycle jobs.",
+      "concurrency_model": "ClickUp API conditional workflow and task-level evidence contract"
+    },
+    {
+      "id": "repo-worktrees",
+      "path": "/Users/colingreig/dev/* worktrees and governed branch refs",
+      "description": "Repository worktrees and cleanup targets used by executor and maintenance jobs.",
+      "concurrency_model": "per-repository worktree/claim controls; scripts own their deletion safety checks"
+    },
+    {
+      "id": "clickup-workspace-cache",
+      "path": "~/.hermes/state/clickup-map.json, ~/.hermes/state/clickup-workspace-map.md, and ~/brain/clickup-workspace-map.md",
+      "description": "Refreshed ClickUp topology cache and canonical human-readable workspace note.",
+      "concurrency_model": "script-local atomic replacement and refresh lock"
+    },
+    {
+      "id": "pr-pipeline-state",
+      "path": "~/.hermes/state/ci-health-*.json and ~/.hermes/scripts/pr_pipeline/* state",
+      "description": "PR pipeline health, review-poll, and validation state used by no-agent watchdogs.",
+      "concurrency_model": "script-local atomic state files and pipeline-specific locks"
+    },
+    {
+      "id": "claim-ledger",
+      "path": "~/.hermes/state/claim* and executor claim records",
+      "description": "Stranded task claim and lease records reconciled by the claim reaper.",
+      "concurrency_model": "claim-store transactional ownership rules"
+    },
+    {
+      "id": "email-delivery",
+      "path": "Postmark delivery to colin@colingreig.com",
+      "description": "The explicit fleet health digest delivery side effect.",
+      "concurrency_model": "one cron invocation; Postmark sender owns delivery retry and receipts"
+    },
+    {
+      "id": "purelymail-poller-deploy",
+      "path": "~/.hermes/deploy/purelymail-poller/ and ~/.hermes/deploy/purelymail-poller/.lock",
+      "description": "External ignite-email-infra deployment target and deployment lease.",
+      "concurrency_model": "external deployer-held named lock"
+    }
+  ],
+  "actors": [
+    {
+      "id": "fleet-config-installer",
+      "name": "Fleet configuration installer",
+      "actor_class": "conductor-ssh",
+      "owning_repository": "hermes-agent",
+      "mutability": "mutating",
+      "entry_points": ["machine-setup/fleet-config/install_fleet_config.py"],
+      "resources_touched": ["fleet-config", "cron-jobs", "skills-policy"],
+      "current_lock_or_transaction_boundary": {
+        "kind": "exclusive no-follow file lock and install transaction",
+        "path_or_identity": "~/.hermes/.fleet-config-install.lock",
+        "behavior": "Verifies sources, snapshots every destination, writes atomically, and restores snapshots on failure."
+      },
+      "rollback_surface": {
+        "surface": "~/.hermes/logs/fleet-config-installs/<receipt>/destinations",
+        "procedure": "Installer rollback restores planned snapshots; operator may inspect the receipt before a targeted recovery."
+      }
+    },
+    {
+      "id": "mini-release-cut",
+      "name": "Hermes Mini release cut",
+      "actor_class": "conductor-ssh",
+      "owning_repository": "hermes-agent",
+      "mutability": "mutating",
+      "entry_points": ["scripts/mini-release-cut.sh"],
+      "resources_touched": ["runtime-release", "governed-mini-scripts"],
+      "current_lock_or_transaction_boundary": {
+        "kind": "directory lease and atomic release pointer swap",
+        "path_or_identity": "~/.hermes/releases/.mini-release-cut.lock",
+        "behavior": "Builds and validates a fresh release before atomically repointing runtime-current; serializes cuts, rollback, and prune."
+      },
+      "rollback_surface": {
+        "surface": "~/.hermes/releases/.previous and .mini-release-last-receipt.json",
+        "procedure": "mini-release-cut.sh --rollback repoints runtime-current to the verified previous release and restarts services."
+      }
+    },
+    {
+      "id": "ignite-skills-sync",
+      "name": "Ignite skills synchronization",
+      "actor_class": "conductor-ssh",
+      "owning_repository": "hermes-agent",
+      "mutability": "mutating",
+      "entry_points": ["machine-setup/mini-scripts/ignite-skills-pull.sh"],
+      "legacy_entry_point_names": ["sync_ignite_skills_to_hermes.sh"],
+      "resources_touched": ["skills-policy"],
+      "current_lock_or_transaction_boundary": {
+        "kind": "named skill pull and catalog update leases",
+        "path_or_identity": "~/.hermes/state/skill-pulls/ignite-skills-live.lock and catalog-update.lock",
+        "behavior": "The script acquires both leases, validates canonical roots, records the catalog generation, and releases only matching tokens."
+      },
+      "rollback_surface": {
+        "surface": "/Users/colingreig/dev/ignite-skills-live Git checkout and catalog-generation receipt",
+        "procedure": "Failing pulls publish a failed generation; recovery is a reviewed fast-forward or repository rollback before the next pull."
+      },
+      "notes": "The execution brief uses the historic sync_ignite_skills_to_hermes.sh name. The currently deployed governed entry point is ignite-skills-pull.sh."
+    },
+    {
+      "id": "production-clickup-executor",
+      "name": "Unified ClickUp executor dispatch",
+      "actor_class": "cron",
+      "owning_repository": "hermes-agent",
+      "mutability": "mutating",
+      "entry_points": ["cron/executor_admission.py", "cron/scheduler.py"],
+      "cron_job_ids": ["62714b869845", "dcab830aa41c"],
+      "logical_dispatch_surface": "production-clickup-executor",
+      "resources_touched": ["executor-admission", "clickup-remote-state", "repo-worktrees", "cron-jobs"],
+      "current_lock_or_transaction_boundary": {
+        "kind": "fenced SQLite lease",
+        "path_or_identity": "~/.hermes/state/executor-admission.sqlite3 / production-clickup-executor",
+        "behavior": "Both executor cron IDs enter one lease identity; BEGIN IMMEDIATE and monotonically increasing fencing tokens reject overlap."
+      },
+      "rollback_surface": {
+        "surface": "ClickUp evidence handoffs and executor lease history",
+        "procedure": "Release or recover a lease through the admission ledger; revert repository work by its governed commit/PR workflow, never by deleting shared state."
+      }
+    },
+    {
+      "id": "hermes-pr-validator",
+      "name": "Hermes PR validator cron",
+      "actor_class": "cron",
+      "owning_repository": "hermes-agent",
+      "mutability": "mutating",
+      "entry_points": ["cron/scheduler.py", "machine-setup/fleet-config/jobs.json"],
+      "cron_job_ids": ["5a76e290811d"],
+      "resources_touched": ["clickup-remote-state", "repo-worktrees", "cron-jobs"],
+      "current_lock_or_transaction_boundary": {
+        "kind": "cron jobs advisory lock plus validator evidence gate",
+        "path_or_identity": "~/.hermes/cron/.jobs.lock and ClickUp handoff proof contract",
+        "behavior": "Scheduler serializes persisted job metadata; validator status mutation requires its proof packet and finalize token."
+      },
+      "rollback_surface": {
+        "surface": "ClickUp validator comments and repository CI/PR evidence",
+        "procedure": "Correct a false verdict with a new evidence-backed validator action; no local state rewrite is treated as a rollback."
+      }
+    },
+    {
+      "id": "clickup-lifecycle-cron",
+      "name": "ClickUp lifecycle reconciliation cron",
+      "actor_class": "cron",
+      "owning_repository": "hermes-agent",
+      "mutability": "mutating",
+      "entry_points": ["cron/scheduler.py", "machine-setup/fleet-config/jobs.json"],
+      "cron_job_ids": ["777876d3eb16"],
+      "resources_touched": ["clickup-remote-state", "cron-jobs"],
+      "current_lock_or_transaction_boundary": {
+        "kind": "cron jobs advisory lock and ordered reconciliation pass",
+        "path_or_identity": "~/.hermes/cron/.jobs.lock",
+        "behavior": "Scheduler serializes job metadata; the job runs closeout, stalled-task, staleness, then reconciliation in order."
+      },
+      "rollback_surface": {
+        "surface": "ClickUp task event/comment history",
+        "procedure": "Repair incorrect remote lifecycle state with a subsequent audited reconciliation, preserving history."
+      }
+    },
+    {
+      "id": "clickup-poll-gate-cron",
+      "name": "ClickUp poll gate watchdog",
+      "actor_class": "cron",
+      "owning_repository": "hermes-agent",
+      "mutability": "mutating",
+      "entry_points": ["scripts/clickup_poll_gate.py", "~/.hermes/scripts/clickup_poll_gate.py"],
+      "cron_job_ids": ["9dca144ff19b"],
+      "resources_touched": ["clickup-remote-state", "cron-jobs"],
+      "current_lock_or_transaction_boundary": {
+        "kind": "cron jobs advisory lock and gate-local idempotency",
+        "path_or_identity": "~/.hermes/cron/.jobs.lock",
+        "behavior": "The no-agent scheduler serializes its metadata while the poll gate owns its ClickUp eligibility checks."
+      },
+      "rollback_surface": {
+        "surface": "ClickUp task event history and cron output",
+        "procedure": "Correct an incorrect gate action through a subsequent guarded ClickUp reconciliation."
+      }
+    },
+    {
+      "id": "review-poll-gate-cron",
+      "name": "Review poll gate watchdog",
+      "actor_class": "cron",
+      "owning_repository": "hermes-agent",
+      "mutability": "mutating",
+      "entry_points": ["machine-setup/mini-scripts/review_poll_gate.py", "~/.hermes/scripts/review_poll_gate.py"],
+      "cron_job_ids": ["8d3b1d53470d"],
+      "resources_touched": ["pr-pipeline-state", "cron-jobs"],
+      "current_lock_or_transaction_boundary": {
+        "kind": "cron jobs advisory lock and packaged review-poll guard",
+        "path_or_identity": "~/.hermes/cron/.jobs.lock",
+        "behavior": "The compatibility entry point delegates to pr_pipeline.review_poll_gate.safe_main, which owns the guarded poll state transition."
+      },
+      "rollback_surface": {
+        "surface": "PR pipeline state and cron output",
+        "procedure": "A follow-up guarded poll reconciles the review state; inspect its output before any targeted pipeline recovery."
+      }
+    },
+    {
+      "id": "clickup-review-sla-cron",
+      "name": "ClickUp review SLA watchdog",
+      "actor_class": "cron",
+      "owning_repository": "hermes-agent",
+      "mutability": "mutating",
+      "entry_points": ["~/.hermes/scripts/clickup_review_sla.py"],
+      "cron_job_ids": ["ad0ae6b717e2"],
+      "resources_touched": ["clickup-remote-state", "cron-jobs"],
+      "current_lock_or_transaction_boundary": {
+        "kind": "cron jobs advisory lock and SLA script guard",
+        "path_or_identity": "~/.hermes/cron/.jobs.lock",
+        "behavior": "The governed deployed script is the authority for SLA eligibility and remote task follow-up."
+      },
+      "rollback_surface": {
+        "surface": "ClickUp task/comment history and cron output",
+        "procedure": "Correct an SLA action with an auditable subsequent ClickUp update; do not rewrite scheduler history."
+      },
+      "notes": "The fleet jobs file references the deployed Mini script; no tracked source file with this exact name exists in this checkout."
+    },
+    {
+      "id": "spend-meter-cron",
+      "name": "Provider spend meter watchdog",
+      "actor_class": "cron",
+      "owning_repository": "hermes-agent",
+      "mutability": "read-only",
+      "entry_points": ["machine-setup/mini-scripts/spend_meter.py", "~/.hermes/scripts/spend_meter.py"],
+      "cron_job_ids": ["b0c4c5cc70c1"],
+      "resources_touched": ["session-db", "cron-jobs"],
+      "current_lock_or_transaction_boundary": {
+        "kind": "cron jobs advisory lock",
+        "path_or_identity": "~/.hermes/cron/.jobs.lock",
+        "behavior": "The meter reads session and receipt data; scheduler metadata is serialized by the cron lock."
+      },
+      "rollback_surface": {
+        "surface": "Cron output and alert delivery",
+        "procedure": "The meter does not mutate Hermes resources; investigate a bad alert from its source records and rerun after correction."
+      }
+    },
+    {
+      "id": "ci-health-watch-cron",
+      "name": "CI health and PR staleness watchdog",
+      "actor_class": "cron",
+      "owning_repository": "hermes-agent",
+      "mutability": "mutating",
+      "entry_points": ["machine-setup/mini-scripts/ci-health-watch-cron.py", "~/.hermes/scripts/ci-health-watch-cron.py"],
+      "cron_job_ids": ["e835c614cfb2"],
+      "resources_touched": ["pr-pipeline-state", "cron-jobs"],
+      "current_lock_or_transaction_boundary": {
+        "kind": "atomic watchdog state and cron jobs advisory lock",
+        "path_or_identity": "~/.hermes/state/ci-health-pr-staleness-last-run.json",
+        "behavior": "The wrapper atomically claims the daily staleness run and retains separate CI/fleet probe state."
+      },
+      "rollback_surface": {
+        "surface": "CI health state receipts and cron output",
+        "procedure": "Remove or restore only a verified stale state receipt, then let the guarded next run rebuild it."
+      }
+    },
+    {
+      "id": "clickup-workspace-refresh-cron",
+      "name": "ClickUp workspace topology refresh",
+      "actor_class": "cron",
+      "owning_repository": "hermes-agent",
+      "mutability": "mutating",
+      "entry_points": ["machine-setup/mini-scripts/clickup_workspace_refresh.py", "~/.hermes/scripts/clickup_workspace_refresh.py"],
+      "cron_job_ids": ["bcf275768661"],
+      "resources_touched": ["clickup-workspace-cache", "cron-jobs"],
+      "current_lock_or_transaction_boundary": {
+        "kind": "refresh lock and atomic cache replacement",
+        "path_or_identity": "~/.hermes/state/clickup-workspace-refresh.lock",
+        "behavior": "The refresher derives cache cadence from the registered cron and atomically replaces map and note artifacts."
+      },
+      "rollback_surface": {
+        "surface": "~/.hermes/state/clickup-workspace-map.prev.md",
+        "procedure": "Restore the previous verified markdown mirror if needed, then rerun a successful refresh to rebuild canonical cache state."
+      }
+    },
+    {
+      "id": "reap-stranded-claims-cron",
+      "name": "Stranded claim reaper",
+      "actor_class": "cron",
+      "owning_repository": "hermes-agent",
+      "mutability": "mutating",
+      "entry_points": ["~/.hermes/scripts/reap_stranded_claims.py"],
+      "cron_job_ids": ["dd73a5e578e4"],
+      "resources_touched": ["claim-ledger", "cron-jobs"],
+      "current_lock_or_transaction_boundary": {
+        "kind": "claim-store ownership transaction and cron jobs advisory lock",
+        "path_or_identity": "~/.hermes/state/claim*",
+        "behavior": "The deployed claim reaper owns stale-claim eligibility and releases only leases its ledger can prove stranded."
+      },
+      "rollback_surface": {
+        "surface": "Claim ledger history and cron output",
+        "procedure": "Recover an incorrectly released claim through the ledger's normal reassignment flow rather than rewriting prior claim records."
+      },
+      "notes": "The fleet jobs file references the deployed Mini script; no tracked source file with this exact name exists in this checkout."
+    },
+    {
+      "id": "ignite-board-sync-cron",
+      "name": "Ignite board synchronization",
+      "actor_class": "cron",
+      "owning_repository": "hermes-agent",
+      "mutability": "mutating",
+      "entry_points": ["~/.hermes/scripts/ignite-board-sync.sh"],
+      "cron_job_ids": ["542fca8d839f"],
+      "resources_touched": ["clickup-remote-state", "cron-jobs"],
+      "current_lock_or_transaction_boundary": {
+        "kind": "cron jobs advisory lock and board-sync idempotency",
+        "path_or_identity": "~/.hermes/cron/.jobs.lock",
+        "behavior": "The deployed board-sync script owns its remote reconciliation and must remain idempotent across retries."
+      },
+      "rollback_surface": {
+        "surface": "ClickUp sync history and cron output",
+        "procedure": "Correct remote drift through a subsequent guarded synchronization, preserving task history."
+      },
+      "notes": "The fleet jobs file references the deployed Mini script; no tracked source file with this exact name exists in this checkout."
+    },
+    {
+      "id": "clickup-closeout-actor-cron",
+      "name": "ClickUp closeout actor",
+      "actor_class": "cron",
+      "owning_repository": "hermes-agent",
+      "mutability": "mutating",
+      "entry_points": ["machine-setup/mini-scripts/closeout_actor.py", "~/.hermes/scripts/closeout_actor.py"],
+      "cron_job_ids": ["2ff001bea4b5"],
+      "resources_touched": ["clickup-remote-state", "pr-pipeline-state", "cron-jobs"],
+      "current_lock_or_transaction_boundary": {
+        "kind": "guarded ClickUp status transition and cron jobs advisory lock",
+        "path_or_identity": "~/.hermes/cron/.jobs.lock and clickup_status_guard.py",
+        "behavior": "The closeout actor requires merged PR and validator PASS evidence and routes status changes through the guarded ClickUp path."
+      },
+      "rollback_surface": {
+        "surface": "Validator verdict store and ClickUp task history",
+        "procedure": "Repair an incorrect review transition through the guarded status flow; complete remains unavailable to this actor."
+      }
+    },
+    {
+      "id": "fleet-health-digest-cron",
+      "name": "Fleet health digest cron",
+      "actor_class": "cron",
+      "owning_repository": "hermes-agent",
+      "mutability": "read-only",
+      "entry_points": ["cron/scheduler.py", "machine-setup/fleet-config/jobs.json"],
+      "cron_job_ids": ["f23a03e9d1b2"],
+      "resources_touched": ["email-delivery", "cron-jobs"],
+      "current_lock_or_transaction_boundary": {
+        "kind": "cron jobs advisory lock",
+        "path_or_identity": "~/.hermes/cron/.jobs.lock",
+        "behavior": "The prompt explicitly forbids config, skill, cron, and ClickUp writes; scheduler-only job metadata remains serialized by the cron lock."
+      },
+      "rollback_surface": {
+        "surface": "Digest email and sender receipt",
+        "procedure": "No Hermes-owned production resource is changed by the digest; delivery correction is a subsequent digest or sender retry."
+      },
+      "notes": "Email delivery is an external side effect, but this actor is read-only for Hermes production resources."
+    },
+    {
+      "id": "repo-maintenance-cron",
+      "name": "Repository maintenance cron",
+      "actor_class": "cron",
+      "owning_repository": "hermes-agent",
+      "mutability": "mutating",
+      "entry_points": ["cron/scheduler.py", "machine-setup/fleet-config/jobs.json"],
+      "cron_job_ids": ["59bdd8ebc468"],
+      "resources_touched": ["repo-worktrees", "cron-jobs"],
+      "current_lock_or_transaction_boundary": {
+        "kind": "cron jobs advisory lock and script-local deletion guards",
+        "path_or_identity": "~/.hermes/cron/.jobs.lock",
+        "behavior": "Scheduler serializes metadata; each cleanup script owns its dry-run and deletion eligibility checks."
+      },
+      "rollback_surface": {
+        "surface": "Git worktree/ref recovery and retained .bak files",
+        "procedure": "Deletion is deliberately safety-gated; recover a removed worktree from its retained repository ref or backup rather than forcing a script past its guard."
+      }
+    },
+    {
+      "id": "gateway-kanban-dispatcher",
+      "name": "Gateway Kanban dispatcher",
+      "actor_class": "gateway",
+      "owning_repository": "hermes-agent",
+      "mutability": "mutating",
+      "entry_points": ["gateway/kanban_watchers.py"],
+      "resources_touched": ["kanban-dispatcher", "session-db"],
+      "current_lock_or_transaction_boundary": {
+        "kind": "machine-global advisory lock and SQLite transactions",
+        "path_or_identity": "~/.hermes/kanban/kanban/.dispatcher.lock",
+        "behavior": "Only the lock holder dispatches; board and session writes use their SQLite transaction contracts."
+      },
+      "rollback_surface": {
+        "surface": "Kanban event log and SQLite backups",
+        "procedure": "Stop the competing gateway, reconcile from event history, and restore only a verified database backup when lifecycle recovery requires it."
+      }
+    },
+    {
+      "id": "dashboard-session-writer",
+      "name": "Dashboard session writer",
+      "actor_class": "dashboard",
+      "owning_repository": "hermes-agent",
+      "mutability": "mutating",
+      "entry_points": ["hermes_state.py", "gateway/kanban_watchers.py"],
+      "resources_touched": ["session-db"],
+      "current_lock_or_transaction_boundary": {
+        "kind": "SQLite WAL transaction",
+        "path_or_identity": "~/.hermes/state.db",
+        "behavior": "Session DB writers are WAL multi-writer tolerant, subject to the lifecycle contract tracked by 86e2kmud2 rather than a fleet singleton."
+      },
+      "rollback_surface": {
+        "surface": "SQLite backup and session lifecycle records",
+        "procedure": "Recover using the session DB lifecycle procedure; never treat a WAL-capable session store as a fleet-wide single-writer resource."
+      }
+    },
+    {
+      "id": "ignite-email-infra-poller-deploy",
+      "name": "PurelyMail poller deploy",
+      "actor_class": "ignite-email-infra-deploy",
+      "owning_repository": "ignite-email-infra",
+      "mutability": "mutating",
+      "entry_points": ["ignite-email-infra: deploy-poller.sh (external repository)"],
+      "resources_touched": ["purelymail-poller-deploy"],
+      "current_lock_or_transaction_boundary": {
+        "kind": "external deploy lock",
+        "path_or_identity": "~/.hermes/deploy/purelymail-poller/.lock",
+        "behavior": "The external deployer serializes its own atomically staged poller deployment under the named lock."
+      },
+      "rollback_surface": {
+        "surface": "~/.hermes/deploy/purelymail-poller/ previous deployed artifact",
+        "procedure": "The owning ignite-email-infra deploy procedure selects the prior verified poller artifact; Hermes must not mutate this external actor directly."
+      },
+      "notes": "Cross-repository actor: recorded here because it writes Hermes paths, but implemented and tested in ignite-email-infra."
+    }
+  ]
+}

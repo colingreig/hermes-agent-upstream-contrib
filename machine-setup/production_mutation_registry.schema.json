@@ -1,0 +1,138 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/colingreig/hermes-agent/schemas/production-mutation-registry.schema.json",
+  "title": "Hermes production mutation registry",
+  "description": "The allowlist of production writers that may mutate Hermes-owned state on the Hermes Mini. Unknown production mutation paths must fail closed.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "registry_kind",
+    "unknown_path_policy",
+    "resources",
+    "actors"
+  ],
+  "properties": {
+    "$schema": {
+      "const": "./production_mutation_registry.schema.json"
+    },
+    "schema_version": { "const": "1.0" },
+    "registry_kind": { "const": "hermes-production-mutation-registry" },
+    "unknown_path_policy": { "$ref": "#/$defs/unknownPathPolicy" },
+    "resources": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/resource" }
+    },
+    "actors": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/actor" }
+    }
+  },
+  "$defs": {
+    "resource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "path", "description", "concurrency_model"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
+        "path": { "type": "string", "minLength": 1 },
+        "description": { "type": "string", "minLength": 1 },
+        "concurrency_model": { "type": "string", "minLength": 1 }
+      }
+    },
+    "lockBoundary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "path_or_identity", "behavior"],
+      "properties": {
+        "kind": { "type": "string", "minLength": 1 },
+        "path_or_identity": { "type": "string", "minLength": 1 },
+        "behavior": { "type": "string", "minLength": 1 }
+      }
+    },
+    "rollbackSurface": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["surface", "procedure"],
+      "properties": {
+        "surface": { "type": "string", "minLength": 1 },
+        "procedure": { "type": "string", "minLength": 1 }
+      }
+    },
+    "actor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "name",
+        "actor_class",
+        "owning_repository",
+        "mutability",
+        "entry_points",
+        "resources_touched",
+        "current_lock_or_transaction_boundary",
+        "rollback_surface"
+      ],
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
+        "name": { "type": "string", "minLength": 1 },
+        "actor_class": {
+          "enum": ["cron", "gateway", "conductor-ssh", "ignite-email-infra-deploy", "dashboard"]
+        },
+        "owning_repository": { "type": "string", "minLength": 1 },
+        "mutability": { "enum": ["read-only", "mutating"] },
+        "entry_points": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true
+        },
+        "legacy_entry_point_names": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true
+        },
+        "cron_job_ids": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^[a-f0-9]+$" },
+          "uniqueItems": true
+        },
+        "logical_dispatch_surface": { "type": "string", "minLength": 1 },
+        "resources_touched": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
+          "uniqueItems": true
+        },
+        "current_lock_or_transaction_boundary": { "$ref": "#/$defs/lockBoundary" },
+        "rollback_surface": { "$ref": "#/$defs/rollbackSurface" },
+        "notes": { "type": "string" }
+      }
+    },
+    "unknownPathPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["default", "rule", "enforcement_status", "follow_on_hook_points"],
+      "properties": {
+        "default": { "const": "fail-closed" },
+        "rule": { "type": "string", "minLength": 1 },
+        "enforcement_status": { "type": "string", "minLength": 1 },
+        "follow_on_hook_points": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["task", "hook", "purpose"],
+            "properties": {
+              "task": { "type": "string", "pattern": "^86e2[a-z0-9]+$" },
+              "hook": { "type": "string", "minLength": 1 },
+              "purpose": { "type": "string", "minLength": 1 }
+            }
+          }
+        }
+      }
+    }
+  }
+}
