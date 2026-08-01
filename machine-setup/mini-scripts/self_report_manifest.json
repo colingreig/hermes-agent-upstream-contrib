@@ -22,8 +22,8 @@
       "src_rel": "hermes_report_build.py",
       "src_base": "mirror",
       "dest_abs": "~/.hermes/scripts/hermes_report_build.py",
-      "sha256": "179ffdf865618df5c72a8eccf782c81e0893fe638f4aa2058c0e8a4c7c163e84",
-      "role": "report builder (HTML+text+subject+JSON); imports hermes_report_build_v1lib + claim_store; owns team-wide ClickUp review queue and separated spend labels",
+      "sha256": "43a1b3e70e18aed32a188b48ad523b1956cf5f930a83aa473b6e5e41e37163eb",
+      "role": "human-first report builder (HTML+text+subject+JSON); imports hermes_report_build_v1lib + claim_store; owns team-wide ClickUp review queue and separated spend labels",
       "deploy_mode": "script"
     },
     {

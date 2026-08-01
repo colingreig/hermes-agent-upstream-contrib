@@ -27,6 +27,44 @@ def _task(task_id: str, status: str, *, list_name: str = "List", folder_name: st
     }
 
 
+def _empty_scoreboard(**overrides):
+    base = {
+        "shipped": 0,
+        "ready": 0,
+        "in_progress": 0,
+        "in_review": 0,
+        "blocked": 0,
+        "lane_code": 0,
+        "lane_content": 0,
+        "validator_completed_window": 0,
+        "daily": {
+            "claimed": {"today": 0, "yesterday": 0},
+            "shipped": {"today": 0, "yesterday": 0},
+            "blocked": {"today": 0, "yesterday": 0},
+        },
+    }
+    base.update(overrides)
+    return base
+
+
+def _empty_spend(**overrides):
+    base = {
+        "empty": True,
+        "error": None,
+        "total_cost": 0.0,
+        "writer_total_cost": 0.0,
+        "cost_delta": 0.0,
+        "today_cost": 0.0,
+        "provider_rows": [],
+        "drift_n": 0,
+        "top_drift_model": None,
+        "guard_total_cost": 12.34,
+        "guard_error": None,
+    }
+    base.update(overrides)
+    return base
+
+
 def test_workspace_review_query_paginates_dedupes_both_statuses_and_unmapped_board(monkeypatch):
     calls: list[str] = []
 
@@ -72,26 +110,17 @@ def test_review_backlog_threshold_alert_renders_prominently_and_flags_subject():
     meta = {"error": None}
     alert = report.build_review_backlog_alert(row_cards, meta, report.DEFAULT_REVIEW_BACKLOG_ALERT_THRESHOLD)
     alerts = [alert]
-    scoreboard = {"shipped": 0, "ready": 0, "in_progress": 0, "in_review": len(row_cards), "blocked": 0,
-                  "lane_code": 0, "lane_content": 0,
-                  "daily": {"claimed": {"today": 0, "yesterday": 0}, "shipped": {"today": 0, "yesterday": 0}, "blocked": {"today": 0, "yesterday": 0}}}
-    spend = {"empty": True, "error": None, "total_cost": 0.0, "writer_total_cost": 0.0,
-             "cost_delta": 0.0, "provider_rows": [], "drift_n": 0, "top_drift_model": None,
-             "guard_total_cost": 12.34, "guard_error": None}
+    scoreboard = _empty_scoreboard(in_review=len(row_cards))
+    spend = _empty_spend()
 
     subject = report.build_subject(scoreboard, spend, report.summarize_alerts(alerts))
     text = report.build_text({}, scoreboard, spend, alerts, [], {"ready": 0}, [], row_cards, meta,
                              report.DEFAULT_REVIEW_BACKLOG_ALERT_THRESHOLD, 360)
 
-    assert subject.startswith("🚨 REVIEW BACKLOG")
+    assert "review backlog" in subject.lower()
+    assert "25 waiting" in subject
     assert "REVIEW BACKLOG ALERT" in text
-    assert "25 tasks at/above threshold 25" in text
-
-
-class _SpendGuard:
-    @staticmethod
-    def _daily_spend_usd_strict(today_str=None):
-        return 42.125
+    assert "25 tasks waiting" in text
 
 
 def test_spend_labels_keep_guard_and_writer_served_sources_separate():
@@ -102,9 +131,7 @@ def test_spend_labels_keep_guard_and_writer_served_sources_separate():
     spend["error"] = None
     text = report.build_text(
         {},
-        {"shipped": 0, "ready": 0, "in_progress": 0, "in_review": 0, "blocked": 0,
-         "lane_code": 0, "lane_content": 0,
-         "daily": {"claimed": {"today": 0, "yesterday": 0}, "shipped": {"today": 0, "yesterday": 0}, "blocked": {"today": 0, "yesterday": 0}}},
+        _empty_scoreboard(),
         spend,
         [],
         [],
@@ -116,7 +143,101 @@ def test_spend_labels_keep_guard_and_writer_served_sources_separate():
         360,
     )
 
-    assert "Writer-served receipts this window: $3.50" in text
-    assert "Guard-tracked daily spend (spend_guard: state.db + opencode logs): $42.12" in text
-    assert "separate sources; no combined total is reported" in text
+    assert "Writer (6h): $3.50" in text
+    assert "Daily total (all sources): $42.12" in text
+    assert "separate sources" in text
     assert "$45.62" not in text
+
+
+class _SpendGuard:
+    @staticmethod
+    def _daily_spend_usd_strict(today_str=None):
+        return 42.125
+
+
+def test_verdict_subject_is_human_not_metric_dump():
+    scoreboard = _empty_scoreboard(ready=5, validator_completed_window=3, in_progress=1)
+    spend = _empty_spend(empty=False, writer_total_cost=1.25, total_cost=1.25)
+    alert_summary = {
+        "action_required": 0,
+        "watch_list": 0,
+        "system_signals": 0,
+        "review_backlog": 0,
+        "alerts_n": 0,
+    }
+    subject = report.build_subject(scoreboard, spend, alert_summary)
+    assert subject == "Hermes: all clear — 3 completed · $1.25"
+    assert "validator-completed" not in subject
+    assert "action required" not in subject
+
+
+def test_stalled_verdict_outranks_other_signals():
+    scoreboard = _empty_scoreboard(ready=5, in_progress=2, blocked=1)
+    spend = _empty_spend()
+    header = {"work_stoppage": "ready=5 completed=0 in_progress=2 live_claims=0 -> STALLED"}
+    alerts = [
+        {
+            "kind": "blocked",
+            "name": "Blocked task",
+            "detail": "Awaiting you",
+            "url": "https://example.com/t/1",
+        },
+        {
+            "kind": "health",
+            "name": "Work stoppage signal",
+            "detail": header["work_stoppage"],
+            "sub": "Health scan",
+        },
+    ]
+    model = report.build_report_view_model(
+        header, scoreboard, spend, alerts, [], {"ready": 5}, [], 360,
+    )
+    assert model["verdict"]["level"] == "stalled"
+    assert model["subject"].startswith("Hermes: stalled")
+    assert "ready=5 completed=0" not in model["headline"]
+    assert "Ready work isn't moving" in model["verdict"]["summary"]
+    text = report.build_text_view(model)
+    assert "NEEDS YOU" in text
+    assert "SYSTEM" in text
+    assert "ACTION REQUIRED" not in text
+    assert "validator-completed" not in text
+    assert "WORTH WATCHING" not in text
+    html = report.render_html_view(model)
+    assert "Ready work isn" in html
+    assert "At a glance" in html
+    assert "Needs you" in html
+
+
+def test_humanize_work_stoppage_sentences():
+    stalled = report.humanize_work_stoppage(
+        "ready=5 completed=0 in_progress=2 live_claims=0 -> STALLED"
+    )
+    assert "Ready work isn't moving" in stalled
+    assert "5 ready" in stalled
+    assert "->" not in stalled
+
+    ok = report.humanize_work_stoppage("ready=1 completed=2 in_progress=1 live_claims=1 -> OK")
+    assert ok == "Work is flowing."
+
+
+def test_queue_roster_not_dumped_in_digest():
+    hermes_rows = [
+        {"name": f"Task {i}", "status": "to do", "url": f"https://x/{i}", "project": "P", "list": "L"}
+        for i in range(8)
+    ]
+    model = report.build_report_view_model(
+        {},
+        _empty_scoreboard(ready=8, validator_completed_window=1),
+        _empty_spend(empty=False, writer_total_cost=0.5, total_cost=0.5),
+        [],
+        hermes_rows,
+        {"ready": 8, "generated": "2026-08-01T13:00:00Z"},
+        [],
+        360,
+    )
+    text = report.build_text_view(model)
+    html = report.render_html_view(model)
+    assert "8 tasks on the Hermes board · 8 ready" in text
+    assert "Task 0" not in text
+    assert "Task 0" not in html
+    assert "8 tasks on the Hermes board" in html

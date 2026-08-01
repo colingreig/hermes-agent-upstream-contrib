@@ -2,31 +2,26 @@
 """
 hermes_report_build.py — deterministic Hermes status email (HTML + text).
 
-The mobile-first v2 renderer reuses the frozen v1 data-collection layer
-(queue snapshot + work-cron briefs + live clickup.mjs resolution) and adds a
-spend/model section sourced from ~/.hermes/logs/writer-served.jsonl.
+Human-first digest. Same data layer as before (queue snapshot + work-cron
+briefs + ClickUp review queue + writer-served spend), but the email is built
+for a 10-second scan, not a machine log dump.
 
-Why a rewrite of the rendering layer: v1's two 4-column HTML tables
-(project | list | task | status) are unreadable in a mobile mail client —
-that's the defect this candidate fixes. v2 restructures the SAME underlying
-data into a mobile-first single-column layout:
+Layout (empty sections are omitted):
 
-  1. Headline banner (mirrors the subject)
-  2. ACTION REQUIRED (blocked/needs-human only)
-  3. WATCH LIST (stale in-progress only)
-  4. SYSTEM SIGNALS
-  5. SCOREBOARD (ready/in-progress/in-review/blocked/validator-completed, lanes)
-  6. MODEL & SPEND (from the writer-served ledger: cost, per-provider, drift)
-  7. ROSTER (work list + queue list, bounded and moved to the bottom)
+  1. Verdict banner — one status + one sentence
+  2. At a glance — completed / ready / in review / spend
+  3. Needs you — blocked / needs-human only
+  4. Worth watching — stale in-progress only
+  5. System — non-OK health signals, humanized
+  6. Review queue — count always; cards when non-empty / alert
+  7. Activity — what Hermes did this window
+  8. Spend — compact writer + daily totals (separate sources)
+  9. Queue summary — one line (no full roster dump)
 
-v1's collection functions (_resolve_task, build_hermes_list, build_work_list,
-_work_cron_dirs) are reused via `import hermes_report_build_v1lib as v1` — that
-lib is a frozen copy of the original v1 data layer, untouched and guarding its
-own execution under `if __name__ == "__main__"`, so importing it does not run
-its main(). (This file is installed AS hermes_report_build.py at cutover, so it
-must import the collectors from the v1lib copy, not from itself.)
+Data collection (_resolve_task, build_hermes_list, build_work_list) still
+comes from `hermes_report_build_v1lib as v1`.
 
-Outputs (paths printed as JSON on stdout, v1-compatible keys + new ones):
+Outputs:
   --out-html     final HTML body     (default /tmp/hermes_report.html)
   --out-text     final text body     (default /tmp/hermes_report.txt)
   --out-subject  suggested subject   (default /tmp/hermes_report_subject.txt)
@@ -37,6 +32,7 @@ import datetime
 import html
 import json
 import os
+import re
 import sys
 import urllib.parse
 import urllib.request
@@ -551,7 +547,7 @@ def build_scoreboard(hermes_rows, snap_tasks, hermes_meta, work_completed, revie
     }
 
 
-# ---------- subject / headline ----------
+# ---------- subject / verdict / copy ----------
 
 def summarize_alerts(alerts):
     counts = collections.Counter(a.get("kind") for a in alerts)
@@ -564,60 +560,191 @@ def summarize_alerts(alerts):
     }
 
 
-def _alert_count_text(alert_summary):
-    return (
-        f"{alert_summary['action_required']} action required · "
-        f"{alert_summary['watch_list']} watch list · "
-        f"{alert_summary['system_signals']} system signals"
-    )
-
-
 def build_review_backlog_alert(review_rows, review_meta, threshold):
     if review_meta.get("error"):
         return {
             "kind": "health",
-            "name": "Workspace review queue degraded",
+            "name": "Review queue unavailable",
             "url": None,
-            "detail": review_meta["error"] + " — review count unknown, not zero",
-            "sub": "ClickUp team-wide review query",
+            "detail": (
+                "Couldn't load the workspace review queue — count is unknown, not zero. "
+                f"({review_meta['error']})"
+            ),
+            "sub": "ClickUp",
         }
     if len(review_rows) >= threshold:
         return {
             "kind": "review_backlog",
-            "name": "Workspace review backlog threshold breached",
+            "name": "Review backlog is high",
             "url": None,
-            "detail": f"{len(review_rows)} tasks in review/ready for review (threshold {threshold})",
-            "sub": "ClickUp team-wide review query",
+            "detail": (
+                f"{len(review_rows)} tasks waiting in review "
+                f"(alert threshold is {threshold})"
+            ),
+            "sub": "ClickUp",
         }
     return None
 
 
-def build_subject(scoreboard, spend, alert_summary):
-    completed = scoreboard.get("validator_completed_window", scoreboard.get("shipped", 0))
-    prefix = "🚨 REVIEW BACKLOG · " if alert_summary.get("review_backlog", 0) else ""
-    subj = (
-        f"{prefix}Hermes: {completed} validator-completed · {_alert_count_text(alert_summary)} · "
-        f"{_cost_display(spend)} · {scoreboard['ready']} ready"
-    )
-    return subj
+def _parse_work_stoppage_fields(raw):
+    """Extract ready/completed/in_progress/live_claims and verdict from machine string."""
+    text = (raw or "").strip()
+    fields = {}
+    for key in ("ready", "completed", "in_progress", "live_claims"):
+        m = re.search(rf"{key}=([0-9?]+)", text)
+        if m:
+            fields[key] = m.group(1)
+    verdict = "OK"
+    if "-> STALLED" in text:
+        verdict = "STALLED"
+    elif "-> UNKNOWN" in text:
+        verdict = "UNKNOWN"
+    elif "-> OK" in text or text.lower().endswith("-> ok"):
+        verdict = "OK"
+    return fields, verdict, text
 
 
-def build_headline_emoji_text(scoreboard, spend, alert_summary):
-    alerts_n = alert_summary["alerts_n"]
-    dot = "🟢" if alerts_n == 0 else "⚠️"
-    completed = scoreboard.get("validator_completed_window", scoreboard.get("shipped", 0))
-    return (
-        f"{dot} {completed} validator-completed · "
-        f"{'⚠️' if alert_summary['action_required'] else '✓'} "
-        f"{alert_summary['action_required']} action required · "
-        f"{'⚠️' if alert_summary['watch_list'] else '✓'} "
-        f"{alert_summary['watch_list']} watch list · "
-        f"{'⚠️' if alert_summary['system_signals'] else '✓'} "
-        f"{alert_summary['system_signals']} system signals · "
-        f"{'🚨' if alert_summary.get('review_backlog') else '✓'} "
-        f"{scoreboard['in_review']} review · "
-        f"💸 {_cost_display(spend)} · {scoreboard['ready']} ready"
-    )
+def humanize_work_stoppage(raw):
+    """Turn the machine work-stoppage string into a sentence a human can act on."""
+    fields, verdict, text = _parse_work_stoppage_fields(raw)
+    if not text:
+        return ""
+    ready = fields.get("ready", "?")
+    completed = fields.get("completed", "?")
+    in_progress = fields.get("in_progress", "?")
+    live_claims = fields.get("live_claims", "?")
+    if verdict == "OK":
+        return "Work is flowing."
+    if verdict == "STALLED":
+        return (
+            f"Ready work isn't moving — {ready} ready, {completed} completed this window, "
+            f"{in_progress} in progress, {live_claims} live claims."
+        )
+    if "live claim count unavailable" in text:
+        return (
+            "Can't confirm whether work is moving — the claim store couldn't be read. "
+            f"(ready={ready}, completed={completed}, in progress={in_progress})"
+        )
+    if "work evidence unresolved" in text:
+        return (
+            f"{in_progress} tasks show in progress, but work evidence for this window "
+            "couldn't be verified."
+        )
+    return "Work-stoppage check was inconclusive."
+
+
+def humanize_health_alert(alert):
+    """Return a display copy of a health alert with humanized detail when applicable."""
+    out = dict(alert or {})
+    name = (out.get("name") or "").lower()
+    detail = out.get("detail") or ""
+    if "work stoppage" in name or "-> STALLED" in detail or "-> UNKNOWN" in detail:
+        out["name"] = "Work may be stalled" if "STALLED" in detail else "Work status unclear"
+        out["detail"] = humanize_work_stoppage(detail)
+        out["sub"] = out.get("sub") or "Health"
+    elif "served ledger" in detail.lower() or "ledger unreadable" in detail.lower():
+        out["name"] = out.get("name") if out.get("name") != "Needs attention" else "Spend ledger unreadable"
+        if "Needs attention" in (out.get("name") or "") or out.get("name") == "Spend ledger unreadable":
+            out["name"] = "Spend ledger unreadable"
+        out["detail"] = "Writer spend for this window is unknown — the receipt ledger couldn't be read."
+    elif "work-card resolution degraded" in detail.lower() or "resolution degraded" in detail.lower():
+        out["name"] = "Some activity cards couldn't be resolved"
+        out["detail"] = detail.replace("ClickUp work-card resolution degraded: ", "Resolved ")
+    return out
+
+
+def _window_label(window_min):
+    hours = window_min / 60.0
+    if hours == int(hours):
+        return f"{int(hours)}h"
+    return f"{hours:.1f}h"
+
+
+def _completed_count(scoreboard):
+    return scoreboard.get("validator_completed_window", scoreboard.get("shipped", 0))
+
+
+def _spend_short(spend):
+    """Compact spend for subject / glance — never formats ledger failure as $0."""
+    if spend.get("error"):
+        return "spend unknown"
+    cost = spend.get("writer_total_cost", spend.get("total_cost"))
+    if cost is None:
+        return "spend unknown"
+    return f"${float(cost):.2f}"
+
+
+def build_verdict(scoreboard, spend, alert_summary, header=None):
+    """Single human verdict driving subject + banner. Priority: stalled > backlog > needs you > signals > watch > ok."""
+    header = header or {}
+    raw_stop = (header.get("work_stoppage") or "")
+    _, stop_verdict, _ = _parse_work_stoppage_fields(raw_stop)
+    completed = _completed_count(scoreboard)
+    spend_bit = _spend_short(spend)
+    action_n = alert_summary.get("action_required", 0)
+    watch_n = alert_summary.get("watch_list", 0)
+    signal_n = alert_summary.get("system_signals", 0)
+    review_n = alert_summary.get("review_backlog", 0)
+    in_review = scoreboard.get("in_review", 0)
+
+    if stop_verdict == "STALLED":
+        return {
+            "level": "stalled",
+            "label": "Stalled",
+            "summary": humanize_work_stoppage(raw_stop),
+            "subject": "Hermes: stalled — ready work isn't moving",
+        }
+    if review_n:
+        count = in_review if in_review not in (None, "UNKNOWN") else "many"
+        return {
+            "level": "alert",
+            "label": "Review backlog",
+            "summary": f"{count} tasks are waiting on review (over the alert threshold).",
+            "subject": f"Hermes: review backlog — {count} waiting",
+        }
+    if action_n:
+        noun = "task" if action_n == 1 else "tasks"
+        return {
+            "level": "attention",
+            "label": "Needs you",
+            "summary": f"{action_n} blocked {noun} waiting on a human decision.",
+            "subject": f"Hermes: needs you — {action_n} blocked",
+        }
+    if stop_verdict == "UNKNOWN" or signal_n:
+        return {
+            "level": "attention",
+            "label": "Check signals",
+            "summary": (
+                humanize_work_stoppage(raw_stop)
+                if stop_verdict == "UNKNOWN"
+                else f"{signal_n} system signal{'s' if signal_n != 1 else ''} need a look."
+            ),
+            "subject": "Hermes: check signals",
+        }
+    if watch_n:
+        noun = "task" if watch_n == 1 else "tasks"
+        return {
+            "level": "watch",
+            "label": "Worth watching",
+            "summary": f"{watch_n} in-progress {noun} went quiet for 2h+.",
+            "subject": f"Hermes: watching — {watch_n} quiet {noun}",
+        }
+    return {
+        "level": "ok",
+        "label": "All clear",
+        "summary": f"{completed} completed this window · {spend_bit} writer spend · {scoreboard.get('ready', 0)} ready.",
+        "subject": f"Hermes: all clear — {completed} completed · {spend_bit}",
+    }
+
+
+def build_subject(scoreboard, spend, alert_summary, header=None):
+    return build_verdict(scoreboard, spend, alert_summary, header)["subject"]
+
+
+def build_headline_emoji_text(scoreboard, spend, alert_summary, header=None):
+    """Back-compat name: returns the human headline sentence (no emoji soup)."""
+    v = build_verdict(scoreboard, spend, alert_summary, header)
+    return f"{v['label']} — {v['summary']}"
 
 
 def add_resolution_health(header, work_counts):
@@ -652,14 +779,14 @@ def build_report_view_model(
     review_meta = review_meta or {"error": None}
     action_required = [a for a in alerts if a.get("kind") == "blocked"]
     watch_list = [a for a in alerts if a.get("kind") == "stuck"]
-    system_signals = [a for a in alerts if a.get("kind") == "health"]
+    system_signals = [humanize_health_alert(a) for a in alerts if a.get("kind") == "health"]
     review_backlog = [a for a in alerts if a.get("kind") == "review_backlog"]
     sections = {
-        "action_required": {"title": "Action required", "items": action_required},
-        "watch_list": {"title": "Watch list", "items": watch_list},
-        "system_signals": {"title": "System signals", "items": system_signals},
-        "workspace_review_queue": {"title": "Workspace review queue", **_bounded(review_rows)},
-        "what_hermes_did": {"title": "What Hermes did", **_bounded(work_rows)},
+        "action_required": {"title": "Needs you", "items": action_required},
+        "watch_list": {"title": "Worth watching", "items": watch_list},
+        "system_signals": {"title": "System", "items": system_signals},
+        "workspace_review_queue": {"title": "Review queue", **_bounded(review_rows)},
+        "what_hermes_did": {"title": "Activity", **_bounded(work_rows)},
         "queue": {"title": "Queue", **_bounded(hermes_rows)},
     }
     alert_summary = {
@@ -669,7 +796,7 @@ def build_report_view_model(
         "review_backlog": len(review_backlog),
         "alerts_n": len(action_required) + len(watch_list) + len(system_signals) + len(review_backlog),
     }
-    subject = build_subject(scoreboard, spend, alert_summary)
+    verdict = build_verdict(scoreboard, spend, alert_summary, h)
     return {
         "header": h,
         "scoreboard": scoreboard,
@@ -680,8 +807,9 @@ def build_report_view_model(
         "review_meta": review_meta,
         "review_threshold": review_threshold,
         "window_min": window_min,
-        "subject": subject,
-        "headline": build_headline_emoji_text(scoreboard, spend, alert_summary),
+        "verdict": verdict,
+        "subject": verdict["subject"],
+        "headline": f"{verdict['label']} — {verdict['summary']}",
     }
 
 
@@ -768,8 +896,35 @@ def compute_work_stoppage(ready, work_completed, in_progress, work_counts):
 
 # ---------- HTML rendering ----------
 
+_VERDICT_STYLES = {
+    "ok": {"bg": "#eef7f1", "accent": "#0f6b3c", "label": "#0f6b3c"},
+    "watch": {"bg": "#fff8eb", "accent": "#9a6700", "label": "#9a6700"},
+    "attention": {"bg": "#fff4ed", "accent": "#c2410c", "label": "#c2410c"},
+    "stalled": {"bg": "#fef2f2", "accent": "#b91c1c", "label": "#b91c1c"},
+    "alert": {"bg": "#fef2f2", "accent": "#b91c1c", "label": "#b91c1c"},
+}
+
+
 def _esc(x):
     return html.escape(str(x)) if x is not None else ""
+
+
+def _section_heading(title):
+    return (
+        f'<h2 style="margin:28px 0 10px;font-size:13px;font-weight:700;letter-spacing:0.04em;'
+        f'text-transform:uppercase;color:#6b7280">{_esc(title)}</h2>'
+    )
+
+
+def _metric_cell(label, value, emphasize=False):
+    color = "#111827" if emphasize else "#374151"
+    return (
+        '<td style="width:25%;padding:14px 8px;text-align:center;vertical-align:top">'
+        f'<div style="font-size:22px;font-weight:700;color:{color};line-height:1.1">{_esc(value)}</div>'
+        f'<div style="font-size:11px;color:#6b7280;margin-top:4px;text-transform:uppercase;'
+        f'letter-spacing:0.03em">{_esc(label)}</div>'
+        '</td>'
+    )
 
 
 def render_html_view(model):
@@ -782,242 +937,234 @@ def render_html_view(model):
     review_threshold = model.get("review_threshold", DEFAULT_REVIEW_BACKLOG_ALERT_THRESHOLD)
     window_min = model["window_min"]
     subject_line = model["subject"]
+    verdict = model.get("verdict") or build_verdict(scoreboard, spend, model["counts"], h)
     when = _esc(h.get("when", ""))
-    window_h = window_min / 60.0
-    window_h_str = f"{window_h:.0f}" if window_h == int(window_h) else f"{window_h:.1f}"
+    window_label = _window_label(window_min)
+    style = _VERDICT_STYLES.get(verdict.get("level"), _VERDICT_STYLES["attention"])
 
     css_body = (
-        "margin:0;padding:0;background:#f2f2f2;"
-        "font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;"
+        "margin:0;padding:0;background:#eceff3;"
+        "font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;"
+        "color:#111827;"
     )
-    css_container = (
-        "max-width:600px;margin:0 auto;background:#ffffff;"
-    )
+    css_container = "max-width:560px;margin:0 auto;background:#ffffff;"
 
-    parts = []
-    parts.append('<!DOCTYPE html>')
-    parts.append('<html>')
-    parts.append('<head>')
-    parts.append('<meta charset="utf-8">')
-    parts.append('<meta name="viewport" content="width=device-width,initial-scale=1">')
-    parts.append(f'<title>{_esc(subject_line)}</title>')
-    parts.append('</head>')
-    parts.append(f'<body style="{css_body}">')
-    parts.append(f'<div style="{css_container}">')
+    parts = [
+        '<!DOCTYPE html>',
+        '<html><head>',
+        '<meta charset="utf-8">',
+        '<meta name="viewport" content="width=device-width,initial-scale=1">',
+        f'<title>{_esc(subject_line)}</title>',
+        '</head>',
+        f'<body style="{css_body}">',
+        f'<div style="{css_container}">',
+    ]
 
-    # 1. Headline banner
-    banner_color = "#e8f5e9" if model["counts"]["alerts_n"] == 0 else "#fff3e0"
-    border_color = "#2e7d32" if model["counts"]["alerts_n"] == 0 else "#e65100"
-    headline = model["headline"]
+    # 1. Verdict banner
     parts.append(
-        f'<div style="background:{banner_color};border-bottom:3px solid {border_color};'
-        f'padding:18px 20px;">'
-        f'<div style="font-size:18px;font-weight:700;color:#1a1a1a;line-height:1.3">{_esc(headline)}</div>'
-        f'<div style="font-size:13px;color:#666;margin-top:6px">'
-        f'Hermes status · {when} · trailing {window_h_str}h</div>'
+        f'<div style="background:{style["bg"]};border-bottom:3px solid {style["accent"]};padding:22px 24px;">'
+        f'<div style="font-size:12px;font-weight:700;letter-spacing:0.06em;text-transform:uppercase;'
+        f'color:{style["label"]};margin-bottom:6px">Hermes · {_esc(verdict["label"])}</div>'
+        f'<div style="font-size:20px;font-weight:700;color:#111827;line-height:1.35">'
+        f'{_esc(verdict["summary"])}</div>'
+        f'<div style="font-size:13px;color:#6b7280;margin-top:10px">'
+        f'{when} · last {window_label}</div>'
         '</div>'
     )
 
-    parts.append('<div style="padding:20px">')
+    parts.append('<div style="padding:8px 24px 28px">')
 
-    # 2. Action required
-    action_items = sections["action_required"]["items"]
-    parts.append('<h2 style="margin:0 0 12px;font-size:16px;color:#1a1a1a">Action required</h2>')
-    if not action_items:
-        parts.append(
-            '<div style="padding:14px 16px;background:#e8f5e9;border-left:4px solid #2e7d32;'
-            'border-radius:4px;font-size:14px;color:#1a1a1a;margin-bottom:24px">'
-            'No blocked or needs-human tasks right now.</div>'
-        )
-    else:
-        parts.append('<div style="margin-bottom:24px">')
-        for a in action_items:
-            parts.append(render_html_alert_card(a, "#b00020"))
-        parts.append('</div>')
-
-    # 3. Watch list
-    watch_items = sections["watch_list"]["items"]
-    parts.append('<h2 style="margin:0 0 12px;font-size:16px;color:#1a1a1a">Watch list</h2>')
-    if not watch_items:
-        parts.append('<div style="font-size:13px;color:#888;margin-bottom:24px">No stale in-progress tasks.</div>')
-    else:
-        parts.append('<div style="margin-bottom:24px">')
-        for a in watch_items:
-            parts.append(render_html_alert_card(a, "#b15c00"))
-        parts.append('</div>')
-
-    # 4. System signals
-    system_items = sections["system_signals"]["items"]
-    parts.append('<h2 style="margin:0 0 12px;font-size:16px;color:#1a1a1a">System signals</h2>')
-    if not system_items:
-        parts.append('<div style="font-size:13px;color:#888;margin-bottom:24px">No system signals.</div>')
-    else:
-        parts.append('<div style="margin-bottom:24px">')
-        for a in system_items:
-            parts.append(render_html_alert_card(a, "#666"))
-        parts.append('</div>')
-
-    # 5. Scoreboard
-    parts.append('<h2 style="margin:0 0 12px;font-size:16px;color:#1a1a1a">📊 Scoreboard</h2>')
-    cells = [
-        ("Ready", scoreboard["ready"], "#0b57d0"),
-        ("In progress", scoreboard["in_progress"], "#b15c00"),
-        ("Current in review", scoreboard["in_review"], "#0b69c7"),
-        ("Blocked", scoreboard["blocked"], "#b00020"),
-        ("Validator-completed (window)", scoreboard["validator_completed_window"], "#0a7d33"),
+    # 2. At a glance
+    completed = _completed_count(scoreboard)
+    review_glance = "—" if review_meta.get("error") else scoreboard["in_review"]
+    spend_glance = _spend_short(spend)
+    parts.append(_section_heading("At a glance"))
+    parts.append(
+        '<table cellpadding="0" cellspacing="0" border="0" width="100%" '
+        'style="width:100%;background:#f9fafb;border-radius:8px;margin-bottom:4px">'
+        '<tr>'
+        f'{_metric_cell("Completed", completed, emphasize=True)}'
+        f'{_metric_cell("Ready", scoreboard["ready"])}'
+        f'{_metric_cell("In review", review_glance)}'
+        f'{_metric_cell("Writer spend", spend_glance)}'
+        '</tr></table>'
+    )
+    extra_bits = [
+        f'{scoreboard["in_progress"]} in progress',
+        f'{scoreboard["blocked"]} blocked',
     ]
+    if scoreboard.get("lane_code") or scoreboard.get("lane_content"):
+        extra_bits.append(
+            f'lanes {scoreboard["lane_code"]} code / {scoreboard["lane_content"]} content'
+        )
     parts.append(
-        '<table cellpadding="0" cellspacing="0" border="0" style="width:100%;border-collapse:separate;'
-        'border-spacing:6px 6px;margin:0 -6px 8px">'
-    )
-    for i in range(0, len(cells), 2):
-        parts.append('<tr>')
-        for label, val, color in cells[i:i + 2]:
-            parts.append(
-                '<td style="width:50%;background:#f7f7f8;border-radius:6px;padding:12px;text-align:center;'
-                'vertical-align:top">'
-                f'<div style="font-size:22px;font-weight:700;color:{color}">{_esc(val)}</div>'
-                f'<div style="font-size:12px;color:#666;margin-top:2px">{_esc(label)}</div>'
-                '</td>'
-            )
-        if len(cells[i:i + 2]) == 1:
-            parts.append('<td style="width:50%"></td>')
-        parts.append('</tr>')
-    parts.append('</table>')
-    parts.append(
-        f'<div style="font-size:13px;color:#555;margin-bottom:24px">'
-        f'Lanes — Code: {scoreboard["lane_code"]} · Content: {scoreboard["lane_content"]}</div>'
+        f'<div style="font-size:12px;color:#6b7280;margin:8px 0 0">'
+        f'{" · ".join(extra_bits)}</div>'
     )
 
-    # 6. Model & spend
-    parts.append('<h2 style="margin:0 0 12px;font-size:16px;color:#1a1a1a">💸 Model &amp; spend</h2>')
-    if spend.get("guard_error"):
-        parts.append(
-            '<div style="padding:12px 14px;background:#fdecea;border:1px solid #b00020;'
-            'border-radius:4px;font-size:14px;color:#b00020;margin-bottom:10px">'
-            f'⚠️ Guard-tracked daily spend UNKNOWN ({_esc(str(spend["guard_error"]))}) — '
-            'not reported as $0.00.</div>'
-        )
-    else:
-        parts.append(
-            '<div style="font-size:14px;color:#1a1a1a;margin-bottom:10px">'
-            f'Guard-tracked daily spend (spend_guard: state.db + opencode logs): '
-            f'<b>${spend["guard_total_cost"]:.2f}</b></div>'
-        )
+    # 3. Needs you (omit when empty)
+    action_items = sections["action_required"]["items"]
+    if action_items:
+        parts.append(_section_heading(f'Needs you ({len(action_items)})'))
+        for a in action_items:
+            parts.append(render_html_alert_card(a, "#b91c1c"))
 
-    if spend.get("error"):
-        parts.append(
-            '<div style="padding:12px 14px;background:#fdecea;border:1px solid #b00020;'
-            'border-radius:4px;font-size:14px;color:#b00020;margin-bottom:24px">'
-            f'⚠️ Writer-served receipt ledger UNREADABLE ({_esc(str(spend["error"]))}) — spend this window is '
-            'UNKNOWN, not $0.00.</div>'
-        )
-    elif spend.get("empty"):
-        parts.append(
-            '<div style="padding:12px 14px;background:#f7f7f8;border-radius:4px;font-size:14px;'
-            'color:#666;margin-bottom:24px">No writer-served receipts in the window.</div>'
-        )
-    else:
-        cost_line = f'Writer-served receipts this window: <b>${spend["writer_total_cost"]:.2f}</b>'
-        delta = spend["cost_delta"]
-        if delta > 0.0001:
-            cost_line += f' &nbsp; <span style="color:#b00020">▲ ${delta:.2f} vs previous window</span>'
-        elif delta < -0.0001:
-            cost_line += f' &nbsp; <span style="color:#0a7d33">▼ ${abs(delta):.2f} vs previous window</span>'
-        else:
-            cost_line += ' &nbsp; <span style="color:#888">(flat vs previous window)</span>'
-        parts.append(f'<div style="font-size:14px;color:#1a1a1a;margin-bottom:10px">{cost_line}</div>')
-        parts.append(
-            f'<div style="font-size:13px;color:#555;margin-bottom:10px">'
-            f'Today so far: ${spend["today_cost"]:.2f}</div>'
-        )
+    # 4. Worth watching
+    watch_items = sections["watch_list"]["items"]
+    if watch_items:
+        parts.append(_section_heading(f'Worth watching ({len(watch_items)})'))
+        for a in watch_items:
+            parts.append(render_html_alert_card(a, "#9a6700"))
 
-        parts.append('<div style="margin-bottom:10px">')
-        for pr in spend["provider_rows"]:
-            deg = f' · {pr["degraded"]} degraded' if pr["degraded"] else ''
-            parts.append(
-                '<div style="padding:10px 12px;background:#f7f7f8;border-radius:4px;margin-bottom:6px;'
-                'font-size:13px;color:#1a1a1a">'
-                f'<b>{_esc(pr["provider"])}</b> · {pr["n"]} runs · ${pr["cost"]:.2f}{deg}'
-                '</div>'
-            )
-        parts.append('</div>')
+    # 5. System
+    system_items = sections["system_signals"]["items"]
+    if system_items:
+        parts.append(_section_heading(f'System ({len(system_items)})'))
+        for a in system_items:
+            parts.append(render_html_alert_card(a, "#4b5563"))
 
-        if spend["drift_n"] > 0:
-            top = f' (mostly {_esc(spend["top_drift_model"])})' if spend["top_drift_model"] else ''
-            parts.append(
-                f'<div style="font-size:13px;color:#b15c00;margin-bottom:24px">'
-                f'⚠️ {spend["drift_n"]} runs fell off the pinned model{top}</div>'
-            )
-        else:
-            parts.append(
-                '<div style="font-size:13px;color:#0a7d33;margin-bottom:24px">'
-                '✓ All runs served on the pinned model.</div>'
-            )
-
-    # 7. Workspace-wide review queue
+    # 6. Review queue
     review_section = sections["workspace_review_queue"]
     review_rows = review_section["rows"]
-    review_count_label = "UNKNOWN" if review_meta.get("error") else str(review_section["total"])
-    parts.append(
-        f'<h2 style="margin:0 0 12px;font-size:16px;color:#1a1a1a">🚨 Workspace review queue '
-        f'({review_count_label})</h2>'
-    )
+    review_count_label = "unknown" if review_meta.get("error") else str(review_section["total"])
+    parts.append(_section_heading(f'Review queue ({review_count_label})'))
     if review_meta.get("error"):
         parts.append(
-            '<div style="padding:12px 14px;background:#fdecea;border:1px solid #b00020;'
-            'border-radius:4px;font-size:14px;color:#b00020;margin-bottom:16px">'
-            f'ClickUp review queue degraded: {_esc(review_meta.get("error"))}. Count is UNKNOWN, not zero.</div>'
+            '<div style="padding:12px 14px;background:#fef2f2;border-left:4px solid #b91c1c;'
+            'border-radius:4px;font-size:14px;color:#991b1b;margin-bottom:12px">'
+            f'Couldn\'t load the review queue — count is unknown, not zero. '
+            f'({_esc(review_meta.get("error"))})</div>'
         )
     elif review_section["total"] >= review_threshold:
         parts.append(
-            '<div style="padding:14px 16px;background:#fdecea;border:2px solid #b00020;'
-            'border-radius:4px;font-size:15px;color:#b00020;margin-bottom:16px;font-weight:700">'
-            f'REVIEW BACKLOG ALERT: {review_section["total"]} tasks at/above threshold {review_threshold}.</div>'
+            '<div style="padding:14px 16px;background:#fef2f2;border-left:4px solid #b91c1c;'
+            'border-radius:4px;font-size:15px;color:#991b1b;margin-bottom:12px;font-weight:700">'
+            f'REVIEW BACKLOG ALERT: {review_section["total"]} tasks waiting '
+            f'(threshold {review_threshold}).</div>'
         )
+    if review_rows:
+        parts.append(render_html_cards(review_rows))
+        if review_section["shown"] < review_section["total"]:
+            parts.append(
+                f'<div style="font-size:12px;color:#9ca3af;margin:-4px 0 8px">'
+                f'Showing {review_section["shown"]} of {review_section["total"]}.</div>'
+            )
+    elif not review_meta.get("error"):
+        parts.append(
+            '<div style="font-size:14px;color:#6b7280;margin-bottom:8px">Nothing waiting on review.</div>'
+        )
+
+    # 7. Activity
+    work_section = sections["what_hermes_did"]
+    parts.append(_section_heading(f'Activity ({work_section["total"]})'))
+    if work_section["rows"]:
+        parts.append(render_html_cards(work_section["rows"]))
+        if work_section["shown"] < work_section["total"]:
+            parts.append(
+                f'<div style="font-size:12px;color:#9ca3af;margin:-4px 0 8px">'
+                f'Showing {work_section["shown"]} of {work_section["total"]}.</div>'
+            )
     else:
         parts.append(
-            f'<div style="font-size:13px;color:#555;margin-bottom:12px">'
-            f'Threshold {review_threshold}; team-wide query includes subtasks and both review statuses.</div>'
+            '<div style="font-size:14px;color:#6b7280;margin-bottom:8px">'
+            'No completed work cards in this window.</div>'
         )
-    parts.append(render_html_cards(review_rows))
-    if review_section["shown"] < review_section["total"]:
-        parts.append(f'<div style="font-size:12px;color:#888;margin-bottom:16px">Showing {review_section["shown"]} of {review_section["total"]}.</div>')
 
-    # 8. Roster
-    work_section = sections["what_hermes_did"]
-    parts.append(
-        f'<h2 style="margin:0 0 12px;font-size:16px;color:#1a1a1a">📋 What Hermes did '
-        f'({work_section["total"]})</h2>'
-    )
-    parts.append(render_html_cards(work_section["rows"]))
-    if work_section["shown"] < work_section["total"]:
-        parts.append(f'<div style="font-size:12px;color:#888;margin-bottom:16px">Showing {work_section["shown"]} of {work_section["total"]}.</div>')
+    # 8. Spend (compact)
+    parts.append(_section_heading("Spend"))
+    parts.append(render_html_spend(spend, window_label))
 
+    # 9. Queue summary (no roster dump)
     queue_section = sections["queue"]
+    parts.append(_section_heading("Queue"))
     parts.append(
-        f'<h2 style="margin:24px 0 12px;font-size:16px;color:#1a1a1a">📋 Queue '
-        f'({queue_section["total"]})</h2>'
-    )
-    parts.append(
-        f'<div style="font-size:12px;color:#888;margin:-8px 0 12px">'
-        f'{_esc(hermes_meta.get("ready"))} agent-ready · snapshot {_esc(hermes_meta.get("generated"))}</div>'
-    )
-    parts.append(render_html_cards(queue_section["rows"]))
-    if queue_section["shown"] < queue_section["total"]:
-        parts.append(f'<div style="font-size:12px;color:#888;margin-bottom:16px">Showing {queue_section["shown"]} of {queue_section["total"]}.</div>')
-
-    parts.append(
-        '<p style="margin:24px 0 0;font-size:11px;color:#999">'
-        'Read-only status report. It does not fix anything — '
-        'see ignite-babysit-hermes for that.</p>'
+        f'<div style="font-size:14px;color:#374151;line-height:1.5">'
+        f'{queue_section["total"]} tasks on the Hermes board · '
+        f'{_esc(hermes_meta.get("ready", 0))} ready'
+        + (
+            f'<br><span style="font-size:12px;color:#9ca3af">Snapshot {_esc(hermes_meta.get("generated"))}</span>'
+            if hermes_meta.get("generated") else ""
+        )
+        + '</div>'
     )
 
-    parts.append('</div>')  # padding div
-    parts.append('</div>')  # container
-    parts.append('</body>')
-    parts.append('</html>')
+    parts.append(
+        '<p style="margin:28px 0 0;font-size:11px;color:#9ca3af;line-height:1.4">'
+        'Read-only status digest. It does not fix anything.</p>'
+    )
+    parts.append('</div></div></body></html>')
     return "\n".join(parts)
+
+
+def render_html_spend(spend, window_label):
+    chunks = []
+    if spend.get("guard_error"):
+        chunks.append(
+            '<div style="padding:12px 14px;background:#fef2f2;border-left:4px solid #b91c1c;'
+            'border-radius:4px;font-size:14px;color:#991b1b;margin-bottom:10px">'
+            f'Daily spend unknown ({_esc(str(spend["guard_error"]))}) — not reported as $0.00.</div>'
+        )
+    else:
+        guard = spend.get("guard_total_cost")
+        guard_txt = f"${float(guard):.2f}" if guard is not None else "unknown"
+        chunks.append(
+            f'<div style="font-size:14px;color:#111827;margin-bottom:8px">'
+            f'Daily total (all sources): <b>{guard_txt}</b></div>'
+        )
+
+    if spend.get("error"):
+        chunks.append(
+            '<div style="padding:12px 14px;background:#fef2f2;border-left:4px solid #b91c1c;'
+            'border-radius:4px;font-size:14px;color:#991b1b;margin-bottom:8px">'
+            f'Writer spend for this {window_label} is unknown — ledger unreadable '
+            f'({_esc(str(spend["error"]))}).</div>'
+        )
+    elif spend.get("empty"):
+        chunks.append(
+            f'<div style="font-size:14px;color:#6b7280;margin-bottom:8px">'
+            f'No writer spend in the last {window_label}.</div>'
+        )
+    else:
+        delta = spend.get("cost_delta") or 0
+        if delta > 0.0001:
+            delta_html = f'<span style="color:#b91c1c">↑ ${delta:.2f} vs prior {window_label}</span>'
+        elif delta < -0.0001:
+            delta_html = f'<span style="color:#0f6b3c">↓ ${abs(delta):.2f} vs prior {window_label}</span>'
+        else:
+            delta_html = f'<span style="color:#9ca3af">flat vs prior {window_label}</span>'
+        chunks.append(
+            f'<div style="font-size:14px;color:#111827;margin-bottom:6px">'
+            f'Writer ({window_label}): <b>${spend["writer_total_cost"]:.2f}</b> · {delta_html}</div>'
+        )
+        if spend.get("today_cost") is not None:
+            chunks.append(
+                f'<div style="font-size:13px;color:#6b7280;margin-bottom:8px">'
+                f'Today so far (writer): ${spend["today_cost"]:.2f}</div>'
+            )
+        if spend.get("provider_rows"):
+            for pr in spend["provider_rows"]:
+                deg = f' · {pr["degraded"]} degraded' if pr.get("degraded") else ""
+                run_label = "run" if pr["n"] == 1 else "runs"
+                chunks.append(
+                    '<div style="padding:8px 12px;background:#f9fafb;border-radius:4px;margin-bottom:4px;'
+                    'font-size:13px;color:#374151">'
+                    f'{_esc(pr["provider"])} · {pr["n"]} {run_label} · ${pr["cost"]:.2f}{deg}'
+                    '</div>'
+                )
+        if spend.get("drift_n", 0) > 0:
+            top = f' (mostly {_esc(spend["top_drift_model"])})' if spend.get("top_drift_model") else ""
+            drift_n = spend["drift_n"]
+            run_label = "run" if drift_n == 1 else "runs"
+            chunks.append(
+                f'<div style="font-size:13px;color:#9a6700;margin-top:8px">'
+                f'{drift_n} {run_label} used a different model than pinned{top}.</div>'
+            )
+
+    chunks.append(
+        '<div style="font-size:11px;color:#9ca3af;margin-top:10px">'
+        'Writer and daily totals are separate sources — they are not added together.</div>'
+    )
+    return "\n".join(chunks)
 
 
 def render_html_alert_card(a, color):
@@ -1027,17 +1174,17 @@ def render_html_alert_card(a, color):
     sub = _esc(a.get("sub") or "")
     if url:
         title_html = (
-            f'<a href="{_esc(url)}" style="color:#0b57d0;text-decoration:none;'
-            f'font-weight:600;font-size:14px">{name}</a>'
+            f'<a href="{_esc(url)}" style="color:#1d4ed8;text-decoration:none;'
+            f'font-weight:600;font-size:15px">{name}</a>'
         )
     else:
-        title_html = f'<span style="font-weight:600;font-size:14px;color:#1a1a1a">{name}</span>'
+        title_html = f'<span style="font-weight:600;font-size:15px;color:#111827">{name}</span>'
     return (
-        '<div style="padding:12px 14px;margin-bottom:8px;background:#fff6f6;'
+        '<div style="padding:12px 14px;margin-bottom:8px;background:#fafafa;'
         f'border-left:4px solid {color};border-radius:4px">'
         f'{title_html}'
-        f'<div style="font-size:13px;color:{color};margin-top:4px;font-weight:600">{detail}</div>'
-        + (f'<div style="font-size:12px;color:#888;margin-top:2px">{sub}</div>' if sub else '')
+        f'<div style="font-size:13px;color:#374151;margin-top:4px;line-height:1.4">{detail}</div>'
+        + (f'<div style="font-size:12px;color:#9ca3af;margin-top:4px">{sub}</div>' if sub else "")
         + '</div>'
     )
 
@@ -1066,24 +1213,23 @@ def render_html(header, scoreboard, spend, alerts, hermes_rows, hermes_meta, wor
 
 def render_html_cards(rows):
     if not rows:
-        return '<div style="font-size:13px;color:#888;margin-bottom:16px">none in this window</div>'
-    out = ['<div style="margin-bottom:16px">']
+        return ""
+    out = ['<div style="margin-bottom:8px">']
     for r in rows:
         name = _esc(r.get("name"))
-        url = _esc(r.get("url", ""), )
+        url = _esc(r.get("url") or "")
         status = r.get("status") or "unknown"
         color = v1._status_color(status)
         project = _esc(r.get("project", "—"))
         lst = _esc(r.get("list", "—"))
         out.append(
-            '<div style="padding:10px 12px;margin-bottom:6px;background:#fafafa;'
-            'border:1px solid #eee;border-radius:4px">'
-            f'<span style="display:inline-block;padding:2px 8px;border-radius:10px;'
-            f'background:{color};color:#fff;font-size:11px;font-weight:600;margin-bottom:6px">'
-            f'{_esc(status)}</span><br>'
-            f'<a href="{url}" style="color:#0b57d0;text-decoration:none;font-size:14px;'
-            f'font-weight:600">{name}</a>'
-            f'<div style="font-size:12px;color:#888;margin-top:2px">{project} · {lst}</div>'
+            '<div style="padding:10px 12px;margin-bottom:6px;background:#f9fafb;'
+            'border:1px solid #eef0f3;border-radius:6px">'
+            f'<div style="font-size:11px;font-weight:600;color:{color};text-transform:uppercase;'
+            f'letter-spacing:0.03em;margin-bottom:4px">{_esc(status)}</div>'
+            f'<a href="{url}" style="color:#1d4ed8;text-decoration:none;font-size:14px;'
+            f'font-weight:600;line-height:1.3">{name}</a>'
+            f'<div style="font-size:12px;color:#9ca3af;margin-top:3px">{project} · {lst}</div>'
             '</div>'
         )
     out.append('</div>')
@@ -1094,23 +1240,64 @@ def render_html_cards(rows):
 
 def render_text_cards(rows):
     if not rows:
-        return "  none in this window"
+        return "  (none)"
     lines = []
     for r in rows:
-        lines.append(f'  [{r.get("status","unknown")}] {r.get("name")}')
-        lines.append(f'    {r.get("project","—")} · {r.get("list","—")}')
-        lines.append(f'    {r.get("url","")}')
+        lines.append(f'  · {r.get("name")}  [{r.get("status", "unknown")}]')
+        lines.append(f'    {r.get("project", "—")} · {r.get("list", "—")}')
+        if r.get("url"):
+            lines.append(f'    {r["url"]}')
     return "\n".join(lines)
 
 
 def render_text_alerts(alerts):
     lines = []
     for a in alerts:
-        lines.append(f'  - {a.get("name")}: {a.get("detail")}')
+        lines.append(f'  · {a.get("name")}')
+        if a.get("detail"):
+            lines.append(f'    {a["detail"]}')
         if a.get("sub"):
             lines.append(f'    ({a["sub"]})')
         if a.get("url"):
             lines.append(f'    {a["url"]}')
+    return lines
+
+
+def _text_spend_block(spend, window_label):
+    lines = []
+    if spend.get("error"):
+        lines.append(
+            f"  Writer ({window_label}): unknown — ledger unreadable ({spend['error']})"
+        )
+    elif spend.get("empty"):
+        lines.append(f"  Writer ({window_label}): no spend")
+    else:
+        delta = spend.get("cost_delta") or 0
+        if delta > 0.0001:
+            delta_str = f"(up ${delta:.2f} vs prior {window_label})"
+        elif delta < -0.0001:
+            delta_str = f"(down ${abs(delta):.2f} vs prior {window_label})"
+        else:
+            delta_str = f"(flat vs prior {window_label})"
+        lines.append(f'  Writer ({window_label}): ${spend["writer_total_cost"]:.2f} {delta_str}')
+        if spend.get("today_cost") is not None:
+            lines.append(f'  Today so far (writer): ${spend["today_cost"]:.2f}')
+        for pr in spend.get("provider_rows") or []:
+            deg = f' · {pr["degraded"]} degraded' if pr.get("degraded") else ""
+            run_label = "run" if pr["n"] == 1 else "runs"
+            lines.append(f'    {pr["provider"]} · {pr["n"]} {run_label} · ${pr["cost"]:.2f}{deg}')
+        if spend.get("drift_n", 0) > 0:
+            top = f' (mostly {spend["top_drift_model"]})' if spend.get("top_drift_model") else ""
+            drift_n = spend["drift_n"]
+            run_label = "run" if drift_n == 1 else "runs"
+            lines.append(f'  {drift_n} {run_label} used a different model than pinned{top}')
+    if spend.get("guard_error"):
+        lines.append(f'  Daily total (all sources): unknown ({spend["guard_error"]}) — not $0.00')
+    else:
+        guard = spend.get("guard_total_cost")
+        guard_txt = f"${float(guard):.2f}" if guard is not None else "unknown"
+        lines.append(f'  Daily total (all sources): {guard_txt}')
+    lines.append("  Writer and daily totals are separate sources — they are not added together.")
     return lines
 
 
@@ -1122,103 +1309,79 @@ def build_text_view(model):
     hermes_meta = model["hermes_meta"]
     review_meta = model.get("review_meta") or {"error": None}
     review_threshold = model.get("review_threshold", DEFAULT_REVIEW_BACKLOG_ALERT_THRESHOLD)
-    window_h = model["window_min"] / 60.0
-    window_h_str = f"{window_h:.0f}" if window_h == int(window_h) else f"{window_h:.1f}"
+    window_label = _window_label(model["window_min"])
+    verdict = model.get("verdict") or build_verdict(scoreboard, spend, model["counts"], h)
 
     lines = [
-        model["headline"],
-        f'Hermes status · {h.get("when","")} · trailing {window_h_str}h',
+        f"HERMES · {verdict['label'].upper()}",
+        verdict["summary"],
+        f'{h.get("when", "")} · last {window_label}'.strip(" ·"),
         "",
-        "=" * 40,
-        "ACTION REQUIRED",
-        "=" * 40,
+        "AT A GLANCE",
+        f'  Completed {_completed_count(scoreboard)}  ·  Ready {scoreboard["ready"]}  ·  '
+        f'In review {"unknown" if review_meta.get("error") else scoreboard["in_review"]}  ·  '
+        f'Writer {_spend_short(spend)}',
+        f'  {scoreboard["in_progress"]} in progress · {scoreboard["blocked"]} blocked'
+        + (
+            f' · lanes {scoreboard["lane_code"]} code / {scoreboard["lane_content"]} content'
+            if scoreboard.get("lane_code") or scoreboard.get("lane_content") else ""
+        ),
     ]
+
     action_items = sections["action_required"]["items"]
-    lines.extend(render_text_alerts(action_items) if action_items else ["  No blocked or needs-human tasks right now."])
-    lines += ["", "=" * 40, "WATCH LIST", "=" * 40]
+    if action_items:
+        lines += ["", f"NEEDS YOU ({len(action_items)})"]
+        lines.extend(render_text_alerts(action_items))
+
     watch_items = sections["watch_list"]["items"]
-    lines.extend(render_text_alerts(watch_items) if watch_items else ["  No stale in-progress tasks."])
-    lines += ["", "=" * 40, "SYSTEM SIGNALS", "=" * 40]
+    if watch_items:
+        lines += ["", f"WORTH WATCHING ({len(watch_items)})"]
+        lines.extend(render_text_alerts(watch_items))
+
     system_items = sections["system_signals"]["items"]
-    lines.extend(render_text_alerts(system_items) if system_items else ["  No system signals."])
-    lines.append("")
+    if system_items:
+        lines += ["", f"SYSTEM ({len(system_items)})"]
+        lines.extend(render_text_alerts(system_items))
 
-    lines += [
-        "=" * 40,
-        "SCOREBOARD",
-        "=" * 40,
-        f'  Ready: {scoreboard["ready"]}   In progress: {scoreboard["in_progress"]}   '
-        f'Current in review: {scoreboard["in_review"]}   Blocked: {scoreboard["blocked"]}   '
-        f'Validator-completed (window): {scoreboard.get("validator_completed_window", scoreboard.get("shipped", 0))}',
-        f'  Lanes - Code: {scoreboard["lane_code"]} · Content: {scoreboard["lane_content"]}',
-        "",
-    ]
-
-    lines += ["=" * 40, "MODEL & SPEND", "=" * 40]
-    if spend.get("error"):
-        lines.append(f"  WARNING: writer-served receipt ledger UNREADABLE ({spend['error']}) — "
-                      "spend this window is UNKNOWN, not $0.00.")
-    elif spend.get("empty"):
-        lines.append("  No writer-served receipts in the window.")
-    else:
-        delta = spend["cost_delta"]
-        if delta > 0.0001:
-            delta_str = f'(up ${delta:.2f} vs previous window)'
-        elif delta < -0.0001:
-            delta_str = f'(down ${abs(delta):.2f} vs previous window)'
-        else:
-            delta_str = '(flat vs previous window)'
-        lines.append(f'  Writer-served receipts this window: ${spend["writer_total_cost"]:.2f} {delta_str}')
-        lines.append(f'  Today so far: ${spend["today_cost"]:.2f}')
-        for pr in spend["provider_rows"]:
-            deg = f' · {pr["degraded"]} degraded' if pr["degraded"] else ''
-            lines.append(f'    {pr["provider"]} · {pr["n"]} runs · ${pr["cost"]:.2f}{deg}')
-        if spend["drift_n"] > 0:
-            top = f' (mostly {spend["top_drift_model"]})' if spend["top_drift_model"] else ''
-            lines.append(f'  WARNING: {spend["drift_n"]} runs fell off the pinned model{top}')
-        else:
-            lines.append('  All runs served on the pinned model.')
-    if spend.get("guard_error"):
-        lines.append(f'  WARNING: guard-tracked daily spend UNKNOWN ({spend["guard_error"]}) — not $0.00.')
-    else:
-        lines.append(f'  Guard-tracked daily spend (spend_guard: state.db + opencode logs): ${spend["guard_total_cost"]:.2f}')
-    lines.append("  Writer-served and guard-tracked figures are separate sources; no combined total is reported.")
-    lines.append("")
-
-    lines += [
-        "=" * 40,
-        f'WORKSPACE REVIEW QUEUE ({"UNKNOWN" if review_meta.get("error") else sections["workspace_review_queue"]["total"]})',
-        "=" * 40,
-    ]
     review_section = sections["workspace_review_queue"]
-    review_rows = review_section["rows"]
+    review_count = "unknown" if review_meta.get("error") else review_section["total"]
+    lines += ["", f"REVIEW QUEUE ({review_count})"]
     if review_meta.get("error"):
-        lines.append(f'  WARNING: ClickUp review queue degraded ({review_meta["error"]}); count UNKNOWN, not zero.')
+        lines.append(f'  Couldn\'t load review queue — count unknown, not zero. ({review_meta["error"]})')
     elif review_section["total"] >= review_threshold:
-        lines.append(f'  REVIEW BACKLOG ALERT: {review_section["total"]} tasks at/above threshold {review_threshold}.')
-    else:
-        lines.append(f'  Threshold {review_threshold}; team-wide query includes subtasks and both review statuses.')
-    lines.append(render_text_cards(review_rows))
-    if review_section["shown"] < review_section["total"]:
-        lines.append(f'  Showing {review_section["shown"]} of {review_section["total"]}.')
-    lines.append("")
+        lines.append(
+            f'  REVIEW BACKLOG ALERT: {review_section["total"]} tasks waiting '
+            f'(threshold {review_threshold}).'
+        )
+    if review_section["rows"]:
+        lines.append(render_text_cards(review_section["rows"]))
+        if review_section["shown"] < review_section["total"]:
+            lines.append(f'  Showing {review_section["shown"]} of {review_section["total"]}.')
+    elif not review_meta.get("error"):
+        lines.append("  Nothing waiting on review.")
 
     work_section = sections["what_hermes_did"]
-    lines += ["=" * 40, f'WHAT HERMES DID ({work_section["total"]})', "=" * 40, render_text_cards(work_section["rows"])]
-    if work_section["shown"] < work_section["total"]:
-        lines.append(f'  Showing {work_section["shown"]} of {work_section["total"]}.')
+    lines += ["", f"ACTIVITY ({work_section['total']})"]
+    if work_section["rows"]:
+        lines.append(render_text_cards(work_section["rows"]))
+        if work_section["shown"] < work_section["total"]:
+            lines.append(f'  Showing {work_section["shown"]} of {work_section["total"]}.')
+    else:
+        lines.append("  No completed work cards in this window.")
+
+    lines += ["", "SPEND"]
+    lines.extend(_text_spend_block(spend, window_label))
+
     queue_section = sections["queue"]
     lines += [
         "",
-        "=" * 40,
-        f'QUEUE ({queue_section["total"]})',
-        "=" * 40,
-        f'  {hermes_meta.get("ready",0)} agent-ready · snapshot {hermes_meta.get("generated","")}',
-        render_text_cards(queue_section["rows"]),
+        "QUEUE",
+        f'  {queue_section["total"]} tasks on the Hermes board · {hermes_meta.get("ready", 0)} ready',
     ]
-    if queue_section["shown"] < queue_section["total"]:
-        lines.append(f'  Showing {queue_section["shown"]} of {queue_section["total"]}.')
-    lines += ["", "(Read-only status report. It does not fix anything - see ignite-babysit-hermes for that.)"]
+    if hermes_meta.get("generated"):
+        lines.append(f'  Snapshot {hermes_meta["generated"]}')
+
+    lines += ["", "(Read-only status digest. It does not fix anything.)"]
     return "\n".join(lines)
 
 
