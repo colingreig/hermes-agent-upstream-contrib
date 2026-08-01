@@ -51,8 +51,17 @@ LAUNCHCTL_TRANSIENT_BOOTSTRAP_CODES = {
 }
 LAUNCHCTL_BOOTSTRAP_ATTEMPTS = 3
 LAUNCHCTL_TIMEOUT_SECONDS = 30
+LAUNCHD_EXIT_TIMEOUT_SECONDS = 25
 LAUNCHCTL_STATE_POLL_ATTEMPTS = 60
 LAUNCHCTL_STATE_POLL_INTERVAL_SECONDS = 0.1
+LAUNCHCTL_STATE_POLL_GRACE_SECONDS = 5
+# launchd may retain a booted-out service until its full ExitTimeOut elapses.
+# Include the initial state check plus enough sleeps to cover that timeout and
+# a bounded scheduling margin before declaring the registration stale.
+LAUNCHCTL_UNREGISTER_POLL_ATTEMPTS = 1 + int(
+    (LAUNCHD_EXIT_TIMEOUT_SECONDS + LAUNCHCTL_STATE_POLL_GRACE_SECONDS)
+    / LAUNCHCTL_STATE_POLL_INTERVAL_SECONDS
+)
 
 
 def _sha256(data: bytes) -> str:
@@ -305,7 +314,7 @@ class Reconciler:
             # parking the job. Transient failures remain nonzero and retry.
             "KeepAlive": {"SuccessfulExit": False},
             "ThrottleInterval": 30,
-            "ExitTimeOut": 25,
+            "ExitTimeOut": LAUNCHD_EXIT_TIMEOUT_SECONDS,
             "StandardOutPath": str(self.hermes_home / "logs" / f"{log_stem}.log"),
             "StandardErrorPath": str(
                 self.hermes_home / "logs" / f"{log_stem}.error.log"
@@ -451,7 +460,7 @@ class Reconciler:
                 raise RuntimeError(f"plist active venv mismatch: {plist_path}")
             if plist.get("LimitLoadToSessionType") != ["Aqua", "Background"]:
                 raise RuntimeError(f"plist session-type contract mismatch: {plist_path}")
-            if plist.get("ExitTimeOut") != 25:
+            if plist.get("ExitTimeOut") != LAUNCHD_EXIT_TIMEOUT_SECONDS:
                 raise RuntimeError(f"plist exit-timeout contract mismatch: {plist_path}")
             serialized = plist_path.read_text(encoding="utf-8")
             forbidden = (
@@ -504,6 +513,18 @@ class Reconciler:
         except (subprocess.TimeoutExpired, OSError):
             return False
 
+    @staticmethod
+    def _launchd_domains() -> tuple[str, str]:
+        uid = os.getuid()
+        return f"gui/{uid}", f"user/{uid}"
+
+    def _ordered_launchd_domains(self, preferred: str) -> tuple[str, str]:
+        domains = self._launchd_domains()
+        if preferred not in domains:
+            raise ValueError(f"unsupported launchd domain: {preferred}")
+        alternate = domains[1] if preferred == domains[0] else domains[0]
+        return preferred, alternate
+
     def _resolve_launchd_domain(self, label: str) -> str:
         """Return the domain that owns ``label``, or the current session domain.
 
@@ -515,9 +536,7 @@ class Reconciler:
         existing GUI registration, then an existing user registration, then
         use ``launchctl managername`` only as the unloaded-service heuristic.
         """
-        uid = os.getuid()
-        gui_domain = f"gui/{uid}"
-        user_domain = f"user/{uid}"
+        gui_domain, user_domain = self._launchd_domains()
         if self._registered(gui_domain, label):
             return gui_domain
         if self._registered(user_domain, label):
@@ -559,6 +578,7 @@ class Reconciler:
             domain,
             label,
             registered=False,
+            attempts=LAUNCHCTL_UNREGISTER_POLL_ATTEMPTS,
         ):
             raise RuntimeError(
                 f"launchctl did not unregister {domain}/{label} after bounded wait"
@@ -629,11 +649,18 @@ class Reconciler:
             (DASHBOARD_LABEL, self.dashboard_plist),
         ):
             domain = self._resolve_launchd_domain(label)
-            self._bootout(domain, label)
-            self._wait_until_unregistered(domain, label)
+            domains = self._ordered_launchd_domains(domain)
+            # A label can survive in the alternate per-user launchd domain
+            # after a prior GUI/SSH generation change. Signal both domains
+            # before waiting so their bounded ExitTimeOut windows overlap.
+            for candidate in domains:
+                self._bootout(candidate, label)
+            for candidate in domains:
+                self._wait_until_unregistered(candidate, label)
             if not plist.is_file():
                 continue
             self._bootstrap_until_registered(domain, label, plist)
+            self._wait_until_unregistered(domains[1], label)
 
 
 def _parser() -> argparse.ArgumentParser:
