@@ -1,4 +1,4 @@
-"""Verifies the real fleet-config bundle's lifecycle contracts across all 5 profiles."""
+"""Contracts for the direct fleet ClickUp executors and profile bundle."""
 
 from __future__ import annotations
 
@@ -9,11 +9,17 @@ from pathlib import Path
 
 FLEET_CONFIG_ROOT = Path(__file__).resolve().parents[1]
 MANIFEST_PATH = FLEET_CONFIG_ROOT / "fleet_config_manifest.json"
+JOBS_PATH = FLEET_CONFIG_ROOT / "jobs.json"
 PROFILES = ("coder", "content", "design", "research", "ops")
 
 
 def _load_manifest() -> dict:
     return json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+
+
+def _jobs_by_name() -> dict[str, dict]:
+    jobs = json.loads(JOBS_PATH.read_text(encoding="utf-8"))["jobs"]
+    return {job["name"]: job for job in jobs}
 
 
 def _soul_text(profile: str) -> str:
@@ -40,24 +46,94 @@ def test_manifest_source_hashes_match():
         assert actual_sha256 == entry["sha256"], f"hash mismatch for {entry['src_rel']}"
 
 
-def test_all_souls_contain_lifecycle_contract():
+def test_clickup_executor_jobs_use_direct_paths_with_stable_scheduling():
+    jobs = _jobs_by_name()
+    expected = {
+        "clickup-executor": {
+            "id": "62714b869845",
+            "prompt": "Work the ClickUp queue now — follow the clickup-queue-poller skill.",
+        },
+        "content-lane-executor": {
+            "id": "dcab830aa41c",
+            "prompt": "/ignite-execute --lane content",
+        },
+    }
+
+    for name, contract in expected.items():
+        job = jobs[name]
+        assert job["id"] == contract["id"]
+        assert job["prompt"] == contract["prompt"]
+        assert job["enabled"] is True
+        assert job["schedule"] == {
+            "display": "*/30 * * * *",
+            "expr": "*/30 * * * *",
+            "kind": "cron",
+        }
+        assert job["schedule_display"] == "*/30 * * * *"
+
+
+def test_clickup_executor_jobs_have_no_fleet_swarm_handoff_contract():
+    jobs = _jobs_by_name()
+    for name in ("clickup-executor", "content-lane-executor"):
+        prompt = jobs[name]["prompt"]
+        assert "hermes kanban swarm" not in prompt.casefold()
+        assert "swarm_synthesis" not in prompt.casefold()
+        assert "synthesizer" not in prompt.casefold()
+
+
+def test_content_executor_is_sonnet_only_and_loads_approved_skill():
+    job = _jobs_by_name()["content-lane-executor"]
+
+    assert job["provider"] == "anthropic"
+    assert job["model"] == "claude-sonnet-5"
+    assert job["no_fallback"] is True
+    assert job["skill"] == "ignite-execute"
+    assert job["skills"] == ["ignite-execute"]
+    assert job["skill_scope"] == "content-executor"
+    assert job["max_turns"] == 200
+
+
+def test_pr_validator_uses_only_the_canonical_ignite_root():
+    job = _jobs_by_name()["hermes-pr-validate"]
+    prompt = job["prompt"]
+    expected_modules = (
+        "$IGNITE_SKILLS_ROOT/clickup/clickup.mjs",
+        "$IGNITE_SKILLS_ROOT/ignite-state/scripts/blocklist-sync.mjs",
+        "$IGNITE_SKILLS_ROOT/ignite-state/scripts/sync-project-plugins.mjs",
+        "$IGNITE_SKILLS_ROOT/ignite-state/scripts/target-repo.mjs",
+    )
+
+    assert "IGNITE_SKILLS_ROOT" in job["required_environment_variables"]
+    assert job["skill"] == "ignite-validate"
+    assert job["skills"] == ["ignite-validate"]
+    for module_path in expected_modules:
+        assert module_path in prompt
+    for home_local_root in (
+        "~/.hermes/skills",
+        "~/.claude/skills",
+        "~/.codex/skills",
+    ):
+        assert home_local_root not in prompt
+    assert "Do not probe, copy, symlink, or fall back" in prompt
+
+
+def test_all_souls_are_direct_profile_personas():
     for profile in PROFILES:
         text = _soul_text(profile)
-        norm = _normalized(text)
-        assert "Kanban card handoff vs ClickUp" in text
-        assert "kanban complete" in text
-        assert "kanban block" in text
-        assert "does **not** mark the ClickUp task Complete" in norm
-        assert "remain short of Complete" in norm
+        lowered = text.casefold()
+        assert "direct hermes" in _normalized(lowered)
+        assert "kanban" not in lowered
+        assert "synthesizer" not in lowered
+        assert "--worker" not in lowered
+        assert "--verifier" not in lowered
 
 
-def test_ops_soul_contains_verifier_contract():
+def test_ops_soul_preserves_truthful_validation_boundary():
     norm = _normalized(_soul_text("ops"))
-    assert "verifier" in norm
-    assert "verification evidence" in norm
-    assert '"gate":"pass"' in norm
-    assert "Only a session explicitly acting as the" in norm
-    assert "`ignite-validate` pass may move ClickUp to Complete" in norm
+    assert "Actually exercise the claim" in norm
+    assert "exact evidence" in norm
+    assert "Only a session explicitly acting as the `ignite-validate` pass may move" in norm
+    assert "ClickUp task to Complete" in norm
 
 
 def test_content_soul_fail_closed_model_policy():
