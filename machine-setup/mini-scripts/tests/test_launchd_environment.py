@@ -154,7 +154,10 @@ class LaunchdEnvironmentTests(unittest.TestCase):
             self.assertEqual(
                 payload["LimitLoadToSessionType"], ["Aqua", "Background"]
             )
-            self.assertEqual(payload["ExitTimeOut"], 25)
+            self.assertEqual(
+                payload["ExitTimeOut"],
+                module.LAUNCHD_EXIT_TIMEOUT_SECONDS,
+            )
             serialized = plist_path.read_text(encoding="utf-8")
             for forbidden in (
                 "github_app_token.py",
@@ -647,10 +650,58 @@ class LaunchdEnvironmentTests(unittest.TestCase):
                     "gui/501",
                     module.GATEWAY_LABEL,
                 )
-        self.assertEqual(registered.call_count, module.LAUNCHCTL_STATE_POLL_ATTEMPTS)
+        self.assertEqual(
+            registered.call_count,
+            module.LAUNCHCTL_UNREGISTER_POLL_ATTEMPTS,
+        )
         self.assertEqual(
             sleep.call_count,
-            module.LAUNCHCTL_STATE_POLL_ATTEMPTS - 1,
+            module.LAUNCHCTL_UNREGISTER_POLL_ATTEMPTS - 1,
+        )
+
+    def test_wait_for_job_absence_covers_launchd_exit_timeout(self):
+        bounded_wait_seconds = (
+            module.LAUNCHCTL_UNREGISTER_POLL_ATTEMPTS - 1
+        ) * module.LAUNCHCTL_STATE_POLL_INTERVAL_SECONDS
+        self.assertGreaterEqual(
+            bounded_wait_seconds,
+            module.LAUNCHD_EXIT_TIMEOUT_SECONDS
+            + module.LAUNCHCTL_STATE_POLL_GRACE_SECONDS,
+        )
+
+    def test_wait_for_job_absence_accepts_cleanup_after_exit_timeout(self):
+        checks = 0
+        checks_through_exit_timeout = (
+            int(
+                module.LAUNCHD_EXIT_TIMEOUT_SECONDS
+                / module.LAUNCHCTL_STATE_POLL_INTERVAL_SECONDS
+            )
+            + 1
+        )
+
+        def registered_until_cleanup(_domain, _label):
+            nonlocal checks
+            checks += 1
+            return checks <= checks_through_exit_timeout
+
+        with (
+            mock.patch.object(
+                self.reconciler,
+                "_registered",
+                side_effect=registered_until_cleanup,
+            ) as registered,
+            mock.patch.object(module.time, "sleep") as sleep,
+        ):
+            self.reconciler._wait_until_unregistered(
+                "user/501",
+                module.GATEWAY_LABEL,
+            )
+
+        self.assertEqual(registered.call_count, checks_through_exit_timeout + 1)
+        self.assertEqual(sleep.call_count, checks_through_exit_timeout)
+        self.assertGreater(
+            sleep.call_count * module.LAUNCHCTL_STATE_POLL_INTERVAL_SECONDS,
+            module.LAUNCHD_EXIT_TIMEOUT_SECONDS,
         )
 
     def test_launchd_domain_prefers_existing_gui_registration(self):
@@ -721,6 +772,27 @@ class LaunchdEnvironmentTests(unittest.TestCase):
                     text=True,
                 )
 
+    def test_launchctl_registration_commands_use_exact_service_targets(self):
+        target = f"user/{os.getuid()}/{module.GATEWAY_LABEL}"
+        with mock.patch.object(
+            module.subprocess,
+            "run",
+            side_effect=(
+                subprocess.CompletedProcess([], 0),
+                subprocess.CompletedProcess([], 0),
+            ),
+        ) as run:
+            self.reconciler._bootout(f"user/{os.getuid()}", module.GATEWAY_LABEL)
+            self.assertTrue(
+                self.reconciler._registered(
+                    f"user/{os.getuid()}",
+                    module.GATEWAY_LABEL,
+                )
+            )
+
+        self.assertEqual(run.call_args_list[0].args[0], ["launchctl", "bootout", target])
+        self.assertEqual(run.call_args_list[1].args[0], ["launchctl", "print", target])
+
     def test_reload_verifies_gateway_and_dashboard_registration(self):
         self.reconciler.install()
         gui_domain = f"gui/{os.getuid()}"
@@ -746,15 +818,84 @@ class LaunchdEnvironmentTests(unittest.TestCase):
             [call.args[:2] for call in wait_absent.call_args_list],
             [
                 (user_domain, module.GATEWAY_LABEL),
+                (gui_domain, module.GATEWAY_LABEL),
+                (gui_domain, module.GATEWAY_LABEL),
                 (gui_domain, module.DASHBOARD_LABEL),
+                (user_domain, module.DASHBOARD_LABEL),
+                (user_domain, module.DASHBOARD_LABEL),
             ],
         )
         self.assertEqual(
             [call.args[0] for call in resolve_domain.call_args_list],
             [module.GATEWAY_LABEL, module.DASHBOARD_LABEL],
         )
-        self.assertEqual(bootout.call_count, 2)
+        self.assertEqual(
+            [call.args[:2] for call in bootout.call_args_list],
+            [
+                (user_domain, module.GATEWAY_LABEL),
+                (gui_domain, module.GATEWAY_LABEL),
+                (gui_domain, module.DASHBOARD_LABEL),
+                (user_domain, module.DASHBOARD_LABEL),
+            ],
+        )
         self.assertEqual(bootstrap.call_count, 2)
+
+    def test_reload_removes_duplicate_domain_registrations_before_bootstrap(self):
+        self.reconciler.install()
+        gui_domain = f"gui/{os.getuid()}"
+        user_domain = f"user/{os.getuid()}"
+        labels = (module.GATEWAY_LABEL, module.DASHBOARD_LABEL)
+        registrations = {
+            (domain, label): True
+            for domain in (gui_domain, user_domain)
+            for label in labels
+        }
+        bootout_calls = []
+        bootstrap_calls = []
+
+        def registered(domain, label):
+            return registrations[(domain, label)]
+
+        def bootout(domain, label):
+            bootout_calls.append((domain, label))
+            registrations[(domain, label)] = False
+
+        def run(args, **kwargs):
+            self.assertEqual(args[:2], ["launchctl", "bootstrap"])
+            domain = args[2]
+            label = module.GATEWAY_LABEL if not bootstrap_calls else module.DASHBOARD_LABEL
+            self.assertFalse(registrations[(gui_domain, label)])
+            self.assertFalse(registrations[(user_domain, label)])
+            bootstrap_calls.append((domain, label))
+            registrations[(domain, label)] = True
+            return subprocess.CompletedProcess(args, 0)
+
+        with (
+            mock.patch.object(self.reconciler, "_registered", side_effect=registered),
+            mock.patch.object(self.reconciler, "_bootout", side_effect=bootout),
+            mock.patch.object(module.subprocess, "run", side_effect=run),
+        ):
+            self.reconciler.reload()
+
+        self.assertEqual(
+            bootout_calls,
+            [
+                (gui_domain, module.GATEWAY_LABEL),
+                (user_domain, module.GATEWAY_LABEL),
+                (gui_domain, module.DASHBOARD_LABEL),
+                (user_domain, module.DASHBOARD_LABEL),
+            ],
+        )
+        self.assertEqual(
+            bootstrap_calls,
+            [
+                (gui_domain, module.GATEWAY_LABEL),
+                (gui_domain, module.DASHBOARD_LABEL),
+            ],
+        )
+        for label in labels:
+            self.assertTrue(registrations[(gui_domain, label)])
+            self.assertFalse(registrations[(user_domain, label)])
 
     def test_registration_failure_restores_snapshot_before_returning_error(self):
         target = self.hermes / "scripts" / "gateway_secrets_wrap.sh"
