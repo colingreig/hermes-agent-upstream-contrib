@@ -461,6 +461,35 @@
       }
     },
     {
+      "label": "com.colingreig.hermes.disk-space-alert",
+      "expected": "loaded",
+      "outcome": {
+        "kind": "json_artifact",
+        "path": "~/.hermes/state/hermes-disk-space-alert.json",
+        "max_age_seconds": 7200,
+        "timestamp_key": "checked_at",
+        "required_values": {
+          "status": "ok"
+        },
+        "success_patterns": ["\"status\"\\s*:\\s*\"ok\""],
+        "failure_patterns": ["\"status\"\\s*:\\s*\"(?:low|check_error)\"", "\"delivery\"\\s*:\\s*\"failed\""]
+      }
+    },
+    {
+      "label": "com.colingreig.hermes.kanban-workspace-sweep",
+      "expected": "loaded",
+      "outcome": {
+        "kind": "text_artifact",
+        "path": "~/.hermes/logs/kanban-workspace-sweep.launchd.log",
+        "max_age_seconds": 129600,
+        "tail_lines": 2000,
+        "run_end_pattern": "^.*\\bsweep-finish\\b[^\\r\\n]*$",
+        "success_patterns": ["sweep-finish[^\\r\\n]*\\berrors=0\\b"],
+        "required_patterns": ["sweep-finish[^\\r\\n]*\\berrors=0\\b"],
+        "failure_patterns": ["sweep-finish[^\\r\\n]*\\berrors=[1-9][0-9]*\\b", "BOARD_SKIP_NO_DB", "BOARD_SKIP_UNLISTABLE", "BOARD_SKIP_TASK_LOOKUP_ERROR", "BOARD_DISCOVERY_UNLISTABLE", "Traceback"]
+      }
+    },
+    {
       "label": "com.colingreig.hermes.release-poll",
       "expected": "retired",
       "outcome": {

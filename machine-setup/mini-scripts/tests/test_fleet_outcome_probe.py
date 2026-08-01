@@ -268,13 +268,32 @@ def test_alarm_dedup_state_advances_only_after_confirmed_send(tmp_path):
 def test_canonical_contract_inventory_covers_exact_jobs_and_semantic_outcomes():
     contracts = json.loads(CONTRACTS_PATH.read_text(encoding="utf-8"))
     jobs = json.loads(JOBS_PATH.read_text(encoding="utf-8"))["jobs"]
-    assert len(jobs) == 16
     assert {item["id"] for item in contracts["cron_jobs"]} == {
         item["id"] for item in jobs
     }
-    assert len(contracts["launch_agents"]) == 19
-    assert sum(item["expected"] == "loaded" for item in contracts["launch_agents"]) == 18
-    assert sum(item["expected"] == "retired" for item in contracts["launch_agents"]) == 1
+    declared_launch_labels = {item["label"] for item in contracts["launch_agents"]}
+    loaded_labels = {
+        item["label"] for item in contracts["launch_agents"]
+        if item["expected"] == "loaded"
+    }
+    retired_labels = {
+        item["label"] for item in contracts["launch_agents"]
+        if item["expected"] == "retired"
+    }
+    assert loaded_labels | retired_labels == declared_launch_labels
+    assert loaded_labels.isdisjoint(retired_labels)
+    required_states = {
+        "com.colingreig.hermes.usage-alert": "loaded",
+        "com.colingreig.hermes.fleet-outcome-probe": "loaded",
+        "com.colingreig.hermes.disk-space-alert": "loaded",
+        "com.colingreig.hermes.kanban-workspace-sweep": "loaded",
+        "com.colingreig.hermes.release-poll": "retired",
+    }
+    declared_states = {
+        item["label"]: item["expected"] for item in contracts["launch_agents"]
+    }
+    assert {label: declared_states[label] for label in required_states} == required_states
+    assert retired_labels == {"com.colingreig.hermes.release-poll"}
 
     for item in contracts["cron_jobs"]:
         if not item["enabled"]:
@@ -335,6 +354,157 @@ def test_clickup_refresh_receipt_requires_success_and_matching_map(tmp_path):
         )
     }
     assert {"failure_marker", "success_marker_missing"} <= codes
+
+
+def test_disk_space_contract_requires_fresh_ok_receipt(tmp_path):
+    module = _load_module()
+    label = "com.colingreig.hermes.disk-space-alert"
+    outcome = _canonical_contract(launch_label=label)["outcome"]
+    artifact = _fresh_artifact(
+        tmp_path,
+        json.dumps(
+            {"checked_at": NOW.isoformat(), "status": "ok", "delivery": "n/a"}
+        ),
+    )
+    checked_outcome = {**outcome, "path": str(artifact)}
+
+    assert module._check_artifact(
+        surface="launchd",
+        identifier=label,
+        outcome=checked_outcome,
+        home=tmp_path,
+        now=NOW,
+    ) == []
+
+    import os
+
+    for status in ("low", "check_error"):
+        artifact.write_text(
+            json.dumps(
+                {
+                    "checked_at": NOW.isoformat(),
+                    "status": status,
+                    "delivery": "n/a",
+                }
+            ),
+            encoding="utf-8",
+        )
+        os.utime(artifact, (NOW.timestamp(), NOW.timestamp()))
+        findings = module._check_artifact(
+            surface="launchd",
+            identifier=label,
+            outcome=checked_outcome,
+            home=tmp_path,
+            now=NOW,
+        )
+        assert {(item["id"], item["code"]) for item in findings} == {
+            (label, "failure_marker"),
+            (label, "success_marker_missing"),
+        }
+
+    artifact.write_text(
+        json.dumps(
+            {
+                "checked_at": NOW.isoformat(),
+                "status": "ok",
+                "delivery": "failed",
+            }
+        ),
+        encoding="utf-8",
+    )
+    os.utime(artifact, (NOW.timestamp(), NOW.timestamp()))
+    findings = module._check_artifact(
+        surface="launchd",
+        identifier=label,
+        outcome=checked_outcome,
+        home=tmp_path,
+        now=NOW,
+    )
+    assert {(item["id"], item["code"]) for item in findings} == {
+        (label, "failure_marker")
+    }
+
+    stale_timestamp = NOW.timestamp() - outcome["max_age_seconds"] - 1
+    os.utime(artifact, (stale_timestamp, stale_timestamp))
+    findings = module._check_artifact(
+        surface="launchd",
+        identifier=label,
+        outcome=checked_outcome,
+        home=tmp_path,
+        now=NOW,
+    )
+    assert {(item["id"], item["code"]) for item in findings} == {
+        (label, "evidence_stale")
+    }
+
+
+def test_kanban_sweep_contract_requires_complete_clean_summary(tmp_path):
+    module = _load_module()
+    label = "com.colingreig.hermes.kanban-workspace-sweep"
+    outcome = _canonical_contract(launch_label=label)["outcome"]
+    full_summary = (
+        "sweep-finish root=/tmp/hermes boards_swept=2 removed=0 "
+        "orphan_removed=0 removed_bytes=0 removed_size=0B skipped_active=0 "
+        "skipped_non_scratch=0 skipped_path_mismatch=0 skipped_recent=0 "
+        "errors=0 days=14 dry_run=False\n"
+    )
+    artifact = _fresh_artifact(tmp_path, full_summary)
+
+    def check():
+        return module._check_text_evidence(
+            surface="launchd",
+            identifier=label,
+            path=artifact,
+            outcome=outcome,
+            now=NOW,
+        )
+
+    def rewrite(text):
+        artifact.write_text(text, encoding="utf-8")
+        import os
+
+        os.utime(artifact, (NOW.timestamp(), NOW.timestamp()))
+
+    assert check() == []
+
+    rewrite(full_summary.replace("errors=0", "errors=1"))
+    findings = check()
+    assert {(item["id"], item["code"]) for item in findings} == {
+        (label, "failure_marker"),
+        (label, "required_marker_missing"),
+        (label, "success_marker_missing"),
+    }
+
+    rewrite(full_summary + "next sweep still running\n")
+    findings = check()
+    assert {(item["id"], item["code"]) for item in findings} == {
+        (label, "run_incomplete")
+    }
+
+    rewrite(full_summary + "Traceback (most recent call last):\ncrash\n")
+    findings = check()
+    assert {(item["id"], item["code"]) for item in findings} == {
+        (label, "failure_marker"),
+        (label, "run_incomplete"),
+    }
+
+    rewrite("sweep-start root=/tmp/hermes\n")
+    findings = check()
+    assert {(item["id"], item["code"]) for item in findings} == {
+        (label, "run_boundary_missing")
+    }
+
+    for marker in (
+        "BOARD_SKIP_NO_DB",
+        "BOARD_SKIP_UNLISTABLE",
+        "BOARD_SKIP_TASK_LOOKUP_ERROR",
+        "BOARD_DISCOVERY_UNLISTABLE",
+    ):
+        rewrite(f"{marker}: content\n{full_summary}")
+        findings = check()
+        assert {(item["id"], item["code"]) for item in findings} == {
+            (label, "failure_marker")
+        }
 
 
 def test_launchctl_inventory_ignores_enabled_overrides_outside_services():
@@ -731,9 +901,32 @@ def test_drill_trips_one_real_predicate_per_contract():
     module = _load_module()
     contracts = json.loads(CONTRACTS_PATH.read_text(encoding="utf-8"))
     findings = module._inject_contract_failures(contracts, now=NOW)
-    assert len(findings) == 35
-    assert len({(item["surface"], item["id"]) for item in findings}) == 35
+    expected = {
+        *(("cron", item["id"]) for item in contracts["cron_jobs"]),
+        *(("launchd", item["label"]) for item in contracts["launch_agents"]),
+    }
+    observed = {(item["surface"], item["id"]) for item in findings}
+    assert observed == expected
+    assert len(findings) == len(expected)
     assert all(item["code"] != "synthetic_outcome_failure" for item in findings)
     assert all(item["detail"].startswith("SYNTHETIC DRILL:") for item in findings)
     assert module.DEFAULT_DRILL_STATE != module.DEFAULT_STATE
     assert module.DEFAULT_DRILL_RECEIPT != module.DEFAULT_RECEIPT
+
+
+def test_kanban_sweep_stderr_shares_canonical_semantic_evidence_log():
+    contract = _canonical_contract(
+        launch_label="com.colingreig.hermes.kanban-workspace-sweep"
+    )
+    plist_path = (
+        SCRIPTS
+        / "launchd"
+        / "com.colingreig.hermes.kanban-workspace-sweep.plist"
+    )
+    with plist_path.open("rb") as handle:
+        plist = plistlib.load(handle)
+
+    stdout_path = plist["StandardOutPath"]
+    assert plist["StandardErrorPath"] == stdout_path
+    assert Path(stdout_path).expanduser() == Path(contract["outcome"]["path"]).expanduser()
+    assert "Traceback" in contract["outcome"]["failure_patterns"]

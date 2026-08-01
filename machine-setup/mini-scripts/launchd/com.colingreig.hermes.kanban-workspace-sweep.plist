@@ -24,8 +24,8 @@
   <integer>21600</integer>
   <key>StandardOutPath</key>
   <string>/Users/colingreig/.hermes/logs/kanban-workspace-sweep.launchd.log</string>
-  <key>StandardErrorPath</key>
-  <string>/Users/colingreig/.hermes/logs/kanban-workspace-sweep.launchd.error.log</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/colingreig/.hermes/logs/kanban-workspace-sweep.launchd.log</string>
   <key>ProcessType</key>
   <string>Background</string>
 </dict>

@@ -558,6 +558,16 @@ DRY_PLANNED="$DRY_RELEASES/v0.0.0-dry-run-${DRY_TARGET_SHA:0:12}"
 [ ! -e "$DRY_RELOAD_LOG" ] || fail "dry cut triggered a launchd reload"
 [ ! -e "$DRY_HERMES/launchd-reconciler-calls" ] \
   || fail "dry cut executed a governed reconciler"
+dry_marketplace_line="$(grep -nF 'reconcile_marketplace_skills.py install --source-root' "$DRY_ROOT/output" \
+  | head -n1 | cut -d: -f1 || true)"
+dry_launchd_line="$(grep -nF 'reconcile_launchd_environment.py install --source-root' "$DRY_ROOT/output" \
+  | head -n1 | cut -d: -f1 || true)"
+[ -n "$dry_marketplace_line" ] \
+  || fail "dry cut did not plan marketplace skill reconciliation"
+[ -n "$dry_launchd_line" ] \
+  || fail "dry cut did not plan launchd reconciliation and gateway start"
+[ "$dry_marketplace_line" -lt "$dry_launchd_line" ] \
+  || fail "dry cut planned gateway start before marketplace skill reconciliation"
 grep -Fq "ls-tree $DRY_TARGET_SHA -- $VENDORED_REFRESH_REL" "$DRY_GIT_LOG" \
   || fail "dry cut did not validate refresh metadata from the target tree"
 grep -Fq "ls-tree $DRY_TARGET_SHA -- $VENDORED_LAUNCHD_RECONCILER_REL" "$DRY_GIT_LOG" \

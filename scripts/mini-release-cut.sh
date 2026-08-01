@@ -1606,14 +1606,14 @@ fi
 # --- Switch: atomic symlink swap + restart + verify ------------------------
 LAUNCHD_GW_OFFSET="$(log_offset)"
 repoint_symlink "$NEW_DIR"
-if ! install_governed_launchd_environment "$NEW_DIR"; then
-  warn "governed launchd environment install/reload failed — rolling back"
-  rollback_to_previous "governed launchd environment install failed"
-  die "cut aborted and rolled back to previous release"
-fi
 if ! install_governed_marketplace_skills "$NEW_DIR"; then
   warn "governed marketplace skills install/reload failed — rolling back"
   rollback_to_previous "governed marketplace skills install failed"
+  die "cut aborted and rolled back to previous release"
+fi
+if ! install_governed_launchd_environment "$NEW_DIR"; then
+  warn "governed launchd environment install/reload failed — rolling back"
+  rollback_to_previous "governed launchd environment install failed"
   die "cut aborted and rolled back to previous release"
 fi
 if ! reconcile_governed_pr_pipeline "$NEW_DIR" "$SHA"; then

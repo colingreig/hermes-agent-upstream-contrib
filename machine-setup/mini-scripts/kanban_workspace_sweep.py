@@ -112,10 +112,7 @@ def _discover_boards(root: Path):
     boards_parent = root / "kanban" / "boards"
     if not boards_parent.is_dir():
         return
-    try:
-        entries = sorted(os.listdir(boards_parent))
-    except OSError:
-        return
+    entries = sorted(os.listdir(boards_parent))
     for slug in entries:
         bdir = boards_parent / slug
         if not bdir.is_dir():
@@ -140,13 +137,10 @@ def _open_ro(db_path: Path):
 
 
 def _task_row(conn, task_id: str):
-    try:
-        return conn.execute(
-            "SELECT id, status, workspace_kind, workspace_path FROM tasks WHERE id = ?",
-            (task_id,),
-        ).fetchone()
-    except Exception:
-        return None
+    return conn.execute(
+        "SELECT id, status, workspace_kind, workspace_path FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
 
 
 def sweep_board(label: str, db_path: Path, workspaces_root: Path, days: int, dry_run: bool) -> dict:
@@ -155,12 +149,19 @@ def sweep_board(label: str, db_path: Path, workspaces_root: Path, days: int, dry
         "skipped_active": 0, "skipped_non_scratch": 0, "skipped_path_mismatch": 0,
         "skipped_recent": 0,
     }
-    if not workspaces_root.is_dir():
+    try:
+        has_workspaces_root = workspaces_root.is_dir()
+    except OSError as exc:
+        stats["errors"] += 1
+        _log(f"BOARD_SKIP_UNLISTABLE: {label} ({exc})")
+        return stats
+    if not has_workspaces_root:
         _log(f"BOARD_SKIP: {label} (no workspaces root at {workspaces_root})")
         return stats
 
     conn = _open_ro(db_path)
     if conn is None:
+        stats["errors"] += 1
         _log(f"BOARD_SKIP_NO_DB: {label} (cannot open {db_path} read-only — refusing to guess from disk state alone)")
         return stats
 
@@ -169,23 +170,37 @@ def sweep_board(label: str, db_path: Path, workspaces_root: Path, days: int, dry
         try:
             names = sorted(os.listdir(workspaces_root))
         except OSError as exc:
+            stats["errors"] += 1
             _log(f"BOARD_SKIP_UNLISTABLE: {label} ({exc})")
             return stats
 
         for name in names:
             wdir = workspaces_root / name
-            if wdir.is_symlink() or not wdir.is_dir():
+            try:
+                is_candidate_dir = not wdir.is_symlink() and wdir.is_dir()
+            except OSError as exc:
+                stats["errors"] += 1
+                _log(f"BOARD_SKIP_UNLISTABLE: {label}/{name} ({exc})")
+                return stats
+            if not is_candidate_dir:
                 continue
 
-            row = _task_row(conn, name)
+            try:
+                row = _task_row(conn, name)
+            except Exception as exc:
+                stats["errors"] += 1
+                _log(f"BOARD_SKIP_TASK_LOOKUP_ERROR: {label}/{name} ({exc})")
+                return stats
 
             if row is None:
                 # Orphan: no task row at all for this directory name (deleted task,
                 # or a leftover from before a schema change). Age-gate only.
                 try:
                     age_days = (now - wdir.stat().st_mtime) / 86400
-                except OSError:
-                    continue
+                except OSError as exc:
+                    stats["errors"] += 1
+                    _log(f"BOARD_SKIP_UNLISTABLE: {label}/{name} ({exc})")
+                    return stats
                 if age_days < days:
                     stats["skipped_recent"] += 1
                     _log(f"SKIP_RECENT_ORPHAN: {label}/{name} | age_days={age_days:.1f}")
@@ -216,9 +231,16 @@ def sweep_board(label: str, db_path: Path, workspaces_root: Path, days: int, dry
                         stats["skipped_path_mismatch"] += 1
                         _log(f"SKIP_PATH_MISMATCH: {label}/{name}")
                         continue
-                except OSError:
-                    stats["skipped_path_mismatch"] += 1
-                    _log(f"SKIP_PATH_MISMATCH: {label}/{name} (unresolvable workspace_path)")
+                except OSError as exc:
+                    # Resolution failure is not evidence of a mismatch. Treat it
+                    # as the same fail-closed inspection error used elsewhere so
+                    # the fleet outcome probe sees its canonical failure marker
+                    # and main returns nonzero without touching the workspace.
+                    stats["errors"] += 1
+                    _log(
+                        f"BOARD_SKIP_UNLISTABLE: {label}/{name} "
+                        f"(unresolvable workspace_path: {exc})"
+                    )
                     continue
 
             status = row["status"]
@@ -229,8 +251,10 @@ def sweep_board(label: str, db_path: Path, workspaces_root: Path, days: int, dry
 
             try:
                 age_days = (now - wdir.stat().st_mtime) / 86400
-            except OSError:
-                continue
+            except OSError as exc:
+                stats["errors"] += 1
+                _log(f"BOARD_SKIP_UNLISTABLE: {label}/{name} ({exc})")
+                return stats
             if age_days < days:
                 stats["skipped_recent"] += 1
                 _log(f"SKIP_RECENT: {label}/{name} | age_days={age_days:.1f} status={status}")
@@ -288,7 +312,16 @@ def main(argv=None) -> int:
         "skipped_active": 0, "skipped_non_scratch": 0, "skipped_path_mismatch": 0,
         "skipped_recent": 0, "boards_swept": 0,
     }
-    for label, db_path, workspaces_root in _discover_boards(root):
+    try:
+        boards = list(_discover_boards(root))
+    except OSError as exc:
+        totals["errors"] += 1
+        _log(
+            f"BOARD_DISCOVERY_UNLISTABLE: {root / 'kanban' / 'boards'} ({exc})"
+        )
+        boards = []
+
+    for label, db_path, workspaces_root in boards:
         stats = sweep_board(label, db_path, workspaces_root, args.days, args.dry_run)
         totals["boards_swept"] += 1
         for key in (
