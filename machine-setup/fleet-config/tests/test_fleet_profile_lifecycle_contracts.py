@@ -72,6 +72,7 @@ def test_clickup_executor_jobs_use_direct_paths_with_stable_scheduling():
         },
         "content-lane-executor": {
             "id": "dcab830aa41c",
+            "workdir": "/Users/colingreig/dev/hermes-agent",
             "prompt": "/ignite-execute --lane content",
         },
     }
@@ -80,6 +81,8 @@ def test_clickup_executor_jobs_use_direct_paths_with_stable_scheduling():
         job = jobs[name]
         assert job["id"] == contract["id"]
         assert job["prompt"] == contract["prompt"]
+        if "workdir" in contract:
+            assert job["workdir"] == contract["workdir"]
         assert job["enabled"] is True
         assert job["schedule"] == {
             "display": "*/30 * * * *",

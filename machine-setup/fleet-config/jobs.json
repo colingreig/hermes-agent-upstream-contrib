@@ -61,7 +61,7 @@
       "state": "scheduled",
       "no_agent": false,
       "deliver": "local",
-      "workdir": null,
+      "workdir": "/Users/colingreig/dev/hermes-agent",
       "model": "claude-sonnet-5",
       "provider": "anthropic",
       "model_snapshot": null,
