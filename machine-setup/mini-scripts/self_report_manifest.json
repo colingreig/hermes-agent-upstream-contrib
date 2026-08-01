@@ -22,7 +22,7 @@
       "src_rel": "hermes_self_report_run.py",
       "src_base": "mirror",
       "dest_abs": "~/.hermes/scripts/hermes_self_report_run.py",
-      "sha256": "a3c4f29442195c107bd9e0740a1c59d375175f6d1c824f4123ea806bcf92416d",
+      "sha256": "d7cb342f2639451f984c928e5b25409e9fe439288289749b54c168f0b64d19c3",
       "role": "no_agent fleet-health-digest entrypoint: hermes_report_build + probe fold-in + postmark_send; never LLM-composed",
       "deploy_mode": "script"
     },

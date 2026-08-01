@@ -28,12 +28,21 @@ BUILDER = SCRIPTS / "hermes_report_build.py"
 SENDER = SCRIPTS / "postmark_send_report.py"
 DEFAULT_TO = "colin@colingreig.com"
 
+
+def _python() -> str:
+    """Prefer the Hermes release venv so lazy_secret_resolver / ClickUp token work."""
+    venv_python = HERMES / "runtime-current" / "venv" / "bin" / "python"
+    if venv_python.is_file():
+        return str(venv_python)
+    return sys.executable
+
+
 PROBE_COMMANDS = (
-    ("Prior delivery", [sys.executable, str(SCRIPTS / "hermes_self_report_delivery_probe.py")]),
-    ("Skill size", [sys.executable, str(SCRIPTS / "hermes_validate_size_monitor.py")]),
+    ("Prior delivery", [_python(), str(SCRIPTS / "hermes_self_report_delivery_probe.py")]),
+    ("Skill size", [_python(), str(SCRIPTS / "hermes_validate_size_monitor.py")]),
     ("Model deprecation", ["bash", str(SCRIPTS / "ignite-model-deprecation-check.sh")]),
-    ("Supabase RLS", [sys.executable, str(SCRIPTS / "supabase_rls_guard.py")]),
-    ("Usage alerts", [sys.executable, str(SCRIPTS / "hermes_usage_alert.py")]),
+    ("Supabase RLS", [_python(), str(SCRIPTS / "supabase_rls_guard.py")]),
+    ("Usage alerts", [_python(), str(SCRIPTS / "hermes_usage_alert.py")]),
 )
 
 
@@ -145,7 +154,7 @@ def build_and_send(*, to: str, window_min: int, skip_probes: bool, dry_run: bool
 
         build = _run(
             [
-                sys.executable,
+                _python(),
                 str(BUILDER),
                 "--window-min",
                 str(window_min),
@@ -185,7 +194,7 @@ def build_and_send(*, to: str, window_min: int, skip_probes: bool, dry_run: bool
 
         send = _run(
             [
-                sys.executable,
+                _python(),
                 str(SENDER),
                 "--to",
                 to,
