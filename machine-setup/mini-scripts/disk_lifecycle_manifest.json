@@ -22,7 +22,7 @@
       "src_rel": "kanban_workspace_sweep.py",
       "src_base": "mirror",
       "dest_abs": "~/.hermes/scripts/kanban_workspace_sweep.py",
-      "sha256": "2628e11f56a58804304b3b32778d6bada83764cb3f17eeecda2d3d17ae5a9ed8",
+      "sha256": "5795b39b0c650500a048392f540f370872ee20fd76f6860a035ef8ded3e5387a",
       "role": "age-based backstop for terminal kanban scratch workspaces across all boards",
       "deploy_mode": "script"
     },

@@ -121,18 +121,30 @@ def _discover_boards(root: Path):
 
 
 def _open_ro(db_path: Path):
-    """Read-only sqlite connection, or None if the DB can't be opened/used.
-    Never creates a DB file — a missing or unusable DB means this board is
-    skipped entirely by the caller (fail closed)."""
+    """Query-only sqlite connection, or None if the DB can't be opened/used.
+
+    ``mode=ro`` cannot open a WAL database when SQLite needs to create or
+    attach its ``-wal``/``-shm`` sidecars (the live default-board database is
+    such a database).  Open the *existing* file with ``mode=rw`` so SQLite can
+    participate in WAL locking, then enable ``query_only`` before the first
+    schema read.  ``mode=rw`` still refuses to create a missing database and
+    ``query_only`` makes every SQL write fail, preserving this sweep's
+    read-only safety contract without using ``immutable=1`` (which could hide
+    committed WAL content from deletion decisions).
+    """
     if not db_path.exists():
         return None
+    conn = None
     try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=10)
+        conn = sqlite3.connect(f"file:{db_path}?mode=rw", uri=True, timeout=10)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA query_only = ON")
         # Cheap probe that the schema is actually usable before trusting it.
         conn.execute("SELECT 1 FROM tasks LIMIT 1")
         return conn
     except Exception:
+        if conn is not None:
+            conn.close()
         return None
 
 

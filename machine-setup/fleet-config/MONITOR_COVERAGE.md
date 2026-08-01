@@ -84,7 +84,7 @@ even though the label is not part of the active contract.
 Repository tests prove semantic failures are distinguishable from scheduler
 success, unknown enabled jobs and monitored plists fail closed, a failed Slack
 send does not advance dedupe, confirmed delivery dedupes a repeat, and the
-drill emits exactly one finding for each of the 37 declared contracts by
+drill emits exactly one finding for every declared contract by
 executing its real predicate.
 The content-addressed `fleet_outcome_manifest.json` and
 `reconcile_fleet_outcomes.py` deploy the scripts, contracts, two LaunchAgents,

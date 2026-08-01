@@ -310,8 +310,9 @@
         "max_age_seconds": 5400,
         "tail_lines": 2000,
         "run_start_pattern": "sentinel_run: secrets resolved, running monitor.py",
-        "success_patterns": ["sentinel_run: secrets resolved, running monitor.py", "\"(?:status|issues|findings|healthy)\""],
-        "failure_patterns": ["sentinel_run: FATAL", "Sentry GET .* failed", "\"errors\"\\s*:\\s*\\[[^\\]]", "Traceback"]
+        "success_patterns": ["^.*sentinel_run: secrets resolved, running monitor\\.py[ \\t]*$"],
+        "required_patterns": ["^[ \\t]*\"errors\"[ \\t]*:[ \\t]*\\[[ \\t]*\\][ \\t]*,?[ \\t]*$"],
+        "failure_patterns": ["^.*sentinel_run: FATAL:", "^[ \\t]*\"errors\"[ \\t]*:[ \\t]*\\[[ \\t\\r\\n]*\\{", "^Traceback \\(most recent call last\\):"]
       }
     },
     {
@@ -484,9 +485,9 @@
         "max_age_seconds": 129600,
         "tail_lines": 2000,
         "run_end_pattern": "^.*\\bsweep-finish\\b[^\\r\\n]*$",
-        "success_patterns": ["sweep-finish[^\\r\\n]*\\berrors=0\\b"],
-        "required_patterns": ["sweep-finish[^\\r\\n]*\\berrors=0\\b"],
-        "failure_patterns": ["sweep-finish[^\\r\\n]*\\berrors=[1-9][0-9]*\\b", "BOARD_SKIP_NO_DB", "BOARD_SKIP_UNLISTABLE", "BOARD_SKIP_TASK_LOOKUP_ERROR", "BOARD_DISCOVERY_UNLISTABLE", "Traceback"]
+        "success_patterns": ["^.*\\bsweep-finish\\b[^\\r\\n]*[ \\t]errors=0(?:[ \\t]|$)[^\\r\\n]*[ \\t]dry_run=False(?:[ \\t]|$)[^\\r\\n]*$"],
+        "required_patterns": ["^.*\\bsweep-finish\\b[^\\r\\n]*[ \\t]errors=0(?:[ \\t]|$)[^\\r\\n]*[ \\t]dry_run=False(?:[ \\t]|$)[^\\r\\n]*$"],
+        "failure_patterns": ["^.*\\bsweep-finish\\b[^\\r\\n]*[ \\t]errors=[1-9][0-9]*(?:[ \\t]|$)", "^.*\\bBOARD_SKIP_NO_DB:", "^.*\\bBOARD_SKIP_UNLISTABLE:", "^.*\\bBOARD_SKIP_TASK_LOOKUP_ERROR:", "^.*\\bBOARD_DISCOVERY_UNLISTABLE:", "^Traceback \\(most recent call last\\):"]
       }
     },
     {

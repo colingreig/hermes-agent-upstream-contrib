@@ -48,6 +48,39 @@ def _touch_dir(path: Path, age_days: float = 0):
         os.utime(path, (ts, ts))
 
 
+def test_open_ro_reads_live_wal_and_enforces_query_only(tmp_path, mod):
+    db_path = tmp_path / "kanban.db"
+    writer = sqlite3.connect(db_path)
+    assert writer.execute("PRAGMA journal_mode = WAL").fetchone()[0] == "wal"
+    writer.execute("PRAGMA wal_autocheckpoint = 0")
+    writer.execute(
+        "CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT NOT NULL, "
+        "workspace_kind TEXT NOT NULL DEFAULT 'scratch', workspace_path TEXT)"
+    )
+    writer.execute(
+        "INSERT INTO tasks VALUES (?, ?, ?, ?)",
+        ("wal-task", "running", "scratch", None),
+    )
+    writer.commit()
+
+    conn = mod._open_ro(db_path)
+    assert conn is not None
+    try:
+        assert conn.execute("PRAGMA query_only").fetchone()[0] == 1
+        assert mod._task_row(conn, "wal-task")["status"] == "running"
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            conn.execute("DELETE FROM tasks")
+    finally:
+        conn.close()
+        writer.close()
+
+
+def test_open_ro_does_not_create_missing_database(tmp_path, mod):
+    db_path = tmp_path / "missing.db"
+    assert mod._open_ro(db_path) is None
+    assert not db_path.exists()
+
+
 def test_active_task_never_swept_regardless_of_age(tmp_path, mod):
     root = tmp_path
     _make_db(root / "kanban.db", [("t_active", "running", "scratch", None)])
