@@ -90,8 +90,8 @@
     },
     {
       "src_rel": "skills-policy.json",
-      "sha256": "10410c34e00379a81c3b04aa223932e70a0cc9aff0a1464d3cd03022f4c1811f",
-      "role": "governed Mini-specific bundled/local/hub skill allowlist, historical-reference consolidation, exact hub provenance, per-profile suppression, and recoverable cull policy",
+      "sha256": "7fddaca9d40e048209a34f67f67a18804d860bd1b687ee3a7ae256dec1878a1b",
+      "role": "governed Mini-specific bundled/local/hub skill allowlist, historical-reference consolidation, obsolete sentry wrapper archival, exact hub provenance, per-profile suppression, and recoverable cull policy",
       "deploy_mode": "skill_policy"
     }
   ]
