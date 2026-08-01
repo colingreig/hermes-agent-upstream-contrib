@@ -1,14 +1,16 @@
 # fleet-config
 
 Declarative fleet-config bundle for the Hermes mini, authored for the
-2026-07-29 rebuild cutover. This is the sole writer of three destinations on
-the mini:
+2026-07-29 rebuild cutover and governed by the 2026-08-01 skill-surface
+hardening rollout. This is the sole writer of four governed surfaces on the
+mini:
 
 | Source | Destination | What it does |
 |---|---|---|
 | `config-overlay.yaml` | `~/.hermes/config.yaml` | Governed **overlay** (not a replacement) — deep-merges `model`, `fallback_providers`, `delegation`, `kanban` in. Every other section (platforms, secrets wiring, security, approvals, credential_pool_strategies, ...) is left untouched. |
-| `profiles/<name>/{config.yaml,SOUL.md}` | `~/.hermes/profiles/<name>/` | Five kanban-swarm profiles: `coder`, `content`, `design`, `research`, `ops`. Each gets its model config, its SOUL.md persona, and the full `_PROFILE_DIRS` bootstrap tree from `hermes_cli/profiles.py` (`memories`, `sessions`, `skills`, `skins`, `logs`, `plans`, `workspace`, `cron`, `home`). The `home/` entry is a subprocess workspace, not the profile's Hermes root. |
+| `profiles/<name>/{config.yaml,SOUL.md}` | `~/.hermes/profiles/<name>/` | Five direct-execution profiles: `coder`, `content`, `design`, `research`, `ops`. Each gets its model config, its SOUL.md persona, and the full `_PROFILE_DIRS` bootstrap tree from `hermes_cli/profiles.py` (`memories`, `sessions`, `skills`, `skins`, `logs`, `plans`, `workspace`, `cron`, `home`). The `home/` entry is a subprocess workspace, not the profile's Hermes root. |
 | `jobs.json` | `~/.hermes/cron/jobs.json` | Curated 16-job cron set (13 carried forward from the pre-freeze live config, 3 new consolidated hygiene/digest jobs). **Wholesale replace**, not a merge. |
+| `skills-policy.json` | Default plus five profile-local `skills/` trees | SHA-pinned allowlist/cull policy. Preserves allowed bundled skills, archives and suppresses removals, consolidates two historical ClickUp poller references, and removes the local hub shadow of `vehicle-image-qc` only with exact hub provenance. |
 
 `fleet_config_manifest.json` sha256-pins every source file above.
 `install_fleet_config.py` verifies those hashes before writing anything,
@@ -46,9 +48,9 @@ particular, `delegation: {}` in the overlay **replaces** the live delegation
 block with `{}` (a deliberate reset), it does not "merge nothing." That
 matters here: a past incident set `delegation.base_url` alongside a named
 `delegation.provider` and leaked the parent cron's credential to a
-third-party endpoint. Profile-based kanban routing replaces delegation-based
-subagent routing going forward, so this bundle always ships delegation
-cleared. **Never** re-introduce `delegation.base_url` + a named provider.
+third-party endpoint. The fleet's direct ClickUp executors do not need that
+delegation path, so this bundle always ships delegation cleared. **Never**
+re-introduce `delegation.base_url` + a named provider.
 
 `fallback_providers` and `model` are scalar/list overlay keys — they
 **replace** the live value wholesale, they don't append. Never use provider
@@ -64,8 +66,8 @@ provider credential store is therefore:
 ~/.hermes/profiles/<name>/auth.json
 ```
 
-The kanban dispatcher sets `HERMES_HOME` to that profile root before resolving
-model credentials. Do not put Hermes provider credentials in
+Profile-scoped Hermes runs resolve credentials from that profile root. Do not
+put Hermes provider credentials in
 `~/.hermes/profiles/<name>/home/auth.json`: `home/` is a required
 `_PROFILE_DIRS` bootstrap directory used when a subprocess needs a
 profile-scoped `HOME`; it is not the Hermes auth root and must not be removed
@@ -149,7 +151,7 @@ tier 3    nous / deepseek/deepseek-v4-pro   (Nous Research Portal, effort high)
 Starting point: the pre-freeze snapshot at
 `~/hermes-archive-20260729/jobs.json.pre-freeze` on the mini (36 jobs).
 
-- **13 kept as-is** (config unchanged): `clickup-poll-gate`,
+- **13 carried forward by stable job ID and schedule**: `clickup-poll-gate`,
   `review-poll-gate`, `clickup-review-sla`, `hermes-pr-validate` (kept
   disabled at cutover time, matching its prior paused state — see
   "Re-enablement" below), `spend-meter`, `ci-health-watch`,
@@ -170,9 +172,9 @@ RC1/RC2 2026-07-26 fixes documented in the job's own `prompt` field — see
 `jobs.json`). `provider: openai-codex` / `model: gpt-5.4-mini` are
 operator-set and were not touched.
 
-This bundle now flips it back on: `enabled: true`, `state: scheduled`,
-`paused_at: null`. No provider, model, skill, `max_turns`, or `workdir`
-field changed — only the enablement/scheduling fields. The matching
+The 2026-07-31 re-enablement flipped it back on: `enabled: true`, `state:
+scheduled`, `paused_at: null`. That change left provider, model, skill,
+`max_turns`, and `workdir` untouched. The matching
 `fleet_outcome_contracts.json` entry (id `5a76e290811d`) and
 [MONITOR_COVERAGE.md](MONITOR_COVERAGE.md) row were updated in the same
 change: the contract previously *asserted the job stays disabled*
@@ -184,6 +186,12 @@ success/failure patterns modeled on the other LLM-orchestrated executor
 jobs (`ignite-validate`/`PASS`/`FAIL` markers as success, hard execution
 failures or the `validator_repo_guard.py` safety-guard `ABORT` output as
 failure).
+
+The validator job also requires `IGNITE_SKILLS_ROOT` and invokes its ClickUp
+and Ignite State modules only below that canonical root. It never probes or
+falls back to `~/.hermes/skills`, `~/.claude/skills`, or `~/.codex/skills`;
+a missing canonical module is a fail-closed job error, not a reason to create
+a home-local copy or symlink.
 
 - **3 new consolidated jobs**: `clickup-lifecycle` (every 30m; folds
   clickup-closeout-audit + clickup-stalled-reconciler + clickup-reconciler +
@@ -199,35 +207,37 @@ failure).
   `alpha`, `Spam-gate label accrual`, `legacy job`, `run {lane}`,
   `clickup-executor-2`.
 - `pr-staleness-alert` and `research-stage-monitor` are dropped as
-  **standalone** jobs. `research-stage-monitor`'s check is folded into
-  `content-lane-executor`'s prompt (it's already agent-driven, so adding a
-  Bash step is free). `ci-health-watch-cron.py` now provides the
-  `pr-staleness-alert` daily fold without changing either underlying
-  monitor. The bundled `jobs.json` points `ci-health-watch` at that argv-free
-  wrapper so the fold and its independent fleet-probe watchdog are live.
+  **standalone** jobs. The direct `content-lane-executor` prompt is reserved
+  for `/ignite-execute --lane content`; it does not carry a hidden monitor
+  side job. `ci-health-watch-cron.py` provides the `pr-staleness-alert` daily
+  fold without changing either underlying monitor. The bundled `jobs.json`
+  points `ci-health-watch` at that argv-free wrapper so the fold and its
+  independent fleet-probe watchdog are live.
 
 ### Modified: clickup-executor / content-lane-executor
 
-Both jobs now claim a task, then **hand it to a kanban swarm** instead of
-working it in-session:
+Both jobs execute ClickUp work directly in their scheduled Hermes session.
+Their prompts are deliberately small and exact:
 
 ```
-hermes kanban swarm "<task goal>" --worker coder:"implement" --verifier ops \
-  --synthesizer coder --idempotency-key <clickup-task-id> --json
+clickup-executor:      Work the ClickUp queue now — follow the clickup-queue-poller skill.
+content-lane-executor: /ignite-execute --lane content
 ```
 
-(`content-lane-executor` uses `--worker content:"draft"`.) The job polls for
-the synthesizer to reach `done`, then posts the result back to ClickUp as a
-comment and moves the task to **In Review** — never Complete;
-`ignite-validate` owns Complete.
+The root-scheduled content job does not inherit the root profile's inference
+route. It is explicitly pinned through the cron job contract to
+`provider: anthropic`, `model: claude-sonnet-5`, and `no_fallback: true`, and
+loads `ignite-execute` under `skill_scope: content-executor`. This preserves
+the content profile's Sonnet-only, fail-closed behavior while keeping the
+approved direct `/ignite-execute --lane content` path in the governed root
+cron store.
 
-The internal kanban lifecycle is deliberately separate from that ClickUp
-lifecycle. Each successful worker, verifier, and synthesizer must complete its
-own card (`kanban_complete`; CLI equivalent:
-`hermes kanban complete <card-id> --result "..."`) so dependent cards can run.
-That internal `done` never means ClickUp Complete. `kanban_block` is only for a
-genuine blocker, not for enforcing the ClickUp In Review rule; the outer
-executor is the sole bridge that posts the final swarm result to ClickUp.
+The invoked skills own claiming, implementation, validation, handoff comments,
+and the move to **In Review**. They never move tasks to Complete;
+`ignite-validate` owns Complete. Upstream Hermes kanban commands remain
+available as a product feature, but these fleet ClickUp jobs and their profile
+SOULs do not depend on a worker/verifier/synthesizer pipeline or scratch-file
+handoff.
 
 ## Deploy
 
@@ -248,6 +258,8 @@ The installer fails closed on: any source file's sha256 not matching the
 manifest, an existing `~/.hermes/config.yaml` that isn't valid YAML, a
 rendered merge result that doesn't round-trip through a YAML parse, a
 bundled `jobs.json` that isn't valid JSON or has no top-level `jobs` list,
+an unmanifested or hash-drifted skill policy, historical reference provenance
+drift, conflicting archive bytes, hub-lock identity drift,
 or a deployed file whose re-read hash doesn't match the manifest. Any
 mid-install failure rolls back every step already written in that run from
 its snapshot.

@@ -201,10 +201,11 @@ class CronSkillUnresolvable(Exception):
 class CronSkillRootConflict(CronSkillUnresolvable):
     """A cron job resolved skills from incompatible plugin roots.
 
-    A single ``CLAUDE_PLUGIN_ROOT`` must describe every loaded skill before the
-    first model-driven subprocess runs.  Guessing when multiple roots are
-    present can silently execute a sibling plugin's scripts, so this is a
-    fail-closed job configuration error.
+    A single plugin root must describe every loaded skill before the first
+    model-driven subprocess runs.  It supplies both ``CLAUDE_PLUGIN_ROOT`` and
+    ``IGNITE_SKILLS_ROOT``; guessing when multiple roots are present can
+    silently execute a sibling plugin's scripts, so this is a fail-closed job
+    configuration error.
     """
 
 
@@ -2520,7 +2521,7 @@ def _normalize_required_environment_variables(value: Any) -> tuple[str, ...]:
 
 
 def _plugin_root_from_skill_dir(skill_dir: Any) -> Optional[Path]:
-    """Derive ``CLAUDE_PLUGIN_ROOT`` from a successful skill-view directory.
+    """Derive the shared plugin/skills roots from a successful skill directory.
 
     Plugin skills are rooted at ``<plugin-root>/skills/<skill>``.  Find the
     nearest ``skills`` path component after resolving symlinks; legacy
@@ -2563,25 +2564,46 @@ def _install_cron_child_env(
         rendered = ", ".join(sorted(roots))
         raise CronSkillRootConflict(
             "Cron job resolved skills from conflicting plugin roots: "
-            f"{rendered}. Refusing to choose a CLAUDE_PLUGIN_ROOT."
+            f"{rendered}. Refusing to choose CLAUDE_PLUGIN_ROOT/IGNITE_SKILLS_ROOT."
         )
     names = _normalize_required_environment_variables(required_names)
-    required_values = _resolve_cron_required_environment(names)
-    optional_values = _resolve_cron_optional_environment(optional_names)
+    optional = _normalize_required_environment_variables(optional_names)
+
+    # A successfully resolved plugin root is the authority for these two
+    # non-secret path values.  Do not try to resolve a job/skill declaration
+    # for them through the ambient environment or secret stores first: that
+    # would make a clean cron process fail before it can install the canonical
+    # derived values (and could admit a stale home-local root).  Declarations
+    # remain strict when no plugin root was resolved.
+    derived_root_names = (
+        {"CLAUDE_PLUGIN_ROOT", "IGNITE_SKILLS_ROOT"} if roots else set()
+    )
+    required_values = _resolve_cron_required_environment(
+        tuple(name for name in names if name not in derived_root_names)
+    )
+    optional_values = _resolve_cron_optional_environment(
+        tuple(name for name in optional if name not in derived_root_names)
+    )
 
     # Resolve every required value before mutating the child overlay. A job
     # either receives its complete declared environment or receives none.
-    combined_overlay = {**optional_values, **required_values}
+    secret_overlay = {**optional_values, **required_values}
+    root_overlay: dict[str, str] = {}
     if roots:
-        combined_overlay["CLAUDE_PLUGIN_ROOT"] = next(iter(roots))
-    if combined_overlay:
-        # One ContextVar write after every requirement and root has validated.
-        # Marking the non-secret plugin root as redactable is harmless and keeps
-        # the transaction atomic.
-        register_child_env_overlay(
-            combined_overlay,
-            redact_values=bool(required_values or optional_values),
-        )
+        plugin_root = Path(next(iter(roots)))
+        root_overlay = {
+            "CLAUDE_PLUGIN_ROOT": str(plugin_root),
+            "IGNITE_SKILLS_ROOT": str(plugin_root / "skills"),
+        }
+
+    # Every value has resolved before either registration, so a required-value
+    # failure still leaves the overlay empty. Register credentials separately
+    # from derived path metadata: exact canonical paths are operational error
+    # evidence and must never be hidden by literal-secret redaction.
+    if secret_overlay:
+        register_child_env_overlay(secret_overlay, redact_values=True)
+    if root_overlay:
+        register_child_env_overlay(root_overlay, redact_values=False)
 
 
 def _resolve_cron_required_environment(
@@ -2873,11 +2895,26 @@ def _run_job_script(
         subprocess_env = _sanitize_subprocess_env(
             os.environ.copy(), apply_secret_shape_gate=False
         )
-        required_values = _resolve_cron_required_environment(
+        declarations = _normalize_environment_variable_declarations(
             required_environment_variables
         )
-        injected_secret_values = list(required_values.values())
-        subprocess_env.update(required_values)
+        required_values = _resolve_cron_required_environment(
+            tuple(
+                declaration.name
+                for declaration in declarations
+                if not declaration.optional
+            )
+        )
+        optional_values = _resolve_cron_optional_environment(
+            tuple(
+                declaration.name
+                for declaration in declarations
+                if declaration.optional
+            )
+        )
+        injected_values = {**optional_values, **required_values}
+        injected_secret_values = list(injected_values.values())
+        subprocess_env.update(injected_values)
 
         popen_kwargs = {}
         if sys.platform == "win32":
@@ -2955,7 +2992,7 @@ def _run_job_script_with_claim_heartbeat(
         # Preserve the historical one-positional-argument call shape when the
         # job has no env passthrough. This keeps custom/test script runners
         # compatible while still forwarding declared production secrets.
-        if not _normalize_required_environment_variables(
+        if not _normalize_environment_variable_declarations(
             required_environment_variables
         ):
             return _run_job_script(script_path)
@@ -3073,8 +3110,18 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
     # frontmatter. This mirrors — and is independent of — the
     # skill-frontmatter-driven registration that skill_view() performs
     # below for each of the job's skills.
-    job_required_env = _normalize_required_environment_variables(
+    job_env_declarations = _normalize_environment_variable_declarations(
         job.get("required_environment_variables")
+    )
+    job_required_env = tuple(
+        declaration.name
+        for declaration in job_env_declarations
+        if not declaration.optional
+    )
+    job_optional_env = tuple(
+        declaration.name
+        for declaration in job_env_declarations
+        if declaration.optional
     )
     skills = job.get("skills")
     # True when runtime-collected DATA (script stdout, upstream-job output)
@@ -3189,8 +3236,11 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
 
     skill_names = [str(name).strip() for name in skills if str(name).strip()]
     if not skill_names:
-        if job_required_env:
-            _install_cron_child_env(job_required_env)
+        if job_required_env or job_optional_env:
+            _install_cron_child_env(
+                job_required_env,
+                optional_names=job_optional_env,
+            )
         return _scan_assembled_cron_prompt(
             prompt,
             job,
@@ -3352,7 +3402,13 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
     # from this strict set.
     all_declarations = _normalize_environment_variable_declarations(
         [
-            *job_required_env,
+            *(
+                {
+                    "name": declaration.name,
+                    "optional": declaration.optional,
+                }
+                for declaration in job_env_declarations
+            ),
             *(
                 {
                     "name": declaration.name,
@@ -4198,6 +4254,13 @@ def run_job(
             or configured_provider_for_drift
             or None
         )
+        # Resolve the per-job fail-closed pin BEFORE primary authentication.
+        # An AuthError is handled below, before AIAgent is constructed; waiting
+        # until fallback_model assembly would let that earlier handler route a
+        # no-fallback content job onto a global fallback provider.
+        job_no_fallback = _coerce_job_bool(
+            job.get("no_fallback"), default=False
+        )
         try:
             # Do not inject HERMES_INFERENCE_PROVIDER here. resolve_runtime_provider()
             # already prefers persisted config over stale shell/env overrides when
@@ -4222,6 +4285,19 @@ def run_job(
                 str(getattr(auth_exc, "provider", "") or "").strip().lower()
                 or primary_provider_for_drift
             )
+            if job_no_fallback:
+                auth_message = format_runtime_provider_error(auth_exc)
+                logger.warning(
+                    "Job '%s': primary auth failed and no_fallback=true; "
+                    "failing closed without consulting the global fallback chain: %s",
+                    job_id,
+                    auth_message,
+                )
+                raise RuntimeError(
+                    f"Cron job '{job_name}' has no_fallback=true and primary "
+                    "provider authentication failed; no fallback provider was "
+                    f"attempted. {auth_message}"
+                ) from auth_exc
             logger.warning("Job '%s': primary auth failed (%s), trying fallback", job_id, auth_exc)
             fb_list = get_fallback_chain(_cfg)
             runtime = None
@@ -4389,7 +4465,6 @@ def run_job(
         # jobs MUST set this so the sonnet-or-nothing policy can never be defeated by
         # the global chain. Drop the chain here too (belt-and-suspenders alongside the
         # AIAgent hard guard) so nothing downstream sees a chain for a pinned job.
-        job_no_fallback = _coerce_job_bool(job.get("no_fallback"), default=False)
         if job_no_fallback:
             if fallback_model:
                 logger.info(

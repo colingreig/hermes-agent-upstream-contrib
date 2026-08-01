@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -105,6 +106,9 @@ def bundle(tmp_path):
 
 
 def test_dry_run_writes_nothing(bundle, capsys):
+    config_path = bundle["home"] / ".hermes" / "config.yaml"
+    config_path.write_text("model: old\n", encoding="utf-8")
+    os.chmod(config_path, 0o644)
     rc = install_mod.install(
         bundle["manifest"],
         home=bundle["home"],
@@ -113,9 +117,11 @@ def test_dry_run_writes_nothing(bundle, capsys):
         dry_run=True,
     )
     assert rc == 0
-    assert not (bundle["home"] / ".hermes" / "config.yaml").exists()
+    assert yaml.safe_load(config_path.read_text()) == {"model": "old"}
+    assert config_path.stat().st_mode & 0o777 == 0o644
     assert not (bundle["home"] / ".hermes" / "cron" / "jobs.json").exists()
     out = capsys.readouterr().out
+    assert "mode: 0644 -> 0600" in out
     assert "dry-run: verified all source hashes; wrote nothing." in out
 
 
@@ -130,6 +136,7 @@ def test_real_install_writes_all_three_destinations(bundle):
     assert rc == 0
     cfg = yaml.safe_load((bundle["home"] / ".hermes" / "config.yaml").read_text())
     assert cfg["model"] == "synthetic-model"
+    assert (bundle["home"] / ".hermes" / "config.yaml").stat().st_mode & 0o777 == 0o600
     for profile in PROFILE_NAMES:
         profile_dir = bundle["home"] / ".hermes" / "profiles" / profile
         assert (profile_dir / "config.yaml").is_file()
@@ -139,6 +146,28 @@ def test_real_install_writes_all_three_destinations(bundle):
     # profile bootstrap dirs got created too
     for sub in install_mod.PROFILE_BOOTSTRAP_DIRS:
         assert (bundle["home"] / ".hermes" / "profiles" / "ops" / sub).is_dir()
+
+
+def test_existing_config_and_its_install_backups_are_repaired_to_0600(bundle):
+    config_path = bundle["home"] / ".hermes" / "config.yaml"
+    config_path.write_text("model: old\n", encoding="utf-8")
+    config_path.chmod(0o644)
+
+    assert install_mod.install(
+        bundle["manifest"],
+        home=bundle["home"],
+        bundle_root=bundle["bundle_root"],
+        manifest_path=bundle["manifest_path"],
+        dry_run=False,
+    ) == 0
+
+    assert config_path.stat().st_mode & 0o777 == 0o600
+    sibling_backups = list(config_path.parent.glob("config.yaml.bak-fleet-config-install-*"))
+    assert len(sibling_backups) == 1
+    assert sibling_backups[0].stat().st_mode & 0o777 == 0o600
+    receipts = list((bundle["home"] / ".hermes" / "logs" / "fleet-config-installs").iterdir())
+    central_backup = receipts[0] / "destinations" / "config.yaml"
+    assert central_backup.stat().st_mode & 0o777 == 0o600
 
 
 def test_forced_failure_mid_step_rolls_back_and_reraises(bundle, monkeypatch):

@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch, MagicMock
 
@@ -2627,6 +2628,187 @@ class TestRunJobConfigEnvVarExpansion:
         "api_mode": "chat_completions",
     }
 
+    def test_governed_content_job_executes_sonnet_only_direct_skill_path(
+        self, tmp_path, monkeypatch
+    ):
+        """Drive the checked-in fleet job through the real cron dispatch sink."""
+        # Keep this focused test independent of optional provider SDKs: cron
+        # imports both modules lazily, so install the exact runtime/auth seam it
+        # consumes rather than importing the full network stack.
+        import sys
+        import types
+        import hermes_cli
+
+        class FakeAuthError(Exception):
+            pass
+
+        jobs_path = (
+            Path(__file__).resolve().parents[2]
+            / "machine-setup"
+            / "fleet-config"
+            / "jobs.json"
+        )
+        jobs = json.loads(jobs_path.read_text(encoding="utf-8"))["jobs"]
+        job = next(
+            item for item in jobs if item["name"] == "content-lane-executor"
+        )
+        (tmp_path / "config.yaml").write_text(
+            "model:\n"
+            "  provider: openai-codex\n"
+            "  default: gpt-5.5\n"
+            "fallback_providers:\n"
+            "  - provider: openrouter\n"
+            "    model: fallback-must-not-run\n",
+            encoding="utf-8",
+        )
+        plugin_root = tmp_path / "ignite-plugin"
+        skill_dir = plugin_root / "skills" / "ignite-execute"
+        skill_dir.mkdir(parents=True)
+        loaded_skill = json.dumps(
+            {
+                "success": True,
+                "content": "# Ignite execute\nGovern the content lane.",
+                "skill_dir": str(skill_dir),
+            }
+        )
+        fake_db = MagicMock()
+        runtime = {
+            "api_key": "test-anthropic-key",
+            "base_url": "https://api.anthropic.com",
+            "provider": "anthropic",
+            "api_mode": "anthropic_messages",
+        }
+        resolve_runtime = MagicMock(return_value=runtime)
+        runtime_module = types.ModuleType("hermes_cli.runtime_provider")
+        runtime_module.resolve_runtime_provider = resolve_runtime
+        runtime_module.format_runtime_provider_error = str
+        auth_module = types.ModuleType("hermes_cli.auth")
+        auth_module.AuthError = FakeAuthError
+        mock_agent_cls = MagicMock()
+        fake_run_agent = types.ModuleType("run_agent")
+        fake_run_agent.AIAgent = mock_agent_cls
+        monkeypatch.setitem(
+            sys.modules, "hermes_cli.runtime_provider", runtime_module
+        )
+        monkeypatch.setitem(sys.modules, "hermes_cli.auth", auth_module)
+        monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+        monkeypatch.setattr(
+            hermes_cli, "runtime_provider", runtime_module, raising=False
+        )
+        monkeypatch.setattr(hermes_cli, "auth", auth_module, raising=False)
+
+        with (
+            patch("cron.scheduler._hermes_home", tmp_path),
+            patch("cron.scheduler._resolve_origin", return_value=None),
+            patch("hermes_cli.env_loader.load_hermes_dotenv"),
+            patch("hermes_cli.env_loader.reset_secret_source_cache"),
+            patch("hermes_state.SessionDB", return_value=fake_db),
+            patch("tools.skills_tool.skill_view", return_value=loaded_skill),
+            patch("tools.skill_usage.bump_use"),
+            patch("tools.mcp_tool.discover_mcp_tools", return_value=[]),
+        ):
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent_cls.return_value = mock_agent
+
+            success, _, final_response, error = run_job(job)
+
+        assert success is True
+        assert error is None
+        assert final_response == "ok"
+        assert resolve_runtime.call_args.kwargs["requested"] == "anthropic"
+        kwargs = mock_agent_cls.call_args.kwargs
+        assert kwargs["provider"] == "anthropic"
+        assert kwargs["model"] == "claude-sonnet-5"
+        assert kwargs["fallback_model"] is None
+        assert kwargs["no_fallback"] is True
+        effective_prompt = mock_agent.run_conversation.call_args.args[0]
+        assert "Govern the content lane." in effective_prompt
+        assert "/ignite-execute --lane content" in effective_prompt
+
+    def test_governed_content_job_auth_error_never_attempts_global_fallback(
+        self, tmp_path, monkeypatch
+    ):
+        """The no-fallback pin applies before the pre-agent auth handler."""
+        import sys
+        import types
+        import hermes_cli
+
+        class FakeAuthError(Exception):
+            pass
+
+        jobs_path = (
+            Path(__file__).resolve().parents[2]
+            / "machine-setup"
+            / "fleet-config"
+            / "jobs.json"
+        )
+        jobs = json.loads(jobs_path.read_text(encoding="utf-8"))["jobs"]
+        job = next(
+            item for item in jobs if item["name"] == "content-lane-executor"
+        )
+        (tmp_path / "config.yaml").write_text(
+            "model:\n"
+            "  provider: openai-codex\n"
+            "  default: gpt-5.5\n"
+            "fallback_providers:\n"
+            "  - provider: openrouter\n"
+            "    model: fallback-must-not-run\n",
+            encoding="utf-8",
+        )
+        skill_dir = (
+            tmp_path / "ignite-plugin" / "skills" / "ignite-execute"
+        )
+        skill_dir.mkdir(parents=True)
+        loaded_skill = json.dumps(
+            {
+                "success": True,
+                "content": "# Ignite execute\nGovern the content lane.",
+                "skill_dir": str(skill_dir),
+            }
+        )
+        auth_error = FakeAuthError("Anthropic credentials unavailable")
+        resolve_runtime = MagicMock(side_effect=auth_error)
+        runtime_module = types.ModuleType("hermes_cli.runtime_provider")
+        runtime_module.resolve_runtime_provider = resolve_runtime
+        runtime_module.format_runtime_provider_error = (
+            lambda exc: f"auth-error: {exc}"
+        )
+        auth_module = types.ModuleType("hermes_cli.auth")
+        auth_module.AuthError = FakeAuthError
+        mock_agent_cls = MagicMock()
+        fake_run_agent = types.ModuleType("run_agent")
+        fake_run_agent.AIAgent = mock_agent_cls
+        monkeypatch.setitem(
+            sys.modules, "hermes_cli.runtime_provider", runtime_module
+        )
+        monkeypatch.setitem(sys.modules, "hermes_cli.auth", auth_module)
+        monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+        monkeypatch.setattr(
+            hermes_cli, "runtime_provider", runtime_module, raising=False
+        )
+        monkeypatch.setattr(hermes_cli, "auth", auth_module, raising=False)
+
+        with (
+            patch("cron.scheduler._hermes_home", tmp_path),
+            patch("cron.scheduler._resolve_origin", return_value=None),
+            patch("hermes_cli.env_loader.load_hermes_dotenv"),
+            patch("hermes_cli.env_loader.reset_secret_source_cache"),
+            patch("hermes_state.SessionDB", return_value=MagicMock()),
+            patch("tools.skills_tool.skill_view", return_value=loaded_skill),
+            patch("tools.skill_usage.bump_use"),
+            patch("cron.scheduler.get_fallback_chain") as fallback_chain,
+        ):
+            success, _, final_response, error = run_job(job)
+
+        assert success is False
+        assert final_response == ""
+        assert "no_fallback=true" in error
+        assert "no fallback provider was attempted" in error
+        resolve_runtime.assert_called_once_with(requested="anthropic")
+        fallback_chain.assert_not_called()
+        mock_agent_cls.assert_not_called()
+
     def test_model_env_ref_in_config_yaml_is_expanded(self, tmp_path, monkeypatch):
         """${VAR} in config.yaml model: is expanded using env after .env is loaded."""
         (tmp_path / "config.yaml").write_text("model: ${_HERMES_TEST_CRON_MODEL}\n")
@@ -4365,7 +4547,10 @@ class TestBuildJobPromptChildEnvironment:
             module_path.write_text("// fixture\n", encoding="utf-8")
         declared = "THERMAL_TEST_DATABASE_URL"
         undeclared = "UNDECLARED_CRON_SECRET"
-        monkeypatch.delenv("CLAUDE_PLUGIN_ROOT", raising=False)
+        stale_claude_root = "/Users/example/.claude/plugins/cache/ignite"
+        stale_ignite_root = "/Users/example/.hermes/skills"
+        monkeypatch.setenv("CLAUDE_PLUGIN_ROOT", stale_claude_root)
+        monkeypatch.setenv("IGNITE_SKILLS_ROOT", stale_ignite_root)
         monkeypatch.delenv(declared, raising=False)
         monkeypatch.delenv(undeclared, raising=False)
         scope_token = set_secret_scope(
@@ -4396,9 +4581,13 @@ class TestBuildJobPromptChildEnvironment:
             (child_plugin_root / relative_path).is_file()
             for relative_path in configured_root_modules
         )
+        assert child_env["IGNITE_SKILLS_ROOT"] == str(
+            plugin_root.resolve() / "skills"
+        )
         assert child_env[declared] == "postgresql://user:scoped-secret@db/test"
         assert undeclared not in child_env
-        assert "CLAUDE_PLUGIN_ROOT" not in os.environ
+        assert os.environ["CLAUDE_PLUGIN_ROOT"] == stale_claude_root
+        assert os.environ["IGNITE_SKILLS_ROOT"] == stale_ignite_root
         assert declared not in os.environ
 
     def test_absent_optional_skill_environment_does_not_abort(self, monkeypatch):
@@ -4465,6 +4654,31 @@ class TestBuildJobPromptChildEnvironment:
                     {"skills": ["optional-integration"], "prompt": "go"}
                 )
             assert get_child_env_overlay()[optional_name] == "optional-present-value"
+            strict_resolver.assert_not_called()
+        finally:
+            clear_env_passthrough()
+
+    def test_present_optional_job_environment_is_injected(self, monkeypatch):
+        from tools.env_passthrough import (
+            clear_env_passthrough,
+            get_child_env_overlay,
+        )
+
+        optional_name = "OPTIONAL_CRON_JOB_TOKEN"
+        monkeypatch.setenv(optional_name, "optional-job-value")
+        try:
+            with patch(
+                "agent.lazy_secret_resolver.get_required"
+            ) as strict_resolver:
+                _build_job_prompt(
+                    {
+                        "prompt": "go",
+                        "required_environment_variables": [
+                            {"name": optional_name, "optional": True}
+                        ],
+                    }
+                )
+            assert get_child_env_overlay()[optional_name] == "optional-job-value"
             strict_resolver.assert_not_called()
         finally:
             clear_env_passthrough()
@@ -4610,10 +4824,71 @@ class TestBuildJobPromptChildEnvironment:
             assert overlay[required] == "bundle-required-value"
             assert optional not in overlay
             assert overlay["CLAUDE_PLUGIN_ROOT"] == str(plugin_root.resolve())
+            assert overlay["IGNITE_SKILLS_ROOT"] == str(
+                plugin_root.resolve() / "skills"
+            )
             strict_resolver.assert_not_called()
             assert build_bundle.call_args.kwargs["include_member_metadata"] is True
         finally:
             reset_secret_scope(scope_token)
+            clear_env_passthrough()
+
+    def test_declared_ignite_root_is_derived_without_ambient_secret(
+        self, tmp_path, monkeypatch
+    ):
+        from tools.env_passthrough import (
+            clear_env_passthrough,
+            get_child_env_overlay,
+            get_child_env_redaction_values,
+        )
+
+        plugin_root = tmp_path / "canonical-plugin"
+        skill_dir = plugin_root / "skills" / "ignite-validate"
+        skill_dir.mkdir(parents=True)
+        monkeypatch.delenv("IGNITE_SKILLS_ROOT", raising=False)
+        monkeypatch.setenv("CLICKUP_API_TOKEN", "clickup-secret-value")
+        response = json.dumps(
+            {
+                "success": True,
+                "content": "# ignite-validate",
+                "skill_dir": str(skill_dir),
+            }
+        )
+
+        try:
+            with (
+                patch("tools.skills_tool.skill_view", return_value=response),
+                patch(
+                    "agent.lazy_secret_resolver.get_required",
+                    side_effect=AssertionError(
+                        "derived IGNITE_SKILLS_ROOT must not use secret resolution"
+                    ),
+                ),
+            ):
+                effective_prompt = _build_job_prompt(
+                    {
+                        "skills": ["ignite-validate"],
+                        "prompt": "go",
+                        "required_environment_variables": [
+                            "IGNITE_SKILLS_ROOT",
+                            "CLICKUP_API_TOKEN",
+                        ],
+                    }
+                )
+
+            overlay = get_child_env_overlay()
+            assert overlay["CLAUDE_PLUGIN_ROOT"] == str(plugin_root.resolve())
+            assert overlay["IGNITE_SKILLS_ROOT"] == str(
+                plugin_root.resolve() / "skills"
+            )
+            assert overlay["CLICKUP_API_TOKEN"] == "clickup-secret-value"
+            redactions = get_child_env_redaction_values()
+            assert "clickup-secret-value" in redactions
+            assert str(plugin_root.resolve()) not in redactions
+            assert str(plugin_root.resolve() / "skills") not in redactions
+            assert "# ignite-validate" in effective_prompt
+            assert "go" in effective_prompt
+        finally:
             clear_env_passthrough()
 
     def test_bundle_member_required_failure_leaves_overlay_empty(
@@ -4716,6 +4991,11 @@ class TestBuildJobPromptChildEnvironment:
             clear_env_passthrough()
 
     def test_conflicting_successful_skill_roots_fail_closed(self, tmp_path):
+        from tools.env_passthrough import (
+            clear_env_passthrough,
+            get_child_env_overlay,
+        )
+
         roots = [tmp_path / "one", tmp_path / "two"]
         responses = {}
         for index, root in enumerate(roots):
@@ -4729,14 +5009,19 @@ class TestBuildJobPromptChildEnvironment:
                 }
             )
 
-        with patch(
-            "tools.skills_tool.skill_view",
-            side_effect=lambda name: responses[name],
-        ):
-            with pytest.raises(CronSkillRootConflict) as exc_info:
-                _build_job_prompt(
-                    {"skills": ["skill-0", "skill-1"], "prompt": "go"}
-                )
+        try:
+            with patch(
+                "tools.skills_tool.skill_view",
+                side_effect=lambda name: responses[name],
+            ):
+                with pytest.raises(CronSkillRootConflict) as exc_info:
+                    _build_job_prompt(
+                        {"skills": ["skill-0", "skill-1"], "prompt": "go"}
+                    )
+
+            assert get_child_env_overlay() == {}
+        finally:
+            clear_env_passthrough()
 
         assert "conflicting plugin roots" in str(exc_info.value)
         assert str(roots[0].resolve()) in str(exc_info.value)
@@ -4770,6 +5055,9 @@ class TestBuildJobPromptChildEnvironment:
                 assert get_child_env_overlay()["CLAUDE_PLUGIN_ROOT"] == str(
                     roots["first"].resolve()
                 )
+                assert get_child_env_overlay()["IGNITE_SKILLS_ROOT"] == str(
+                    roots["first"].resolve() / "skills"
+                )
 
                 # Same Python context, independent direct build. The first
                 # root must be replaced rather than treated as a same-build
@@ -4777,6 +5065,9 @@ class TestBuildJobPromptChildEnvironment:
                 _build_job_prompt({"skills": ["second"], "prompt": "go"})
                 assert get_child_env_overlay()["CLAUDE_PLUGIN_ROOT"] == str(
                     roots["second"].resolve()
+                )
+                assert get_child_env_overlay()["IGNITE_SKILLS_ROOT"] == str(
+                    roots["second"].resolve() / "skills"
                 )
         finally:
             clear_env_passthrough()
@@ -4813,7 +5104,11 @@ class TestBuildJobPromptChildEnvironment:
         def _build(name):
             barrier.wait(timeout=5)
             _build_job_prompt({"skills": [name], "prompt": "go"})
-            return get_child_env_overlay()["CLAUDE_PLUGIN_ROOT"]
+            overlay = get_child_env_overlay()
+            return (
+                overlay["CLAUDE_PLUGIN_ROOT"],
+                overlay["IGNITE_SKILLS_ROOT"],
+            )
 
         clear_env_passthrough()
         with patch("tools.skills_tool.skill_view", side_effect=_skill_view):
@@ -4829,7 +5124,11 @@ class TestBuildJobPromptChildEnvironment:
                 }
 
         assert observed == {
-            name: str(root.resolve()) for name, root in roots.items()
+            name: (
+                str(root.resolve()),
+                str(root.resolve() / "skills"),
+            )
+            for name, root in roots.items()
         }
         assert get_child_env_overlay() == {}
 
