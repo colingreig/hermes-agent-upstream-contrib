@@ -84,8 +84,8 @@
     {
       "src_rel": "jobs.json",
       "dest_abs": "~/.hermes/cron/jobs.json",
-      "sha256": "2cd3a3817bb90fc4db51feea831ed7a6900cca51225d130d024cd18c1a8f6bd0",
-      "role": "curated 16-job cron set (13 kept + 3 consolidated; hermes-pr-validate re-enabled 2026-07-31 per task 86e2k3qe1), wholesale-replaces the live jobs.json",
+      "sha256": "4b7954898bfc1dde08014831d6bc37b3921988a1579b02813fb3b9cd58685a2b",
+      "role": "curated 16-job cron set (13 kept + 3 consolidated; fleet-health-digest is no_agent hermes_self_report_run.py), wholesale-replaces the live jobs.json",
       "deploy_mode": "jobs_json"
     }
   ]
