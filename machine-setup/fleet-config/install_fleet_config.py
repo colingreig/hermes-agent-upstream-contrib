@@ -52,7 +52,9 @@ import datetime as _dt
 import hashlib
 import json
 import os
+import re
 import shutil
+import stat
 import sys
 import tarfile
 from pathlib import Path
@@ -86,6 +88,9 @@ PROFILE_BOOTSTRAP_DIRS = [
 
 SKILL_POLICY_PROFILES = ("default", "coder", "content", "ops", "design", "research")
 SKILL_POLICY_CONFIG_MODE = 0o600
+LEGACY_CONFIG_BACKUP_NAME_RE = re.compile(
+    r"^config\.yaml\.bak-fleet-config-install-\d{8}T\d{6}Z$"
+)
 
 
 class InstallError(RuntimeError):
@@ -161,6 +166,79 @@ def _check_dest_in_bounds(dest: Path, dest_abs: str, allowed_root: Path) -> None
             f"to {resolved_ancestor} which is outside {resolved_root} — refusing"
         ) from exc
 
+
+def _open_regular_file_no_follow(path: Path, *, expected: os.stat_result | None = None) -> int:
+    """Open ``path`` without following links and prove it is the expected file.
+
+    Legacy backup permissions are security-sensitive because those files may
+    contain the same secrets as ``config.yaml``.  Discovery alone is not
+    sufficient: an entry could be swapped between planning and mutation.  The
+    descriptor-level identity check closes that race before ``fchmod``.
+    """
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:  # pragma: no cover - supported by macOS/Linux targets
+        raise InstallError("platform has no O_NOFOLLOW; refusing legacy config backup mutation")
+    flags = os.O_RDONLY | nofollow
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise InstallError(f"unsafe legacy config backup {path}: cannot open without following links: {exc}") from exc
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode):
+            raise InstallError(f"unsafe legacy config backup {path}: not a regular file")
+        if expected is not None and (opened.st_dev, opened.st_ino) != (expected.st_dev, expected.st_ino):
+            raise InstallError(f"unsafe legacy config backup {path}: identity changed after planning")
+        return fd
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def _discover_legacy_config_backups(destination_root: Path) -> list[dict[str, Any]]:
+    """Return safe, root-level legacy config backups governed by this installer.
+
+    Only the installer's exact historical UTC-stamped sibling naming contract
+    is recognized.  Profile backups, nested files, loose prefix matches, and
+    any symlink/non-regular entry are deliberately outside this remediation.
+    """
+    if not destination_root.is_dir():
+        return []
+    root_stat = destination_root.stat()
+    root_resolved = destination_root.resolve()
+    backups: list[dict[str, Any]] = []
+    with os.scandir(destination_root) as entries:
+        for entry in entries:
+            if LEGACY_CONFIG_BACKUP_NAME_RE.fullmatch(entry.name) is None:
+                continue
+            path = destination_root / entry.name
+            _check_dest_in_bounds(path, str(path), destination_root)
+            try:
+                info = entry.stat(follow_symlinks=False)
+            except OSError as exc:
+                raise InstallError(f"cannot inspect legacy config backup {path}: {exc}") from exc
+            if not stat.S_ISREG(info.st_mode):
+                raise InstallError(f"unsafe legacy config backup {path}: not a regular file")
+            if info.st_uid != root_stat.st_uid:
+                raise InstallError(
+                    f"unsafe legacy config backup {path}: owner uid {info.st_uid} "
+                    f"does not match Hermes root owner uid {root_stat.st_uid}"
+                )
+            try:
+                resolved = path.resolve(strict=True)
+            except OSError as exc:
+                raise InstallError(f"cannot resolve legacy config backup {path}: {exc}") from exc
+            if resolved.parent != root_resolved:
+                raise InstallError(
+                    f"unsafe legacy config backup {path}: resolves outside Hermes root {root_resolved}"
+                )
+            backups.append({
+                "path": path,
+                "stat": info,
+                "mode": stat.S_IMODE(info.st_mode),
+            })
+    return sorted(backups, key=lambda item: item["path"].name)
 
 def load_manifest(manifest_path: Path) -> dict:
     with open(manifest_path, "r", encoding="utf-8") as fh:
@@ -249,12 +327,16 @@ def build_plan(manifest: dict, *, home: Path, bundle_root: Path) -> dict:
         "profiles": [],
         "jobs_json": None,
         "skill_policy": None,
+        "installer_source": None,
     }
 
     for entry in verified:
         mode = entry.get("deploy_mode")
         if mode == "skill_policy":
             plan["skill_policy"] = entry
+            continue
+        if mode == "installer_source":
+            plan["installer_source"] = entry
             continue
         dest = _expand(entry["dest_abs"], home)
         _check_dest_in_bounds(dest, entry["dest_abs"], allowed_root)
@@ -302,6 +384,20 @@ def _print_config_plan(item: dict, home: Path) -> None:
         print(f"  mode: {current_mode:04o} -> {SKILL_POLICY_CONFIG_MODE:04o}")
     else:
         print("  mode: 0600 (already governed)")
+
+
+def _print_legacy_config_backup_plan(backups: list[dict[str, Any]]) -> None:
+    print("legacy root config backup modes:")
+    if not backups:
+        print("  (no governed legacy backups found)")
+        return
+    for backup in backups:
+        current_mode = backup["mode"]
+        if current_mode == SKILL_POLICY_CONFIG_MODE:
+            transition = "0600 (already governed)"
+        else:
+            transition = f"{current_mode:04o} -> {SKILL_POLICY_CONFIG_MODE:04o}"
+        print(f"  {backup['path']}: {transition}")
 
 
 def _print_profiles_plan(items: list[dict]) -> None:
@@ -1060,6 +1156,8 @@ def install(
     skill_policy_path: Path | None = None,
 ) -> int:
     plan = build_plan(manifest, home=home, bundle_root=bundle_root)
+    destination_root = home / ALLOWED_DEST_SUBPATH
+    legacy_config_backups = _discover_legacy_config_backups(destination_root)
     skill_policy = None
     skill_actions: list[dict[str, Any]] = []
     if skill_policy_path is not None:
@@ -1080,6 +1178,8 @@ def install(
     if dry_run:
         _print_config_plan(plan["config_overlay"], home)
         print()
+        _print_legacy_config_backup_plan(legacy_config_backups)
+        print()
         _print_profiles_plan(plan["profiles"])
         print()
         _print_jobs_plan(plan["jobs_json"])
@@ -1090,7 +1190,6 @@ def install(
         return 0
 
     stamp = _utc_stamp()
-    destination_root = home / ALLOWED_DEST_SUBPATH
     snapshot_dir = destination_root / "logs" / "fleet-config-installs" / stamp
     snapshot_dir.mkdir(parents=True, exist_ok=True)
     shutil.copy2(manifest_path, snapshot_dir / manifest_path.name)
@@ -1154,6 +1253,37 @@ def install(
         if _config_mode(dest) != SKILL_POLICY_CONFIG_MODE:
             raise InstallError(f"deployed {dest} mode is not 0600 — restoring snapshot")
         step["status"] = "installed"
+
+        # --- Step 1b: normalize legacy root config backup permissions ---
+        # These backups pre-date the private-backup behavior in _backup and
+        # can contain the same credentials as config.yaml.  Only the exact
+        # root-level UTC-stamped sibling pattern is governed; profile backups
+        # and unrelated files remain untouched.
+        for backup in legacy_config_backups:
+            path = backup["path"]
+            fd = _open_regular_file_no_follow(path, expected=backup["stat"])
+            try:
+                current = os.fstat(fd)
+                prior_mode = stat.S_IMODE(current.st_mode)
+                mode_step = {
+                    "step": "legacy_config_backup_mode",
+                    "dest": str(path),
+                    "prior_mode": f"{prior_mode:04o}",
+                    "mode": "0600",
+                    "device": current.st_dev,
+                    "inode": current.st_ino,
+                    "created": False,
+                    "rollback": "chmod-mode",
+                    "status": "already-governed" if prior_mode == SKILL_POLICY_CONFIG_MODE else "installing",
+                }
+                receipt["steps"].append(mode_step)
+                if prior_mode != SKILL_POLICY_CONFIG_MODE:
+                    os.fchmod(fd, SKILL_POLICY_CONFIG_MODE)
+                    if stat.S_IMODE(os.fstat(fd).st_mode) != SKILL_POLICY_CONFIG_MODE:
+                        raise InstallError(f"legacy config backup {path} mode is not 0600")
+                    mode_step["status"] = "installed"
+            finally:
+                os.close(fd)
 
         # --- Step 2: profiles/ ---
         for item in plan["profiles"]:
@@ -1280,6 +1410,25 @@ def install(
 def _rollback(steps: list[dict]) -> None:
     """Best-effort restore of already-written destinations from their snapshots."""
     for rec in reversed(steps):
+        if rec.get("rollback") == "chmod-mode":
+            dest = rec.get("dest")
+            prior_mode = rec.get("prior_mode")
+            if not dest or prior_mode is None:
+                continue
+            path = Path(dest)
+            try:
+                current = path.lstat()
+                if (current.st_dev, current.st_ino) != (rec.get("device"), rec.get("inode")):
+                    raise InstallError(f"identity changed; refusing chmod rollback for {path}")
+                fd = _open_regular_file_no_follow(path, expected=current)
+                try:
+                    os.fchmod(fd, int(prior_mode, 8))
+                finally:
+                    os.close(fd)
+                rec["status"] = "rolled-back"
+            except (OSError, InstallError, ValueError) as exc:  # pragma: no cover - best-effort rollback
+                print(f"  ROLLBACK WARNING: could not restore mode for {dest}: {exc}", file=sys.stderr)
+            continue
         if rec.get("rollback") == "move-back":
             source = rec.get("source")
             archive_dest = rec.get("archive_dest")

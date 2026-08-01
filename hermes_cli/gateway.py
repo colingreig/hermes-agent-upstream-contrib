@@ -192,7 +192,7 @@ def _get_parent_pid(pid: int) -> int | None:
         return psutil.Process(pid).ppid() or None
     except ImportError:
         pass
-    except Exception:
+    except (ValueError, TypeError, IndexError, plistlib.InvalidFileException):
         return None
     # Fallback: shell out to ps (POSIX only).  Git Bash installs ``ps.exe`` on
     # Windows; running it from the windowless desktop/gateway backend flashes a
@@ -2914,17 +2914,34 @@ def _normalize_launchd_plist_for_comparison(text: str) -> str:
     The generated plist intentionally captures a broad PATH assembled from the
     invoking shell so user-installed tools remain reachable under launchd.
     That makes raw text comparison unstable across shells, so ignore the PATH
-    payload when deciding whether the installed plist is stale.
+    payload when deciding whether the installed plist is stale. Compare the
+    parsed property list as well: governed installers may serialize the same
+    launchd contract with a different key order and XML whitespace.
     """
+    import plistlib
     import re
 
-    normalized = _normalize_service_definition(text)
-    return re.sub(
-        r"(<key>PATH</key>\s*<string>)(.*?)(</string>)",
-        r"\1__HERMES_PATH__\3",
-        normalized,
-        flags=re.S,
-    )
+    try:
+        payload = plistlib.loads(text.encode("utf-8"))
+    except Exception:
+        # Keep malformed/legacy definitions comparable without turning a
+        # status check into an exception. A malformed installed plist still
+        # differs from the valid generated definition and will be refreshed.
+        normalized = _normalize_service_definition(text)
+        return re.sub(
+            r"(<key>PATH</key>\s*<string>)(.*?)(</string>)",
+            r"\1__HERMES_PATH__\3",
+            normalized,
+            flags=re.S,
+        )
+
+    if not isinstance(payload, dict):
+        return _normalize_service_definition(text)
+
+    environment = payload.get("EnvironmentVariables")
+    if isinstance(environment, dict) and "PATH" in environment:
+        environment["PATH"] = "__HERMES_PATH__"
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
 
 def systemd_unit_is_current(system: bool = False) -> bool:

@@ -228,26 +228,84 @@ class Reconciler:
                 f"{self.gateway_wrapper}; refusing a config mutation"
             )
 
+    def _active_venv_dir(self) -> Path:
+        """Return the release-specific venv behind ``runtime-current``.
+
+        The launchd definition must not retain the mutable ``runtime-current``
+        alias.  Hermes' ordinary gateway generator records the active
+        interpreter's venv, which is the concrete release directory.  Resolve
+        the alias here as well so the governed installer and later generic
+        ``hermes gateway`` regeneration agree on the same service contract.
+
+        The runtime must resolve below this profile's own releases directory.
+        This keeps a custom/profile ``HERMES_HOME`` self-contained and prevents
+        a poisoned alias from pinning launchd to another home.
+        """
+        runtime = self.hermes_home / "runtime-current"
+        releases_root = (self.hermes_home / "releases").resolve()
+        try:
+            active_runtime = runtime.resolve(strict=True)
+        except (FileNotFoundError, NotADirectoryError) as exc:
+            raise RuntimeError(f"active runtime is missing: {runtime}") from exc
+        if not active_runtime.is_dir():
+            raise RuntimeError(
+                f"active runtime is not a directory: {active_runtime}"
+            )
+        try:
+            active_runtime.relative_to(releases_root)
+            active_runtime.relative_to(self.hermes_home)
+        except ValueError as exc:
+            raise RuntimeError(
+                "runtime-current escapes the profile release root: "
+                f"{active_runtime}"
+            ) from exc
+
+        venv = active_runtime / "venv"
+        try:
+            active_venv = venv.resolve(strict=True)
+        except (FileNotFoundError, NotADirectoryError) as exc:
+            raise RuntimeError(f"active release venv is missing: {venv}") from exc
+        if not active_venv.is_dir():
+            raise RuntimeError(
+                f"active release venv is not a directory: {active_venv}"
+            )
+        try:
+            active_venv.relative_to(active_runtime)
+            active_venv.relative_to(releases_root)
+            active_venv.relative_to(self.hermes_home)
+        except ValueError as exc:
+            raise RuntimeError(
+                "active release venv escapes the profile runtime root: "
+                f"{active_venv}"
+            ) from exc
+        return active_venv
+
     def _plist(self, *, label: str, wrapper: Path) -> bytes:
+        active_venv = self._active_venv_dir()
         environment = {
             "HERMES_HOME": str(self.hermes_home),
             "PATH": (
                 f"{self.home}/.local/bin:/opt/homebrew/bin:/usr/local/bin:"
                 "/usr/bin:/bin:/usr/sbin:/sbin"
             ),
-            "VIRTUAL_ENV": str(self.hermes_home / "runtime-current" / "venv"),
+            "VIRTUAL_ENV": str(active_venv),
         }
         log_stem = "gateway" if label == GATEWAY_LABEL else "dashboard"
         payload = {
             "Label": label,
             "ProgramArguments": ["/bin/bash", str(wrapper)],
-            "WorkingDirectory": str(self.hermes_home / "runtime-current"),
+            # Stable state root, matching hermes_cli.gateway.  A release
+            # checkout is deliberately not the cwd because it can move during
+            # update/rollback before the service process starts.
+            "WorkingDirectory": str(self.hermes_home),
             "EnvironmentVariables": environment,
+            "LimitLoadToSessionType": ["Aqua", "Background"],
             "RunAtLoad": True,
             # A permanent-auth failure is mapped by the wrapper to exit 0,
             # parking the job. Transient failures remain nonzero and retry.
             "KeepAlive": {"SuccessfulExit": False},
             "ThrottleInterval": 30,
+            "ExitTimeOut": 25,
             "StandardOutPath": str(self.hermes_home / "logs" / f"{log_stem}.log"),
             "StandardErrorPath": str(
                 self.hermes_home / "logs" / f"{log_stem}.error.log"
@@ -385,6 +443,16 @@ class Reconciler:
                 raise RuntimeError(f"plist does not point only to canonical wrapper: {plist_path}")
             if plist.get("KeepAlive") != {"SuccessfulExit": False}:
                 raise RuntimeError(f"plist retry contract mismatch: {plist_path}")
+            if plist.get("WorkingDirectory") != str(self.hermes_home):
+                raise RuntimeError(f"plist working directory mismatch: {plist_path}")
+            if plist.get("EnvironmentVariables", {}).get("VIRTUAL_ENV") != str(
+                self._active_venv_dir()
+            ):
+                raise RuntimeError(f"plist active venv mismatch: {plist_path}")
+            if plist.get("LimitLoadToSessionType") != ["Aqua", "Background"]:
+                raise RuntimeError(f"plist session-type contract mismatch: {plist_path}")
+            if plist.get("ExitTimeOut") != 25:
+                raise RuntimeError(f"plist exit-timeout contract mismatch: {plist_path}")
             serialized = plist_path.read_text(encoding="utf-8")
             forbidden = (
                 "github_app_token.py",

@@ -55,6 +55,13 @@ def test_manifest_source_hashes_match():
         assert actual_sha256 == entry["sha256"], f"hash mismatch for {entry['src_rel']}"
 
 
+def test_manifest_pins_governed_installer_as_source_only():
+    manifest = _load_manifest()
+    installer = next(entry for entry in manifest["files"] if entry["src_rel"] == "install_fleet_config.py")
+    assert installer["deploy_mode"] == "installer_source"
+    assert "dest_abs" not in installer
+
+
 def test_clickup_executor_jobs_use_direct_paths_with_stable_scheduling():
     jobs = _jobs_by_name()
     expected = {
