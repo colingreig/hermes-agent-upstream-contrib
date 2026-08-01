@@ -18,6 +18,25 @@ mini:
 snapshots each existing destination, writes atomically, and re-verifies the
 deployed bytes.
 
+## Production-write lease
+
+The normal installer takes its existing `.fleet-config-install.lock` first,
+then acquires the `fleet-config-installer` production-write lease for the
+registry's exact `fleet-config`, `cron-jobs`, and `skills-policy` resources.
+It heartbeats while writing, verifying, or rolling back and records the fence
+in the install receipt. Operators can inspect the shared fence without
+changing state:
+
+```bash
+hermes production-write-lease status
+```
+
+Cross-repository deployers must add their actor and complete resource mapping
+to `machine-setup/production_mutation_registry.json` before calling the lease;
+unknown actors, unknown resources, partial mappings, and overlap all fail
+closed. Use `recover` only for an expired exact lease and include durable JSON
+evidence; it writes an immutable recovery receipt.
+
 ## Production release path
 
 The rebuilt fleet has one production release path: an operator manually runs

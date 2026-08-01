@@ -97,7 +97,7 @@
     },
     {
       "src_rel": "install_fleet_config.py",
-      "sha256": "06bb5f7665f2a71dcfb1a7160300819a56de9c389122854b4ed347fb52c11fa5",
+      "sha256": "c6a4b0498e7bf949956eeb07c8abd9814a62905e00d1a964da33f32c72a2450d",
       "role": "source-only pin for the governed fleet installer, including private legacy root config-backup remediation and exact-mode rollback",
       "deploy_mode": "installer_source"
     }

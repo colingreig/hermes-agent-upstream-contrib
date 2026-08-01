@@ -28,6 +28,37 @@ export HERMES_HOME
 # shellcheck disable=SC1090 # SCRIPT is calculated from this test's location.
 MINI_RELEASE_CUT_TEST_LIB=1 source "$SCRIPT"
 
+# The first guarded cut can start from an older runtime. Bootstrap must carry
+# the target registry beside the target lease client, or registry validation
+# would fail before the new runtime is activated.
+grep -Fq 'machine-setup/production_mutation_registry.json' "$SCRIPT" \
+  || fail "production write lease bootstrap omits the target registry"
+grep -Fq 'active runtime commit for rollback lease' "$SCRIPT" \
+  || fail "explicit rollback is not fenced by the production write lease"
+
+# A fence failure after the atomic runtime-current swap must NOT invoke a
+# stale-owner rollback. It records loss evidence and leaves recovery to the
+# successor/operator.
+LEASE_NEW="$RELEASES_DIR/v-fence-new"
+LEASE_OLD="$RELEASES_DIR/v-fence-old"
+mkdir -p "$LEASE_NEW" "$LEASE_OLD"
+ln -s "$LEASE_NEW" "$HERMES_HOME/runtime-current"
+(
+  PRODUCTION_WRITE_LEASE_JSON='{"lease_id":"test"}'
+  NEW_DIR="$LEASE_NEW"
+  PREV_TARGET="$LEASE_OLD"
+  production_write_lease_call() {
+    [ "$1" = fence-loss ] || return 1
+    : > "$TEST_ROOT/fence-loss-receipt"
+    printf '{}\n'
+  }
+  rollback_to_previous() { : > "$TEST_ROOT/rollback-after-fence"; return 0; }
+  heartbeat_production_write_lease
+) >/dev/null 2>&1 && fail "post-swap fence failure unexpectedly succeeded"
+[ ! -f "$TEST_ROOT/rollback-after-fence" ] || fail "stale owner rolled back after fence loss"
+[ -f "$TEST_ROOT/fence-loss-receipt" ] || fail "post-swap fence loss did not record evidence"
+rm "$HERMES_HOME/runtime-current"
+
 RELEASES_DIR="$(canonical_existing_dir "$TEST_ROOT/home/.hermes/releases")"
 PREV_FILE="$RELEASES_DIR/.previous"
 CUT_LOCK_DIR="$RELEASES_DIR/.mini-release-cut.lock"
@@ -40,6 +71,26 @@ DRY_RUN=0
 mkdir -p "$HERMES_HOME/scripts"
 printf '#!/usr/bin/env python3\nprint("old")\n' > "$DEPLOYED_REFRESH"
 chmod 0755 "$DEPLOYED_REFRESH"
+
+# Fence every rollback boundary. A successor takeover after the pointer
+# restoration must prevent every remaining rollback write from this owner.
+ROLLBACK_NEW="$RELEASES_DIR/v-rollback-new"
+ROLLBACK_OLD="$RELEASES_DIR/v-rollback-old"
+mkdir -p "$ROLLBACK_NEW" "$ROLLBACK_OLD"
+printf '%s\n' "$ROLLBACK_OLD" > "$PREV_FILE"
+(
+  rollback_fences=0
+  heartbeat_production_write_lease() {
+    rollback_fences=$((rollback_fences + 1))
+    [ "$rollback_fences" -lt 2 ] || exit 77
+  }
+  repoint_symlink() { : > "$TEST_ROOT/rollback-pointer-write"; }
+  restore_governed_refresh_for_release() { : > "$TEST_ROOT/rollback-refresh-write"; }
+  rollback_to_previous "forced successor takeover"
+) >/dev/null 2>&1 && fail "mid-rollback successor takeover unexpectedly succeeded"
+[ -f "$TEST_ROOT/rollback-pointer-write" ] || fail "first fenced rollback mutation did not run"
+[ ! -f "$TEST_ROOT/rollback-refresh-write" ] || fail "stale rollback mutated after successor takeover"
+rm "$PREV_FILE"
 
 # The managed ClickUp wrapper is installed atomically, is executable, and a
 # later cut repairs a stale or missing command with the release-owned source.
