@@ -121,7 +121,14 @@ def test_pr_job_check_cannot_override_failed_governing_workflow(tmp_path):
 
 def test_offline_cli_writes_only_the_requested_atomic_snapshot(tmp_path):
     config = tmp_path / "config.json"
+    fixture = tmp_path / "live-sources.json"
     output = tmp_path / "state" / "snapshot.json"
+    fixture_data = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    current_ms = str(int(time.time() * 1000))
+    for task in fixture_data["clickup_tasks"]:
+        if str(task.get("status", "")).casefold() in {"complete", "closed"}:
+            task["date_updated"] = current_ms
+    fixture.write_text(json.dumps(fixture_data), encoding="utf-8")
     config.write_text(
         json.dumps(
             {
@@ -142,7 +149,7 @@ def test_offline_cli_writes_only_the_requested_atomic_snapshot(tmp_path):
             str(SCRIPTS / "hermes_delivery_snapshot.py"),
             "--once",
             "--fixture",
-            str(FIXTURE),
+            str(fixture),
             "--config",
             str(config),
             "--output",
