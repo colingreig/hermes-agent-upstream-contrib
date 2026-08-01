@@ -59,10 +59,16 @@ import secrets
 import shutil
 import stat
 import sys
+import subprocess
 import tarfile
 from pathlib import Path
 from pathlib import PurePosixPath
 from typing import Any
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+from cron import production_write_lease
 
 try:
     import yaml
@@ -101,6 +107,80 @@ LEGACY_CONFIG_BACKUP_NAME_RE = re.compile(
 
 class InstallError(RuntimeError):
     """Fail-closed installer error (drift, out-of-bounds dest, verify failure)."""
+
+
+def _production_write_commit() -> str:
+    """Pin a lease to the exact installer source checkout, not its test bundle."""
+    try:
+        value = subprocess.check_output(
+            ["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL
+        ).strip()
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise InstallError("could not resolve full source SHA for production write lease") from exc
+    if len(value) != 40 or any(ch not in "0123456789abcdef" for ch in value):
+        raise InstallError("production write lease requires a full lowercase source SHA")
+    return value
+
+
+def _acquire_production_write_lease(*, home: Path, bundle_root: Path):
+    try:
+        return production_write_lease.acquire(
+            ["fleet-config", "cron-jobs", "skills-policy"],
+            "fleet-config-installer",
+            f"fleet-config-install-{os.getpid()}-{secrets.token_hex(8)}",
+            str(home / ".hermes"),
+            "hermes-agent",
+            _production_write_commit(),
+            "manifest-verified fleet configuration installation",
+            database_path=home / ".hermes" / "state" / "production-write-lease.db",
+        )
+    except production_write_lease.ProductionWriteLeaseError as exc:
+        raise InstallError(f"production write lease refused fleet install: {exc}") from exc
+
+
+def _heartbeat_production_write_lease(lease, *, home: Path) -> Any:
+    try:
+        return production_write_lease.fence_mutation(
+            lease_id=lease.lease_id, actor=lease.actor, session_id=lease.session_id,
+            fencing_token=lease.fencing_token,
+            database_path=home / ".hermes" / "state" / "production-write-lease.db",
+        )
+    except production_write_lease.ProductionWriteLeaseError as exc:
+        raise InstallError(f"production write lease heartbeat failed: {exc}") from exc
+
+
+def _release_production_write_lease(lease, *, home: Path) -> None:
+    if lease is None:
+        return
+    try:
+        production_write_lease.release(
+            lease_id=lease.lease_id, actor=lease.actor, session_id=lease.session_id,
+            fencing_token=lease.fencing_token,
+            database_path=home / ".hermes" / "state" / "production-write-lease.db",
+        )
+    except production_write_lease.ProductionWriteLeaseError as exc:
+        print(f"WARNING: production write lease release failed: {exc}", file=sys.stderr)
+
+
+def _best_effort_fence_for_rollback(lease, *, home: Path, receipt: dict[str, Any]):
+    """Return whether this owner may still safely mutate rollback targets."""
+    try:
+        return _heartbeat_production_write_lease(lease, home=home), True
+    except InstallError as exc:
+        receipt["production_write_lease_fence_failure"] = str(exc)
+        try:
+            loss = production_write_lease.record_fence_loss(
+                lease_id=lease.lease_id, actor=lease.actor, session_id=lease.session_id,
+                fencing_token=lease.fencing_token,
+                reason="fleet-config installer lost production write fence before rollback",
+                evidence={"operation": "fleet-config-install", "result": "rollback-refused"},
+                database_path=home / ".hermes" / "state" / "production-write-lease.db",
+            )
+            receipt["production_write_lease_fence_loss_receipt"] = loss
+        except production_write_lease.ProductionWriteLeaseError as loss_exc:
+            receipt["production_write_lease_fence_loss_receipt_failure"] = str(loss_exc)
+        print(f"WARNING: {exc}; refusing rollback after lost fence", file=sys.stderr)
+        return lease, False
 
 
 # ---------------------------------------------------------------------------
@@ -1445,6 +1525,9 @@ def install(
         _release_install_lock(lock_fd)
         raise
 
+    # This local lock serializes this installer; the fenced lease additionally
+    # serializes it with every other registered production writer.
+    write_lease = _acquire_production_write_lease(home=home, bundle_root=bundle_root)
     receipt: dict[str, Any] = {
         "bundle": manifest.get("bundle", "fleet-config"),
         "source_task": manifest.get("source_task"),
@@ -1457,6 +1540,7 @@ def install(
         "skill_policy_sha256": _sha256(skill_policy_path) if skill_policy_path else None,
         "result": "success",
         "failure_detail": None,
+        "production_write_lease": write_lease.as_dict(),
         "steps": [],
     }
 
@@ -1496,6 +1580,7 @@ def install(
             "status": "installing",
         }
         receipt["steps"].append(step)
+        write_lease = _heartbeat_production_write_lease(write_lease, home=home)
         _write_private(dest, rendered.encode("utf-8"))
         # Re-verify the deployed bytes parse cleanly.
         deployed = yaml.safe_load(dest.read_text(encoding="utf-8"))
@@ -1504,6 +1589,7 @@ def install(
         if _config_mode(dest) != SKILL_POLICY_CONFIG_MODE:
             raise InstallError(f"deployed {dest} mode is not 0600 — restoring snapshot")
         step["status"] = "installed"
+        write_lease = _heartbeat_production_write_lease(write_lease, home=home)
 
         # --- Step 1b: normalize legacy root config backup permissions ---
         # These backups pre-date the private-backup behavior in _backup and
@@ -1529,12 +1615,14 @@ def install(
                 }
                 receipt["steps"].append(mode_step)
                 if prior_mode != SKILL_POLICY_CONFIG_MODE:
+                    write_lease = _heartbeat_production_write_lease(write_lease, home=home)
                     os.fchmod(fd, SKILL_POLICY_CONFIG_MODE)
                     if stat.S_IMODE(os.fstat(fd).st_mode) != SKILL_POLICY_CONFIG_MODE:
                         raise InstallError(f"legacy config backup {path} mode is not 0600")
                     mode_step["status"] = "installed"
             finally:
                 os.close(fd)
+        write_lease = _heartbeat_production_write_lease(write_lease, home=home)
 
         # --- Step 2: profiles/ ---
         for item in plan["profiles"]:
@@ -1559,6 +1647,7 @@ def install(
                 "status": "installing",
             }
             receipt["steps"].append(step)
+            write_lease = _heartbeat_production_write_lease(write_lease, home=home)
             if is_profile_config:
                 _write_private(pdest, data)
             else:
@@ -1578,6 +1667,7 @@ def install(
         for name in profile_names:
             profile_dir = home / ".hermes" / "profiles" / name
             for subdir in PROFILE_BOOTSTRAP_DIRS:
+                write_lease = _heartbeat_production_write_lease(write_lease, home=home)
                 (profile_dir / subdir).mkdir(parents=True, exist_ok=True)
             receipt["steps"].append({
                 "step": "profile_bootstrap_dirs",
@@ -1585,6 +1675,7 @@ def install(
                 "dirs": PROFILE_BOOTSTRAP_DIRS,
                 "status": "ensured",
             })
+        write_lease = _heartbeat_production_write_lease(write_lease, home=home)
 
         # --- Step 3: cron/jobs.json (fail-closed JSON validate) ---
         jobs_item = plan["jobs_json"]
@@ -1606,6 +1697,7 @@ def install(
             "status": "installing",
         }
         receipt["steps"].append(step)
+        write_lease = _heartbeat_production_write_lease(write_lease, home=home)
         _atomic_write(jdest, new_bytes)
         deployed_sha = _sha256(jdest)
         if deployed_sha != jobs_item["sha256"]:
@@ -1614,11 +1706,13 @@ def install(
                 f"{jobs_item['sha256']} — restoring snapshot"
             )
         step["status"] = "installed"
+        write_lease = _heartbeat_production_write_lease(write_lease, home=home)
 
         # --- Step 4: Mini-specific skill policy ---
         # Runs only after jobs.json is installed, so the direct-executor fleet
         # contract is in place before humanizer is removed from active homes.
         if skill_policy is not None:
+            write_lease = _heartbeat_production_write_lease(write_lease, home=home)
             _apply_skill_policy(
                 skill_policy,
                 skill_actions,
@@ -1627,11 +1721,23 @@ def install(
                 stamp=stamp,
                 receipt_steps=receipt["steps"],
             )
+            write_lease = _heartbeat_production_write_lease(write_lease, home=home)
 
     except InstallError as exc:
         receipt["result"] = "failed"
         receipt["failure_detail"] = str(exc)
-        _rollback(receipt["steps"])
+        write_lease, may_rollback = _best_effort_fence_for_rollback(write_lease, home=home, receipt=receipt)
+        receipt["production_write_lease"] = write_lease.as_dict()
+        if may_rollback:
+            lease_box = {"value": write_lease}
+            def rollback_guard() -> bool:
+                lease_box["value"], allowed = _best_effort_fence_for_rollback(
+                    lease_box["value"], home=home, receipt=receipt
+                )
+                return allowed
+            if not _rollback(receipt["steps"], guard=rollback_guard):
+                receipt["rollback_refused_after_fence_loss"] = True
+            write_lease = lease_box["value"]
 
     except Exception as exc:
         # Broadened beyond `except InstallError` (the pre-fix scope) — any
@@ -1644,17 +1750,30 @@ def install(
         # and tests must still see the real exception, not a silent 1.
         receipt["result"] = "failed"
         receipt["failure_detail"] = str(exc)
-        _rollback(receipt["steps"])
+        write_lease, may_rollback = _best_effort_fence_for_rollback(write_lease, home=home, receipt=receipt)
+        receipt["production_write_lease"] = write_lease.as_dict()
+        if may_rollback:
+            lease_box = {"value": write_lease}
+            def rollback_guard() -> bool:
+                lease_box["value"], allowed = _best_effort_fence_for_rollback(
+                    lease_box["value"], home=home, receipt=receipt
+                )
+                return allowed
+            if not _rollback(receipt["steps"], guard=rollback_guard):
+                receipt["rollback_refused_after_fence_loss"] = True
+            write_lease = lease_box["value"]
         receipt_path = snapshot_dir / "install-receipt.json"
         with open(receipt_path, "w", encoding="utf-8") as fh:
             json.dump(receipt, fh, indent=2)
             fh.write("\n")
         print(f"receipt: {receipt_path}")
         print(f"install FAILED and was rolled back where possible: {receipt['failure_detail']}", file=sys.stderr)
+        _release_production_write_lease(write_lease, home=home)
         _release_install_lock(lock_fd)
         raise
 
     receipt_path = snapshot_dir / "install-receipt.json"
+    receipt["production_write_lease"] = write_lease.as_dict()
     with open(receipt_path, "w", encoding="utf-8") as fh:
         json.dump(receipt, fh, indent=2)
         fh.write("\n")
@@ -1662,14 +1781,16 @@ def install(
     print(f"receipt: {receipt_path}")
     if receipt["result"] != "success":
         print(f"install FAILED and was rolled back where possible: {receipt['failure_detail']}", file=sys.stderr)
+        _release_production_write_lease(write_lease, home=home)
         _release_install_lock(lock_fd)
         return 1
     print("install complete; config.yaml merged, profiles installed, jobs.json replaced, skill policy applied.")
+    _release_production_write_lease(write_lease, home=home)
     _release_install_lock(lock_fd)
     return 0
 
 
-def _rollback(steps: list[dict]) -> None:
+def _rollback(steps: list[dict], *, guard=None) -> bool:
     """Best-effort restore of already-written destinations from their snapshots."""
     for rec in reversed(steps):
         if rec.get("rollback") == "chmod-mode":
@@ -1679,6 +1800,8 @@ def _rollback(steps: list[dict]) -> None:
                 continue
             path = Path(dest)
             try:
+                if guard is not None and not guard():
+                    return False
                 current = path.lstat()
                 if (current.st_dev, current.st_ino) != (rec.get("device"), rec.get("inode")):
                     raise InstallError(f"identity changed; refusing chmod rollback for {path}")
@@ -1697,6 +1820,8 @@ def _rollback(steps: list[dict]) -> None:
             if not source or not archive_dest:
                 continue
             try:
+                if guard is not None and not guard():
+                    return False
                 source_path = Path(source)
                 archive_path = Path(archive_dest)
                 if archive_path.exists() and not source_path.exists():
@@ -1711,6 +1836,8 @@ def _rollback(steps: list[dict]) -> None:
         if not dest:
             continue
         try:
+            if guard is not None and not guard():
+                return False
             if snapshot:
                 Path(dest).parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(snapshot, dest)
@@ -1728,6 +1855,7 @@ def _rollback(steps: list[dict]) -> None:
             rec["status"] = "rolled-back"
         except OSError as exc:  # pragma: no cover - best-effort rollback
             print(f"  ROLLBACK WARNING: could not restore {dest}: {exc}", file=sys.stderr)
+    return True
 
 
 def main(argv: list[str] | None = None) -> int:

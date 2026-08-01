@@ -2,6 +2,17 @@
 
 Safe, repeatable release cut for the Hermes production Mac mini.
 
+## Production-write lease
+
+Before a real cut mutates release state, it acquires the registry-backed
+`mini-release-cut` lease for `runtime-release` and `governed-mini-scripts`.
+The cut uses the target tree's stdlib lease module directly, rather than the
+`hermes` CLI, so an older active runtime can safely bootstrap this guard. The
+lease is heartbeated through the cut, included in the immutable release
+receipt, and released by the cut cleanup trap. Do not run a second cut while
+`hermes production-write-lease status` reports an overlapping active lease;
+recover only an expired lease with an operator evidence record.
+
 ## Why this exists
 
 On **2026-07-19** an improvised cutover to a

@@ -12709,6 +12709,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "gui", "desktop", "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate", "moa",
         "journey", "memory-graph", "learning",
         "model", "pairing", "pets", "plugins", "portal", "postinstall", "profile",
+        "production-write-lease",
         "project", "proxy",
         "prompt-size",
         "send", "sessions", "setup",
@@ -13253,6 +13254,9 @@ def main():
     # model command  (parser built in hermes_cli/subcommands/model.py)
     # =========================================================================
     build_model_parser(subparsers, cmd_model=cmd_model)
+
+    from hermes_cli.production_write_lease_cmd import register_parser as _register_production_write_lease_parser
+    _register_production_write_lease_parser(subparsers)
 
     from hermes_cli.moa_cmd import cmd_moa
 

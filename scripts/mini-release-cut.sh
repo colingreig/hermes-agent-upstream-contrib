@@ -341,14 +341,14 @@ write_release_receipt() {
   payload="$(python3 - "$event" "$REF" "$from_sha" "$to_sha" "$runtime_dir" \
     "$source_hash" "$deployed_hash" "$detail" "$CERTIFIED_SHA" \
     "$PR_PIPELINE_RECEIPT_ID" "$REVIEW_GATE_SMOKE_STATUS" \
-    "$PROMOTION_RECEIPT_ID" <<'PY'
+    "$PROMOTION_RECEIPT_ID" "$PRODUCTION_WRITE_LEASE_JSON" <<'PY'
 import json
 import sys
 
 (
     event, ref, from_sha, to_sha, runtime_dir, source_hash, deployed_hash,
     detail, certified_sha, pipeline_receipt, review_gate_smoke,
-    promotion_receipt_id,
+    promotion_receipt_id, production_write_lease,
 ) = sys.argv[1:]
 print(json.dumps({
     "schema_version": 2,
@@ -363,6 +363,7 @@ print(json.dumps({
     "refresh_deployed_sha256": deployed_hash,
     "pr_pipeline_reconciliation_receipt_id": pipeline_receipt or None,
     "review_poll_gate_smoke": review_gate_smoke or None,
+    "production_write_lease": json.loads(production_write_lease) if production_write_lease else None,
     "detail": detail,
 }, sort_keys=True, separators=(",", ":")))
 PY
@@ -898,6 +899,10 @@ kickstart_label() {
 # cuts, explicit rollbacks, and pruning so two operators cannot race the
 # runtime-current switch or delete one another's release.
 LOCK_HELD=0
+PRODUCTION_WRITE_LEASE_JSON=""
+PRODUCTION_WRITE_LEASE_PYTHON=""
+PRODUCTION_WRITE_LEASE_ROOT=""
+PRODUCTION_WRITE_LEASE_BOOTSTRAP_DIR=""
 acquire_cut_lock() {
   assert_release_target "$CUT_LOCK_DIR"
   if [ "$DRY_RUN" -eq 1 ]; then
@@ -918,6 +923,105 @@ release_cut_lock() {
   assert_release_target "$CUT_LOCK_DIR"
   rmdir "$CUT_LOCK_DIR" || warn "could not remove release-cut lock: $CUT_LOCK_DIR"
   LOCK_HELD=0
+}
+
+# Do not call ``hermes production-write-lease`` here: the currently-active
+# runtime can predate that CLI command during a rolling upgrade.  The module
+# is imported directly from the exact release tree that is about to write
+# persistent state, which also binds the lease to the cut's exact SHA.
+production_write_lease_call() {
+  local action="${1:-}"; shift
+  [ -n "$PRODUCTION_WRITE_LEASE_PYTHON" ] || die "production write lease Python is not selected"
+  HERMES_HOME="$HERMES_HOME" PYTHONPATH="$PRODUCTION_WRITE_LEASE_ROOT" \
+    "$PRODUCTION_WRITE_LEASE_PYTHON" - "$action" "$@" <<'PY'
+import json, os, sys
+from cron import production_write_lease as lease
+action = sys.argv[1]
+try:
+    if action == "acquire":
+        value = lease.acquire(
+            ["runtime-release", "governed-mini-scripts"], "mini-release-cut",
+            sys.argv[2], os.environ["HERMES_HOME"], "hermes-agent", sys.argv[3],
+            "governed Mini release cut")
+        print(json.dumps(value.as_dict(), sort_keys=True))
+    else:
+        data = json.loads(sys.argv[2])
+        kwargs = dict(lease_id=data["lease_id"], actor=data["actor"],
+                      session_id=data["session_id"], fencing_token=data["fencing_token"])
+        if action == "heartbeat": print(json.dumps(lease.fence_mutation(**kwargs).as_dict(), sort_keys=True))
+        elif action == "release": lease.release(**kwargs); print("{}")
+        elif action == "fence-loss": print(json.dumps(lease.record_fence_loss(
+            **kwargs, reason="Mini release cut lost its production write fence",
+            evidence={"operation": "mini-release-cut", "commit_sha": data["commit_sha"]}).copy(), sort_keys=True))
+        else: raise RuntimeError("unknown lease action")
+except Exception as exc:
+    print(f"production write lease {action} refused: {exc}", file=sys.stderr)
+    raise SystemExit(2)
+PY
+}
+
+acquire_production_write_lease() {
+  local session="mini-release-cut-${UID_NUM}-$$-${RANDOM}"
+  PRODUCTION_WRITE_LEASE_JSON="$(production_write_lease_call acquire "$session" "$SHA")" \
+    || die "could not acquire fenced production write lease"
+  ok "acquired fenced production write lease"
+}
+
+heartbeat_production_write_lease() {
+  [ -n "$PRODUCTION_WRITE_LEASE_JSON" ] || return 0
+  PRODUCTION_WRITE_LEASE_JSON="$(production_write_lease_call heartbeat "$PRODUCTION_WRITE_LEASE_JSON")" \
+    || {
+      warn "production write lease fence failed"
+      production_write_lease_call fence-loss "$PRODUCTION_WRITE_LEASE_JSON" >/dev/null \
+        || warn "could not persist production write lease fence-loss receipt"
+      # Never roll back after ownership is lost: another writer may already
+      # hold the successor fence. The successor/operator owns recovery.
+      die "production write lease heartbeat failed"
+    }
+}
+
+release_production_write_lease() {
+  [ -n "$PRODUCTION_WRITE_LEASE_JSON" ] || return 0
+  production_write_lease_call release "$PRODUCTION_WRITE_LEASE_JSON" >/dev/null \
+    || warn "could not release fenced production write lease"
+  PRODUCTION_WRITE_LEASE_JSON=""
+}
+
+guarded_rollback_to_previous() {
+  local reason="${1:-production write rollback}"
+  # The rollback pointer swap is itself a protected write. Refresh the exact
+  # owner/fence immediately before it; a stale owner must leave recovery to
+  # the successor instead of changing runtime-current.
+  heartbeat_production_write_lease
+  rollback_to_previous "$reason"
+}
+
+cleanup_production_write_lease_bootstrap() {
+  [ -n "$PRODUCTION_WRITE_LEASE_BOOTSTRAP_DIR" ] || return 0
+  case "$PRODUCTION_WRITE_LEASE_BOOTSTRAP_DIR" in
+    "${TMPDIR:-/tmp}"/hermes-production-write-lease.*)
+      rm -rf -- "$PRODUCTION_WRITE_LEASE_BOOTSTRAP_DIR" || warn "could not remove lease bootstrap directory"
+      ;;
+    *) warn "refusing to remove unexpected lease bootstrap directory: $PRODUCTION_WRITE_LEASE_BOOTSTRAP_DIR" ;;
+  esac
+  PRODUCTION_WRITE_LEASE_BOOTSTRAP_DIR=""
+}
+
+bootstrap_production_write_lease() {
+  # The old runtime may not have the new CLI (or module).  Extract just the
+  # target's stdlib-only lease module and Hermes-home helper into /tmp before
+  # any release-state write, then execute it with the known working current
+  # runtime interpreter.  This is an upgrade bridge, not a persistent deploy.
+  PRODUCTION_WRITE_LEASE_BOOTSTRAP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/hermes-production-write-lease.XXXXXX")" \
+    || die "could not reserve production write lease bootstrap directory"
+  git_current archive "$SHA" cron/production_write_lease.py hermes_constants.py \
+    machine-setup/production_mutation_registry.json \
+    | tar -x -C "$PRODUCTION_WRITE_LEASE_BOOTSTRAP_DIR" \
+    || die "could not extract target production write lease bootstrap"
+  PRODUCTION_WRITE_LEASE_ROOT="$PRODUCTION_WRITE_LEASE_BOOTSTRAP_DIR"
+  PRODUCTION_WRITE_LEASE_PYTHON="$CURRENT_LINK/venv/bin/python"
+  [ -x "$PRODUCTION_WRITE_LEASE_PYTHON" ] \
+    || die "current runtime Python is unavailable for production write lease bootstrap"
 }
 
 # ---------------------------------------------------------------------------
@@ -1011,21 +1115,30 @@ rollback_to_previous() {
   warn "ROLLBACK ($reason) → $prev"
   local offset
   offset="$(log_offset)"
+  heartbeat_production_write_lease
   repoint_symlink "$prev"
+  heartbeat_production_write_lease
   restore_governed_refresh_for_release "$prev" \
     || die "rollback could not restore governed ClickUp refresh — MANUAL INTERVENTION REQUIRED"
+  heartbeat_production_write_lease
   install_clickup_cli "$prev" \
     || die "rollback could not restore managed ClickUp CLI — MANUAL INTERVENTION REQUIRED"
+  heartbeat_production_write_lease
   rollback_governed_fleet_outcomes "$reason" \
     || die "rollback could not restore governed fleet outcomes — MANUAL INTERVENTION REQUIRED"
+  heartbeat_production_write_lease
   restore_governed_pr_pipeline_for_release "$prev" \
     || die "rollback could not restore governed PR pipeline — MANUAL INTERVENTION REQUIRED"
+  heartbeat_production_write_lease
   rollback_governed_marketplace_skills "$reason" \
     || die "rollback could not restore governed marketplace skills — MANUAL INTERVENTION REQUIRED"
+  heartbeat_production_write_lease
   rollback_governed_launchd_environment "$reason" \
     || die "rollback could not restore governed launchd environment — MANUAL INTERVENTION REQUIRED"
+  heartbeat_production_write_lease
   kickstart_label "$GATEWAY_LABEL"
   if verify_gateway "$prev" "$offset"; then
+    heartbeat_production_write_lease
     kickstart_label "$DASHBOARD_LABEL"
     verify_dashboard || die "rollback dashboard did NOT verify healthy — MANUAL INTERVENTION REQUIRED (release: $prev)"
     ok "rollback complete → $prev"
@@ -1041,7 +1154,7 @@ record_cut_receipt_or_rollback() {
   if ! write_release_receipt "$event" "$from_sha" "$to_sha" "$runtime_dir" \
     "$source_hash" "$deployed_hash" "$detail"; then
     warn "release receipt recording failed — rolling back"
-    rollback_to_previous "release receipt recording failed"
+    guarded_rollback_to_previous "release receipt recording failed"
     die "cut aborted and rolled back to previous release"
   fi
 }
@@ -1054,7 +1167,7 @@ kickstart_after_switch() {
   local target="${1:-}" service="${2:-service}"
   if ! kickstart "$target"; then
     warn "$service did not restart on new release — rolling back"
-    rollback_to_previous "$service kickstart failed"
+    guarded_rollback_to_previous "$service kickstart failed"
     die "cut aborted and rolled back to previous release ($service kickstart failed)"
   fi
 }
@@ -1275,6 +1388,8 @@ cleanup_on_exit() {
       status=70
     fi
   fi
+  release_production_write_lease
+  cleanup_production_write_lease_bootstrap
   release_cut_lock
   trap - EXIT
   exit "$status"
@@ -1285,8 +1400,14 @@ trap cleanup_on_exit EXIT
 
 if [ "$DO_ROLLBACK" -eq 1 ]; then
   [ -L "$CURRENT_LINK" ] || die "no runtime-current symlink at $CURRENT_LINK"
+  if [ "$DRY_RUN" -eq 0 ]; then
+    SHA="$(git_current rev-parse --verify "HEAD^{commit}")" \
+      || die "could not resolve active runtime commit for rollback lease"
+    bootstrap_production_write_lease
+    acquire_production_write_lease
+  fi
   PR_PIPELINE_CHANGED=1
-  rollback_to_previous "explicit --rollback"
+  guarded_rollback_to_previous "explicit --rollback"
   exit 0
 fi
 
@@ -1336,6 +1457,10 @@ fi
 if [ "$DRY_RUN" -eq 0 ]; then
   verify_promotion_authority "$SHA" "$PROMOTION_RECEIPT_ID" \
     || die "immutable promotion receipt does not authorize exact target $SHA"
+  if [ "$PREFLIGHT" -eq 0 ]; then
+    bootstrap_production_write_lease
+    acquire_production_write_lease
+  fi
 fi
 
 # Polling mode is evaluated under the same lock as the eventual cut, after the
@@ -1359,8 +1484,10 @@ if [ "$IF_ADVANCED" -eq 1 ]; then
       fi
       reconcile_governed_pr_pipeline "$CURRENT_LINK" "$SHA" \
         || die "active runtime PR pipeline could not reconcile to exact source $SHA"
+      heartbeat_production_write_lease
       install_governed_fleet_outcomes "$CURRENT_LINK" \
         || die "active runtime fleet outcomes could not reconcile to exact source $SHA"
+      heartbeat_production_write_lease
       smoke_live_review_poll_gate "$CURRENT_LINK" \
         || die "active runtime root review_poll_gate smoke failed"
       write_release_receipt "noop" "$ACTIVE_SHA" "$SHA" "$ACTIVE_TARGET" \
@@ -1502,6 +1629,7 @@ if ! clone_and_checkout; then
   clone_and_checkout \
     || die "clone/checkout failed twice for $SHA — aborting (possible non-transient git maintenance/object race, or missing objects at origin)"
 fi
+heartbeat_production_write_lease
 
 # --- Build the Python venv inside the release dir --------------------------
 # The repo's own setup-hermes.sh prefers a hash-verified `uv sync --extra all
@@ -1548,6 +1676,7 @@ else
         && "$NEW_DIR/venv/bin/pip" install -e ".[all]" ) || die "venv build failed"
   fi
 fi
+heartbeat_production_write_lease
 
 # --- Build the web dashboard bundle into hermes_cli/web_dist ---------------
 # vite is configured with outDir ../hermes_cli/web_dist (web/vite.config.ts).
@@ -1618,10 +1747,12 @@ for label, cadence in expected.items():
 PY
   ok "build verified (import, web dist, governed refresh, launchd sources)"
 fi
+heartbeat_production_write_lease
 
 # Preserve the exact pre-cut deployed script for bootstrap rollback before
 # runtime-current or any protected operational file changes.
 stage_refresh_backup
+heartbeat_production_write_lease
 
 # --- Record previous target for rollback (lives under releases/, allowed) --
 PREV_TARGET="$(readlink "$CURRENT_LINK")"
@@ -1634,52 +1765,61 @@ else
   assert_regular_release_file "$PREV_FILE"
   printf '%s\n' "$PREV_TARGET" > "$PREV_FILE"
 fi
+heartbeat_production_write_lease
 
 # --- Switch: atomic symlink swap + restart + verify ------------------------
 LAUNCHD_GW_OFFSET="$(log_offset)"
 repoint_symlink "$NEW_DIR"
+heartbeat_production_write_lease
 if ! install_governed_marketplace_skills "$NEW_DIR"; then
   warn "governed marketplace skills install/reload failed — rolling back"
-  rollback_to_previous "governed marketplace skills install failed"
+  guarded_rollback_to_previous "governed marketplace skills install failed"
   die "cut aborted and rolled back to previous release"
 fi
+heartbeat_production_write_lease
 if ! install_governed_launchd_environment "$NEW_DIR"; then
   warn "governed launchd environment install/reload failed — rolling back"
-  rollback_to_previous "governed launchd environment install failed"
+  guarded_rollback_to_previous "governed launchd environment install failed"
   die "cut aborted and rolled back to previous release"
 fi
+heartbeat_production_write_lease
 if ! reconcile_governed_pr_pipeline "$NEW_DIR" "$SHA"; then
   warn "governed PR-pipeline reconciliation failed — rolling back"
-  rollback_to_previous "governed PR-pipeline reconciliation failed"
+  guarded_rollback_to_previous "governed PR-pipeline reconciliation failed"
   die "cut aborted and rolled back to previous release"
 fi
+heartbeat_production_write_lease
 if ! install_governed_fleet_outcomes "$NEW_DIR"; then
   warn "governed fleet-outcome reconciliation failed — rolling back"
-  rollback_to_previous "governed fleet-outcome reconciliation failed"
+  guarded_rollback_to_previous "governed fleet-outcome reconciliation failed"
   die "cut aborted and rolled back to previous release"
 fi
+heartbeat_production_write_lease
 if ! smoke_live_review_poll_gate "$NEW_DIR"; then
   warn "live review_poll_gate root-command smoke failed — rolling back"
-  rollback_to_previous "review_poll_gate smoke failed"
+  guarded_rollback_to_previous "review_poll_gate smoke failed"
   die "cut aborted and rolled back to previous release"
 fi
+heartbeat_production_write_lease
 if ! verify_gateway "$NEW_DIR" "$LAUNCHD_GW_OFFSET" || ! verify_dashboard; then
   warn "services did not verify through governed launchd environment — rolling back"
-  rollback_to_previous "governed launchd environment verify failed"
+  guarded_rollback_to_previous "governed launchd environment verify failed"
   die "cut aborted and rolled back to previous release"
 fi
 
 if ! install_governed_refresh "$NEW_DIR"; then
   warn "governed ClickUp refresh install failed — rolling back"
-  rollback_to_previous "governed refresh install failed"
+  guarded_rollback_to_previous "governed refresh install failed"
   die "cut aborted and rolled back to previous release"
 fi
+heartbeat_production_write_lease
 
 if ! install_clickup_cli "$NEW_DIR"; then
   warn "managed ClickUp CLI install failed — rolling back"
-  rollback_to_previous "managed ClickUp CLI install failed"
+  guarded_rollback_to_previous "managed ClickUp CLI install failed"
   die "cut aborted and rolled back to previous release"
 fi
+heartbeat_production_write_lease
 
 if [ "$DRY_RUN" -eq 1 ]; then
   # The planned release was never built, and the deployed script intentionally
@@ -1693,7 +1833,7 @@ else
   REFRESH_DEPLOYED_HASH="$(sha256_file "$DEPLOYED_REFRESH" 2>/dev/null || true)"
   if [ -z "$REFRESH_SOURCE_HASH" ] || [ "$REFRESH_SOURCE_HASH" != "$REFRESH_DEPLOYED_HASH" ]; then
     warn "governed refresh source/deployed hash verification failed — rolling back"
-    rollback_to_previous "governed refresh hash verification failed"
+    guarded_rollback_to_previous "governed refresh hash verification failed"
     die "cut aborted and rolled back to previous release"
   fi
 fi

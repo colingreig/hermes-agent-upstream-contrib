@@ -134,6 +134,9 @@ def test_real_install_writes_all_three_destinations(bundle):
         dry_run=False,
     )
     assert rc == 0
+    # The test home's installer lease must not leak to the process/default
+    # Hermes home; profile and --home isolation applies to its state DB too.
+    assert (bundle["home"] / ".hermes" / "state" / "production-write-lease.db").is_file()
     cfg = yaml.safe_load((bundle["home"] / ".hermes" / "config.yaml").read_text())
     assert cfg["model"] == "synthetic-model"
     assert (bundle["home"] / ".hermes" / "config.yaml").stat().st_mode & 0o777 == 0o600
@@ -441,6 +444,49 @@ def test_forced_failure_mid_step_rolls_back_and_reraises(bundle, monkeypatch):
     receipt = json.loads((install_dirs[0] / "install-receipt.json").read_text())
     assert receipt["result"] == "failed"
     assert "simulated disk failure" in receipt["failure_detail"]
+
+
+def test_lost_fence_refuses_installer_rollback_after_successor_handoff(bundle, monkeypatch):
+    """An old installer must not restore bytes once its write fence is gone."""
+    home = bundle["home"]
+    config = home / ".hermes" / "config.yaml"
+    config.write_text("model: old-owner\n", encoding="utf-8")
+    real_atomic_write = install_mod._atomic_write
+    real_fence = install_mod._heartbeat_production_write_lease
+    fence_calls = {"count": 0}
+    handoff_done = {"value": False}
+
+    def successor_has_fence(lease, *, home):
+        fence_calls["count"] += 1
+        # Let one rollback restoration run, then give the successor the next
+        # fence before the remaining old-owner restoration boundary.
+        if fence_calls["count"] >= 6 and not handoff_done["value"]:
+            db = home / ".hermes" / "state" / "production-write-lease.db"
+            install_mod.production_write_lease.release(
+                lease_id=lease.lease_id, actor=lease.actor, session_id=lease.session_id,
+                fencing_token=lease.fencing_token, database_path=db,
+            )
+            successor = install_mod.production_write_lease.acquire(
+                ["fleet-config", "cron-jobs", "skills-policy"], "fleet-config-installer",
+                "successor", str(home / ".hermes"), "hermes-agent", lease.commit_sha,
+                "successor owns rollback", database_path=db,
+            )
+            assert successor.fencing_token > lease.fencing_token
+            handoff_done["value"] = True
+        return real_fence(lease, home=home)
+
+    writes = {"count": 0}
+    def fail_after_config(dest, data):
+        writes["count"] += 1
+        if writes["count"] == 2:
+            raise OSError("simulated successor handoff")
+        return real_atomic_write(dest, data)
+
+    monkeypatch.setattr(install_mod, "_heartbeat_production_write_lease", successor_has_fence)
+    monkeypatch.setattr(install_mod, "_atomic_write", fail_after_config)
+    with pytest.raises(OSError, match="simulated successor handoff"):
+        install_mod.install(bundle["manifest"], home=home, bundle_root=bundle["bundle_root"], manifest_path=bundle["manifest_path"], dry_run=False)
+    assert "synthetic-model" in config.read_text(encoding="utf-8")
 
 
 def test_late_failure_restores_every_distinct_profile_snapshot(bundle, monkeypatch):
