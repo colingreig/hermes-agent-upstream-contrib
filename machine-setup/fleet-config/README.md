@@ -11,6 +11,7 @@ mini:
 | `profiles/<name>/{config.yaml,SOUL.md}` | `~/.hermes/profiles/<name>/` | Five direct-execution profiles: `coder`, `content`, `design`, `research`, `ops`. Each gets its model config, its SOUL.md persona, and the full `_PROFILE_DIRS` bootstrap tree from `hermes_cli/profiles.py` (`memories`, `sessions`, `skills`, `skins`, `logs`, `plans`, `workspace`, `cron`, `home`). The `home/` entry is a subprocess workspace, not the profile's Hermes root. |
 | `jobs.json` | `~/.hermes/cron/jobs.json` | Curated 15-job cron set (12 carried forward from the pre-freeze live config, 3 new consolidated hygiene/digest jobs). **Wholesale replace**, not a merge. |
 | `skills-policy.json` | Default plus five profile-local `skills/` trees | SHA-pinned allowlist/cull policy. Preserves allowed bundled skills, archives and suppresses removals, consolidates two historical ClickUp poller references, removes the obsolete local `sentry-monitor` wrapper without touching the operational Ignite Sentinel checkout, and removes the local hub shadow of `vehicle-image-qc` only with exact hub provenance. |
+| `install_fleet_config.py` | Operator entry point (source-only manifest pin) | Verifies the whole bundle, performs the governed mutations, and records rollback receipts. The installer itself is SHA-256 pinned by the same manifest before any mutation. |
 
 `fleet_config_manifest.json` sha256-pins every source file above.
 `install_fleet_config.py` verifies those hashes before writing anything,
@@ -260,6 +261,8 @@ rendered merge result that doesn't round-trip through a YAML parse, a
 bundled `jobs.json` that isn't valid JSON or has no top-level `jobs` list,
 an unmanifested or hash-drifted skill policy, historical reference provenance
 drift, conflicting archive bytes, hub-lock identity drift,
+an exact-pattern root legacy config backup that is a symlink, non-regular
+entry, owned by a different user, or resolves outside the Hermes root,
 or a deployed file whose re-read hash doesn't match the manifest. Any
 mid-install failure rolls back every step already written in that run from
 its snapshot.
@@ -282,6 +285,14 @@ cp ~/.hermes/profiles/<name>/config.yaml.bak-fleet-config-profile-<name>-install
 The full receipt (`install-receipt.json` in the same snapshot dir) records
 every destination touched, its snapshot path, and the exact diff applied —
 use it to find the right timestamp/paths rather than guessing.
+
+The installer also discovers only root-level legacy siblings matching
+`~/.hermes/config.yaml.bak-fleet-config-install-<YYYYMMDDTHHMMSSZ>` and
+normalizes those regular files to mode `0600`. Dry-run reports every planned
+mode transition. The receipt journals each file's exact prior mode and inode,
+and an interrupted install restores that mode during rollback. Re-running is
+idempotent. Similar loose names, nested files, and all profile config backups
+are intentionally untouched.
 
 ## Deviations from the original spec
 

@@ -170,6 +170,141 @@ def test_existing_config_and_its_install_backups_are_repaired_to_0600(bundle):
     assert central_backup.stat().st_mode & 0o777 == 0o600
 
 
+def test_dry_run_reports_multiple_legacy_root_backups_without_mutating(bundle, capsys):
+    hermes_dir = bundle["home"] / ".hermes"
+    first = hermes_dir / "config.yaml.bak-fleet-config-install-20260729T010203Z"
+    second = hermes_dir / "config.yaml.bak-fleet-config-install-20260730T040506Z"
+    first.write_text("secret: first\n", encoding="utf-8")
+    second.write_text("secret: second\n", encoding="utf-8")
+    first.chmod(0o644)
+    second.chmod(0o640)
+
+    # Similar and profile-scoped names are deliberately not governed.
+    loose_match = hermes_dir / "config.yaml.bak-fleet-config-install-manual"
+    loose_match.write_text("leave: alone\n", encoding="utf-8")
+    loose_match.chmod(0o644)
+    profile_backup = hermes_dir / "profiles" / "coder" / "config.yaml.bak-fleet-config-install-20260729T010203Z"
+    profile_backup.parent.mkdir(parents=True)
+    profile_backup.write_text("leave: profile-alone\n", encoding="utf-8")
+    profile_backup.chmod(0o644)
+
+    assert install_mod.install(
+        bundle["manifest"],
+        home=bundle["home"],
+        bundle_root=bundle["bundle_root"],
+        manifest_path=bundle["manifest_path"],
+        dry_run=True,
+    ) == 0
+
+    assert first.stat().st_mode & 0o777 == 0o644
+    assert second.stat().st_mode & 0o777 == 0o640
+    assert loose_match.stat().st_mode & 0o777 == 0o644
+    assert profile_backup.stat().st_mode & 0o777 == 0o644
+    out = capsys.readouterr().out
+    assert f"{first}: 0644 -> 0600" in out
+    assert f"{second}: 0640 -> 0600" in out
+    assert str(loose_match) not in out
+    assert str(profile_backup) not in out
+
+
+def test_legacy_root_backup_modes_are_normalized_idempotently(bundle, monkeypatch):
+    hermes_dir = bundle["home"] / ".hermes"
+    backups = [
+        hermes_dir / "config.yaml.bak-fleet-config-install-20260729T010203Z",
+        hermes_dir / "config.yaml.bak-fleet-config-install-20260730T040506Z",
+    ]
+    for index, backup in enumerate(backups):
+        backup.write_text(f"secret: {index}\n", encoding="utf-8")
+        backup.chmod(0o644 if index == 0 else 0o640)
+
+    stamps = iter(("20260801T010101Z", "20260801T010102Z"))
+    monkeypatch.setattr(install_mod, "_utc_stamp", lambda: next(stamps))
+    for _ in range(2):
+        assert install_mod.install(
+            bundle["manifest"],
+            home=bundle["home"],
+            bundle_root=bundle["bundle_root"],
+            manifest_path=bundle["manifest_path"],
+            dry_run=False,
+        ) == 0
+        assert all(backup.stat().st_mode & 0o777 == 0o600 for backup in backups)
+
+    receipts = sorted((hermes_dir / "logs" / "fleet-config-installs").glob("*/install-receipt.json"))
+    assert len(receipts) == 2
+    second_receipt = json.loads(receipts[1].read_text())
+    governed = [
+        step for step in second_receipt["steps"]
+        if step["step"] == "legacy_config_backup_mode"
+        and Path(step["dest"]) in backups
+    ]
+    assert len(governed) == 2
+    assert all(step["prior_mode"] == "0600" for step in governed)
+    assert all(step["status"] == "already-governed" for step in governed)
+
+
+@pytest.mark.parametrize("unsafe_kind", ["symlink", "directory"])
+def test_unsafe_legacy_root_backup_entry_fails_closed(bundle, tmp_path, unsafe_kind):
+    hermes_dir = bundle["home"] / ".hermes"
+    unsafe = hermes_dir / "config.yaml.bak-fleet-config-install-20260729T010203Z"
+    if unsafe_kind == "symlink":
+        outside = tmp_path / "outside-secret.yaml"
+        outside.write_text("secret: untouched\n", encoding="utf-8")
+        outside.chmod(0o644)
+        unsafe.symlink_to(outside)
+    else:
+        unsafe.mkdir()
+
+    with pytest.raises(install_mod.InstallError, match="legacy config backup|outside"):
+        install_mod.install(
+            bundle["manifest"],
+            home=bundle["home"],
+            bundle_root=bundle["bundle_root"],
+            manifest_path=bundle["manifest_path"],
+            dry_run=False,
+        )
+
+    assert not (hermes_dir / "logs" / "fleet-config-installs").exists()
+    if unsafe_kind == "symlink":
+        assert outside.stat().st_mode & 0o777 == 0o644
+
+
+def test_late_failure_restores_exact_legacy_backup_modes(bundle, monkeypatch):
+    hermes_dir = bundle["home"] / ".hermes"
+    first = hermes_dir / "config.yaml.bak-fleet-config-install-20260729T010203Z"
+    second = hermes_dir / "config.yaml.bak-fleet-config-install-20260730T040506Z"
+    first.write_text("secret: first\n", encoding="utf-8")
+    second.write_text("secret: second\n", encoding="utf-8")
+    first.chmod(0o644)
+    second.chmod(0o640)
+
+    real_atomic_write = install_mod._atomic_write
+    calls = {"count": 0}
+
+    def fail_after_mode_normalization(dest, data):
+        calls["count"] += 1
+        if calls["count"] == 2:
+            raise OSError("simulated failure after legacy mode normalization")
+        return real_atomic_write(dest, data)
+
+    monkeypatch.setattr(install_mod, "_atomic_write", fail_after_mode_normalization)
+    with pytest.raises(OSError, match="after legacy mode normalization"):
+        install_mod.install(
+            bundle["manifest"],
+            home=bundle["home"],
+            bundle_root=bundle["bundle_root"],
+            manifest_path=bundle["manifest_path"],
+            dry_run=False,
+        )
+
+    assert first.stat().st_mode & 0o777 == 0o644
+    assert second.stat().st_mode & 0o777 == 0o640
+    receipt_path = next((hermes_dir / "logs" / "fleet-config-installs").glob("*/install-receipt.json"))
+    receipt = json.loads(receipt_path.read_text())
+    mode_steps = [step for step in receipt["steps"] if step["step"] == "legacy_config_backup_mode"]
+    assert {step["prior_mode"] for step in mode_steps} == {"0640", "0644"}
+    assert all(step["status"] == "rolled-back" for step in mode_steps)
+
+
 def test_forced_failure_mid_step_rolls_back_and_reraises(bundle, monkeypatch):
     """FIX 3 regression test: a non-InstallError exception raised during the
     write phase (e.g. an OSError from the filesystem) must still trigger
