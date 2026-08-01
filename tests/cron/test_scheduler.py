@@ -5085,22 +5085,33 @@ class TestParallelTick:
         )
         assert state["max_seen"] > 1
 
-    def test_max_parallel_explicit_zero_config_is_still_unbounded_opt_out(self):
+    def test_max_parallel_explicit_zero_config_is_still_unbounded_opt_out(
+        self, monkeypatch,
+    ):
         """``max_parallel_jobs: 0`` remains the explicit unbounded opt-out —
         distinct from ``null``/absent, which now bounds to the default (4).
         Regression guard so the null-handling fix above doesn't accidentally
         collapse the escape hatch operators use to restore old behaviour.
         """
+        import cron.scheduler as sched
         import threading
+
+        monkeypatch.delenv("HERMES_CRON_MAX_PARALLEL", raising=False)
 
         lock = threading.Lock()
         state = {"current": 0, "max_seen": 0}
+        observed_workers = []
+        real_get_pool = sched._get_parallel_pool
+
+        def capture_pool(max_workers):
+            observed_workers.append(max_workers)
+            return real_get_pool(max_workers)
 
         def mock_run_job(job):
             with lock:
                 state["current"] += 1
                 state["max_seen"] = max(state["max_seen"], state["current"])
-            time.sleep(0.05)
+            time.sleep(0.15)
             with lock:
                 state["current"] -= 1
             return (True, "output", "response", None)
@@ -5110,17 +5121,24 @@ class TestParallelTick:
             for i in range(8)
         ]
 
-        with patch("cron.scheduler.get_due_jobs", return_value=jobs), \
-             patch("cron.scheduler.advance_next_run"), \
-             patch("cron.scheduler.run_job", side_effect=mock_run_job), \
-             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
-             patch("cron.scheduler._deliver_result", return_value=None), \
-             patch("cron.scheduler.mark_job_run"), \
-             patch("cron.scheduler.load_config", return_value={"cron": {"max_parallel_jobs": 0}}):
-            from cron.scheduler import tick
-            result = tick(verbose=False)
+        try:
+            with patch("cron.scheduler.get_due_jobs", return_value=jobs), \
+                 patch("cron.scheduler.advance_next_run"), \
+                 patch("cron.scheduler.run_job", side_effect=mock_run_job), \
+                 patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+                 patch("cron.scheduler._deliver_result", return_value=None), \
+                 patch("cron.scheduler.mark_job_run"), \
+                 patch("cron.scheduler.load_config", return_value={"cron": {"max_parallel_jobs": 0}}), \
+                 patch("cron.scheduler._get_parallel_pool", side_effect=capture_pool):
+                result = sched.tick(verbose=False)
+        finally:
+            sched._shutdown_parallel_pool()
 
         assert result == 8
+        assert observed_workers == [len(jobs)], (
+            "max_parallel_jobs: 0 should size the pool to the full due set, "
+            f"got max_workers sequence {observed_workers!r}"
+        )
         # Unbounded opt-out: all 8 due jobs may run simultaneously (no cap).
         assert state["max_seen"] > 4, (
             "max_parallel_jobs: 0 should remain an explicit unbounded opt-out, "

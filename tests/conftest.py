@@ -184,6 +184,8 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     "HERMES_SESSION_KEY",
     "HERMES_GATEWAY_SESSION",
     "HERMES_CRON_SESSION",
+    # Env wins over cron.max_parallel_jobs in config; must not leak from shell/CI.
+    "HERMES_CRON_MAX_PARALLEL",
     "_HERMES_GATEWAY",
     "HERMES_PLATFORM",
     "HERMES_MODEL",
