@@ -1,8 +1,8 @@
 {
   "bundle": "fleet-config",
-  "source_task": "kyiv-v1-fleet-rebuild-cutover",
-  "generated": "2026-07-30",
-  "description": "Declarative fleet-config bundle for the 2026-07-29 Hermes mini rebuild cutover: a governed OVERLAY for ~/.hermes/config.yaml (model/fallback/delegation/browser CDP/kanban dispatch only \u2014 every other config section is left untouched by the deep-merge), five kanban-swarm profiles under ~/.hermes/profiles/, and a curated ~/.hermes/cron/jobs.json (16 jobs: 13 carried forward from the pre-freeze live config, 3 new consolidated hygiene/digest jobs). install_fleet_config.py is the sole writer of all three destinations; sha256-pinned against this manifest, fails closed on any source drift or a config.yaml/jobs.json that doesn't parse.",
+  "source_task": "86e2kkj69",
+  "generated_at": "2026-08-01T15:01:41Z",
+  "description": "Governed Hermes Mini fleet bundle for the 86e2kkj69 skill-surface hardening rollout. install_fleet_config.py is the sole writer of four surfaces: the deep-merged ~/.hermes/config.yaml overlay, five direct-execution profiles under ~/.hermes/profiles/, the curated 16-job ~/.hermes/cron/jobs.json, and the manifest-pinned skill policy across the default plus five profile homes. ClickUp executor jobs use direct skill paths while upstream Hermes kanban remains available independently. Every source is SHA-256 verified before mutation; config, jobs, skill provenance, archive-copy bytes, and hub identity fail closed, with snapshots, recoverable archives, rollback, and receipts.",
   "files": [
     {
       "src_rel": "config-overlay.yaml",
@@ -15,13 +15,13 @@
       "src_rel": "profiles/coder/config.yaml",
       "dest_abs": "~/.hermes/profiles/coder/config.yaml",
       "sha256": "c26e7d8da621e4eec20ffdff9ec973308e691a94fdd22d659676cb3cf0919710",
-      "role": "senior engineer profile \u2014 openai-codex/gpt-5.5, works ClickUp code tasks via kanban swarm",
+      "role": "senior engineer profile \u2014 openai-codex/gpt-5.5, works ClickUp code tasks directly",
       "deploy_mode": "profile_file"
     },
     {
       "src_rel": "profiles/coder/SOUL.md",
       "dest_abs": "~/.hermes/profiles/coder/SOUL.md",
-      "sha256": "d61e556f9fb0d225d43b91d89f36108cfaead01fb77bae536697786b2e282ca3",
+      "sha256": "eb78276cd3113b75fed2e35a2c0612f88cf9e16fb5d1a5259503a7b93056199f",
       "role": "coder persona/SOUL",
       "deploy_mode": "profile_file"
     },
@@ -35,7 +35,7 @@
     {
       "src_rel": "profiles/content/SOUL.md",
       "dest_abs": "~/.hermes/profiles/content/SOUL.md",
-      "sha256": "67278337956d790022680348c73bf96c0f1991552a4c6644a86ad9ead996d4e5",
+      "sha256": "1fb017b1c093a41462b39069a16884d25d5809c53e9b14f2192974f50e4c487f",
       "role": "content persona/SOUL",
       "deploy_mode": "profile_file"
     },
@@ -49,7 +49,7 @@
     {
       "src_rel": "profiles/design/SOUL.md",
       "dest_abs": "~/.hermes/profiles/design/SOUL.md",
-      "sha256": "bfc5036905d59a8e65116168928e569773fc5b2d401014437a98366b15e1d18b",
+      "sha256": "1740088e635622f2df383b0e16d7f8fe62a1295073ea88ded05920f7d64e8f02",
       "role": "design persona/SOUL",
       "deploy_mode": "profile_file"
     },
@@ -63,7 +63,7 @@
     {
       "src_rel": "profiles/research/SOUL.md",
       "dest_abs": "~/.hermes/profiles/research/SOUL.md",
-      "sha256": "20a8878fcff30bd08f196acfe5ccc977a3a2949722f1cd681f76b1f8a2a0f488",
+      "sha256": "f986ec306ba47102a975d30f2afdef4a3e0a952bb97970a7fb8086568da353a8",
       "role": "research persona/SOUL",
       "deploy_mode": "profile_file"
     },
@@ -77,16 +77,22 @@
     {
       "src_rel": "profiles/ops/SOUL.md",
       "dest_abs": "~/.hermes/profiles/ops/SOUL.md",
-      "sha256": "c3bda16df807fb11a5a7e189b2084679bbeb70281301debfb4a0427d8350d45b",
+      "sha256": "017b372200091f2094bcea6088a2aa32bec42eb1694915378c2e07db2faef053",
       "role": "ops persona/SOUL",
       "deploy_mode": "profile_file"
     },
     {
       "src_rel": "jobs.json",
       "dest_abs": "~/.hermes/cron/jobs.json",
-      "sha256": "2cd3a3817bb90fc4db51feea831ed7a6900cca51225d130d024cd18c1a8f6bd0",
-      "role": "curated 16-job cron set (13 kept + 3 consolidated; hermes-pr-validate re-enabled 2026-07-31 per task 86e2k3qe1), wholesale-replaces the live jobs.json",
+      "sha256": "e23e6974eaccdb0852647c6b628154fed6f57e85afc3846e2d2b85ec1970c654",
+      "role": "curated 16-job cron set (13 kept + 3 consolidated; direct ClickUp executor prompts; hermes-pr-validate re-enabled 2026-07-31 and pinned to IGNITE_SKILLS_ROOT), wholesale-replaces the live jobs.json",
       "deploy_mode": "jobs_json"
+    },
+    {
+      "src_rel": "skills-policy.json",
+      "sha256": "10410c34e00379a81c3b04aa223932e70a0cc9aff0a1464d3cd03022f4c1811f",
+      "role": "governed Mini-specific bundled/local/hub skill allowlist, historical-reference consolidation, exact hub provenance, per-profile suppression, and recoverable cull policy",
+      "deploy_mode": "skill_policy"
     }
   ]
 }
