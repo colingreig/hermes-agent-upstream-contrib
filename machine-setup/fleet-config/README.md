@@ -187,15 +187,15 @@ failure).
 
 - **3 new consolidated jobs**: `clickup-lifecycle` (every 30m; folds
   clickup-closeout-audit + clickup-stalled-reconciler + clickup-reconciler +
-  staleness-sweep), `fleet-health-digest` (every 6h; no_agent `hermes_self_report_run.py`
-  builds+sends the status email via Postmark — never LLM-composed),
-  + delivery-probe + skill-size-monitor + model-deprecation-check +
-  supabase-rls-guard + hermes-usage-alert), `repo-maintenance` (daily 04:00;
+  staleness-sweep), `fleet-health-digest` (every 6h; **no_agent**
+  `hermes_self_report_run.py` builds+sends the status email via Postmark —
+  never LLM-composed; also runs delivery-probe + skill-size-monitor +
+  model-deprecation-check + supabase-rls-guard + hermes-usage-alert and folds
+  non-clean probe results into the digest), `repo-maintenance` (daily 04:00;
   folds repo-worktree-gc + cleanup-hermes-baks + orphan-unpushed-monitor).
-  Each is an LLM-orchestrated job (not `no_agent`) whose prompt runs the
-  original per-check scripts via Bash, in order, and folds any non-clean
-  result into its report — the underlying scripts are unchanged, only the
-  cron entry that invoked them standalone is retired.
+  The LLM-orchestrated consolidations keep the underlying scripts unchanged and
+  only retire the old standalone cron entries; `fleet-health-digest` is the
+  exception that must stay script-only so scoreboard/spend cannot be freestyled.
 - **8 dropped outright**: `email-triage`, `clickup-email-triage-gate`, `w`,
   `alpha`, `Spam-gate label accrual`, `legacy job`, `run {lane}`,
   `clickup-executor-2`.
