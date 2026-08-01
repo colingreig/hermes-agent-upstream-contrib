@@ -602,6 +602,30 @@ def test_run_job_script_accepts_skill_style_secret_declarations(
     lazy_get.assert_called_once_with("CLICKUP_API_TOKEN")
 
 
+def test_run_job_script_injects_present_optional_job_environment(
+    hermes_env, monkeypatch
+):
+    from cron.scheduler import _run_job_script
+
+    optional_name = "OPTIONAL_SCRIPT_INTEGRATION_TOKEN"
+    _write_secret_probe(hermes_env, "optional_mapping.py", optional_name)
+    monkeypatch.setenv(optional_name, "optional-script-value")
+
+    with patch(
+        "agent.lazy_secret_resolver.get_required"
+    ) as strict_resolver:
+        ok, output = _run_job_script(
+            "optional_mapping.py",
+            required_environment_variables=[
+                {"name": optional_name, "optional": True}
+            ],
+        )
+
+    assert ok is True
+    assert output == "PRESENT"
+    strict_resolver.assert_not_called()
+
+
 def test_run_job_script_declaration_does_not_bypass_provider_blocklist(
     hermes_env, monkeypatch
 ):
