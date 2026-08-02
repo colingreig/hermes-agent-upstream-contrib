@@ -53,12 +53,29 @@ def test_enabled_consumer_passes_strict_count_and_window_to_adapter():
         )
 
     result = report.load_activity_continuity(
-        3, enabled=True, report_window_min=720, runner=runner
+        3,
+        enabled=True,
+        report_window_min=720,
+        scheduled_slot="2026-08-02T12:00:00Z",
+        runner=runner,
     )
     assert result["state"] == "ACTIVE"
     argv = calls[0][0]
     assert argv[argv.index("--strict-validator-completed") + 1] == "3"
     assert argv[argv.index("--report-window-min") + 1] == "720"
+    assert argv[argv.index("--scheduled-slot") + 1] == "2026-08-02T12:00:00Z"
+
+
+def test_missing_or_malformed_nominal_slot_fails_closed_without_invoking_adapter():
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("invalid nominal slot invoked adapter")
+
+    for value in (None, "", "not-a-time", "2026-08-02T13:00:00Z"):
+        result = report.load_activity_continuity(
+            0, enabled=True, scheduled_slot=value, runner=forbidden
+        )
+        assert result["state"] == "UNKNOWN"
+        assert "nominal scheduled slot" in result["detail"]
 
 
 def test_adapter_failure_or_malformed_contract_becomes_unknown():
@@ -72,6 +89,7 @@ def test_adapter_failure_or_malformed_contract_becomes_unknown():
         result = report.load_activity_continuity(
             0,
             enabled=True,
+            scheduled_slot="2026-08-02T12:00:00Z",
             runner=lambda *_args, _result=completed, **_kwargs: _result,
         )
         assert result["state"] == "UNKNOWN"

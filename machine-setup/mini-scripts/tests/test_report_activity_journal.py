@@ -209,7 +209,7 @@ def test_enabled_producer_without_emitter_makes_coverage_unknown(journal, tmp_pa
 
 
 def test_enabled_producer_inventory_covers_every_lifecycle_writer(journal):
-    assert {producer["id"] for producer in journal.PRODUCER_INVENTORY} == {
+    expected = {
         "queue-poller-claim",
         "merged-before-claim-reconciliation",
         "ordinary-publish-closeout",
@@ -218,8 +218,36 @@ def test_enabled_producer_inventory_covers_every_lifecycle_writer(journal):
         "clickup-lifecycle-reconciliation",
         "validator",
     }
+    assert journal.REQUIRED_PRODUCER_IDS == expected
+    assert {producer["id"] for producer in journal.PRODUCER_INVENTORY} == expected
     assert all(producer["enabled"] is True for producer in journal.PRODUCER_INVENTORY)
     assert all(producer["emitter"].strip() for producer in journal.PRODUCER_INVENTORY)
+
+
+@pytest.mark.parametrize(
+    "missing_id",
+    [
+        "queue-poller-claim",
+        "merged-before-claim-reconciliation",
+        "ordinary-publish-closeout",
+        "db-publish-closeout",
+        "closeout-actor",
+        "clickup-lifecycle-reconciliation",
+        "validator",
+    ],
+)
+def test_removing_any_required_producer_declaration_is_unknown(
+    journal, tmp_path, missing_id
+):
+    inventory = [
+        row for row in journal.PRODUCER_INVENTORY if row["id"] != missing_id
+    ]
+    result = journal.health(state_dir=tmp_path / "empty", inventory=inventory)
+    assert result["status"] == "UNKNOWN"
+    assert (
+        f"required producer declaration missing: {missing_id}"
+        in result["reasons"]
+    )
 
 
 def test_append_failure_is_visible_as_unknown_health(journal, tmp_path, monkeypatch):
@@ -323,7 +351,50 @@ def test_confirm_transition_rejects_mismatch_then_dedupes_verified_success(journ
     assert second["deduped"] is True
     records = _records(success_root)
     assert len(records) == 1
-    assert records[0]["clickup_updated_at"] == "1785630000123"
+    assert records[0]["clickup_transition_at"] == "1785630000123"
+    assert "clickup_updated_at" not in records[0]
+
+
+def test_validator_confirmation_requires_and_records_exact_date_closed(
+    journal, tmp_path
+):
+    missing_root = tmp_path / "missing-closed"
+    missing = journal.confirm_transition(
+        kind="validator_complete",
+        task_id="86complete",
+        source="validator",
+        expected_status="complete",
+        state_dir=missing_root,
+        fetch_task=lambda _tid: {
+            "id": "86complete",
+            "status": {"status": "complete"},
+            "date_updated": "1785639999999",
+            "date_closed": None,
+        },
+    )
+    assert missing["confirmed"] is False
+    assert _records(missing_root) == []
+    assert journal.health(state_dir=missing_root)["status"] == "UNKNOWN"
+
+    success_root = tmp_path / "closed"
+    success = journal.confirm_transition(
+        kind="validator_complete",
+        task_id="86complete",
+        source="validator",
+        expected_status="complete",
+        state_dir=success_root,
+        fetch_task=lambda _tid: {
+            "id": "86complete",
+            "status": {"status": "complete"},
+            "date_updated": "1785639999999",
+            "date_closed": "1785630000456",
+        },
+    )
+    assert success["confirmed"] is True
+    records = _records(success_root)
+    assert len(records) == 1
+    assert records[0]["clickup_transition_at"] == "1785630000456"
+    assert "clickup_updated_at" not in records[0]
 
 
 def test_closeout_writer_rejection_has_no_event_and_verified_success_has_one(

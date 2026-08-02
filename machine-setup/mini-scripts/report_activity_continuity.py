@@ -88,6 +88,20 @@ def scheduled_slot(value: dt.datetime) -> dt.datetime:
     return value.replace(hour=hour, minute=0, second=0, microsecond=0)
 
 
+def require_scheduled_slot(value: Any) -> dt.datetime:
+    if value in (None, ""):
+        raise ContinuityError("nominal scheduled slot is required")
+    try:
+        slot = parse_timestamp(value)
+    except ContinuityError as exc:
+        raise ContinuityError(f"invalid nominal scheduled slot: {exc}") from exc
+    if scheduled_slot(slot) != slot:
+        raise ContinuityError(
+            "nominal scheduled slot must be an exact six-hour UTC boundary"
+        )
+    return slot
+
+
 def slot_windows(
     slot: dt.datetime,
 ) -> tuple[tuple[dt.datetime, dt.datetime], tuple[dt.datetime, dt.datetime]]:
@@ -98,7 +112,7 @@ def slot_windows(
 
 def _result(
     *,
-    slot: dt.datetime,
+    slot: dt.datetime | None,
     state: str,
     reasons: list[str],
     windows: dict[str, Any],
@@ -114,15 +128,16 @@ def _result(
     reason_text = "; ".join(reasons) if reasons else (
         f"{total} qualifying lifecycle events across two complete covered windows"
     )
+    slot_id = iso(slot) if slot is not None else None
     return {
         "schema": SCHEMA,
         "scope": SCOPE,
         "state": state,
-        "slot_id": iso(slot),
+        "slot_id": slot_id,
         "concern_id": concern_id,
         "detail": (
             f"Activity continuity {state} for the Hermes Mac mini at slot "
-            f"{iso(slot)}: {reason_text}. Known residual: a process can crash "
+            f"{slot_id or 'UNKNOWN'}: {reason_text}. Known residual: a process can crash "
             "after ClickUp succeeds but before the outbox append."
         ),
         "reasons": reasons,
@@ -322,21 +337,22 @@ def _status(task: dict[str, Any]) -> str:
     return str(value or "").strip().casefold()
 
 
-def _authoritative_timestamp(task: dict[str, Any]) -> dt.datetime:
-    parsed: list[dt.datetime] = []
-    for key in ("date_updated", "updated_at", "date_closed", "date_done"):
-        value = task.get(key)
-        if value in (None, ""):
-            continue
-        try:
-            parsed.append(parse_timestamp(value))
-        except ContinuityError:
-            continue
-    if not parsed:
+def _authoritative_transition_timestamp(
+    kind: str, task: dict[str, Any]
+) -> dt.datetime:
+    if kind == "validator_complete":
+        value = task.get("date_closed")
+        field = "date_closed"
+    elif kind == "review_handoff":
+        value = task.get("date_updated") or task.get("updated_at")
+        field = "date_updated/updated_at"
+    else:
+        raise ContinuityError(f"{kind} has no ClickUp transition timestamp contract")
+    if value in (None, ""):
         raise ContinuityError(
-            "authoritative ClickUp task has no usable transition timestamp"
+            f"authoritative ClickUp task lacks {field} transition evidence"
         )
-    return max(parsed)
+    return parse_timestamp(value)
 
 
 def _event_matches_task(
@@ -356,19 +372,20 @@ def _event_matches_task(
         return False, f"{event['kind']} disagrees with status {status!r}"
     if str(task.get("id") or "") != str(event.get("task_id") or ""):
         return False, "authoritative task id mismatch"
-    event_at = parse_timestamp(
-        event.get("clickup_transition_at")
-        or event.get("clickup_updated_at")
-        or event.get("ts")
+    if event["kind"] == "claim":
+        return True, "matched"
+    transition_at = event.get("clickup_transition_at")
+    if not transition_at:
+        return False, f"{event['kind']} lacks exact transition timestamp identity"
+    event_at = parse_timestamp(transition_at)
+    authoritative_at = _authoritative_transition_timestamp(
+        str(event["kind"]), task
     )
-    authoritative_at = _authoritative_timestamp(task)
-    if authoritative_at < event_at:
+    if authoritative_at != event_at:
         return False, (
-            f"authoritative timestamp {iso(authoritative_at)} precedes "
-            f"outbox transition {iso(event_at)}"
+            f"authoritative {event['kind']} timestamp {iso(authoritative_at)} "
+            f"does not equal outbox transition {iso(event_at)}"
         )
-    if event["kind"] == "validator_complete" and not task.get("date_closed"):
-        return False, "validator_complete lacks authoritative date_closed"
     return True, "matched"
 
 
@@ -429,6 +446,7 @@ def _counts(events: list[dict[str, Any]]) -> dict[str, Any]:
 def evaluate_continuity(
     *,
     now: dt.datetime,
+    nominal_scheduled_slot: Any = None,
     state_dir: Path = DEFAULT_STATE_DIR,
     strict_validator_completed: int,
     report_window_min: int = 360,
@@ -440,7 +458,18 @@ def evaluate_continuity(
     fetch_task: Callable[[str], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     now = parse_timestamp(now)
-    slot = scheduled_slot(now)
+    try:
+        slot = require_scheduled_slot(nominal_scheduled_slot)
+    except ContinuityError as exc:
+        return _result(
+            slot=None,
+            state="UNKNOWN",
+            reasons=[str(exc)],
+            windows={},
+            parity={"status": "UNKNOWN", "reasons": [str(exc)]},
+            provenance=provenance,
+            health_attestation=health_attestation,
+        )
     previous, current = slot_windows(slot)
     reasons: list[str] = []
 
@@ -637,6 +666,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--now", help="UTC/offset timestamp; defaults to current UTC"
     )
     evaluate.add_argument(
+        "--scheduled-slot",
+        help="Nominal six-hour UTC slot; late/manual reruns reuse the original value",
+    )
+    evaluate.add_argument(
         "--strict-validator-completed", type=int, required=True
     )
     evaluate.add_argument("--report-window-min", type=int, default=360)
@@ -680,6 +713,7 @@ def main(argv: list[str] | None = None) -> int:
         }
     result = evaluate_continuity(
         now=now,
+        nominal_scheduled_slot=args.scheduled_slot,
         state_dir=args.state_dir,
         strict_validator_completed=args.strict_validator_completed,
         report_window_min=args.report_window_min,
