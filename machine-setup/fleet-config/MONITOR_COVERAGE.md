@@ -49,7 +49,7 @@ two scheduling planes therefore cross-watch rather than self-monitor.
 | `59bdd8ebc468` | repo-maintenance | enabled | fresh non-empty maintenance response | empty/failed/stale maintenance pass |
 | `6e25865a22a4` | Purelymail notify-me poller | enabled | fresh `purelymail-poller.log` production finish (`dry_run=False` start + finished); rejects SSL/mailbox connect failures | missing/stale log, SSL/CERTIFICATE_VERIFY_FAILED, Mailbox poll failed, or Traceback |
 
-## LaunchAgent fleet: 20 active + 1 retired
+## LaunchAgent fleet: 21 active + 1 retired
 
 | Label | Expected | Outcome proof (not exit-only) | Alarm condition |
 |---|---:|---|---|
@@ -65,6 +65,7 @@ two scheduling planes therefore cross-watch rather than self-monitor.
 | `com.colingreig.hermes.worktree-backstop-sweep` | loaded | fresh sweep summary and prune completion | safety/removal error or stale summary |
 | `com.colingreig.ignite-marketplace-sync` | loaded | fresh `sync.sh exited 0` record | non-zero, missing, or stale sync |
 | `com.hermes.offbox-restic-backup` | loaded | fresh post-restic `backup and retention complete` marker | backup/delivery failure or stale marker |
+| `com.hermes.opendesign` | loaded | semantic HTTP `127.0.0.1:7456/api/health` response with `ok=true` and a version | endpoint or semantic failure, or unloaded agent |
 | `com.colingreig.hermes.mcp-serve-reaper` | loaded | fresh sweep summary; snapshot/reap errors now exit non-zero | snapshot/reap failure or stale summary |
 | `com.colingreig.ignite-skills-pull` | loaded | fresh parsed commit-pinned success receipt | stale/missing/invalid receipt |
 | `com.colingreig.pull_anthropic_skills` | loaded | fresh parsed commit-pinned success receipt | stale/missing/invalid receipt |
