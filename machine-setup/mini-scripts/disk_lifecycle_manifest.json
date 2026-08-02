@@ -54,7 +54,7 @@
       "src_rel": "scripts/worktree_backstop_sweep.py",
       "src_base": "repo",
       "dest_abs": "~/.hermes/scripts/worktree_backstop_sweep.py",
-      "sha256": "162b464e06786f3eb823a765a2d570d68b7b2b2ea8ed379c4502ecf759033fbe",
+      "sha256": "45519e40138c00d48daef57a953a9354e9d4dc9477890201cbf3c0219a675edc",
       "role": "age-based backstop sweep for stale worktrees across all repos; run by the worktree-backstop-sweep LaunchAgent",
       "deploy_mode": "script"
     },

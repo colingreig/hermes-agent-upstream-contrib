@@ -69,10 +69,16 @@ from pathlib import Path
 _SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
 _DEFAULT_SCRIPTS_DIR = os.path.expanduser("~/.hermes/scripts")
 # insert(0) reverses iteration order, so add the fallback first and the sibling
-# directory second to keep the documented sibling-first import contract.
+# directory second to keep the documented sibling-first import contract. Remove
+# any existing occurrence before inserting: the interpreter auto-adds the
+# script's own directory to sys.path, and a bare membership check would skip
+# the sibling insert and leave the ~/.hermes/scripts fallback at the front —
+# importing the deployed worktree_safety instead of the sibling when this
+# script runs from a staging/test location.
 for _p in (_DEFAULT_SCRIPTS_DIR, _SCRIPTS_DIR):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
+    while _p in sys.path:
+        sys.path.remove(_p)
+    sys.path.insert(0, _p)
 
 # worktree_safety.py (2026-07-10 refactor) is now the single source of truth for the
 # deletion-safety predicates. This is a HARD dependency for this script: without it we
