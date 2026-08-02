@@ -260,6 +260,64 @@ class FleetOutcomeReconcilerTests(unittest.TestCase):
             (self.launch_agents / "probe.plist").resolve(),
         )
 
+    def test_set_loaded_preserves_gui_owner_across_bootout(self) -> None:
+        reconciler = self.reconciler()
+        gui_domain, _user_domain = module.Reconciler._launchd_domains()
+        loaded = True
+        (self.launch_agents / "probe.plist").write_text(
+            (self.source / "launchd" / "probe.plist").read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+
+        def registered(domain: str, label: str) -> bool:
+            return loaded and domain == gui_domain
+
+        def bootout(label: str) -> None:
+            nonlocal loaded
+            loaded = False
+
+        with (
+            mock.patch.object(reconciler, "_registered", side_effect=registered),
+            mock.patch.object(reconciler, "_bootout", side_effect=bootout),
+            mock.patch.object(reconciler, "_wait_registered", return_value=True),
+            mock.patch.object(module, "subprocess") as subprocess_module,
+        ):
+            subprocess_module.run.return_value = mock.Mock(returncode=0)
+            reconciler._set_loaded({"com.colingreig.hermes.test-probe": True})
+
+        bootstrap = [
+            call.args[0]
+            for call in subprocess_module.run.call_args_list
+            if call.args[0][:2] == ["launchctl", "bootstrap"]
+        ]
+        self.assertEqual(bootstrap[0][2], gui_domain)
+
+    def test_absent_label_prefers_available_gui_domain(self) -> None:
+        reconciler = self.reconciler()
+        gui_domain, user_domain = module.Reconciler._launchd_domains()
+
+        with (
+            mock.patch.object(reconciler, "_registered", return_value=False),
+            mock.patch.object(
+                reconciler,
+                "_domain_available",
+                side_effect=lambda domain: domain == gui_domain,
+            ),
+        ):
+            self.assertEqual(
+                reconciler._resolve_launchd_domain("com.colingreig.hermes.test-probe"),
+                gui_domain,
+            )
+
+        with (
+            mock.patch.object(reconciler, "_registered", return_value=False),
+            mock.patch.object(reconciler, "_domain_available", return_value=False),
+        ):
+            self.assertEqual(
+                reconciler._resolve_launchd_domain("com.colingreig.hermes.test-probe"),
+                user_domain,
+            )
+
 
 def test_repository_manifest_is_content_addressed() -> None:
     source_root = SCRIPT.parent

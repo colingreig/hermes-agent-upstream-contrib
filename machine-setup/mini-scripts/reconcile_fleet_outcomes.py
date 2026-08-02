@@ -285,6 +285,20 @@ class Reconciler:
             return False
         return result.returncode == 0
 
+    @staticmethod
+    def _domain_available(domain: str) -> bool:
+        try:
+            result = subprocess.run(
+                ["launchctl", "print", domain],
+                check=False,
+                timeout=LAUNCHCTL_TIMEOUT_SECONDS,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        return result.returncode == 0
+
     def _is_loaded(self, label: str) -> bool:
         return any(
             self._registered(domain, label) for domain in self._launchd_domains()
@@ -301,25 +315,16 @@ class Reconciler:
         )
 
     def _resolve_launchd_domain(self, label: str) -> str:
-        """Return the domain that owns ``label``, or the session heuristic domain."""
+        """Return the owning domain, preferring an available GUI session."""
         gui_domain, user_domain = self._launchd_domains()
         if self._registered(gui_domain, label):
             return gui_domain
         if self._registered(user_domain, label):
             return user_domain
-        try:
-            result = subprocess.run(
-                ["launchctl", "managername"],
-                check=False,
-                timeout=LAUNCHCTL_TIMEOUT_SECONDS,
-                capture_output=True,
-                text=True,
-            )
-            manager_name = (result.stdout or "").strip().casefold()
-            if result.returncode == 0 and manager_name == "aqua":
-                return gui_domain
-        except (subprocess.TimeoutExpired, OSError):
-            pass
+        # An SSH caller reports a Background manager even while the logged-in
+        # GUI domain exists, so probe the domain instead of the caller session.
+        if self._domain_available(gui_domain):
+            return gui_domain
         return user_domain
 
     def _wait_registered(self, domain: str, label: str, expected: bool) -> bool:
@@ -428,6 +433,10 @@ class Reconciler:
             payload = plistlib.loads(target.read_bytes())
             plist_by_label[str(payload["Label"])] = target
         for label, should_load in sorted(loaded.items()):
+            # Bootout erases the strongest ownership signal; retain it first.
+            selected_domain = (
+                self._resolve_launchd_domain(label) if should_load else None
+            )
             self._bootout(label)
             for domain in self._launchd_domains():
                 if not self._wait_registered(domain, label, False):
@@ -439,7 +448,8 @@ class Reconciler:
             plist = plist_by_label.get(label)
             if plist is None:
                 raise ReconcileError(f"cannot reload {label}: plist is absent")
-            domain = self._resolve_launchd_domain(label)
+            if selected_domain is None:
+                raise ReconcileError(f"cannot resolve launchd domain for {label}")
             last_error: BaseException | None = None
             for attempt in range(1, LAUNCHCTL_BOOTSTRAP_ATTEMPTS + 1):
                 try:
@@ -447,7 +457,7 @@ class Reconciler:
                         [
                             "launchctl",
                             "bootstrap",
-                            domain,
+                            selected_domain,
                             str(plist),
                         ],
                         check=True,
@@ -462,11 +472,11 @@ class Reconciler:
                 except (OSError, subprocess.TimeoutExpired) as exc:
                     last_error = exc
                 else:
-                    if self._wait_registered(domain, label, True):
+                    if self._wait_registered(selected_domain, label, True):
                         last_error = None
                         break
                     last_error = ReconcileError(
-                        f"launchctl did not register {label} in {domain}"
+                        f"launchctl did not register {label} in {selected_domain}"
                     )
                 if attempt < LAUNCHCTL_BOOTSTRAP_ATTEMPTS:
                     self._bootout(label)
