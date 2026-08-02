@@ -15,6 +15,7 @@ import os
 import stat
 import sys
 from dataclasses import dataclass
+from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +43,7 @@ RUNTIME_JOB_FIELDS = {
     "paused_reason",
     "fire_claim",
     "run_claim",
+    "lane_state",
 }
 
 
@@ -171,6 +173,23 @@ def _managed_job(job: dict[str, Any]) -> dict[str, Any]:
         repeat = dict(managed["repeat"])
         repeat.pop("completed", None)
         managed["repeat"] = repeat
+    # The scheduler persists normalized shares while the governed source may
+    # express the same lane ratio as integer weights.  Compare the ratio, not
+    # the incidental representation, without accepting malformed values.
+    lane_weights = managed.get("lane_weights")
+    if isinstance(lane_weights, dict) and set(lane_weights) == {"code", "content"}:
+        values = (lane_weights["code"], lane_weights["content"])
+        if all(isinstance(value, (int, float)) and not isinstance(value, bool) for value in values):
+            try:
+                code, content = (Fraction(str(value)) for value in values)
+                total = code + content
+                if code > 0 and content > 0 and total > 0:
+                    managed["lane_weights"] = {
+                        "code": code / total,
+                        "content": content / total,
+                    }
+            except (ValueError, ZeroDivisionError):
+                pass
     return managed
 
 
