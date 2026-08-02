@@ -141,6 +141,29 @@ def test_verifier_ignores_runtime_claims_but_enforces_repeat_limit(tmp_path):
         module.GovernedPathsVerifier(home=tmp_path, fixture_safe=True).verify()
 
 
+def test_verifier_accepts_scheduler_lane_state_and_equivalent_lane_weight_ratio(tmp_path):
+    _install_fixture(tmp_path)
+    jobs_path = tmp_path / ".hermes" / "cron" / "jobs.json"
+    jobs = json.loads(jobs_path.read_text())
+    job = jobs["jobs"][0]
+    job["lane_state"] = {"counter": 17}
+    job["lane_weights"] = {"code": 0.5, "content": 0.5}
+    jobs_path.write_text(json.dumps(jobs), encoding="utf-8")
+
+    module.GovernedPathsVerifier(home=tmp_path, fixture_safe=True).verify()
+
+
+def test_verifier_rejects_real_lane_weight_ratio_drift(tmp_path):
+    _install_fixture(tmp_path)
+    jobs_path = tmp_path / ".hermes" / "cron" / "jobs.json"
+    jobs = json.loads(jobs_path.read_text())
+    jobs["jobs"][0]["lane_weights"] = {"code": 0.75, "content": 0.25}
+    jobs_path.write_text(json.dumps(jobs), encoding="utf-8")
+
+    with pytest.raises(module.VerificationError, match="managed cron job drifted"):
+        module.GovernedPathsVerifier(home=tmp_path, fixture_safe=True).verify()
+
+
 def test_deployed_default_fleet_root_uses_active_release(tmp_path):
     active = _install_fixture(tmp_path)
     deployed_machine_setup = active / "machine-setup"
