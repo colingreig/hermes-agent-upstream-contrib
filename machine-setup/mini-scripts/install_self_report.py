@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """Manifest-verified installer for the hermes-self-report deploy bundle.
 
-This script is the SOLE writer of the seven hermes-self-report artifacts into
+This script is the SOLE writer of the ten hermes-self-report and lifecycle
+shadow-outbox artifacts into
 ``~/.hermes/scripts/`` (and ``~/.hermes/skills/hermes-self-report/SKILL.md``).
 It reads ``self_report_manifest.json`` (the declared bundle), verifies every
 source's sha256 against the manifest, snapshots each existing destination, then
 atomically installs and re-verifies the deployed bytes. It NEVER rsyncs the
 scripts dir and NEVER touches any file that is not a manifest destination — in
-particular ``claim_store.py``, ``queue_snapshot.json``, and the release venv,
-which must co-exist alongside the bundle (the installer only warns if the
-required co-exist files are missing).
+particular ``queue_snapshot.json`` and the release venv, which must co-exist
+alongside the bundle (the installer only warns if required co-exist files are
+missing). ``claim_store.py`` and ``closeout_actor.py`` are manifest-governed
+because they are load-bearing producers for the bundled shadow outbox.
 
 stdlib only, ``no_agent``-safe. All destination roots derive from ``--home``
 (default ``~``), so the whole flow is sandbox-testable against a tmp dir with
@@ -32,9 +34,10 @@ import shutil
 import sys
 from pathlib import Path
 
-# Files that must co-exist alongside the bundle but are NEVER written by the
-# installer (belt-and-suspenders: refuse a manifest that tries to include them).
-BLOCKED_DEST_BASENAMES = {"claim_store.py", "queue_snapshot.json"}
+# Runtime-state files that must co-exist alongside the bundle but are NEVER
+# written by the installer (belt-and-suspenders: refuse a manifest that tries
+# to include them).
+BLOCKED_DEST_BASENAMES = {"queue_snapshot.json"}
 
 # Every destination must resolve under <home>/.hermes/ — a manifest that points
 # anywhere else is rejected before any write happens.

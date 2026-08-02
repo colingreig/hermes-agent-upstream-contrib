@@ -40,7 +40,6 @@ def bundle(tmp_path):
     # co-exist files present so the happy path emits no warnings
     scripts_dir = home / ".hermes" / "scripts"
     scripts_dir.mkdir(parents=True)
-    (scripts_dir / "claim_store.py").write_text("# live claim store\n")
     (scripts_dir / "queue_snapshot.json").write_text("{}\n")
 
     script_names = [
@@ -81,7 +80,6 @@ def bundle(tmp_path):
         "bundle": "hermes-self-report",
         "source_task": "86e2gnz60",
         "coexist_required": [
-            {"dest_abs": "~/.hermes/scripts/claim_store.py", "reason": "import claim_store"},
             {"dest_abs": "~/.hermes/scripts/queue_snapshot.json", "reason": "freshness"},
         ],
         "files": files,
@@ -272,21 +270,19 @@ def test_refuses_symlinked_parent_escape(bundle):
 
 
 def test_refuses_protected_basename(bundle):
-    bundle["manifest"]["files"][0]["dest_abs"] = "~/.hermes/scripts/claim_store.py"
+    bundle["manifest"]["files"][0]["dest_abs"] = "~/.hermes/scripts/queue_snapshot.json"
     with pytest.raises(install_mod.InstallError):
         _install(bundle)
-    # the real live co-exist file is untouched
-    assert (bundle["home"] / ".hermes" / "scripts" / "claim_store.py").read_text() == (
-        "# live claim store\n"
-    )
+    # the live runtime-state file is untouched
+    assert (bundle["home"] / ".hermes" / "scripts" / "queue_snapshot.json").read_text() == "{}\n"
 
 
 def test_missing_coexist_file_warns_not_fails(bundle):
-    (bundle["home"] / ".hermes" / "scripts" / "claim_store.py").unlink()
+    (bundle["home"] / ".hermes" / "scripts" / "queue_snapshot.json").unlink()
     rc = _install(bundle)
     assert rc == 0
     receipt = _receipt(bundle["home"])
-    assert any("claim_store.py" in w for w in receipt["coexist_warnings"])
+    assert any("queue_snapshot.json" in w for w in receipt["coexist_warnings"])
 
 
 # --- CLI entry ------------------------------------------------------------

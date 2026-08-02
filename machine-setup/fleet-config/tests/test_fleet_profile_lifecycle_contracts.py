@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import re
+import sys
 from pathlib import Path
+
+import pytest
 
 FLEET_CONFIG_ROOT = Path(__file__).resolve().parents[1]
 MANIFEST_PATH = FLEET_CONFIG_ROOT / "fleet_config_manifest.json"
@@ -17,6 +21,7 @@ COVERAGE_PATH = FLEET_CONFIG_ROOT / "MONITOR_COVERAGE.md"
 PROFILES = ("coder", "content", "design", "research", "ops")
 RETIRED_POLLER_JOB_ID = "6139465f559f"
 PURELYMAIL_POLLER_JOB_ID = "6e25865a22a4"
+INSTALLER_PATH = FLEET_CONFIG_ROOT / "install_fleet_config.py"
 
 
 def _load_manifest() -> dict:
@@ -148,6 +153,53 @@ def test_pr_validator_uses_only_the_canonical_ignite_root():
     ):
         assert home_local_root not in prompt
     assert "Do not probe, copy, symlink, or fall back" in prompt
+
+
+def test_enabled_lifecycle_jobs_materialize_report_activity_postconditions():
+    spec = importlib.util.spec_from_file_location("fleet_installer_activity_test", INSTALLER_PATH)
+    installer = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = installer
+    spec.loader.exec_module(installer)
+    payload = installer._load_jobs_payload({"src": JOBS_PATH})
+    jobs = {job["id"]: job for job in payload["jobs"]}
+
+    executor_prompt = jobs["62714b869845"]["prompt"]
+    assert executor_prompt.startswith("/ignite-execute --lane {lane}\n\n")
+    for marker in (
+        "merged-before-claim-reconciliation",
+        "ordinary-publish-closeout",
+        "db-publish-closeout",
+        "confirm-transition",
+    ):
+        assert marker in executor_prompt
+
+    validator_prompt = jobs["5a76e290811d"]["prompt"]
+    assert "--kind validator_complete" in validator_prompt
+    assert "--expected-status complete" in validator_prompt
+    assert "86e2gnz71" in validator_prompt
+
+    lifecycle_prompt = jobs["777876d3eb16"]["prompt"]
+    assert "--kind review_handoff" in lifecycle_prompt
+    assert "--source clickup-lifecycle-reconciliation" in lifecycle_prompt
+    assert "--expected-status 'in review'" in lifecycle_prompt
+    assert "86e2gnz71" in lifecycle_prompt
+
+
+def test_enabled_lifecycle_job_without_verified_emitter_is_rejected():
+    spec = importlib.util.spec_from_file_location(
+        "fleet_installer_activity_negative_test", INSTALLER_PATH
+    )
+    installer = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = installer
+    spec.loader.exec_module(installer)
+    payload = installer._load_jobs_payload({"src": JOBS_PATH})
+    lifecycle = next(job for job in payload["jobs"] if job["id"] == "777876d3eb16")
+    lifecycle["prompt"] = lifecycle["prompt"].replace(
+        "report_activity_journal.py confirm-transition", "missing-emitter"
+    )
+
+    with pytest.raises(installer.InstallError, match="clickup-lifecycle.*postcondition"):
+        installer._validate_direct_clickup_jobs(payload)
 
 
 def test_retired_purelymail_poller_id_is_absent_from_fleet_surfaces():

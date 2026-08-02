@@ -867,9 +867,9 @@ never the directory.
 
 ## hermes-self-report bundle (ClickUp 86e2gnz60)
 
-The `hermes-self-report` cron builds and delivers Colin's status email. Its
-seven artifacts now deploy through one **declared bundle + manifest-verified
-installer** rather than ad-hoc `scp`. This directory is the deploy mirror; the
+The `hermes-self-report` cron builds and delivers Colin's status email. Its ten
+report and lifecycle-shadow-outbox artifacts now deploy through one **declared
+bundle + manifest-verified installer** rather than ad-hoc `scp`. This directory is the deploy mirror; the
 authored source of truth is Brain (`hermes/skills/hermes-self-report/`), which
 mirrors these exact bytes and does not deploy anything itself.
 
@@ -884,6 +884,9 @@ mirrors these exact bytes and does not deploy anything itself.
 | `hermes-metrics.py` | `~/.hermes/scripts/` | live (standalone CLI, no cron caller) |
 | `postmark_send_report.py` | `~/.hermes/scripts/` | deploy-mirror bytes (live behavior + `encoding="utf-8"`) |
 | `hermes_self_report_delivery_probe.py` | `~/.hermes/scripts/` | deploy-mirror bytes (live behavior + `encoding="utf-8"`) |
+| `report_activity_journal.py` | `~/.hermes/scripts/` | durable Mini lifecycle shadow outbox (consumers disabled until `86e2gnz71`) |
+| `claim_store.py` | `~/.hermes/scripts/` | durable queue-claim producer for the shadow outbox |
+| `closeout_actor.py` | `~/.hermes/scripts/` | verified review-handoff producer for PR and DB closeout |
 | `SKILL.md` | `~/.hermes/skills/hermes-self-report/` | live RC4 (Brain source; installed only with `--include-skill --brain-path`) |
 
 **The installer** (`install_self_report.py`, stdlib only, `no_agent`-safe) is
@@ -899,10 +902,10 @@ the **sole writer** of these files. It:
   mismatch;
 - writes a durable `install-receipt.json` recording every file's src/dest,
   expected/deployed sha, snapshot location, and overall result;
-- refuses any destination outside `~/.hermes/` or named `claim_store.py` /
-  `queue_snapshot.json`, and **warns (never installs)** if the required co-exist
-  files `claim_store.py` / `queue_snapshot.json` are absent — the builder's
-  work-stoppage verdict imports `claim_store` and degrades to UNKNOWN without it.
+- refuses any destination outside `~/.hermes/` or named `queue_snapshot.json`,
+  and **warns (never installs)** if required runtime co-exist files such as
+  `queue_snapshot.json` are absent. `claim_store.py` and `closeout_actor.py` are
+  installed and hash-verified because they produce shadow-outbox events.
 
 ```bash
 # preview: verify all source hashes, print the plan, write nothing
@@ -917,11 +920,10 @@ python3 machine-setup/mini-scripts/install_self_report.py \
 ```
 
 **Never** rsync `~/.hermes/scripts/` (see the wholesale-rsync warning above):
-this installer copies only the seven declared files by name and touches nothing
-else — in particular it never writes `claim_store.py`, `queue_snapshot.json`, or
-the release venv. Because release/reconcile passes are known to clobber hand
-edits, this manifest + installer must be the ONLY writer of these seven files
-going forward.
+this installer copies only the ten declared files by name and touches nothing
+else — in particular it never writes `queue_snapshot.json` or the release venv.
+Because release/reconcile passes are known to clobber hand edits, this manifest
++ installer must be the ONLY writer of these ten files going forward.
 
 **Delivery-probe cron.** `hermes_self_report_delivery_probe.py` runs as its own
 `no_agent` cron job (offset from the `0 */6 * * *` report tick). It reads the

@@ -67,6 +67,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import validator_verdict
 import clickup_status_guard as guard
 import task_action_lock as task_lock
+try:
+    import report_activity_journal as activity_journal
+except ImportError:  # governed bundle may not have landed yet; closeout stays fail-open
+    activity_journal = None
 
 SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
 HERMES_BIN_DIR = os.path.expanduser("~/.hermes/bin")
@@ -203,6 +207,13 @@ def _comments_json(task_id):
         return []
 
 
+def _task_json_or_raise(task_id):
+    data, error = _task_json(task_id)
+    if data is None:
+        raise RuntimeError(error or "ClickUp task read failed")
+    return data
+
+
 def evaluate(repo, pr, verdict, allowlist):
     """Pure-ish decision. Returns (action, detail, task_id).
     action in {'flip','skip','blocked'}. Network is read-only here."""
@@ -259,6 +270,24 @@ def _do_flip(task_id, repo, pr):
     ok, out = _cu_node(["status", task_id, TERMINAL_STATUS])
     if not ok:
         return False, f"status flip refused/failed: {out}"
+    if activity_journal is None:
+        journal_result = {"status": "UNKNOWN", "confirmed": False,
+                          "error": "report_activity_journal unavailable"}
+    else:
+        journal_result = activity_journal.confirm_transition(
+            kind="review_handoff",
+            task_id=task_id,
+            source="closeout-actor",
+            expected_status=TERMINAL_STATUS,
+            run_id=os.environ.get("HERMES_EXECUTOR_RUN_ID") or None,
+            execution_id=os.environ.get("HERMES_EXECUTION_ID") or None,
+            fetch_task=_task_json_or_raise,
+        )
+    if not journal_result.get("confirmed"):
+        return False, (
+            "status writer returned success but ClickUp read-after-write could not "
+            f"verify '{TERMINAL_STATUS}': {journal_result.get('error', 'unknown')}"
+        )
     pr_url = f"https://github.com/{repo}/pull/{pr}"
     body = (
         f"Outcome: {repo}#{pr} is merged and the task moved to '{TERMINAL_STATUS}'.\n"
@@ -267,8 +296,11 @@ def _do_flip(task_id, repo, pr):
         "Next: watch for any fresh BLOCKs on follow-up review."
     )
     cok, cout = _post_clickup_comment(task_id, body)
+    journal_note = ""
+    if journal_result.get("status") != "ok":
+        journal_note = f"; report activity health UNKNOWN: {journal_result.get('error', 'append failed')}"
     return True, (f"flipped to '{TERMINAL_STATUS}'"
-                  + ("" if cok else f"; comment failed: {cout}"))
+                  + ("" if cok else f"; comment failed: {cout}") + journal_note)
 
 
 def sweep(dry_run=False, only_repo=None, only_pr=None, only_task=None):
@@ -363,6 +395,27 @@ def main():
         import db_closeout_actor as dbca
         dres = dbca.sweep(dry_run=a.dry_run, only_task=a.task)
         for r in dres:
+            if r.get("action") == "flip" and r.get("flip_ok") and not a.dry_run:
+                if activity_journal is None:
+                    confirmation = {"confirmed": False,
+                                    "error": "report_activity_journal unavailable"}
+                else:
+                    confirmation = activity_journal.confirm_transition(
+                        kind="review_handoff",
+                        task_id=r.get("task_id") or "",
+                        source="db-publish-closeout",
+                        expected_status=TERMINAL_STATUS,
+                        run_id=os.environ.get("HERMES_EXECUTOR_RUN_ID") or None,
+                        execution_id=os.environ.get("HERMES_EXECUTION_ID") or None,
+                        fetch_task=_task_json_or_raise,
+                    )
+                r["activity_journal"] = confirmation
+                if not confirmation.get("confirmed"):
+                    r["flip_ok"] = False
+                    r["flip_out"] = (
+                        "status writer returned success but ClickUp read-after-write "
+                        f"confirmation failed: {confirmation.get('error', 'unknown')}"
+                    )
             act = r["action"]
             tag = ({"flip": ("WOULD-FLIP" if a.dry_run else ("FLIPPED" if r.get("flip_ok") else "FLIP-FAILED")),
                     "blocked": "BLOCKED", "error": "ERROR"}).get(act, "SKIP")
