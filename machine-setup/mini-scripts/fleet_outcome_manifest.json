@@ -37,7 +37,7 @@
       "destination_root": "scripts",
       "destination": "fleet_outcome_contracts.json",
       "mode": "0644",
-      "sha256": "6166035854ccbff274a6fb7fa1ef9a98adfe22e9b7a6880069672e42e16c1c14"
+      "sha256": "d1b904c20bb88eba838733b8e740b5a01fe87fbbb8959fb7f405f330875e3bb5"
     },
     {
       "source": "hermes_usage_alert.py",

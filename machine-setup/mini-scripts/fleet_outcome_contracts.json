@@ -640,6 +640,25 @@
       }
     },
     {
+      "label": "com.hermes.opendesign",
+      "expected": "loaded",
+      "outcome": {
+        "kind": "http",
+        "url": "http://127.0.0.1:7456/api/health",
+        "statuses": [
+          200
+        ],
+        "required_values": {
+          "ok": true
+        },
+        "required_patterns": [
+          "\"ok\"\\s*:\\s*true",
+          "\"version\"\\s*:\\s*\"[^\"]+\""
+        ],
+        "timeout_seconds": 5
+      }
+    },
+    {
       "label": "com.colingreig.hermes.mcp-serve-reaper",
       "expected": "loaded",
       "outcome": {
