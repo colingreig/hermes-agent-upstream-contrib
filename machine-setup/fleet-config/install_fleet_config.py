@@ -667,11 +667,18 @@ def merge_jobs_json(
     return result, counts
 
 
-def _load_jobs_payload(item: dict) -> dict[str, Any]:
+def _load_jobs_payload(
+    item: dict,
+    *,
+    verified_bytes: bytes | None = None,
+) -> dict[str, Any]:
     """Read one bundled jobs payload and reject malformed scheduler input."""
     try:
-        payload = json.loads(item["src"].read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        payload_bytes = (
+            verified_bytes if verified_bytes is not None else item["src"].read_bytes()
+        )
+        payload = json.loads(payload_bytes)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise InstallError(f"bundled jobs.json is not valid JSON: {exc}") from exc
     if not isinstance(payload, dict) or not isinstance(payload.get("jobs"), list):
         raise InstallError("bundled jobs.json has no top-level 'jobs' list — refusing")
@@ -1924,12 +1931,10 @@ def install(
                 f"bundled jobs.json sha256 drift for {jobs_item['src']}: "
                 f"manifest pins {jobs_item['sha256']}"
             )
-        try:
-            parsed = json.loads(bundled_bytes.decode("utf-8"))
-        except json.JSONDecodeError as exc:
-            raise InstallError(f"bundled jobs.json is not valid JSON: {exc}") from exc
-        if "jobs" not in parsed or not isinstance(parsed["jobs"], list):
-            raise InstallError("bundled jobs.json has no top-level 'jobs' list — refusing")
+        # Materialize prompt postconditions through the same parser used by
+        # planning/dry-run.  Reading the raw JSON here bypasses those governed
+        # additions and makes a successful dry-run impossible to activate.
+        parsed = _load_jobs_payload(jobs_item, verified_bytes=bundled_bytes)
         live_document: dict[str, Any] | None = None
         if jdest.is_file():
             try:
