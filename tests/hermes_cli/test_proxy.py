@@ -582,17 +582,19 @@ class FakeAdapter(UpstreamAdapter):
 
     def __init__(self, base_url: str, bearer: str = "test-bearer",
                  allowed=None, raise_on_credential=False,
-                 retry_bearer: str | None = None):
+                 retry_bearer: str | None = None,
+                 provider_name: str = "fake"):
         self._base_url = base_url
         self._bearer = bearer
         self._allowed = frozenset(allowed or ["/chat/completions"])
         self._raise = raise_on_credential
         self._retry_bearer = retry_bearer
+        self._provider_name = provider_name
         self.calls = 0
         self.retry_calls = 0
 
     @property
-    def name(self): return "fake"
+    def name(self): return self._provider_name
 
     @property
     def display_name(self): return "Fake Provider"
@@ -739,6 +741,89 @@ def test_server_retries_once_with_adapter_retry_credential_on_401():
                 "Bearer jwt-bearer",
                 "Bearer legacy-bearer",
             ]
+        finally:
+            await proxy_runner.cleanup()
+            await upstream_runner.cleanup()
+
+    asyncio.run(run())
+
+
+def test_server_turns_codex_usage_exhaustion_into_non_retryable_failure(caplog, capsys):
+    async def run():
+        async def quota_exhausted(request):
+            return web.json_response(
+                {
+                    "error": {
+                        "type": "usage_limit_reached",
+                        "message": "The usage limit has been reached",
+                        "diagnostic_token": "must-not-appear-in-logs",
+                    }
+                },
+                status=429,
+            )
+
+        upstream_app = web.Application()
+        upstream_app.router.add_post("/v1/responses", quota_exhausted)
+        upstream_runner, upstream_base = await _start_runner(upstream_app)
+        adapter = FakeAdapter(
+            f"{upstream_base}/v1",
+            allowed=["/responses"],
+            provider_name="openai-codex",
+        )
+        proxy_runner, proxy_base = await _start_runner(create_app(adapter))
+
+        try:
+            with caplog.at_level("WARNING", logger="hermes_cli.proxy.server"):
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(
+                        f"{proxy_base}/v1/responses",
+                        json={"model": "gpt-5.4", "stream": True},
+                    ) as resp:
+                        body = await resp.json()
+
+            assert resp.status == 402
+            assert body["error"]["type"] == "usage_limit_reached"
+            assert "codex upstream quota exhausted" in caplog.text
+            assert "usage_limit_reached" in caplog.text
+            assert "must-not-appear-in-logs" not in caplog.text
+        finally:
+            await proxy_runner.cleanup()
+            await upstream_runner.cleanup()
+
+    asyncio.run(run())
+    proxy_output = capsys.readouterr().out
+    assert "codex upstream quota exhausted: usage_limit_reached" in proxy_output
+    assert "must-not-appear-in-logs" not in proxy_output
+
+
+def test_server_preserves_codex_transient_rate_limit_status():
+    async def run():
+        async def transient_rate_limit(request):
+            return web.json_response(
+                {"error": {"type": "rate_limit_exceeded", "message": "Slow down"}},
+                status=429,
+            )
+
+        upstream_app = web.Application()
+        upstream_app.router.add_post("/v1/responses", transient_rate_limit)
+        upstream_runner, upstream_base = await _start_runner(upstream_app)
+        adapter = FakeAdapter(
+            f"{upstream_base}/v1",
+            allowed=["/responses"],
+            provider_name="openai-codex",
+        )
+        proxy_runner, proxy_base = await _start_runner(create_app(adapter))
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{proxy_base}/v1/responses",
+                    json={"model": "gpt-5.4", "stream": True},
+                ) as resp:
+                    body = await resp.json()
+
+            assert resp.status == 429
+            assert body["error"]["type"] == "rate_limit_exceeded"
         finally:
             await proxy_runner.cleanup()
             await upstream_runner.cleanup()
