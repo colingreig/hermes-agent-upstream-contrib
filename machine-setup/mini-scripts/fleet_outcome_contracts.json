@@ -72,7 +72,7 @@
         "kind": "cron_output",
         "max_age_seconds": 7200,
         "response_only": true,
-        "success_patterns": ["ignite-validate", "PASS", "FAIL", "no.*(?:review|actionable)", "validated"],
+        "success_patterns": ["ignite-validate", "PASS", "FAIL", "no.*(?:review|actionable)", "validated", "^\\[SILENT\\]\\s*$"],
         "failure_patterns": ["\\(FAILED\\)", "\\(No response generated\\)", "Status: .*failed", "Traceback", "ABORT"]
       }
     },
@@ -211,21 +211,6 @@
         "success_patterns": ["Success", "complete", "Nothing to clean", "No stale", "safety gate"],
         "required_patterns": ["repo_gc_sweep", "cleanup_hermes_baks", "orphan_unpushed_cron"],
         "failure_patterns": ["\\(FAILED\\)", "\\(No response generated\\)", "Status: .*failed", "Traceback"]
-      }
-    },
-    {
-      "id": "6e25865a22a4",
-      "name": "Purelymail notify-me poller",
-      "enabled": true,
-      "max_age_seconds": 2700,
-      "outcome": {
-        "kind": "text_artifact",
-        "path": "~/.hermes/logs/purelymail-poller.log",
-        "max_age_seconds": 2700,
-        "tail_lines": 400,
-        "run_start_pattern": "Purelymail notify-poller starting \\(dry_run=False",
-        "success_patterns": ["Purelymail notify-poller finished"],
-        "failure_patterns": ["CERTIFICATE_VERIFY_FAILED", "Mailbox poll failed", "gaierror", "Traceback"]
       }
     }
   ],
