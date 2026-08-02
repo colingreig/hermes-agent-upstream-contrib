@@ -56,5 +56,8 @@ jobs:
           python3 machine-setup/mini-scripts/install_disk_lifecycle.py --verify-manifest-hashes
 
       - name: Verify self_report_manifest.json pins match the source tree
+        # The dry-run resolves destinations under ~/.hermes before hashing
+        # sources; the runner has no such tree, so give it an empty one.
         run: |
+          mkdir -p "$HOME/.hermes/scripts"
           python3 machine-setup/mini-scripts/install_self_report.py --dry-run
