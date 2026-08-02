@@ -37,6 +37,7 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
+from xml.parsers.expat import ExpatError
 
 
 HOME = Path.home()
@@ -576,20 +577,36 @@ def _launch_agent_registration(
     return None, gui_result, user_result
 
 
-def _plist_labels(path: Path) -> set[str]:
+def _plist_labels(path: Path) -> tuple[set[str], list[dict[str, str]]]:
+    """Return monitored labels plus non-fatal warnings for unreadable plists.
+
+    A malformed or unreadable plist (e.g. a third-party LaunchAgent with
+    invalid XML) must never abort the probe -- it is skipped and recorded
+    as a distinguishable, non-fatal warning so it neither trips a false
+    contract failure nor silently vanishes from the receipt.
+    """
     labels: set[str] = set()
+    warnings: list[dict[str, str]] = []
     if not path.is_dir():
-        return labels
+        return labels, warnings
     for plist_path in path.glob("*.plist"):
         try:
             with plist_path.open("rb") as handle:
                 payload = plistlib.load(handle)
-        except (OSError, plistlib.InvalidFileException):
+        except (OSError, ValueError, ExpatError) as exc:
+            warnings.append(
+                _finding(
+                    "launchd",
+                    plist_path.name,
+                    "plist_unreadable",
+                    f"skipped unreadable plist {plist_path}: {exc}",
+                )
+            )
             continue
         label = str(payload.get("Label") or "")
         if label and MONITORED_LABEL_RE.search(label):
             labels.add(label)
-    return labels
+    return labels, warnings
 
 
 def _labels_from_launchctl_domain(text: str) -> set[str]:
@@ -747,7 +764,9 @@ def _check_launch_contracts(
 
     findings: list[dict[str, str]] = []
     evidence: list[dict[str, Any]] = []
-    discovered = _plist_labels(launch_agents_dir) | loaded_inventory
+    discovered_labels, plist_warnings = _plist_labels(launch_agents_dir)
+    evidence.extend(plist_warnings)
+    discovered = discovered_labels | loaded_inventory
     for label in sorted(discovered - set(by_label)):
         findings.append(_finding("launchd", label, "uncovered_plist", str(launch_agents_dir)))
 

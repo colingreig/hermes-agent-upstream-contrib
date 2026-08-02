@@ -209,6 +209,47 @@ def test_unknown_enabled_cron_and_monitored_plist_fail_closed(tmp_path):
     ) in {(item["surface"], item["id"], item["code"]) for item in findings}
 
 
+def test_malformed_plist_is_skipped_with_warning_not_crash(tmp_path):
+    """A third-party LaunchAgent plist with invalid XML (e.g. a malformed
+    comment) must never crash the probe -- it is skipped and surfaced as a
+    distinguishable, non-fatal evidence entry instead of an
+    xml.parsers.expat.ExpatError propagating out of evaluate()."""
+    module = _load_module()
+    contracts, jobs_path, output_root, launch_agents, _output = _fixture(tmp_path)
+    malformed = launch_agents / "com.hermes.opendesign.plist"
+    malformed.write_bytes(
+        b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+        b"<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" "
+        b"\"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
+        b"<plist version=\"1.0\">\n<dict>\n<!-- broken comment -- >\n"
+        b"<key>Label</key>\n<string>com.hermes.opendesign</string>\n</dict>\n</plist>\n"
+    )
+
+    findings, evidence = module.evaluate(
+        contracts,
+        jobs_path=jobs_path,
+        output_root=output_root,
+        launch_agents_dir=launch_agents,
+        home=tmp_path,
+        now=NOW,
+        launchctl=lambda domain, label: _completed(
+            0 if label.endswith(".fixture") and domain != module._launchd_domains()[1] else 113
+        ),
+        launch_inventory=lambda: {"com.colingreig.hermes.fixture"},
+    )
+
+    # The run completes normally (no ExpatError raised) and the fixture's
+    # declared contracts are still unaffected by the unrelated bad plist.
+    assert findings == []
+    warning = next(item for item in evidence if item.get("code") == "plist_unreadable")
+    assert warning["surface"] == "launchd"
+    assert warning["id"] == "com.hermes.opendesign.plist"
+    assert "com.hermes.opendesign.plist" in warning["detail"]
+    # A skipped-plist warning must never masquerade as a checked contract
+    # (those use "checked"/"disabled-as-declared"/"retired-as-declared").
+    assert warning.get("status") is None
+
+
 def test_route_alarm_timeout_expired_maps_to_delivery_failed_not_crash(tmp_path):
     module = _load_module()
     state_path = tmp_path / "state.json"
