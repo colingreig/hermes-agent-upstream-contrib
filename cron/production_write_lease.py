@@ -367,8 +367,46 @@ def mutation_guard(*, lease_id: str, actor: str, session_id: str, fencing_token:
             (now_text, expires, revision, fencing_token),
         )
         guarded = _row(conn.execute("SELECT * FROM active_leases WHERE lease_id=?", (lease_id,)).fetchone())
-        yield guarded
-        conn.execute("COMMIT")
+
+        def finish_guard() -> None:
+            """Leave a long protected operation with a fresh, truthful lease."""
+            completed = _now()
+            completed_text = _iso(completed)
+            completed_revision = revision + 1
+            completed_expires = _iso(completed + timedelta(seconds=lease_seconds))
+            cur = conn.execute(
+                "UPDATE active_leases SET heartbeat_at=?, expires_at=?, revision=? "
+                "WHERE lease_id=? AND actor=? AND session_id=? AND fencing_token=? AND revision=?",
+                (
+                    completed_text, completed_expires, completed_revision,
+                    lease_id, actor, session_id, fencing_token, revision,
+                ),
+            )
+            if cur.rowcount != 1:
+                raise ProductionWriteLeaseError("production write lease mutation guard completion CAS failed")
+            conn.execute(
+                "UPDATE lease_history SET heartbeat_at=?, expires_at=?, revision=? "
+                "WHERE fencing_token=? AND state='active'",
+                (completed_text, completed_expires, completed_revision, fencing_token),
+            )
+            # ProductionWriteLease is frozen so callers cannot alter its fence
+            # identity.  Refresh only its liveness snapshot before the context
+            # returns; callers persist this same object in receipts/state.
+            object.__setattr__(guarded, "heartbeat_at", completed_text)
+            object.__setattr__(guarded, "expires_at", completed_expires)
+            object.__setattr__(guarded, "revision", completed_revision)
+            conn.execute("COMMIT")
+
+        try:
+            yield guarded
+        except BaseException:
+            # The protected command may have partially mutated durable state
+            # before failing.  Retain a live exact fence so its caller can run
+            # the governed rollback path; never commit an already-expired row.
+            finish_guard()
+            raise
+        else:
+            finish_guard()
     except Exception:
         if conn.in_transaction:
             conn.execute("ROLLBACK")
@@ -425,6 +463,13 @@ def record_fence_loss(*, lease_id: str, actor: str, session_id: str, fencing_tok
     conn = _connect(database_path)
     try:
         _transaction(conn)
+        history = conn.execute(
+            "SELECT 1 FROM lease_history "
+            "WHERE lease_id=? AND actor=? AND session_id=? AND fencing_token=?",
+            (lease_id, actor, session_id, fencing_token),
+        ).fetchone()
+        if history is None:
+            raise ProductionWriteLeaseError("fence-loss receipt identity has no matching lease history")
         receipt_id = str(uuid.uuid4())
         observed_at = _iso(_now())
         conn.execute(
@@ -433,6 +478,206 @@ def record_fence_loss(*, lease_id: str, actor: str, session_id: str, fencing_tok
         )
         conn.execute("COMMIT")
         return {"receipt_id": receipt_id, "lease_id": lease_id, "actor": actor, "fencing_token": fencing_token, "observed_at": observed_at}
+    except Exception:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
+
+
+def authorize_stale_lock_recovery(*, stale: dict[str, Any], successor: dict[str, Any],
+                                  database_path: Path | None = None) -> dict[str, Any]:
+    """Prove a successor may remove one exact stale release-cut lock.
+
+    This is deliberately proof-only. The caller must compare the lock bytes
+    again and unlink them inside ``mutation_guard`` using the same successor.
+    """
+    required = (
+        "lease_id", "actor", "resources", "session_id", "workspace", "repo",
+        "commit_sha", "reason", "fencing_token", "acquired_at",
+    )
+    for name, value in (("stale", stale), ("successor", successor)):
+        if not isinstance(value, dict) or not all(key in value for key in required):
+            raise ProductionWriteLeaseError(f"{name} cut-lock lease identity is incomplete")
+        if not all(isinstance(value[key], str) and value[key] for key in ("lease_id", "actor", "session_id", "commit_sha")):
+            raise ProductionWriteLeaseError(f"{name} cut-lock lease identity is invalid")
+        if not isinstance(value["fencing_token"], int):
+            raise ProductionWriteLeaseError(f"{name} cut-lock fencing token is invalid")
+        if not isinstance(value["resources"], list) or not all(isinstance(item, str) for item in value["resources"]):
+            raise ProductionWriteLeaseError(f"{name} cut-lock resources are invalid")
+    conn = _connect(database_path)
+    try:
+        _transaction(conn)
+        current = conn.execute(
+            "SELECT * FROM active_leases WHERE lease_id=? AND actor=? AND session_id=? "
+            "AND fencing_token=? AND commit_sha=?",
+            (
+                successor["lease_id"], successor["actor"], successor["session_id"],
+                successor["fencing_token"], successor["commit_sha"],
+            ),
+        ).fetchone()
+        now = _iso(_now())
+        if current is None or current["expires_at"] <= now:
+            raise ProductionWriteLeaseError("cut-lock successor lease is not current")
+        expected_resources = {"runtime-release", "governed-mini-scripts"}
+        current_identity_matches = (
+            set(successor["resources"]) == set(json.loads(current["resources_json"]))
+            and all(successor[key] == current[key] for key in ("workspace", "repo", "reason", "acquired_at"))
+        )
+        if (current["actor"] != "mini-release-cut"
+                or set(json.loads(current["resources_json"])) != expected_resources
+                or not current_identity_matches):
+            raise ProductionWriteLeaseError("cut-lock successor is not the governed release writer")
+        old = conn.execute(
+            "SELECT * FROM lease_history WHERE lease_id=? AND actor=? AND session_id=? "
+            "AND fencing_token=? AND commit_sha=?",
+            (
+                stale["lease_id"], stale["actor"], stale["session_id"],
+                stale["fencing_token"], stale["commit_sha"],
+            ),
+        ).fetchone()
+        old_identity_matches = old is not None and (
+            set(stale["resources"]) == set(json.loads(old["resources_json"]))
+            and all(stale[key] == old[key] for key in ("workspace", "repo", "reason", "acquired_at"))
+        )
+        if (old is None or old["actor"] != "mini-release-cut"
+                or set(json.loads(old["resources_json"])) != expected_resources
+                or not old_identity_matches):
+            raise ProductionWriteLeaseError("cut-lock owner has no exact governed lease history")
+        if old["state"] not in {"released", "recovered"}:
+            raise ProductionWriteLeaseError("cut-lock owner lease is still live or was not governed-recovered")
+        if int(old["fencing_token"]) >= int(current["fencing_token"]):
+            raise ProductionWriteLeaseError("cut-lock successor fencing token does not supersede its owner")
+        recovery_receipt_id = old["recovery_receipt_id"]
+        if old["state"] == "recovered":
+            recovery = conn.execute(
+                "SELECT 1 FROM recovery_receipts WHERE receipt_id=? AND lease_id=? AND actor=? AND fencing_token=?",
+                (recovery_receipt_id, old["lease_id"], old["actor"], old["fencing_token"]),
+            ).fetchone()
+            if recovery is None:
+                raise ProductionWriteLeaseError("cut-lock owner recovery receipt is missing")
+        conn.execute("COMMIT")
+        return {
+            "authorized": True,
+            "stale_lease_id": old["lease_id"],
+            "stale_fencing_token": old["fencing_token"],
+            "stale_state": old["state"],
+            "recovery_receipt_id": recovery_receipt_id,
+            "successor_lease_id": current["lease_id"],
+            "successor_fencing_token": current["fencing_token"],
+            "authorized_at": now,
+        }
+    except Exception:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
+
+
+def authorize_legacy_lock_directory_recovery(*, successor: dict[str, Any],
+                                             directory_mtime_ns: int,
+                                             database_path: Path | None = None) -> dict[str, Any]:
+    """Prove one old empty-directory cut lock belongs to one terminal owner.
+
+    The legacy cutter left no owner bytes in its mkdir-based lock.  Its inode
+    timestamp is therefore the only immutable identity available: it must
+    fall inside exactly one earlier governed cutter lease lifetime.  The
+    caller still has to re-check the inode, owner, emptiness, timestamp, and
+    absence of another cutter while removing it inside ``mutation_guard``.
+    """
+    required = (
+        "lease_id", "actor", "resources", "session_id", "workspace", "repo",
+        "commit_sha", "reason", "fencing_token", "acquired_at",
+    )
+    if not isinstance(successor, dict) or not all(key in successor for key in required):
+        raise ProductionWriteLeaseError("legacy cut-lock successor lease identity is incomplete")
+    if not all(isinstance(successor[key], str) and successor[key]
+               for key in ("lease_id", "actor", "session_id", "commit_sha")):
+        raise ProductionWriteLeaseError("legacy cut-lock successor lease identity is invalid")
+    if not isinstance(successor["fencing_token"], int):
+        raise ProductionWriteLeaseError("legacy cut-lock successor fencing token is invalid")
+    if (not isinstance(successor["resources"], list)
+            or not all(isinstance(item, str) for item in successor["resources"])):
+        raise ProductionWriteLeaseError("legacy cut-lock successor resources are invalid")
+    if not isinstance(directory_mtime_ns, int) or directory_mtime_ns <= 0:
+        raise ProductionWriteLeaseError("legacy cut-lock directory timestamp is invalid")
+
+    conn = _connect(database_path)
+    try:
+        _transaction(conn)
+        current = conn.execute(
+            "SELECT * FROM active_leases WHERE lease_id=? AND actor=? AND session_id=? "
+            "AND fencing_token=? AND commit_sha=?",
+            (
+                successor["lease_id"], successor["actor"], successor["session_id"],
+                successor["fencing_token"], successor["commit_sha"],
+            ),
+        ).fetchone()
+        now = _now()
+        now_text = _iso(now)
+        if current is None or current["expires_at"] <= now_text:
+            raise ProductionWriteLeaseError("legacy cut-lock successor lease is not current")
+        expected_resources = {"runtime-release", "governed-mini-scripts"}
+        current_identity_matches = (
+            set(successor["resources"]) == set(json.loads(current["resources_json"]))
+            and all(successor[key] == current[key]
+                    for key in ("workspace", "repo", "reason", "acquired_at"))
+        )
+        if (current["actor"] != "mini-release-cut"
+                or set(json.loads(current["resources_json"])) != expected_resources
+                or not current_identity_matches):
+            raise ProductionWriteLeaseError(
+                "legacy cut-lock successor is not the governed release writer"
+            )
+
+        lock_time = datetime.fromtimestamp(directory_mtime_ns / 1_000_000_000, timezone.utc)
+        matches: list[sqlite3.Row] = []
+        for row in conn.execute(
+            "SELECT * FROM lease_history WHERE actor='mini-release-cut' "
+            "AND fencing_token<? AND state IN ('released','recovered')",
+            (current["fencing_token"],),
+        ):
+            if set(json.loads(row["resources_json"])) != expected_resources:
+                continue
+            terminal_at = row["released_at"]
+            if not terminal_at:
+                continue
+            acquired = datetime.fromisoformat(row["acquired_at"])
+            terminal = datetime.fromisoformat(terminal_at)
+            if acquired <= lock_time <= terminal:
+                if row["state"] == "recovered":
+                    recovery = conn.execute(
+                        "SELECT 1 FROM recovery_receipts WHERE receipt_id=? AND lease_id=? "
+                        "AND actor=? AND fencing_token=?",
+                        (
+                            row["recovery_receipt_id"], row["lease_id"],
+                            row["actor"], row["fencing_token"],
+                        ),
+                    ).fetchone()
+                    if recovery is None:
+                        raise ProductionWriteLeaseError(
+                            "legacy cut-lock predecessor recovery receipt is missing"
+                        )
+                matches.append(row)
+        if len(matches) != 1:
+            raise ProductionWriteLeaseError(
+                "legacy cut-lock timestamp does not identify exactly one terminal predecessor"
+            )
+        predecessor = matches[0]
+        conn.execute("COMMIT")
+        return {
+            "authorized": True,
+            "legacy_directory_mtime_ns": directory_mtime_ns,
+            "predecessor_lease_id": predecessor["lease_id"],
+            "predecessor_fencing_token": predecessor["fencing_token"],
+            "predecessor_state": predecessor["state"],
+            "recovery_receipt_id": predecessor["recovery_receipt_id"],
+            "successor_lease_id": current["lease_id"],
+            "successor_fencing_token": current["fencing_token"],
+            "authorized_at": now_text,
+        }
     except Exception:
         if conn.in_transaction:
             conn.execute("ROLLBACK")
