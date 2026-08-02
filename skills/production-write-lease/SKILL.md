@@ -5,8 +5,15 @@ description: Acquire, inspect, release, and evidence-recover Hermes Mini product
 
 # Production write lease
 
-Use the registry mapping exactly; never request a partial resource set. Inspect
-before any manual recovery:
+Use the registry mapping exactly; never request a partial resource set. Cross-repo
+partner ownership for ignite-email-infra poller deploy paths is documented in
+`machine-setup/cross-repo-operating-contract.md` and
+`machine-setup/ignite-email-infra.resource-manifest.json`. Hermes-side installers
+fail closed on those paths unless this lease includes `purelymail-poller-deploy`
+(which Hermes installers must never request — partner deploy PRs in
+ignite-email-infra implement acquire/release in `poller/deploy-poller.sh`).
+
+Inspect before any manual recovery:
 
 ```bash
 hermes production-write-lease status

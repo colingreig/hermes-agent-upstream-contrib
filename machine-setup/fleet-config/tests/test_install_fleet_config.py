@@ -152,6 +152,33 @@ def test_real_install_writes_all_three_destinations(bundle):
         assert (bundle["home"] / ".hermes" / "profiles" / "ops" / sub).is_dir()
 
 
+def test_protected_atomic_write_refuses_poller_deploy_paths_without_lease(bundle):
+    home = bundle["home"]
+    lease_box: dict = {
+        "value": install_mod.production_write_lease.acquire(
+            ["fleet-config", "cron-jobs", "skills-policy"],
+            "fleet-config-installer",
+            "poller-guard-test",
+            str(home / ".hermes"),
+            "hermes-agent",
+            install_mod._production_write_commit(),
+            "test poller guard",
+            database_path=home / ".hermes" / "state" / "production-write-lease.db",
+        )
+    }
+    dest = home / ".hermes" / "deploy" / "purelymail-poller" / "incoming" / "rel"
+    dest.parent.mkdir(parents=True)
+    with pytest.raises(install_mod.InstallError, match="purelymail-poller-deploy"):
+        install_mod._protected_atomic_write(lease_box, home=home, dest=dest, data=b"x")
+    install_mod.production_write_lease.release(
+        lease_id=lease_box["value"].lease_id,
+        actor=lease_box["value"].actor,
+        session_id=lease_box["value"].session_id,
+        fencing_token=lease_box["value"].fencing_token,
+        database_path=home / ".hermes" / "state" / "production-write-lease.db",
+    )
+
+
 def test_competing_lease_refuses_before_installer_stages_any_artifact(bundle):
     """A losing installer must not leave a lock, snapshot, or receipt behind."""
     home = bundle["home"]

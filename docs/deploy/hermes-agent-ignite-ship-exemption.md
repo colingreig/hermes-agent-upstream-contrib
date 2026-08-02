@@ -23,6 +23,11 @@ this repo as `PLATFORM=manual` (`DEPLOY_ON_PUSH=false`) so `ignite-ship` surface
 exemption instead of the bare `unknown` classification reported before that hint
 was added.
 
+Cross-repository Mini resources shared with `ignite-email-infra` (Purelymail poller
+deploy staging under `~/.hermes/deploy/purelymail-poller/`) are governed by
+`machine-setup/cross-repo-operating-contract.md`. Hermes-agent ships contract +
+guards only; poller deploy implementation PRs land in ignite-email-infra.
+
 ## How production actually runs
 
 The mini gateway runs from the `~/.hermes/runtime-current` symlink, which points

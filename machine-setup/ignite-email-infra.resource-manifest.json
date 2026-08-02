@@ -1,0 +1,75 @@
+{
+  "$schema": "./ignite-email-infra.resource-manifest.schema.json",
+  "schema_version": "1.0",
+  "manifest_kind": "hermes-cross-repo-resource-manifest",
+  "partner_repository": "ignite-email-infra",
+  "registry_resource_id": "purelymail-poller-deploy",
+  "description": "Shared Mini paths that ignite-email-infra deploy-poller.sh stages and activates. Hermes-agent records ownership here; mutation is owned by ignite-email-infra actors in production_mutation_registry.json.",
+  "cron_schedule_authority": {
+    "hermes_cron_job_id": "6e25865a22a4",
+    "job_name": "Purelymail notify-me poller",
+    "live_schedule_expr": "*/45 * * * *",
+    "live_schedule_display": "*/45 * * * *",
+    "notes": "Schedule authority lives in Hermes fleet jobs.json once aligned; live Mini cadence is */45 as of 2026-08-01. Skip escalation SLA is ~135 minutes (three missed fires) versus ~45 minutes at the former */15 cadence."
+  },
+  "runtime_lock": {
+    "path": "~/.hermes/state/purelymail-poller/.lock",
+    "kind": "fcntl exclusive non-blocking flock",
+    "owner": "ignite-email-infra-poller-deploy via poller/deploy-poller.sh",
+    "behavior": "Held across the atomic activation shell so cron cannot observe torn renames mid-deploy."
+  },
+  "paths": [
+    {
+      "id": "poller-deploy-root",
+      "path": "~/.hermes/deploy/purelymail-poller/",
+      "role": "release staging root (incoming/, backups/, safety/)",
+      "owner_actor_id": "ignite-email-infra-poller-deploy"
+    },
+    {
+      "id": "poller-deploy-incoming",
+      "path": "~/.hermes/deploy/purelymail-poller/incoming/",
+      "role": "per-release artifact staging directory",
+      "owner_actor_id": "ignite-email-infra-poller-deploy"
+    },
+    {
+      "id": "poller-deploy-backups",
+      "path": "~/.hermes/deploy/purelymail-poller/backups/",
+      "role": "verified rollback snapshots selected by deploy-poller.sh rollback",
+      "owner_actor_id": "ignite-email-infra-poller-deploy"
+    },
+    {
+      "id": "poller-runtime-script",
+      "path": "~/.hermes/scripts/purelymail-notify-poller.py",
+      "role": "hash-verified live poller entrypoint installed by deploy-poller.sh",
+      "owner_actor_id": "ignite-email-infra-poller-deploy",
+      "read_only_for": ["purelymail-poller-cron"]
+    },
+    {
+      "id": "poller-runtime-config",
+      "path": "~/.hermes/scripts/notify-poller.config.json",
+      "role": "live poller config (no secrets; env-backed mailbox passwords)",
+      "owner_actor_id": "ignite-email-infra-poller-deploy"
+    },
+    {
+      "id": "poller-runtime-manifest",
+      "path": "~/.hermes/scripts/purelymail-notify-poller.release.json",
+      "role": "deployed release manifest (commit + artifact hashes)",
+      "owner_actor_id": "ignite-email-infra-poller-deploy"
+    },
+    {
+      "id": "poller-runtime-lock",
+      "path": "~/.hermes/state/purelymail-poller/.lock",
+      "role": "deploy/poll mutual-exclusion lock",
+      "owner_actor_id": "ignite-email-infra-poller-deploy"
+    }
+  ],
+  "shared_production_write_lease": {
+    "database_path": "~/.hermes/state/production-write-lease.db",
+    "registry_path": "machine-setup/production_mutation_registry.json",
+    "ignite_email_infra_actor_id": "ignite-email-infra-poller-deploy",
+    "required_resource_id": "purelymail-poller-deploy",
+    "deploy_entry_point": "ignite-email-infra: poller/deploy-poller.sh",
+    "acquire_call_site": "deploy-poller.sh remote activation shell — fcntl LOCK_EX on ~/.hermes/state/purelymail-poller/.lock before staging renames (implementation PR in ignite-email-infra; Hermes shared lease acquire/release to wrap the same resource id)",
+    "release_call_site": "deploy-poller.sh remote activation shell — lock fd closed on successful activation or explicit rollback completion"
+  }
+}
