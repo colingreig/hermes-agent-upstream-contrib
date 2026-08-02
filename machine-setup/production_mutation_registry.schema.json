@@ -107,7 +107,27 @@
         },
         "current_lock_or_transaction_boundary": { "$ref": "#/$defs/lockBoundary" },
         "rollback_surface": { "$ref": "#/$defs/rollbackSurface" },
+        "operational_pointers": { "$ref": "#/$defs/operationalPointers" },
         "notes": { "type": "string" }
+      }
+    },
+    "operationPointer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["entry_point", "command"],
+      "properties": {
+        "entry_point": { "type": "string", "minLength": 1 },
+        "command": { "type": "string", "minLength": 1 }
+      }
+    },
+    "operationalPointers": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["activation", "rollback", "verification"],
+      "properties": {
+        "activation": { "$ref": "#/$defs/operationPointer" },
+        "rollback": { "$ref": "#/$defs/operationPointer" },
+        "verification": { "$ref": "#/$defs/operationPointer" }
       }
     },
     "unknownPathPolicy": {

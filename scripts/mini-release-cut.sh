@@ -1946,6 +1946,7 @@ PY
     "$LAUNCHD_SOURCE_ROOT/reconcile_marketplace_skills.py" \
     "$LAUNCHD_SOURCE_ROOT/reconcile_pr_pipeline.py" \
     "$LAUNCHD_SOURCE_ROOT/reconcile_fleet_outcomes.py" \
+    "$LAUNCHD_SOURCE_ROOT/verify_governed_paths.py" \
     "$LAUNCHD_SOURCE_ROOT/review_poll_gate.py" \
     "$LAUNCHD_SOURCE_ROOT/mini_health_attestation.py" \
     "$LAUNCHD_SOURCE_ROOT/record_skill_pull_success.py" \

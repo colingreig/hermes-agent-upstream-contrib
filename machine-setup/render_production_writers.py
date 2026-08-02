@@ -122,6 +122,15 @@ def validate_registry(registry: Any) -> dict[str, Any]:
         rollback = _mapping(item.get("rollback_surface"), f"actors[{index}].rollback_surface")
         for field in ("surface", "procedure"):
             _string(rollback.get(field), f"actors[{index}].rollback_surface.{field}")
+        pointers = item.get("operational_pointers")
+        if pointers is not None:
+            pointer_map = _mapping(pointers, f"actors[{index}].operational_pointers")
+            if set(pointer_map) != {"activation", "rollback", "verification"}:
+                raise RegistryError(f"actors[{index}].operational_pointers must name activation, rollback, and verification")
+            for name, pointer in pointer_map.items():
+                pointer_item = _mapping(pointer, f"actors[{index}].operational_pointers.{name}")
+                for field in ("entry_point", "command"):
+                    _string(pointer_item.get(field), f"actors[{index}].operational_pointers.{name}.{field}")
 
         job_ids = _string_list(item.get("cron_job_ids", []), f"actors[{index}].cron_job_ids", allow_empty=True)
         if item["actor_class"] == "cron" and not job_ids:
@@ -181,8 +190,8 @@ def render(registry: dict[str, Any]) -> str:
         "",
         "## Actors",
         "",
-        "| Actor | Class | Owner | Access | Governed entry points | Resources | Lock or transaction boundary | Rollback surface |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- |",
+        "| Actor | Class | Owner | Access | Governed entry points | Resources | Lock or transaction boundary | Rollback surface | Operational pointers |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ])
     for actor in registry["actors"]:
         entry_points = "<br>".join(f"`{_cell(point)}`" for point in actor["entry_points"])
@@ -196,12 +205,19 @@ def render(registry: dict[str, Any]) -> str:
             entry_points += f"<br>Logical dispatch: `{_cell(actor['logical_dispatch_surface'])}`"
         boundary = actor["current_lock_or_transaction_boundary"]
         rollback = actor["rollback_surface"]
+        pointers = actor.get("operational_pointers")
+        pointer_text = "—"
+        if pointers:
+            pointer_text = "<br>".join(
+                f"{name.title()}: `{_cell(pointer['entry_point'])}` — `{_cell(pointer['command'])}`"
+                for name, pointer in pointers.items()
+            )
         lines.append(
             f"| `{_cell(actor['id'])}` — {_cell(actor['name'])} | `{actor['actor_class']}` | "
             f"`{_cell(actor['owning_repository'])}` | `{actor['mutability']}` | {entry_points} | "
             f"{', '.join(f'`{_cell(resource)}`' for resource in actor['resources_touched']) or '—'} | "
             f"{_cell(boundary['kind'])}: `{_cell(boundary['path_or_identity'])}`. {_cell(boundary['behavior'])} | "
-            f"`{_cell(rollback['surface'])}`. {_cell(rollback['procedure'])} |"
+            f"`{_cell(rollback['surface'])}`. {_cell(rollback['procedure'])} | {pointer_text} |"
         )
     notes = [actor for actor in registry["actors"] if actor.get("notes")]
     if notes:
