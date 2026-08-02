@@ -427,8 +427,78 @@ def health(
         "files": files,
         "events": events,
         "retention_days": RETENTION_DAYS,
-        "continuity_consumers_enabled": False,
+        "continuity_consumers_enabled": True,
         "continuity_successor_task": "86e2gnz71",
+    }
+
+
+def read_events(
+    start: dt.datetime,
+    end: dt.datetime,
+    *,
+    state_dir: str | os.PathLike[str] | None = None,
+) -> dict[str, Any]:
+    """Read validated unique events in the half-open UTC range ``[start, end)``.
+
+    This is the journal's deliberately small public consumer API. It never
+    mutates retention or health state. Any unreadable, partial, corrupt, or
+    invalid record makes the result UNKNOWN; exact duplicate event IDs are
+    deduplicated and reported so consumers cannot inflate activity counts.
+    """
+    start_utc = _as_utc(start)
+    end_utc = _as_utc(end)
+    if end_utc <= start_utc:
+        raise JournalError("event range end must be after start")
+
+    root = _state_dir(state_dir)
+    reasons: list[str] = []
+    events: list[dict[str, Any]] = []
+    duplicate_event_ids: list[str] = []
+    seen: set[str] = set()
+    day = start_utc.date()
+    final_day = (end_utc - dt.timedelta(microseconds=1)).date()
+    while day <= final_day:
+        path = root / f"{day.isoformat()}.jsonl"
+        day += dt.timedelta(days=1)
+        if not path.exists():
+            continue
+        try:
+            data = path.read_bytes()
+        except OSError as exc:
+            reasons.append(f"{path.name}: read failed: {exc}")
+            continue
+        if data and not data.endswith(b"\n"):
+            reasons.append(f"{path.name}: incomplete trailing line")
+        for line_number, raw in enumerate(data.splitlines(), start=1):
+            if not raw.strip():
+                continue
+            try:
+                event = json.loads(raw)
+            except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                reasons.append(f"{path.name}:{line_number}: corrupt JSON: {exc}")
+                continue
+            invalid = _validate_event(event)
+            if invalid:
+                reasons.append(f"{path.name}:{line_number}: {invalid}")
+                continue
+            event_id = str(event["event_id"])
+            if event_id in seen:
+                duplicate_event_ids.append(event_id)
+                continue
+            seen.add(event_id)
+            timestamp = dt.datetime.fromisoformat(str(event["ts"]).replace("Z", "+00:00"))
+            if start_utc <= timestamp < end_utc:
+                events.append(event)
+
+    events.sort(key=lambda event: (str(event["ts"]), str(event["event_id"])))
+    return {
+        "status": "UNKNOWN" if reasons else "OK",
+        "reasons": reasons,
+        "events": events,
+        "duplicates": len(duplicate_event_ids),
+        "duplicate_event_ids": sorted(set(duplicate_event_ids)),
+        "start": _iso(start_utc),
+        "end": _iso(end_utc),
     }
 
 

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Manifest-verified installer for the hermes-self-report deploy bundle.
 
-This script is the SOLE writer of the ten hermes-self-report and lifecycle
-shadow-outbox artifacts into
+This script is the SOLE writer of the eleven hermes-self-report and lifecycle
+continuity artifacts into
 ``~/.hermes/scripts/`` (and ``~/.hermes/skills/hermes-self-report/SKILL.md``).
 It reads ``self_report_manifest.json`` (the declared bundle), verifies every
 source's sha256 against the manifest, snapshots each existing destination, then

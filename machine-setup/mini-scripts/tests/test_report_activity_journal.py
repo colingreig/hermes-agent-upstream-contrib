@@ -202,7 +202,9 @@ def test_enabled_producer_without_emitter_makes_coverage_unknown(journal, tmp_pa
     ]
     result = journal.health(state_dir=tmp_path / "empty", inventory=inventory)
     assert result["status"] == "UNKNOWN"
-    assert result["continuity_consumers_enabled"] is False
+    # Source-level activation must not turn incomplete producer coverage into
+    # a false healthy/inactive conclusion.
+    assert result["continuity_consumers_enabled"] is True
     assert any("missing" in item and "lacks emitter" in item for item in result["reasons"])
 
 
@@ -405,6 +407,7 @@ def test_governed_manifest_pins_all_shadow_outbox_producer_bytes():
     manifest = json.loads((MINI_SCRIPTS / "self_report_manifest.json").read_text())
     expected = {
         "report_activity_journal.py": JOURNAL_PATH,
+        "report_activity_continuity.py": MINI_SCRIPTS / "report_activity_continuity.py",
         "claim_store.py": CLAIM_PATH,
         "closeout_actor.py": MINI_SCRIPTS / "closeout_actor.py",
     }
@@ -414,3 +417,8 @@ def test_governed_manifest_pins_all_shadow_outbox_producer_bytes():
         assert entry["dest_abs"] == f"~/.hermes/scripts/{name}"
         assert entry["deploy_mode"] == "script"
         assert hashlib.sha256(path.read_bytes()).hexdigest() == entry["sha256"]
+    canonical = manifest["canonical_builder"]
+    mirror = MINI_SCRIPTS / "hermes_report_build.py"
+    assert canonical["repo"] == "brain"
+    assert canonical["runtime_mirror"] == "machine-setup/mini-scripts/hermes_report_build.py"
+    assert hashlib.sha256(mirror.read_bytes()).hexdigest() == canonical["sha256"]

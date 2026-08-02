@@ -865,26 +865,29 @@ staleness dedupe" above) — never the directory. The same caution applies to
 `~/.hermes/skills/clickup-queue-poller/scripts/` — copy only `claim_next.py`,
 never the directory.
 
-## hermes-self-report bundle (ClickUp 86e2gnz60)
+## hermes-self-report bundle (ClickUp 86e2gnz60, 86e2gnz71)
 
-The `hermes-self-report` cron builds and delivers Colin's status email. Its ten
-report and lifecycle-shadow-outbox artifacts now deploy through one **declared
+The `hermes-self-report` cron builds and delivers Colin's status email. Its eleven
+report and lifecycle-continuity artifacts now deploy through one **declared
 bundle + manifest-verified installer** rather than ad-hoc `scp`. This directory is the deploy mirror; the
-authored source of truth is Brain (`hermes/skills/hermes-self-report/`), which
-mirrors these exact bytes and does not deploy anything itself.
+authored report-builder source of truth is Brain
+(`hermes/skills/hermes-self-report/scripts/hermes_report_build.py`). The builder
+here must be an exact-byte mirror; `canonical_builder.sha256` makes drift a
+release blocker. Brain does not deploy anything itself.
 
 **The bundle** (`self_report_manifest.json`) records `src_rel`, `src_base`,
 `dest_abs`, `sha256`, `role`, and `deploy_mode` for each file:
 
 | File | dest | canon |
 |---|---|---|
-| `hermes_report_build.py` | `~/.hermes/scripts/` | live RC4 |
+| `hermes_report_build.py` | `~/.hermes/scripts/` | exact mirror of Brain canonical builder |
 | `hermes_report_build_v1lib.py` | `~/.hermes/scripts/` | live (load-bearing library) |
 | `hermes_report_build_v2.py` | `~/.hermes/scripts/` | live (compat-only orphan, retirement pending) |
 | `hermes-metrics.py` | `~/.hermes/scripts/` | live (standalone CLI, no cron caller) |
 | `postmark_send_report.py` | `~/.hermes/scripts/` | deploy-mirror bytes (live behavior + `encoding="utf-8"`) |
 | `hermes_self_report_delivery_probe.py` | `~/.hermes/scripts/` | deploy-mirror bytes (live behavior + `encoding="utf-8"`) |
-| `report_activity_journal.py` | `~/.hermes/scripts/` | durable Mini lifecycle shadow outbox (consumers disabled until `86e2gnz71`) |
+| `report_activity_journal.py` | `~/.hermes/scripts/` | durable Mini lifecycle outbox plus validated read-only range API |
+| `report_activity_continuity.py` | `~/.hermes/scripts/` | Mini-only two-window continuity, health/provenance, and bounded ClickUp parity adapter |
 | `claim_store.py` | `~/.hermes/scripts/` | durable queue-claim producer for the shadow outbox |
 | `closeout_actor.py` | `~/.hermes/scripts/` | verified review-handoff producer for PR and DB closeout |
 | `SKILL.md` | `~/.hermes/skills/hermes-self-report/` | live RC4 (Brain source; installed only with `--include-skill --brain-path`) |
@@ -920,10 +923,24 @@ python3 machine-setup/mini-scripts/install_self_report.py \
 ```
 
 **Never** rsync `~/.hermes/scripts/` (see the wholesale-rsync warning above):
-this installer copies only the ten declared files by name and touches nothing
+this installer copies only the eleven declared files by name and touches nothing
 else — in particular it never writes `queue_snapshot.json` or the release venv.
 Because release/reconcile passes are known to clobber hand edits, this manifest
-+ installer must be the ONLY writer of these ten files going forward.
++ installer must be the ONLY writer of these eleven files going forward.
+
+**Activity continuity.** Source consumption is enabled only after the adapter's
+positive and fail-closed tests and the Brain-to-Hermes byte mirror check pass.
+The adapter floors every invocation to a stable six-hour UTC slot and evaluates
+the previous `[slot-12h, slot-6h)` plus current `[slot-6h, slot)` windows. It
+emits an inactivity concern only when both windows have complete provenance,
+health and ClickUp parity and contain no qualifying lifecycle event. Every
+uncertain input is `UNKNOWN` (or `PROVISIONAL` for incomplete coverage), and the
+report renders the result only under System signals. Validator-completed remains
+the strict PASS + terminal status + in-window `date_closed` metric; outbox
+completion events are parity evidence only. Scope is the Hermes Mac mini, with
+the post-ClickUp/pre-append crash residual stated explicitly. Production Mini
+installation, scheduled delivery receipts, hash attestation, and provenance-
+footer verification remain owned by `86e2gnz7a`.
 
 **Delivery-probe cron.** `hermes_self_report_delivery_probe.py` runs as its own
 `no_agent` cron job (offset from the `0 */6 * * *` report tick). It reads the
