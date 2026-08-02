@@ -916,6 +916,7 @@ PRODUCTION_WRITE_LEASE_JSON=""
 PRODUCTION_WRITE_LEASE_PYTHON=""
 PRODUCTION_WRITE_LEASE_ROOT=""
 PRODUCTION_WRITE_LEASE_BOOTSTRAP_DIR=""
+PRODUCTION_WRITE_LEASE_BOOTSTRAP_OWNED=0
 acquire_cut_lock() {
   assert_release_target "$CUT_LOCK_DIR"
   if [ "$DRY_RUN" -eq 1 ]; then
@@ -1115,13 +1116,84 @@ guarded_rollback_to_previous() {
 
 cleanup_production_write_lease_bootstrap() {
   [ -n "$PRODUCTION_WRITE_LEASE_BOOTSTRAP_DIR" ] || return 0
-  case "$PRODUCTION_WRITE_LEASE_BOOTSTRAP_DIR" in
-    "${TMPDIR:-/tmp}"/hermes-production-write-lease.*)
-      rm -rf -- "$PRODUCTION_WRITE_LEASE_BOOTSTRAP_DIR" || warn "could not remove lease bootstrap directory"
-      ;;
-    *) warn "refusing to remove unexpected lease bootstrap directory: $PRODUCTION_WRITE_LEASE_BOOTSTRAP_DIR" ;;
-  esac
+  if [ "$PRODUCTION_WRITE_LEASE_BOOTSTRAP_OWNED" -eq 1 ]; then
+    case "$PRODUCTION_WRITE_LEASE_BOOTSTRAP_DIR" in
+      "${TMPDIR:-/tmp}"/hermes-production-write-lease.*)
+        rm -rf -- "$PRODUCTION_WRITE_LEASE_BOOTSTRAP_DIR" || warn "could not remove lease bootstrap directory"
+        ;;
+      *) warn "refusing to remove unexpected lease bootstrap directory: $PRODUCTION_WRITE_LEASE_BOOTSTRAP_DIR" ;;
+    esac
+  fi
   PRODUCTION_WRITE_LEASE_BOOTSTRAP_DIR=""
+  PRODUCTION_WRITE_LEASE_BOOTSTRAP_OWNED=0
+}
+
+validate_production_write_lease_bootstrap() {
+  local root="${1:?bootstrap root required}" temp_root="${TMPDIR:-/tmp}"
+  "$PRODUCTION_WRITE_LEASE_PYTHON" - "$root" "$temp_root" <<'PY'
+import importlib
+import os
+import stat
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+temp_root = Path(sys.argv[2])
+try:
+    # Do not silently normalize a symlinked override into an allowed path.
+    info = root.lstat()
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise RuntimeError("override must be an existing non-symlink directory")
+    resolved_root = root.resolve(strict=True)
+    resolved_temp = temp_root.resolve(strict=True)
+    resolved_root.relative_to(resolved_temp)
+    if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o022:
+        raise RuntimeError("override directory must be current-user owned and not group/world writable")
+    def safe_dir(relative):
+        path = resolved_root / relative
+        entry = path.lstat()
+        if stat.S_ISLNK(entry.st_mode) or not stat.S_ISDIR(entry.st_mode):
+            raise RuntimeError(f"override bootstrap parent must be a non-symlink directory: {relative}")
+        if entry.st_uid != os.getuid() or stat.S_IMODE(entry.st_mode) & 0o022:
+            raise RuntimeError(f"override bootstrap parent has unsafe ownership/mode: {relative}")
+        # Resolve each component independently: checking only a leaf lets an
+        # intermediate cron/ or machine-setup/ symlink escape the override.
+        if path.resolve(strict=True) != path:
+            raise RuntimeError(f"override bootstrap parent does not resolve directly under root: {relative}")
+
+    safe_dir("cron")
+    safe_dir("machine-setup")
+    required = {
+        "cron/production_write_lease.py": False,
+        "cron/__init__.py": True,
+        "hermes_constants.py": False,
+        "machine-setup/production_mutation_registry.json": False,
+    }
+    for relative, must_be_empty in required.items():
+        path = resolved_root / relative
+        entry = path.lstat()
+        if stat.S_ISLNK(entry.st_mode) or not stat.S_ISREG(entry.st_mode):
+            raise RuntimeError(f"override bootstrap member must be a regular non-symlink file: {relative}")
+        if entry.st_uid != os.getuid() or stat.S_IMODE(entry.st_mode) & 0o022:
+            raise RuntimeError(f"override bootstrap member has unsafe ownership/mode: {relative}")
+        if path.resolve(strict=True) != path:
+            raise RuntimeError(f"override bootstrap member does not resolve directly under root: {relative}")
+        if must_be_empty and path.read_bytes() != b"":
+            raise RuntimeError("override cron/__init__.py must be empty")
+    # Import in a fresh interpreter namespace and prove it resolves to the
+    # supplied target, never the active runtime's older cron package.
+    sys.path.insert(0, str(resolved_root))
+    importlib.invalidate_caches()
+    module = importlib.import_module("cron.production_write_lease")
+    expected = (resolved_root / "cron/production_write_lease.py").resolve(strict=True)
+    if Path(module.__file__).resolve(strict=True) != expected:
+        raise RuntimeError("lease import did not resolve to override target module")
+    if not callable(getattr(module, "mutation_guard", None)):
+        raise RuntimeError("override target lease module lacks mutation_guard")
+except Exception as exc:
+    print(f"invalid production write lease bootstrap override: {exc}", file=sys.stderr)
+    raise SystemExit(2)
+PY
 }
 
 bootstrap_production_write_lease() {
@@ -1129,16 +1201,30 @@ bootstrap_production_write_lease() {
   # target's stdlib-only lease module and Hermes-home helper into /tmp before
   # any release-state write, then execute it with the known working current
   # runtime interpreter.  This is an upgrade bridge, not a persistent deploy.
-  PRODUCTION_WRITE_LEASE_BOOTSTRAP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/hermes-production-write-lease.XXXXXX")" \
-    || die "could not reserve production write lease bootstrap directory"
-  git_current archive "$SHA" cron/production_write_lease.py hermes_constants.py \
-    machine-setup/production_mutation_registry.json \
-    | tar -x -C "$PRODUCTION_WRITE_LEASE_BOOTSTRAP_DIR" \
-    || die "could not extract target production write lease bootstrap"
-  PRODUCTION_WRITE_LEASE_ROOT="$PRODUCTION_WRITE_LEASE_BOOTSTRAP_DIR"
   PRODUCTION_WRITE_LEASE_PYTHON="$CURRENT_LINK/venv/bin/python"
   [ -x "$PRODUCTION_WRITE_LEASE_PYTHON" ] \
     || die "current runtime Python is unavailable for production write lease bootstrap"
+  if [ -n "${HERMES_PRODUCTION_WRITE_LEASE_BOOTSTRAP_DIR:-}" ]; then
+    PRODUCTION_WRITE_LEASE_BOOTSTRAP_DIR="$HERMES_PRODUCTION_WRITE_LEASE_BOOTSTRAP_DIR"
+    PRODUCTION_WRITE_LEASE_BOOTSTRAP_OWNED=0
+    validate_production_write_lease_bootstrap "$PRODUCTION_WRITE_LEASE_BOOTSTRAP_DIR" \
+      || die "production write lease bootstrap override refused"
+  else
+    PRODUCTION_WRITE_LEASE_BOOTSTRAP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/hermes-production-write-lease.XXXXXX")" \
+      || die "could not reserve production write lease bootstrap directory"
+    PRODUCTION_WRITE_LEASE_BOOTSTRAP_OWNED=1
+    git_current archive "$SHA" cron/production_write_lease.py hermes_constants.py \
+      machine-setup/production_mutation_registry.json \
+      | tar -x -C "$PRODUCTION_WRITE_LEASE_BOOTSTRAP_DIR" \
+      || die "could not extract target production write lease bootstrap"
+    # Make the archive a self-contained, deliberately empty cron package so
+    # imports cannot fall through to an older active-runtime package.
+    : > "$PRODUCTION_WRITE_LEASE_BOOTSTRAP_DIR/cron/__init__.py" \
+      || die "could not create isolated lease bootstrap cron package"
+    validate_production_write_lease_bootstrap "$PRODUCTION_WRITE_LEASE_BOOTSTRAP_DIR" \
+      || die "generated production write lease bootstrap failed validation"
+  fi
+  PRODUCTION_WRITE_LEASE_ROOT="$PRODUCTION_WRITE_LEASE_BOOTSTRAP_DIR"
 }
 
 # ---------------------------------------------------------------------------

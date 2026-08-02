@@ -36,6 +36,80 @@ grep -Fq 'machine-setup/production_mutation_registry.json' "$SCRIPT" \
 grep -Fq 'active runtime commit for rollback lease' "$SCRIPT" \
   || fail "explicit rollback is not fenced by the production write lease"
 
+# A first deployment can explicitly provide the target lease module before
+# runtime-current contains it, but only from a tightly verified /tmp bundle.
+BOOTSTRAP_RUNTIME="$TEST_ROOT/bootstrap-runtime"
+BOOTSTRAP_OVERRIDE="$TEST_ROOT/production-write-lease-bootstrap"
+mkdir -p "$BOOTSTRAP_RUNTIME/venv/bin" "$BOOTSTRAP_OVERRIDE/cron" \
+  "$BOOTSTRAP_OVERRIDE/machine-setup"
+ln -s "$(command -v python3)" "$BOOTSTRAP_RUNTIME/venv/bin/python"
+cp "$SCRIPT_DIR/../../cron/production_write_lease.py" \
+  "$BOOTSTRAP_OVERRIDE/cron/production_write_lease.py"
+: > "$BOOTSTRAP_OVERRIDE/cron/__init__.py"
+cp "$SCRIPT_DIR/../../hermes_constants.py" "$BOOTSTRAP_OVERRIDE/hermes_constants.py"
+cp "$SCRIPT_DIR/../../machine-setup/production_mutation_registry.json" \
+  "$BOOTSTRAP_OVERRIDE/machine-setup/production_mutation_registry.json"
+BOOTSTRAP_CURRENT="$HERMES_HOME/runtime-current"
+ln -s "$BOOTSTRAP_RUNTIME" "$BOOTSTRAP_CURRENT"
+bootstrap_production_write_lease() { :; } # replaced after negative fixture below
+
+# The real function must reject an override that would execute package code.
+if (
+  unset -f bootstrap_production_write_lease
+  eval "$(sed -n '/^validate_production_write_lease_bootstrap() {/,/^}$/p' "$SCRIPT")"
+  PRODUCTION_WRITE_LEASE_PYTHON="$BOOTSTRAP_RUNTIME/venv/bin/python"
+  printf 'not empty\n' > "$BOOTSTRAP_OVERRIDE/cron/__init__.py"
+  validate_production_write_lease_bootstrap "$BOOTSTRAP_OVERRIDE"
+); then
+  fail "non-empty lease bootstrap cron init was accepted"
+fi
+: > "$BOOTSTRAP_OVERRIDE/cron/__init__.py"
+# A safe leaf is insufficient if an intermediate directory is a symlink.
+# Exercise both package parents, including a symlink that still points inside
+# the otherwise-valid override tree.
+mv "$BOOTSTRAP_OVERRIDE/cron" "$BOOTSTRAP_OVERRIDE/cron-real"
+ln -s cron-real "$BOOTSTRAP_OVERRIDE/cron"
+if (
+  PRODUCTION_WRITE_LEASE_PYTHON="$BOOTSTRAP_RUNTIME/venv/bin/python"
+  validate_production_write_lease_bootstrap "$BOOTSTRAP_OVERRIDE"
+); then
+  fail "symlinked lease bootstrap cron parent was accepted"
+fi
+rm "$BOOTSTRAP_OVERRIDE/cron"
+mv "$BOOTSTRAP_OVERRIDE/cron-real" "$BOOTSTRAP_OVERRIDE/cron"
+mv "$BOOTSTRAP_OVERRIDE/machine-setup" "$BOOTSTRAP_OVERRIDE/machine-setup-real"
+ln -s machine-setup-real "$BOOTSTRAP_OVERRIDE/machine-setup"
+if (
+  PRODUCTION_WRITE_LEASE_PYTHON="$BOOTSTRAP_RUNTIME/venv/bin/python"
+  validate_production_write_lease_bootstrap "$BOOTSTRAP_OVERRIDE"
+); then
+  fail "symlinked lease bootstrap machine-setup parent was accepted"
+fi
+rm "$BOOTSTRAP_OVERRIDE/machine-setup"
+mv "$BOOTSTRAP_OVERRIDE/machine-setup-real" "$BOOTSTRAP_OVERRIDE/machine-setup"
+# Invoke the real bootstrap in a fresh sourced helper context; it must select
+# and import the override target rather than relying on git archive/current.
+unset -f bootstrap_production_write_lease
+eval "$(sed -n '/^bootstrap_production_write_lease() {/,/^}$/p' "$SCRIPT")"
+HERMES_PRODUCTION_WRITE_LEASE_BOOTSTRAP_DIR="$BOOTSTRAP_OVERRIDE" \
+  bootstrap_production_write_lease
+[ "$PRODUCTION_WRITE_LEASE_ROOT" = "$BOOTSTRAP_OVERRIDE" ] \
+  || fail "valid lease bootstrap override was not selected"
+"$PRODUCTION_WRITE_LEASE_PYTHON" - "$PRODUCTION_WRITE_LEASE_ROOT" <<'PY' \
+  || fail "valid lease bootstrap override did not import target mutation guard"
+import sys
+from pathlib import Path
+root = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(root))
+from cron import production_write_lease
+assert Path(production_write_lease.__file__).resolve() == root / "cron/production_write_lease.py"
+assert callable(production_write_lease.mutation_guard)
+PY
+cleanup_production_write_lease_bootstrap
+[ -d "$BOOTSTRAP_OVERRIDE" ] || fail "caller-owned lease bootstrap override was deleted"
+rm "$BOOTSTRAP_CURRENT"
+unset HERMES_PRODUCTION_WRITE_LEASE_BOOTSTRAP_DIR
+
 # A fence failure after the atomic runtime-current swap must NOT invoke a
 # stale-owner rollback. It records loss evidence and leaves recovery to the
 # successor/operator.
