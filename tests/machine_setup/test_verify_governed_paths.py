@@ -123,6 +123,24 @@ def test_verifier_detects_direct_managed_config_write(tmp_path):
         module.GovernedPathsVerifier(home=tmp_path, fixture_safe=True).verify()
 
 
+def test_verifier_ignores_runtime_claims_but_enforces_repeat_limit(tmp_path):
+    _install_fixture(tmp_path)
+    jobs_path = tmp_path / ".hermes" / "cron" / "jobs.json"
+    jobs = json.loads(jobs_path.read_text())
+    job = jobs["jobs"][0]
+    job["fire_claim"] = {"owner": "scheduler"}
+    job["run_claim"] = {"run": "runtime-only"}
+    job["repeat"]["completed"] = 7
+    jobs_path.write_text(json.dumps(jobs), encoding="utf-8")
+
+    module.GovernedPathsVerifier(home=tmp_path, fixture_safe=True).verify()
+
+    job["repeat"]["times"] = 3
+    jobs_path.write_text(json.dumps(jobs), encoding="utf-8")
+    with pytest.raises(module.VerificationError, match="managed cron job drifted"):
+        module.GovernedPathsVerifier(home=tmp_path, fixture_safe=True).verify()
+
+
 def test_deployed_default_fleet_root_uses_active_release(tmp_path):
     active = _install_fixture(tmp_path)
     deployed_machine_setup = active / "machine-setup"
