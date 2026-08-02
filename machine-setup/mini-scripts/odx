@@ -1,0 +1,472 @@
+#!/bin/bash
+# odx — thin CLI over the loopback-only Open Design daemon HTTP API.
+#
+# Named odx, not od: /usr/bin/od (octal dump) already owns that name, and the
+# upstream `od` CLI is a Node entry point we deliberately do not depend on.
+# This wrapper speaks the daemon's HTTP API directly (no MCP, no node), so it
+# needs only bash 3.2 + curl + /usr/bin/python3, all of which ship with macOS.
+#
+# Endpoint mapping (upstream route -> odx subcommand):
+#   GET  /api/health                        -> odx health
+#   GET  /api/daemon/status                 -> odx health   (bind/port detail)
+#   POST /api/projects                      -> odx run      (implicit project)
+#   POST /api/runs                          -> odx run      (submit)
+#   GET  /api/runs/:id                      -> odx run      (poll) / odx export
+#   GET  /api/projects/:id/export/manifest  -> odx export    (artifact manifest)
+#   GET  /api/projects/:id/archive          -> odx export    (zip of the tree)
+#
+# The daemon's unit of work is a "run"; there is no separate job/session API.
+# Terminal ChatRunStatus values are succeeded | failed | canceled.
+set -euo pipefail
+
+ODX_VERSION="1.0.0"
+OD_BASE_URL="${OD_BASE_URL:-http://127.0.0.1:7456}"
+OD_BASE_URL="${OD_BASE_URL%/}"
+TOKEN_FILE="${OD_API_TOKEN_FILE:-$HOME/.hermes/secrets/od_api_token}"
+DEFAULT_BACKEND="${OD_BACKEND:-codex}"
+CONNECT_TIMEOUT="${ODX_CONNECT_TIMEOUT:-5}"
+HTTP_TIMEOUT="${ODX_HTTP_TIMEOUT:-120}"
+POLL_INTERVAL="${ODX_POLL_INTERVAL:-3}"
+RUN_TIMEOUT="${ODX_RUN_TIMEOUT:-1800}"
+PYTHON_BIN="${ODX_PYTHON:-/usr/bin/python3}"
+
+# Exit codes follow the mini's launchd convention.
+EXIT_RUN_FAILED=1
+EXIT_USAGE=2
+EXIT_RUNTIME=70
+EXIT_TIMEOUT=75
+EXIT_CONFIG=78
+
+CURL_CONFIG=""
+SCRATCH_DIR=""
+SCRATCH_FILE=""
+API_BODY=""
+API_STATUS=""
+RUN_ID=""
+RUN_PROJECT_ID=""
+
+log() { printf 'odx: %s\n' "$*" >&2; }
+die() { local code="$1"; shift; printf 'odx: %s\n' "$*" >&2; exit "$code"; }
+
+# shellcheck disable=SC2329  # invoked by the EXIT trap
+cleanup() {
+  local status=$?
+  trap - EXIT
+  if [ -n "$CURL_CONFIG" ]; then rm -f "$CURL_CONFIG"; fi
+  if [ -n "$SCRATCH_DIR" ]; then rm -rf "$SCRATCH_DIR"; fi
+  exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+usage() {
+  cat >&2 <<'USAGE'
+usage: odx <command> [args]
+
+  odx health
+      Ping the daemon (GET /api/health) and print version + bind info.
+
+  odx run "<prompt>" [--profile ID] [--backend codex|opencode] [--model M]
+                     [--project ID] [--timeout SECONDS]
+      Create a project (unless --project), POST /api/runs, poll to a terminal
+      status. Progress goes to stderr; the run id is the only stdout line.
+      --profile pins the design system (designSystemId) for the run.
+
+  odx export <run-id> --out <dir>
+      Resolve the run's project, write run.json + export-manifest.json + the
+      project archive, and expand the archive under <dir>/files.
+
+  odx run-export "<prompt>" --out <dir> [run options]
+      run + export in one pass. Prints the output dir on stdout.
+
+  odx version | odx help
+
+env: OD_BASE_URL (default http://127.0.0.1:7456), OD_API_TOKEN,
+     OD_API_TOKEN_FILE (default ~/.hermes/secrets/od_api_token),
+     OD_BACKEND (default codex), ODX_RUN_TIMEOUT, ODX_POLL_INTERVAL
+
+exit: 0 ok, 1 run failed/canceled, 2 usage, 70 daemon/HTTP, 75 timeout,
+      78 config (missing/rejected token, missing dependency)
+USAGE
+  exit "$EXIT_USAGE"
+}
+
+ensure_scratch() {
+  if [ -z "$SCRATCH_DIR" ]; then
+    SCRATCH_DIR="$(mktemp -d "${TMPDIR:-/tmp}/odx.XXXXXX")" || die "$EXIT_RUNTIME" "mktemp -d failed"
+    chmod 700 "$SCRATCH_DIR"
+  fi
+}
+
+# Sets SCRATCH_FILE. Never call inside $( ) — it mutates globals.
+scratch_file() {
+  ensure_scratch
+  SCRATCH_FILE="$(mktemp "$SCRATCH_DIR/part.XXXXXX")" || die "$EXIT_RUNTIME" "mktemp failed"
+}
+
+# Resolve the bearer token without ever printing it or exposing it in argv.
+resolve_token() {
+  local token=""
+  if [ -n "${OD_API_TOKEN:-}" ]; then
+    token="$OD_API_TOKEN"
+  else
+    [ -f "$TOKEN_FILE" ] || die "$EXIT_CONFIG" \
+      "OD_API_TOKEN is unset and no token file at $TOKEN_FILE"
+    local perms
+    perms="$(/usr/bin/stat -f '%Lp' "$TOKEN_FILE")" || die "$EXIT_CONFIG" "cannot stat $TOKEN_FILE"
+    case "$perms" in
+      600|400) ;;
+      *) die "$EXIT_CONFIG" "$TOKEN_FILE must be mode 0600 (found 0$perms)" ;;
+    esac
+    token="$(/usr/bin/head -n 1 "$TOKEN_FILE" | /usr/bin/tr -d '\r\n')"
+    [ -n "$token" ] || die "$EXIT_CONFIG" "$TOKEN_FILE is empty"
+  fi
+
+  # curl -K keeps the Authorization header out of the process argv table.
+  CURL_CONFIG="$(mktemp "${TMPDIR:-/tmp}/odx-curl.XXXXXX")" || die "$EXIT_RUNTIME" "mktemp failed"
+  chmod 600 "$CURL_CONFIG"
+  printf '%s' "$token" | "$PYTHON_BIN" -c '
+import sys
+
+token = sys.stdin.read().strip()
+escaped = token.replace("\\", "\\\\").replace("\"", "\\\"")
+sys.stdout.write("silent\nshow-error\n")
+sys.stdout.write("header = \"Authorization: Bearer %s\"\n" % escaped)
+' >"$CURL_CONFIG" || die "$EXIT_RUNTIME" "failed to stage curl config"
+  token=""
+  unset OD_API_TOKEN
+}
+
+# api <method> <path> [request-body-file]; sets API_STATUS and API_BODY (a file).
+api() {
+  local method="$1" path="$2" body_file="${3:-}"
+  scratch_file
+  API_BODY="$SCRATCH_FILE"
+  local curl_status=0
+  set +e
+  if [ -n "$body_file" ]; then
+    API_STATUS="$(curl -K "$CURL_CONFIG" -X "$method" \
+      --connect-timeout "$CONNECT_TIMEOUT" --max-time "$HTTP_TIMEOUT" \
+      -H 'Content-Type: application/json' --data-binary "@$body_file" \
+      -o "$API_BODY" -w '%{http_code}' "$OD_BASE_URL$path")"
+  else
+    API_STATUS="$(curl -K "$CURL_CONFIG" -X "$method" \
+      --connect-timeout "$CONNECT_TIMEOUT" --max-time "$HTTP_TIMEOUT" \
+      -o "$API_BODY" -w '%{http_code}' "$OD_BASE_URL$path")"
+  fi
+  curl_status=$?
+  set -e
+  [ "$curl_status" -eq 0 ] || die "$EXIT_RUNTIME" \
+    "$method $path: curl failed (exit $curl_status, base $OD_BASE_URL)"
+}
+
+# api_download <path> <dest-file>; sets API_STATUS.
+api_download() {
+  local path="$1" dest="$2" curl_status=0
+  set +e
+  API_STATUS="$(curl -K "$CURL_CONFIG" \
+    --connect-timeout "$CONNECT_TIMEOUT" --max-time "$((HTTP_TIMEOUT * 4))" \
+    -o "$dest" -w '%{http_code}' "$OD_BASE_URL$path")"
+  curl_status=$?
+  set -e
+  [ "$curl_status" -eq 0 ] || die "$EXIT_RUNTIME" "GET $path: curl failed (exit $curl_status)"
+}
+
+# jget <file> <dotted.path> -> scalar value, or empty.
+jget() {
+  "$PYTHON_BIN" -c '
+import json, sys
+
+try:
+    data = json.load(open(sys.argv[1]))
+except Exception:
+    raise SystemExit(0)
+cur = data
+for key in sys.argv[2].split("."):
+    if not isinstance(cur, dict):
+        cur = None
+        break
+    cur = cur.get(key)
+if cur is None or isinstance(cur, (dict, list)):
+    raise SystemExit(0)
+if cur is True:
+    print("true")
+elif cur is False:
+    print("false")
+else:
+    print(cur)
+' "$1" "$2" 2>/dev/null || true
+}
+
+api_error() {
+  local code message
+  code="$(jget "$API_BODY" error.code)"
+  message="$(jget "$API_BODY" error.message)"
+  [ -n "$message" ] || message="$(jget "$API_BODY" error)"
+  printf '%s%s' "${code:+$code: }" "${message:-no error detail}"
+}
+
+expect_ok() {
+  local what="$1"
+  case "$API_STATUS" in
+    2*) return 0 ;;
+    401) die "$EXIT_CONFIG" "$what: 401 — OD_API_TOKEN rejected by the daemon" ;;
+    000) die "$EXIT_RUNTIME" "$what: no response from $OD_BASE_URL (daemon down?)" ;;
+    *) die "$EXIT_RUNTIME" "$what: HTTP $API_STATUS — $(api_error)" ;;
+  esac
+}
+
+# json_body key=value ... ; empty values are dropped so we never send nulls.
+json_body() {
+  "$PYTHON_BIN" -c '
+import json, sys
+
+out = {}
+for arg in sys.argv[1:]:
+    key, _, value = arg.partition("=")
+    if not key or value == "":
+        continue
+    out[key] = value
+print(json.dumps(out))
+' "$@"
+}
+
+new_id() {
+  "$PYTHON_BIN" -c '
+import secrets, time
+
+print("odx-%s-%s" % (time.strftime("%Y%m%d-%H%M%S"), secrets.token_hex(3)))
+'
+}
+
+# ---------------------------------------------------------------- health -----
+cmd_health() {
+  local version bind="" port=""
+  api GET /api/health
+  expect_ok "health"
+  version="$(jget "$API_BODY" version)"
+
+  # Rich status is authenticated and reports the bind/port actually opened.
+  # Treat a non-2xx here as informational, not fatal.
+  api GET /api/daemon/status
+  case "$API_STATUS" in
+    2*)
+      bind="$(jget "$API_BODY" bindHost)"
+      port="$(jget "$API_BODY" port)"
+      ;;
+  esac
+  printf 'ok base=%s version=%s%s%s\n' \
+    "$OD_BASE_URL" "${version:-unknown}" "${bind:+ bind=$bind}" "${port:+ port=$port}"
+}
+
+# ------------------------------------------------------------------- run -----
+cmd_run() {
+  local prompt="" profile="" backend="$DEFAULT_BACKEND" model="" project_id=""
+  local timeout="$RUN_TIMEOUT"
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --profile|--design-system) profile="${2:-}"; shift 2 ;;
+      --backend|--agent) backend="${2:-}"; shift 2 ;;
+      --model) model="${2:-}"; shift 2 ;;
+      --project) project_id="${2:-}"; shift 2 ;;
+      --timeout) timeout="${2:-}"; shift 2 ;;
+      --) shift ;;
+      -*) die "$EXIT_USAGE" "unknown run option: $1" ;;
+      *)
+        [ -z "$prompt" ] || die "$EXIT_USAGE" "unexpected argument: $1"
+        prompt="$1"; shift ;;
+    esac
+  done
+  [ -n "$prompt" ] || die "$EXIT_USAGE" "run requires a prompt"
+  case "$backend" in
+    codex|opencode|byok-opencode) ;;
+    *) die "$EXIT_USAGE" "unsupported --backend '$backend' (codex|opencode|byok-opencode)" ;;
+  esac
+  case "$timeout" in
+    ''|*[!0-9]*) die "$EXIT_USAGE" "--timeout must be whole seconds" ;;
+  esac
+
+  if [ -z "$project_id" ]; then
+    local name
+    project_id="$(new_id)"
+    name="$("$PYTHON_BIN" -c '
+import sys
+
+text = " ".join(sys.argv[1].split())
+print(text[:60] or "odx run")
+' "$prompt")"
+    scratch_file
+    json_body "id=$project_id" "name=$name" >"$SCRATCH_FILE"
+    api POST /api/projects "$SCRATCH_FILE"
+    expect_ok "create project $project_id"
+    log "project $project_id created"
+  fi
+  RUN_PROJECT_ID="$project_id"   # exported for callers that need the project
+
+  scratch_file
+  json_body \
+    "projectId=$project_id" \
+    "message=$prompt" \
+    "agentId=$backend" \
+    "clientRequestId=$(new_id)" \
+    "model=$model" \
+    "designSystemId=$profile" >"$SCRATCH_FILE"
+  api POST /api/runs "$SCRATCH_FILE"
+  expect_ok "submit run"
+  RUN_ID="$(jget "$API_BODY" runId)"
+  [ -n "$RUN_ID" ] || die "$EXIT_RUNTIME" "daemon accepted the run but returned no runId"
+  log "run $RUN_ID backend=$backend project=$project_id"
+
+  poll_run "$RUN_ID" "$timeout"
+}
+
+poll_run() {
+  local run_id="$1" timeout="$2"
+  local deadline last_status="" status artifacts deliverable
+  deadline=$(( $(date +%s) + timeout ))
+
+  while :; do
+    api GET "/api/runs/$run_id"
+    expect_ok "poll run $run_id"
+    status="$(jget "$API_BODY" status)"
+    [ -n "$status" ] || status="unknown"
+    if [ "$status" != "$last_status" ]; then
+      log "  ${last_status:+$last_status -> }$status"
+      last_status="$status"
+    fi
+    case "$status" in
+      succeeded)
+        artifacts="$(jget "$API_BODY" artifactCount)"
+        deliverable="$(jget "$API_BODY" deliverableEntryFile)"
+        log "succeeded artifacts=${artifacts:-0}${deliverable:+ entry=$deliverable}"
+        if [ "$(jget "$API_BODY" endedWithUnfinishedWork)" = "true" ]; then
+          log "WARNING: run ended with declared work unfinished"
+        fi
+        if [ "$(jget "$API_BODY" deliverableValid)" = "false" ]; then
+          log "WARNING: deliverable validation = $(jget "$API_BODY" deliverableValidation)"
+        fi
+        printf '%s\n' "$run_id"
+        return 0
+        ;;
+      failed|canceled)
+        log "$status: $(jget "$API_BODY" errorCode) $(jget "$API_BODY" error)"
+        log "  failure=$(jget "$API_BODY" failureCategory)/$(jget "$API_BODY" failureDetail)" \
+            "action=$(jget "$API_BODY" failureAction)"
+        exit "$EXIT_RUN_FAILED"
+        ;;
+    esac
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      die "$EXIT_TIMEOUT" \
+        "run $run_id still $status after ${timeout}s (POST /api/runs/$run_id/cancel to stop it)"
+    fi
+    sleep "$POLL_INTERVAL"
+  done
+}
+
+# ---------------------------------------------------------------- export -----
+cmd_export() {
+  local run_id="" out_dir=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --out) out_dir="${2:-}"; shift 2 ;;
+      --) shift ;;
+      -*) die "$EXIT_USAGE" "unknown export option: $1" ;;
+      *)
+        [ -z "$run_id" ] || die "$EXIT_USAGE" "unexpected argument: $1"
+        run_id="$1"; shift ;;
+    esac
+  done
+  [ -n "$run_id" ] || die "$EXIT_USAGE" "export requires a run id"
+  [ -n "$out_dir" ] || die "$EXIT_USAGE" "export requires --out <dir>"
+
+  local project_id status count zip_path
+  api GET "/api/runs/$run_id"
+  expect_ok "read run $run_id"
+  project_id="$(jget "$API_BODY" projectId)"
+  status="$(jget "$API_BODY" status)"
+  [ -n "$project_id" ] || die "$EXIT_RUNTIME" "run $run_id has no project to export"
+  [ "$status" = "succeeded" ] || log "WARNING: run $run_id status=$status; exporting anyway"
+
+  mkdir -p "$out_dir"
+  cp "$API_BODY" "$out_dir/run.json"
+
+  api GET "/api/projects/$project_id/export/manifest"
+  expect_ok "export manifest for $project_id"
+  cp "$API_BODY" "$out_dir/export-manifest.json"
+
+  zip_path="$out_dir/$project_id.zip"
+  api_download "/api/projects/$project_id/archive" "$zip_path"
+  case "$API_STATUS" in
+    2*) ;;
+    *)
+      # curl -o already wrote the error body to $zip_path; drop it so we never
+      # leave a file named *.zip that is actually a JSON error payload.
+      local archive_error
+      archive_error="$(jget "$zip_path" error.message)"
+      [ -n "$archive_error" ] || archive_error="$(jget "$zip_path" error)"
+      rm -f "$zip_path"
+      die "$EXIT_RUNTIME" \
+        "archive for $project_id: HTTP $API_STATUS${archive_error:+ — $archive_error}"
+      ;;
+  esac
+
+  count="$("$PYTHON_BIN" -c '
+import os, sys, zipfile
+
+archive, dest = sys.argv[1], sys.argv[2]
+root = os.path.abspath(dest)
+os.makedirs(root, exist_ok=True)
+written = 0
+with zipfile.ZipFile(archive) as zf:
+    for info in zf.infolist():
+        name = info.filename
+        if os.path.isabs(name) or name.startswith("/") or ".." in name.split("/"):
+            raise SystemExit("refusing unsafe archive entry: %s" % name)
+        target = os.path.abspath(os.path.join(root, name))
+        if target != root and not target.startswith(root + os.sep):
+            raise SystemExit("refusing archive entry outside destination: %s" % name)
+        zf.extract(info, root)
+        if not info.is_dir():
+            written += 1
+print(written)
+' "$zip_path" "$out_dir/files")" || die "$EXIT_RUNTIME" "failed to expand $zip_path"
+
+  log "exported run=$run_id project=$project_id files=$count -> $out_dir"
+  printf '%s\n' "$out_dir"
+}
+
+# ------------------------------------------------------------ run-export -----
+cmd_run_export() {
+  local out_dir=""
+  local run_args=()
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --out) out_dir="${2:-}"; shift 2 ;;
+      *) run_args[${#run_args[@]}]="$1"; shift ;;
+    esac
+  done
+  [ -n "$out_dir" ] || die "$EXIT_USAGE" "run-export requires --out <dir>"
+  [ "${#run_args[@]}" -gt 0 ] || die "$EXIT_USAGE" "run-export requires a prompt"
+
+  cmd_run "${run_args[@]}" >/dev/null
+  [ -n "$RUN_ID" ] || die "$EXIT_RUNTIME" "run produced no id"
+  cmd_export "$RUN_ID" --out "$out_dir"
+}
+
+# ------------------------------------------------------------------ main -----
+[ "$#" -ge 1 ] || usage
+[ -x "$PYTHON_BIN" ] || die "$EXIT_CONFIG" "python3 not executable at $PYTHON_BIN"
+command -v curl >/dev/null 2>&1 || die "$EXIT_CONFIG" "curl not found on PATH"
+
+odx_command="$1"
+shift
+case "$odx_command" in
+  version|--version|-V) printf 'odx %s\n' "$ODX_VERSION" ;;
+  help|--help|-h) usage ;;
+  health) resolve_token; cmd_health ;;
+  run) resolve_token; cmd_run "$@" ;;
+  export) resolve_token; cmd_export "$@" ;;
+  run-export) resolve_token; cmd_run_export "$@" ;;
+  *) die "$EXIT_USAGE" "unknown command: $odx_command (try: odx help)" ;;
+esac
