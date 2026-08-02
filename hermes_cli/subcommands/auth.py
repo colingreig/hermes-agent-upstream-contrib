@@ -71,7 +71,14 @@ def build_auth_parser(subparsers, *, cmd_auth: Callable) -> None:
     )
     auth_logout.add_argument("provider", help="Provider id")
     auth_codex = auth_subparsers.add_parser(
-        "codex", help="Manage OpenAI Codex OAuth accounts (multi-account)"
+        "codex",
+        help="Manage OpenAI Codex OAuth accounts (multi-account)",
+        description=(
+            "Manage named OpenAI Codex OAuth account slots. Independent "
+            "credentials added via `hermes auth add openai-codex` are separate "
+            "pool entries, not account slots; `switch` ranks the preferred "
+            "slot above them."
+        ),
     )
     codex_subparsers = auth_codex.add_subparsers(dest="codex_action")
     codex_login = codex_subparsers.add_parser(

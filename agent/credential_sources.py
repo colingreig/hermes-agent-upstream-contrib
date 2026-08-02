@@ -324,7 +324,7 @@ def _remove_codex_device_code(provider: str, removed) -> RemovalResult:
         ])
         return result
 
-    if _clear_auth_store_provider(provider):
+    if _clear_codex_primary_slot():
         result.cleaned.append(f"Cleared {provider} OAuth tokens from auth store")
     # Suppress the canonical re-seed source, not just whatever source the
     # removed entry had.  Otherwise `manual:device_code` removals wouldn't
@@ -336,6 +336,50 @@ def _remove_codex_device_code(provider: str, removed) -> RemovalResult:
         "Run `hermes auth add openai-codex` to re-enable if needed.",
     ])
     return result
+
+
+def _clear_codex_primary_slot() -> bool:
+    """Clear the PRIMARY Codex slot, preserving named account slots.
+
+    Removing the primary credential must not destroy independent named
+    accounts living under ``providers.openai-codex.accounts`` (or a
+    ``preferred_account`` pointing at one of them).  Only the primary-slot
+    fields are popped; when no named accounts remain, fall back to deleting
+    the whole provider block — byte-for-byte the legacy single-account
+    removal behavior.  Returns True if anything was cleared.
+    """
+    from hermes_cli.auth import (
+        _auth_store_lock,
+        _load_auth_store,
+        _save_auth_store,
+    )
+
+    try:
+        with _auth_store_lock():
+            auth_store = _load_auth_store()
+            providers_dict = auth_store.get("providers")
+            if not isinstance(providers_dict, dict) or "openai-codex" not in providers_dict:
+                return False
+            state = providers_dict["openai-codex"]
+            accounts = state.get("accounts") if isinstance(state, dict) else None
+            has_named_accounts = isinstance(accounts, dict) and any(
+                isinstance(slot, dict) for slot in accounts.values()
+            )
+            if not has_named_accounts:
+                # Legacy shape — nothing to preserve, delete the block.
+                del providers_dict["openai-codex"]
+                _save_auth_store(auth_store)
+                return True
+            for key in ("tokens", "last_refresh", "label", "auth_mode", "last_auth_error"):
+                state.pop(key, None)
+            # A preference pointing at the (now gone) primary slot is stale;
+            # a preference for a surviving named account is kept.
+            if str(state.get("preferred_account") or "").strip().lower() in {"", "primary"}:
+                state.pop("preferred_account", None)
+            _save_auth_store(auth_store)
+            return True
+    except Exception:
+        return False
 
 
 def _clear_codex_account_slot(account: str) -> bool:

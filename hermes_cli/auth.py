@@ -3686,7 +3686,7 @@ def _codex_pool_source_rate_limited(pool_entries: Any, source: str) -> bool:
     return False
 
 
-def _select_codex_runtime_account() -> str:
+def _select_codex_runtime_account(state: Optional[Dict[str, Any]] = None) -> str:
     """Pick the account slot runtime resolution should serve.
 
     Order: the preferred account first, then the primary slot, then the
@@ -3696,13 +3696,16 @@ def _select_codex_runtime_account() -> str:
     to the other one automatically.  Falls back to the first populated slot
     when every candidate is cooling down (better to surface the provider's
     own 429 than to invent a local error).
+
+    Pass an already-loaded provider ``state`` to skip the auth-store read.
     """
-    try:
-        with _auth_store_lock():
-            auth_store = _load_auth_store()
-        state = _load_provider_state(auth_store, "openai-codex")
-    except Exception:
-        return CODEX_PRIMARY_ACCOUNT
+    if state is None:
+        try:
+            with _auth_store_lock():
+                auth_store = _load_auth_store()
+            state = _load_provider_state(auth_store, "openai-codex")
+        except Exception:
+            return CODEX_PRIMARY_ACCOUNT
     if not isinstance(state, dict):
         return CODEX_PRIMARY_ACCOUNT
 
@@ -4212,11 +4215,28 @@ def resolve_codex_runtime_credentials(
     persists into ITS slot only — it never clobbers the primary singleton or
     other named accounts.
     """
-    resolved_account = (
-        normalize_codex_account_label(account)
-        if account is not None
-        else _select_codex_runtime_account()
-    )
+    if account is not None:
+        resolved_account = normalize_codex_account_label(account)
+    else:
+        # Fast path for the overwhelmingly common single-account setup: when
+        # the provider state has no named ``accounts`` and no persisted
+        # ``preferred_account``, skip multi-account selection entirely (it
+        # costs an extra credential-pool read) — one lock-free state read,
+        # then straight to the legacy resolution below.
+        try:
+            _ma_state = _load_provider_state(_load_auth_store(), "openai-codex")
+        except Exception:
+            _ma_state = None
+        _ma_accounts = _ma_state.get("accounts") if isinstance(_ma_state, dict) else None
+        _ma_preferred = (
+            str(_ma_state.get("preferred_account") or "").strip()
+            if isinstance(_ma_state, dict)
+            else ""
+        )
+        if not _ma_preferred and not (isinstance(_ma_accounts, dict) and _ma_accounts):
+            resolved_account = CODEX_PRIMARY_ACCOUNT
+        else:
+            resolved_account = _select_codex_runtime_account(_ma_state)
     if resolved_account != CODEX_PRIMARY_ACCOUNT:
         return _resolve_codex_named_account_credentials(
             resolved_account,

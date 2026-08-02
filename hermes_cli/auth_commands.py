@@ -579,6 +579,17 @@ def auth_codex_list_command(args) -> None:
         )
     print()
     print("  * = preferred account — change with `hermes auth codex switch <account>`")
+    # Independent Codex credentials created by `hermes auth add openai-codex`
+    # (source manual:device_code) are not account slots; when one of them
+    # would win selection, say so instead of showing no selection marker.
+    slot_sources = {acct["source"] for acct in accounts}
+    if selected is not None and selected.source not in slot_sources:
+        print(
+            f'  note: the pool would currently select the independent credential '
+            f'"{selected.label}" ({_display_source(selected.source)}, added via '
+            "`hermes auth add openai-codex`) — not an account slot. Setting a "
+            "preferred account ranks the slot above it."
+        )
 
 
 def auth_codex_switch_command(args) -> None:

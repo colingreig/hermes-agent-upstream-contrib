@@ -281,3 +281,88 @@ def test_auth_remove_named_account_clears_slot_and_suppresses(tmp_path, monkeypa
     # Re-load does not resurrect the removed slot; the primary remains.
     pool = load_pool("openai-codex")
     assert [e.source for e in pool.entries()] == ["device_code"]
+
+
+def test_auth_remove_primary_preserves_named_accounts(tmp_path, monkeypatch):
+    """Inverse of the named-slot removal test: removing the PRIMARY credential
+    must clear only the primary-slot fields — named accounts and a preference
+    pointing at one of them survive."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(tmp_path, _dual_account_store(preferred="work"))
+
+    from agent.credential_pool import load_pool
+
+    load_pool("openai-codex")  # seed pool entries
+
+    from hermes_cli.auth_commands import auth_remove_command
+
+    auth_remove_command(
+        SimpleNamespace(provider="openai-codex", target="device_code")
+    )
+
+    store = _read_auth_store(tmp_path)
+    state = store["providers"]["openai-codex"]
+    # Primary slot fields gone; named slot + preference intact.
+    assert "tokens" not in state
+    assert state["accounts"]["work"]["tokens"]["access_token"] == "access-WORK-secret"
+    assert state["preferred_account"] == "work"
+    # Only the primary re-seed source is suppressed.
+    suppressed = store.get("suppressed_sources", {}).get("openai-codex", [])
+    assert "device_code" in suppressed
+    assert "device_code:work" not in suppressed
+
+    pool = load_pool("openai-codex")
+    assert [e.source for e in pool.entries()] == ["device_code:work"]
+
+
+def test_auth_remove_primary_without_named_accounts_deletes_block(tmp_path, monkeypatch):
+    """Legacy back-compat: with no named accounts, primary removal still
+    deletes the whole providers.openai-codex block (historical behavior)."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    store = _dual_account_store()
+    del store["providers"]["openai-codex"]["accounts"]
+    _write_auth_store(tmp_path, store)
+
+    from agent.credential_pool import load_pool
+
+    load_pool("openai-codex")
+
+    from hermes_cli.auth_commands import auth_remove_command
+
+    auth_remove_command(
+        SimpleNamespace(provider="openai-codex", target="device_code")
+    )
+
+    persisted = _read_auth_store(tmp_path)
+    assert "openai-codex" not in persisted.get("providers", {})
+    assert persisted.get("credential_pool", {}).get("openai-codex", []) == []
+
+
+def test_codex_list_notes_independent_manual_entry(tmp_path, monkeypatch, capsys):
+    """`hermes auth codex list` must not crash or silently mislead when an
+    independent `hermes auth add openai-codex` credential outranks the slots."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    store = _dual_account_store()
+    store["credential_pool"] = {
+        "openai-codex": [
+            {
+                "id": "manu01",
+                "label": "extra-account",
+                "auth_type": "oauth",
+                "priority": 0,
+                "source": "manual:device_code",
+                "access_token": "access-MANUAL-secret",
+                "refresh_token": "refresh-MANUAL-secret",
+            }
+        ]
+    }
+    _write_auth_store(tmp_path, store)
+
+    from hermes_cli.auth_commands import auth_codex_command
+
+    auth_codex_command(SimpleNamespace(codex_action="list"))
+
+    out = capsys.readouterr().out
+    assert "independent credential" in out
+    assert "extra-account" in out
+    assert "access-MANUAL-secret" not in out
