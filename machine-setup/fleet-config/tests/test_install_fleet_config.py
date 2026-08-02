@@ -152,6 +152,82 @@ def test_real_install_writes_all_three_destinations(bundle):
         assert (bundle["home"] / ".hermes" / "profiles" / "ops" / sub).is_dir()
 
 
+def test_dry_run_and_activation_materialize_the_same_job_prompt_postconditions(
+    bundle, monkeypatch
+):
+    jobs_payload = {
+        "jobs": [{"id": "1", "name": "synthetic-job", "prompt": "base prompt"}],
+        "job_prompt_postconditions": {"1": "required postcondition"},
+    }
+    jobs_data = json.dumps(jobs_payload).encode()
+    (bundle["bundle_root"] / "jobs.json").write_bytes(jobs_data)
+    jobs_entry = next(
+        entry
+        for entry in bundle["manifest"]["files"]
+        if entry["deploy_mode"] == "jobs_json"
+    )
+    jobs_entry["sha256"] = _sha(jobs_data)
+    bundle["manifest_path"].write_text(
+        json.dumps(bundle["manifest"], indent=2), encoding="utf-8"
+    )
+
+    calls = []
+    real_load_jobs_payload = install_mod._load_jobs_payload
+
+    def recording_load_jobs_payload(item, *, verified_bytes=None):
+        calls.append((item["src"], verified_bytes))
+        if verified_bytes is not None:
+            item["src"].write_text(
+                json.dumps(
+                    {
+                        "jobs": [
+                            {
+                                "id": "1",
+                                "name": "unverified-replacement",
+                                "prompt": "must not install",
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+        return real_load_jobs_payload(item, verified_bytes=verified_bytes)
+
+    monkeypatch.setattr(install_mod, "_load_jobs_payload", recording_load_jobs_payload)
+
+    assert install_mod.install(
+        bundle["manifest"],
+        home=bundle["home"],
+        bundle_root=bundle["bundle_root"],
+        manifest_path=bundle["manifest_path"],
+        dry_run=True,
+    ) == 0
+    assert calls == [(bundle["bundle_root"] / "jobs.json", None)]
+
+    calls.clear()
+    assert install_mod.install(
+        bundle["manifest"],
+        home=bundle["home"],
+        bundle_root=bundle["bundle_root"],
+        manifest_path=bundle["manifest_path"],
+        dry_run=False,
+    ) == 0
+    assert calls == [(bundle["bundle_root"] / "jobs.json", jobs_data)]
+
+    installed = json.loads(
+        (bundle["home"] / ".hermes" / "cron" / "jobs.json").read_text()
+    )
+    assert installed == {
+        "jobs": [
+            {
+                "id": "1",
+                "name": "synthetic-job",
+                "prompt": "base prompt\n\nrequired postcondition",
+            }
+        ]
+    }
+
+
 def test_protected_atomic_write_refuses_poller_deploy_paths_without_lease(bundle):
     home = bundle["home"]
     lease_box: dict = {
