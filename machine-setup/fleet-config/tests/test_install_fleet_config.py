@@ -152,6 +152,31 @@ def test_real_install_writes_all_three_destinations(bundle):
         assert (bundle["home"] / ".hermes" / "profiles" / "ops" / sub).is_dir()
 
 
+def test_competing_lease_refuses_before_installer_stages_any_artifact(bundle):
+    """A losing installer must not leave a lock, snapshot, or receipt behind."""
+    home = bundle["home"]
+    holder = install_mod.production_write_lease.acquire(
+        ["fleet-config", "cron-jobs", "skills-policy"],
+        "fleet-config-installer", "competing-installer", str(home / ".hermes"),
+        "hermes-agent", install_mod._production_write_commit(), "test contention",
+        database_path=home / ".hermes" / "state" / "production-write-lease.db",
+    )
+    with pytest.raises(install_mod.InstallError, match="lease refused"):
+        install_mod.install(
+            bundle["manifest"], home=home, bundle_root=bundle["bundle_root"],
+            manifest_path=bundle["manifest_path"], dry_run=False,
+        )
+    hermes = home / ".hermes"
+    assert not (hermes / install_mod.INSTALL_LOCK_NAME).exists()
+    assert not (hermes / "logs" / "fleet-config-installs").exists()
+    assert not (hermes / "config.yaml").exists()
+    install_mod.production_write_lease.release(
+        lease_id=holder.lease_id, actor=holder.actor, session_id=holder.session_id,
+        fencing_token=holder.fencing_token,
+        database_path=home / ".hermes" / "state" / "production-write-lease.db",
+    )
+
+
 def test_atomic_write_replaces_existing_file_privately(tmp_path):
     dest = tmp_path / "private" / "config.yaml"
     dest.parent.mkdir()

@@ -7,7 +7,7 @@ SCRIPT="$SCRIPT_DIR/../../scripts/mini-release-cut.sh"
 TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/mini-release-cut-test.XXXXXX")"
 
 cleanup() {
-  rm -rf "$TEST_ROOT"
+  [ "${KEEP_MINI_RELEASE_TEST_ROOT:-0}" = 1 ] || rm -rf "$TEST_ROOT"
 }
 trap cleanup EXIT
 
@@ -603,6 +603,13 @@ while [ $# -gt 0 ]; do
   esac
 done
 case "${1:-}" in
+  archive)
+    # The pre-fetch bootstrap lease intentionally archives the already-active
+    # runtime.  The fake remote SHA is synthetic, so source the lease module
+    # from this checked-out test repository instead.
+    shift 2
+    /usr/bin/git -C "$FAKE_REPO" archive HEAD "$@"
+    ;;
   remote)
     printf 'ssh://example.invalid/hermes-agent.git\n'
     ;;
@@ -726,10 +733,8 @@ assert payload["ProgramArguments"][-1].endswith("/runtime-current/scripts/mini-r
 assert not payload.get("RunAtLoad", False)
 PY
 
-# Installer preflight must fetch while holding the real release lock. Begin
-# with a stale origin ref equal to HEAD; the fake fetch advances it to a
-# divergent commit. A dry-run-style preflight would incorrectly install,
-# while the real preflight must reject and leave LaunchAgents untouched.
+# A real fetch failure must occur while holding the release lock and must not
+# let the EXIT trap create poll-control state before a verified cut exists.
 PREFLIGHT_ROOT="$TEST_ROOT/preflight"
 PREFLIGHT_HOME="$PREFLIGHT_ROOT/home"
 PREFLIGHT_HERMES="$PREFLIGHT_HOME/.hermes"
@@ -756,8 +761,7 @@ case " $* " in
   *" fetch --prune origin "*)
     [ -d "$FAKE_RELEASES_DIR/.mini-release-cut.lock" ] || exit 90
     printf 'locked\n' > "$FAKE_FETCH_MARKER"
-    printf '%s\n' "$FAKE_REMOTE_SHA" > "$FAKE_GIT_STATE"
-    exit 0
+    exit 42
     ;;
 esac
 while [ $# -gt 0 ]; do
@@ -767,6 +771,10 @@ while [ $# -gt 0 ]; do
   esac
 done
 case "${1:-}" in
+  archive)
+    shift 2
+    /usr/bin/git -C "$FAKE_REPO" archive HEAD "$@"
+    ;;
   remote)
     printf 'ssh://example.invalid/hermes-agent.git\n'
     ;;
@@ -795,21 +803,61 @@ if HOME="$PREFLIGHT_HOME" HERMES_HOME="$PREFLIGHT_HERMES" \
   FAKE_GIT_STATE="$PREFLIGHT_STATE" \
   FAKE_RELEASES_DIR="$PREFLIGHT_HERMES/releases" \
   FAKE_FETCH_MARKER="$PREFLIGHT_MARKER" \
+  FAKE_REPO="$(cd "$SCRIPT_DIR/../.." && pwd -P)" \
   FAKE_ACTIVE_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
   FAKE_REMOTE_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
   "$POLL_INSTALLER" --install \
     --certified-sha aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
     --promotion-receipt-id cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc \
-    >/dev/null 2>&1; then
-  fail "installer accepted stale local equality after current remote diverged"
+    >"$PREFLIGHT_ROOT/cut.out" 2>&1; then
+  fail "installer accepted a failed origin fetch"
 fi
 [ -f "$PREFLIGHT_MARKER" ] \
-  || fail "installer preflight did not fetch while holding the release lock"
+  || fail "failed fetch did not run while holding the release lock"
 [ ! -e "$PREFLIGHT_HERMES/releases/.mini-release-cut.lock" ] \
   || fail "installer preflight left the release lock behind"
 [ ! -e "$PREFLIGHT_HOME/Library/LaunchAgents/com.colingreig.hermes.release-poll.plist" ] \
-  || fail "installer wrote the LaunchAgent after divergent preflight"
+  || fail "installer wrote the LaunchAgent after failed fetch"
 [ ! -e "$PREFLIGHT_HERMES/releases/.mini-release-last-receipt.json" ] \
   || fail "installer preflight wrote a release receipt"
+[ ! -e "$PREFLIGHT_HERMES/releases/.mini-release-poll-control.json" ] \
+  || fail "fetch failure created poll-control state before lease acquisition"
+
+# Exercise the actual EXIT cleanup function after a fence-loss result.  Both
+# a partially-built NEW_DIR and an already-existing poll authorization must
+# survive: the successor owns recovery and this stale process must not mutate
+# either artifact while handling its original failure.
+FENCE_EXIT_ROOT="$TEST_ROOT/fence-loss-exit"
+FENCE_EXIT_RELEASES="$FENCE_EXIT_ROOT/releases"
+FENCE_EXIT_NEW="$FENCE_EXIT_RELEASES/v-partial"
+FENCE_EXIT_POLL="$FENCE_EXIT_RELEASES/.mini-release-poll-control.json"
+mkdir -p "$FENCE_EXIT_NEW"
+printf 'keep partial release\n' > "$FENCE_EXIT_NEW/sentinel"
+printf 'keep existing authorization\n' > "$FENCE_EXIT_POLL"
+cleanup_body="$(sed -n '/^cleanup_on_exit() {/,/^}$/p' "$SCRIPT")"
+if (
+  eval "$cleanup_body"
+  DRY_RUN=0
+  NEW_DIR="$FENCE_EXIT_NEW"
+  LEASE_CUT_READY=1
+  CURRENT_LINK="$FENCE_EXIT_ROOT/runtime-current"
+  PRODUCTION_WRITE_LEASE_JSON='{"lease_id":"stale"}'
+  production_write_mutation_allowed() { return 1; }
+  freeze_managed_poll_after_failure() { : > "$FENCE_EXIT_ROOT/freeze-should-not-run"; return 0; }
+  release_production_write_lease() { :; }
+  cleanup_production_write_lease_bootstrap() { :; }
+  release_cut_lock() { :; }
+  warn() { :; }
+  false
+  cleanup_on_exit
+); then
+  fail "fence-loss cleanup unexpectedly returned success"
+fi
+[ -f "$FENCE_EXIT_NEW/sentinel" ] \
+  || fail "fence-loss EXIT cleanup deleted NEW_DIR"
+[ "$(cat "$FENCE_EXIT_POLL")" = 'keep existing authorization' ] \
+  || fail "fence-loss EXIT cleanup mutated poll-control state"
+[ ! -e "$FENCE_EXIT_ROOT/freeze-should-not-run" ] \
+  || fail "fence-loss EXIT cleanup attempted poll freeze"
 
 printf 'mini-release-cut safety checks passed\n'

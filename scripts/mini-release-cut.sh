@@ -382,19 +382,19 @@ PY
   fi
 
   if [ ! -f "$receipt_file" ]; then
-    tmp="$(mktemp "$RELEASES_DIR/.mini-release-receipt.swap.XXXXXX")" || return 1
-    printf '%s\n' "$payload" > "$tmp" || { rm -f "$tmp"; return 1; }
-    chmod 0644 "$tmp" || { rm -f "$tmp"; return 1; }
-    mv -fh "$tmp" "$receipt_file" || { rm -f "$tmp"; return 1; }
+    tmp="$(guarded_reserve_temp "$RELEASES_DIR/.mini-release-receipt.swap.XXXXXX")" || return 1
+    guarded_write_text "$tmp" "${payload}"$'\n' || { guarded_or_direct rm -f "$tmp"; return 1; }
+    guarded_or_direct chmod 0644 "$tmp" || { guarded_or_direct rm -f "$tmp"; return 1; }
+    guarded_or_direct mv -fh "$tmp" "$receipt_file" || { guarded_or_direct rm -f "$tmp"; return 1; }
   fi
   [ "$(sha256_file "$receipt_file")" = "$receipt_hash" ] || {
     warn "content-addressed receipt hash mismatch: $receipt_file"
     return 1
   }
-  last_tmp="$(mktemp "$RELEASES_DIR/.mini-release-last.swap.XXXXXX")" || return 1
-  cp "$receipt_file" "$last_tmp" || { rm -f "$last_tmp"; return 1; }
-  chmod 0644 "$last_tmp" || { rm -f "$last_tmp"; return 1; }
-  mv -fh "$last_tmp" "$LAST_RECEIPT_FILE" || { rm -f "$last_tmp"; return 1; }
+  last_tmp="$(guarded_reserve_temp "$RELEASES_DIR/.mini-release-last.swap.XXXXXX")" || return 1
+  guarded_or_direct cp "$receipt_file" "$last_tmp" || { guarded_or_direct rm -f "$last_tmp"; return 1; }
+  guarded_or_direct chmod 0644 "$last_tmp" || { guarded_or_direct rm -f "$last_tmp"; return 1; }
+  guarded_or_direct mv -fh "$last_tmp" "$LAST_RECEIPT_FILE" || { guarded_or_direct rm -f "$last_tmp"; return 1; }
   ok "release receipt sha256=$receipt_hash event=$event"
 }
 
@@ -428,16 +428,16 @@ install_governed_refresh_from_source() {
   }
   expected="$(sha256_file "$source")" || return 1
 
-  tmp="$(mktemp "$scripts_dir/.clickup_workspace_refresh.swap.XXXXXX")" || return 1
-  cp "$source" "$tmp" || { rm -f "$tmp"; return 1; }
-  chmod 0755 "$tmp" || { rm -f "$tmp"; return 1; }
-  actual="$(sha256_file "$tmp")" || { rm -f "$tmp"; return 1; }
+  tmp="$(guarded_reserve_temp "$scripts_dir/.clickup_workspace_refresh.swap.XXXXXX")" || return 1
+  guarded_or_direct cp "$source" "$tmp" || { guarded_or_direct rm -f "$tmp"; return 1; }
+  guarded_or_direct chmod 0755 "$tmp" || { guarded_or_direct rm -f "$tmp"; return 1; }
+  actual="$(sha256_file "$tmp")" || { guarded_or_direct rm -f "$tmp"; return 1; }
   [ "$actual" = "$expected" ] || {
-    rm -f "$tmp"
+    guarded_or_direct rm -f "$tmp"
     warn "governed refresh staging hash mismatch"
     return 1
   }
-  mv -fh "$tmp" "$target" || { rm -f "$tmp"; return 1; }
+  guarded_or_direct mv -fh "$tmp" "$target" || { guarded_or_direct rm -f "$tmp"; return 1; }
   [ ! -L "$target" ] && [ "$(sha256_file "$target")" = "$expected" ] || {
     warn "governed refresh post-install verification failed: $target"
     return 1
@@ -467,14 +467,14 @@ stage_refresh_backup() {
       "$source" "$REFRESH_BACKUP_FILE" "$expected"
     return 0
   fi
-  tmp="$(mktemp "$RELEASES_DIR/.clickup-refresh-backup.swap.XXXXXX")" \
+  tmp="$(guarded_reserve_temp "$RELEASES_DIR/.clickup-refresh-backup.swap.XXXXXX")" \
     || die "could not create governed refresh backup"
-  cp "$source" "$tmp" || { rm -f "$tmp"; die "could not stage governed refresh backup"; }
-  chmod 0644 "$tmp" || { rm -f "$tmp"; die "could not secure governed refresh backup"; }
+  guarded_or_direct cp "$source" "$tmp" || { guarded_or_direct rm -f "$tmp"; die "could not stage governed refresh backup"; }
+  guarded_or_direct chmod 0644 "$tmp" || { guarded_or_direct rm -f "$tmp"; die "could not secure governed refresh backup"; }
   [ "$(sha256_file "$tmp")" = "$expected" ] \
-    || { rm -f "$tmp"; die "governed refresh backup hash mismatch"; }
-  mv -fh "$tmp" "$REFRESH_BACKUP_FILE" \
-    || { rm -f "$tmp"; die "could not atomically record governed refresh backup"; }
+    || { guarded_or_direct rm -f "$tmp"; die "governed refresh backup hash mismatch"; }
+  guarded_or_direct mv -fh "$tmp" "$REFRESH_BACKUP_FILE" \
+    || { guarded_or_direct rm -f "$tmp"; die "could not atomically record governed refresh backup"; }
 }
 
 restore_governed_refresh_for_release() {
@@ -502,7 +502,7 @@ install_governed_launchd_environment() {
   fi
   [ -f "$reconciler" ] && [ ! -L "$reconciler" ] \
     || { warn "launchd environment reconciler missing or symlinked: $reconciler"; return 1; }
-  if ! "$release_dir/venv/bin/python" "$reconciler" install \
+  if ! guarded_or_direct "$release_dir/venv/bin/python" "$reconciler" install \
     --source-root "$source_root" --home "$HOME" --hermes-home "$HERMES_HOME" --reload; then
     return 1
   fi
@@ -525,7 +525,7 @@ rollback_governed_launchd_environment() {
       "$CURRENT_LINK/venv/bin/python" "$reconciler" "$HOME" "$HERMES_HOME"
     return 0
   fi
-  "$CURRENT_LINK/venv/bin/python" "$reconciler" rollback \
+  guarded_or_direct "$CURRENT_LINK/venv/bin/python" "$reconciler" rollback \
     --home "$HOME" --hermes-home "$HERMES_HOME" --reload
   LAUNCHD_ENV_CHANGED=0
 }
@@ -546,7 +546,7 @@ install_governed_marketplace_skills() {
   fi
   [ -f "$reconciler" ] && [ ! -L "$reconciler" ] \
     || { warn "marketplace skills reconciler missing or symlinked: $reconciler"; return 1; }
-  if ! "$release_dir/venv/bin/python" "$reconciler" install \
+  if ! guarded_or_direct "$release_dir/venv/bin/python" "$reconciler" install \
     --source-root "$source_root" --home "$HOME" --hermes-home "$HERMES_HOME" --reload; then
     return 1
   fi
@@ -569,7 +569,7 @@ rollback_governed_marketplace_skills() {
       "$CURRENT_LINK/venv/bin/python" "$reconciler" "$HOME" "$HERMES_HOME"
     return 0
   fi
-  "$CURRENT_LINK/venv/bin/python" "$reconciler" rollback \
+  guarded_or_direct "$CURRENT_LINK/venv/bin/python" "$reconciler" rollback \
     --home "$HOME" --hermes-home "$HERMES_HOME" --reload
   MARKETPLACE_SKILLS_CHANGED=0
 }
@@ -596,7 +596,7 @@ install_governed_fleet_outcomes() {
     || { warn "fleet-outcome reconciler missing or symlinked: $reconciler"; return 1; }
   [ -f "$manifest" ] && [ ! -L "$manifest" ] \
     || { warn "fleet-outcome manifest missing or symlinked: $manifest"; return 1; }
-  if ! "$release_dir/venv/bin/python" "$reconciler" install \
+  if ! guarded_or_direct "$release_dir/venv/bin/python" "$reconciler" install \
     --source-root "$source_root" --manifest "$manifest" \
     --home "$HOME" --hermes-home "$HERMES_HOME" --reload; then
     return 1
@@ -623,7 +623,7 @@ rollback_governed_fleet_outcomes() {
       "$manifest" "$HOME" "$HERMES_HOME"
     return 0
   fi
-  "$CURRENT_LINK/venv/bin/python" "$reconciler" rollback \
+  guarded_or_direct "$CURRENT_LINK/venv/bin/python" "$reconciler" rollback \
     --source-root "$HERMES_HOME/scripts" --manifest "$manifest" \
     --home "$HOME" --hermes-home "$HERMES_HOME" --reload
   FLEET_OUTCOMES_CHANGED=0
@@ -637,7 +637,7 @@ reconcile_governed_pr_pipeline() {
   local release_dir="${1:-}" source_sha="${2:-}"
   local reconciler="$release_dir/$VENDORED_PR_PIPELINE_RECONCILER_REL"
   local manifest="$release_dir/machine-setup/mini-scripts/pr_pipeline/manifest.json"
-  local report
+  local report report_file
   if [ "$DRY_RUN" -eq 1 ]; then
     dry_run_target_regular_file_metadata "$VENDORED_PR_PIPELINE_RECONCILER_REL" || return 1
     printf '\033[35m[DRY-RUN]\033[0m %s %s reconcile --manifest %s --destination %s --source-commit %s --runtime-python %s\n' \
@@ -653,13 +653,25 @@ reconcile_governed_pr_pipeline() {
   # partial failure is still a changed deployment and must restore the prior
   # release snapshot.
   PR_PIPELINE_CHANGED=1
-  report="$(
-    "$release_dir/venv/bin/python" "$reconciler" reconcile \
-      --manifest "$manifest" \
-      --destination "$HERMES_HOME/scripts" \
-      --source-commit "$source_sha" \
-      --runtime-python "$release_dir/venv/bin/python"
-  )" || return 1
+  if [ -n "$PRODUCTION_WRITE_LEASE_JSON" ]; then
+    report_file="$RELEASES_DIR/.pr-pipeline-report.${BASHPID:-$$}.${RANDOM}"
+    guarded_production_write_capture "$report_file" \
+      "$release_dir/venv/bin/python" "$reconciler" reconcile \
+        --manifest "$manifest" \
+        --destination "$HERMES_HOME/scripts" \
+        --source-commit "$source_sha" \
+        --runtime-python "$release_dir/venv/bin/python" || return 1
+    report="$(cat "$report_file")"
+    guarded_or_direct rm -f "$report_file"
+  else
+    report="$(
+      "$release_dir/venv/bin/python" "$reconciler" reconcile \
+        --manifest "$manifest" \
+        --destination "$HERMES_HOME/scripts" \
+        --source-commit "$source_sha" \
+        --runtime-python "$release_dir/venv/bin/python"
+    )" || return 1
+  fi
   PR_PIPELINE_RECEIPT_ID="$(
     printf '%s' "$report" | "$release_dir/venv/bin/python" -c '
 import json, sys
@@ -723,18 +735,19 @@ verify_promotion_authority() {
   local_ref="refs/hermes-promotion-authority/$receipt_id"
   certifier="$CURRENT_LINK/$PROMOTION_CERTIFIER_REL"
   [ -f "$certifier" ] && [ ! -L "$certifier" ] || return 1
-  git_current fetch --no-tags origin "+$authority_ref:$local_ref" || return 1
+  guarded_production_write git -C "$CURRENT_LINK" fetch --no-tags origin "+$authority_ref:$local_ref" || return 1
   [ "$(git_current cat-file -t "$local_ref" 2>/dev/null)" = blob ] || return 1
-  receipt_path="$(mktemp "$RELEASES_DIR/.promotion-authority.XXXXXX")" || return 1
-  if ! git_current cat-file blob "$local_ref" > "$receipt_path" \
+  receipt_path="$RELEASES_DIR/.promotion-authority.${BASHPID:-$$}.${RANDOM}"
+  if ! guarded_or_direct python3 -c 'from pathlib import Path; import sys; Path(sys.argv[1]).open("x").close()' "$receipt_path" \
+    || ! guarded_or_direct bash -c 'git -C "$1" cat-file blob "$2" > "$3"' _ "$CURRENT_LINK" "$local_ref" "$receipt_path" \
     || ! "$CURRENT_LINK/venv/bin/python" "$certifier" verify-receipt \
       --receipt "$receipt_path" \
       --receipt-id "$receipt_id" \
       --head-sha "$head_sha" >/dev/null; then
-    rm -f "$receipt_path"
+    guarded_or_direct rm -f "$receipt_path"
     return 1
   fi
-  rm -f "$receipt_path"
+  guarded_or_direct rm -f "$receipt_path"
 }
 
 # Install the release-owned ClickUp wrapper as a stable user command.  The
@@ -768,18 +781,18 @@ install_clickup_cli() {
   }
   target="$bin_dir/$CLICKUP_CLI_NAME"
   path_target="$path_dir/$CLICKUP_CLI_NAME"
-  tmp="$(mktemp "$bin_dir/.${CLICKUP_CLI_NAME}.swap.XXXXXX")" || return 1
+  tmp="$(guarded_reserve_temp "$bin_dir/.${CLICKUP_CLI_NAME}.swap.XXXXXX")" || return 1
 
-  if ! cp "$source" "$tmp"; then
-    rm -f "$tmp"
+  if ! guarded_or_direct cp "$source" "$tmp"; then
+    guarded_or_direct rm -f "$tmp"
     return 1
   fi
-  chmod 0755 "$tmp" || {
-    rm -f "$tmp"
+  guarded_or_direct chmod 0755 "$tmp" || {
+    guarded_or_direct rm -f "$tmp"
     return 1
   }
-  if ! mv -fh "$tmp" "$target"; then
-    rm -f "$tmp"
+  if ! guarded_or_direct mv -fh "$tmp" "$target"; then
+    guarded_or_direct rm -f "$tmp"
     return 1
   fi
   [ -x "$target" ] || {
@@ -790,18 +803,18 @@ install_clickup_cli() {
     warn "managed ClickUp CLI verification failed: $target differs from release source"
     return 1
   }
-  path_swap_dir="$(mktemp -d "$path_dir/.${CLICKUP_CLI_NAME}.swap.XXXXXX")" || return 1
+  path_swap_dir="$(guarded_reserve_temp "$path_dir/.${CLICKUP_CLI_NAME}.swap.XXXXXX" dir)" || return 1
   path_tmp="$path_swap_dir/$CLICKUP_CLI_NAME"
-  ln -s "$target" "$path_tmp" || {
-    rmdir "$path_swap_dir"
+  guarded_or_direct ln -s "$target" "$path_tmp" || {
+    guarded_or_direct rmdir "$path_swap_dir"
     return 1
   }
-  if ! mv -fh "$path_tmp" "$path_target"; then
-    rm -f "$path_tmp"
-    rmdir "$path_swap_dir"
+  if ! guarded_or_direct mv -fh "$path_tmp" "$path_target"; then
+    guarded_or_direct rm -f "$path_tmp"
+    guarded_or_direct rmdir "$path_swap_dir"
     return 1
   fi
-  rmdir "$path_swap_dir" || warn "could not remove managed CLI swap dir: $path_swap_dir"
+  guarded_or_direct rmdir "$path_swap_dir" || warn "could not remove managed CLI swap dir: $path_swap_dir"
   [ -L "$path_target" ] && [ "$(readlink "$path_target")" = "$target" ] || {
     warn "managed ClickUp CLI PATH link verification failed: $path_target"
     return 1
@@ -835,7 +848,7 @@ repoint_symlink() {
     return 0
   fi
   [ -d "$target" ] || die "repoint_symlink: target is not a directory: $target"
-  ln -sfn "$target" "$tmp"
+  guarded_or_direct ln -sfn "$target" "$tmp"
   # -h: do NOT follow CURRENT_LINK even though it is a symlink to a
   # directory. Without -h, macOS/BSD mv(1) treats an existing
   # symlink-that-resolves-to-a-directory destination as its "second form"
@@ -844,7 +857,7 @@ repoint_symlink() {
   # ever repointing CURRENT_LINK, while this function still reported
   # success. -h forces "rename source to target" instead; same filesystem
   # means this is still a plain rename(2) under the hood, i.e. still atomic.
-  mv -fh "$tmp" "$CURRENT_LINK"
+  guarded_or_direct mv -fh "$tmp" "$CURRENT_LINK"
   # Belt-and-suspenders: don't just trust the exit code — confirm the swap
   # actually took effect before declaring success (this is exactly the
   # invariant that was silently violated before the -h fix above).
@@ -909,7 +922,7 @@ acquire_cut_lock() {
     printf '\033[35m[DRY-RUN]\033[0m mkdir %s (single-instance cut lock)\n' "$CUT_LOCK_DIR"
     return 0
   fi
-  if ! mkdir "$CUT_LOCK_DIR"; then
+  if ! guarded_or_direct mkdir "$CUT_LOCK_DIR"; then
     die "another mini-release-cut is already running (lock: $CUT_LOCK_DIR)"
   fi
   LOCK_HELD=1
@@ -921,7 +934,7 @@ release_cut_lock() {
   [ "$LOCK_HELD" -eq 1 ] || return 0
   # Prove the resolved parent again immediately before removing the lock.
   assert_release_target "$CUT_LOCK_DIR"
-  rmdir "$CUT_LOCK_DIR" || warn "could not remove release-cut lock: $CUT_LOCK_DIR"
+  guarded_or_direct rmdir "$CUT_LOCK_DIR" || warn "could not remove release-cut lock: $CUT_LOCK_DIR"
   LOCK_HELD=0
 }
 
@@ -934,7 +947,7 @@ production_write_lease_call() {
   [ -n "$PRODUCTION_WRITE_LEASE_PYTHON" ] || die "production write lease Python is not selected"
   HERMES_HOME="$HERMES_HOME" PYTHONPATH="$PRODUCTION_WRITE_LEASE_ROOT" \
     "$PRODUCTION_WRITE_LEASE_PYTHON" - "$action" "$@" <<'PY'
-import json, os, sys
+import json, os, subprocess, sys, tempfile
 from cron import production_write_lease as lease
 action = sys.argv[1]
 try:
@@ -949,6 +962,42 @@ try:
         kwargs = dict(lease_id=data["lease_id"], actor=data["actor"],
                       session_id=data["session_id"], fencing_token=data["fencing_token"])
         if action == "heartbeat": print(json.dumps(lease.fence_mutation(**kwargs).as_dict(), sort_keys=True))
+        elif action in {"guard", "guard-capture"}:
+            # Hold SQLite's BEGIN IMMEDIATE transaction across the real shell
+            # mutation.  The command is intentionally argv-only: no eval,
+            # interpolation, or user-controlled shell program is accepted.
+            capture_path = sys.argv[3] if action == "guard-capture" else None
+            command = sys.argv[4:] if capture_path else sys.argv[3:]
+            if not command:
+                raise RuntimeError("guard requires a filesystem command")
+            with lease.mutation_guard(**kwargs) as refreshed:
+                # Preserve this protocol's stdout exclusively for the updated
+                # lease JSON; callers that need a report use a guarded capture
+                # file, which is created inside the same fence transaction.
+                if capture_path:
+                    with open(capture_path, "xb") as capture:
+                        completed = subprocess.run(command, check=False, stdout=capture, stderr=sys.stderr)
+                else:
+                    completed = subprocess.run(command, check=False, stdout=sys.stderr)
+                if completed.returncode:
+                    raise RuntimeError(f"guarded mutation failed: {command[0]} exited {completed.returncode}")
+            print(json.dumps(refreshed.as_dict(), sort_keys=True))
+        elif action == "reserve-temp":
+            template, kind = sys.argv[3], sys.argv[4]
+            directory, prefix = os.path.split(template)
+            # Shell mktemp templates are required to end in Xs; preserve the
+            # literal prefix while reserving the inode under the fence.
+            if not directory or not prefix.endswith("XXXXXX"):
+                raise RuntimeError("invalid guarded temporary-file template")
+            with lease.mutation_guard(**kwargs) as refreshed:
+                if kind == "dir":
+                    path = tempfile.mkdtemp(prefix=prefix[:-6], dir=directory)
+                elif kind == "file":
+                    fd, path = tempfile.mkstemp(prefix=prefix[:-6], dir=directory)
+                    os.close(fd)
+                else:
+                    raise RuntimeError("invalid guarded temporary-file kind")
+            print(json.dumps({"lease": refreshed.as_dict(), "path": path}, sort_keys=True))
         elif action == "release": lease.release(**kwargs); print("{}")
         elif action == "fence-loss": print(json.dumps(lease.record_fence_loss(
             **kwargs, reason="Mini release cut lost its production write fence",
@@ -978,6 +1027,74 @@ heartbeat_production_write_lease() {
       # hold the successor fence. The successor/operator owns recovery.
       die "production write lease heartbeat failed"
     }
+}
+
+# A failure trap is still a production writer.  Never let it persist a poll
+# control record, delete a partial release, or roll back after a cut that
+# failed before acquisition or after this owner lost its fence.  This helper
+# intentionally does not call die(), because trap cleanup must be able to
+# leave state untouched and report the original failure.
+production_write_mutation_allowed() {
+  [ -n "$PRODUCTION_WRITE_LEASE_JSON" ] || return 1
+  local prior="$PRODUCTION_WRITE_LEASE_JSON"
+  if PRODUCTION_WRITE_LEASE_JSON="$(production_write_lease_call heartbeat "$prior")"; then
+    return 0
+  fi
+  warn "production write lease fence failed; refusing trap/cleanup mutation"
+  production_write_lease_call fence-loss "$prior" >/dev/null \
+    || warn "could not persist production write lease fence-loss receipt"
+  PRODUCTION_WRITE_LEASE_JSON="$prior"
+  return 1
+}
+
+# Use for each direct persistent shell mutation.  ``mutation_guard`` keeps
+# the lease transaction open through the child command, so a successor cannot
+# commit takeover in the heartbeat-to-mv/rm/ln gap.  Do not use this for
+# ephemeral /tmp bootstrap files.
+guarded_production_write() {
+  [ -n "$PRODUCTION_WRITE_LEASE_JSON" ] || {
+    warn "refusing protected mutation without a production write lease: $*"
+    return 1
+  }
+  local updated
+  updated="$(production_write_lease_call guard "$PRODUCTION_WRITE_LEASE_JSON" "$@")" || {
+    warn "production write lease mutation guard failed: $*"
+    return 1
+  }
+  PRODUCTION_WRITE_LEASE_JSON="$updated"
+}
+
+guarded_or_direct() {
+  if [ -n "$PRODUCTION_WRITE_LEASE_JSON" ]; then
+    guarded_production_write "$@"
+  else
+    "$@"
+  fi
+}
+
+guarded_production_write_capture() {
+  local capture="${1:?capture path required}"; shift
+  [ -n "$PRODUCTION_WRITE_LEASE_JSON" ] || return 1
+  local updated
+  updated="$(production_write_lease_call guard-capture "$PRODUCTION_WRITE_LEASE_JSON" "$capture" "$@")" || return 1
+  PRODUCTION_WRITE_LEASE_JSON="$updated"
+}
+
+guarded_reserve_temp() {
+  local template="${1:?template required}" kind="${2:-file}" result
+  if [ -z "$PRODUCTION_WRITE_LEASE_JSON" ]; then
+    [ "$kind" = dir ] && mktemp -d "$template" || mktemp "$template"
+    return
+  fi
+  result="$(production_write_lease_call reserve-temp "$PRODUCTION_WRITE_LEASE_JSON" "$template" "$kind")" || return 1
+  PRODUCTION_WRITE_LEASE_JSON="$(printf '%s' "$result" | python3 -c 'import json,sys; print(json.load(sys.stdin)["lease"])')"
+  printf '%s\n' "$result" | python3 -c 'import json,sys; print(json.load(sys.stdin)["path"])'
+}
+
+guarded_write_text() {
+  local target="${1:?target required}" payload="${2-}"
+  guarded_or_direct python3 -c 'from pathlib import Path; import sys; Path(sys.argv[1]).write_text(sys.argv[2], encoding="utf-8")' \
+    "$target" "$payload"
 }
 
 release_production_write_lease() {
@@ -1205,7 +1322,7 @@ prune_releases() {
     # cannot turn pruning into a live-state delete.
     assert_release_target "$d"
     log "prune: removing old release $d"
-    run rm -rf "$d"
+    guarded_or_direct rm -rf "$d"
   done
 }
 
@@ -1305,7 +1422,7 @@ freeze_managed_poll_after_failure() {
   [ "$IF_ADVANCED" -eq 1 ] && [ "$PREFLIGHT" -eq 0 ] && [ "$DRY_RUN" -eq 0 ] \
     || return 0
   if [ -x "$python" ] && [ -f "$control" ] && [ ! -L "$control" ]; then
-    if ! "$python" "$control" freeze \
+    if ! guarded_or_direct "$python" "$control" freeze \
       --actor "mini-release-cut" \
       --reason "managed release failed; operator reconciliation required" >/dev/null; then
       # Invalidate the stable authorization pointer even when the governed
@@ -1314,7 +1431,7 @@ freeze_managed_poll_after_failure() {
       local latest="$RELEASES_DIR/.mini-release-poll-control.json"
       local invalidated="$RELEASES_DIR/.mini-release-poll-control.invalidated"
       if [ -f "$latest" ] && [ ! -L "$latest" ] && [ ! -L "$invalidated" ]; then
-        mv -f "$latest" "$invalidated" || return 1
+        guarded_or_direct mv -f "$latest" "$invalidated" || return 1
       fi
       warn "poll freeze persistence failed; prior authorization invalidated"
       return 1
@@ -1365,32 +1482,53 @@ if [ -n "$PROMOTION_RECEIPT_ID" ]; then
     || die "--promotion-receipt-id must be a lowercase SHA-256 digest"
 fi
 
+# Bootstrap the lease from the already-active trusted runtime before the first
+# fetch.  Fetch and promotion authority verification both materialize git and
+# receipt state, so they cannot precede the production-write fence.
+if [ "$DRY_RUN" -eq 0 ]; then
+  SHA="$(git_current rev-parse --verify "HEAD^{commit}")" \
+    || die "could not resolve active runtime commit for bootstrap lease"
+  bootstrap_production_write_lease
+  acquire_production_write_lease
+fi
+
 # This trap owns both failure cleanup and lock release. NEW_DIR remains empty
 # for an explicit rollback, so that mode only releases its lock.
 NEW_DIR=""
+LEASE_CUT_READY=0
 # shellcheck disable=SC2329 # registered as an EXIT trap immediately below
 cleanup_on_exit() {
   local status=$?
   if [ "$status" -ne 0 ] && [ "$DRY_RUN" -ne 1 ] && [ -n "$NEW_DIR" ] && [ -e "$NEW_DIR" ]; then
     local live=""
     [ -L "$CURRENT_LINK" ] && live="$(readlink "$CURRENT_LINK")"
-    if [ "$live" != "$NEW_DIR" ]; then
+    if [ "$live" != "$NEW_DIR" ] && production_write_mutation_allowed; then
       # Prove the resolved parent immediately before removal, even on an
       # error path where values may have been partially initialized.
       assert_release_target "$NEW_DIR"
       warn "cleanup: removing partially-built release dir: $NEW_DIR"
-      rm -rf "$NEW_DIR"
+      guarded_production_write rm -rf "$NEW_DIR"
+    elif [ "$live" != "$NEW_DIR" ]; then
+      warn "cleanup: refusing to remove partial release without current production write fence"
     fi
   fi
   if [ "$status" -ne 0 ]; then
-    if ! freeze_managed_poll_after_failure; then
+    # Fetch/preflight failures happen before lease acquisition.  A trap must
+    # leave poll-control state alone in that case (or after fence loss).
+    if [ "$LEASE_CUT_READY" -ne 1 ]; then
+      warn "poll freeze skipped: release never reached a verified fenced cut"
+      status=70
+    elif ! production_write_mutation_allowed; then
+      warn "poll freeze skipped: no current production write fence"
+      status=70
+    elif ! freeze_managed_poll_after_failure; then
       warn "FATAL: managed poll freeze could not be persisted; authorization was invalidated"
       status=70
     fi
   fi
+  release_cut_lock
   release_production_write_lease
   cleanup_production_write_lease_bootstrap
-  release_cut_lock
   trap - EXIT
   exit "$status"
 }
@@ -1400,12 +1538,8 @@ trap cleanup_on_exit EXIT
 
 if [ "$DO_ROLLBACK" -eq 1 ]; then
   [ -L "$CURRENT_LINK" ] || die "no runtime-current symlink at $CURRENT_LINK"
-  if [ "$DRY_RUN" -eq 0 ]; then
-    SHA="$(git_current rev-parse --verify "HEAD^{commit}")" \
-      || die "could not resolve active runtime commit for rollback lease"
-    bootstrap_production_write_lease
-    acquire_production_write_lease
-  fi
+  # The active runtime commit for rollback lease was resolved before the lock
+  # and is held through every rollback mutation below.
   PR_PIPELINE_CHANGED=1
   guarded_rollback_to_previous "explicit --rollback"
   exit 0
@@ -1436,7 +1570,11 @@ log "fetching origin in current release clone: $CURRENT_LINK"
 # Disable background maintenance (auto-gc/repack) for this fetch: a
 # maintenance job detached by the fetch can race the local clone below and
 # produce transient "unable to read sha1 file" errors.
-run git -c gc.auto=0 -c maintenance.auto=false -C "$CURRENT_LINK" fetch --prune origin
+if [ "$DRY_RUN" -eq 1 ]; then
+  run git -c gc.auto=0 -c maintenance.auto=false -C "$CURRENT_LINK" fetch --prune origin
+else
+  guarded_production_write git -c gc.auto=0 -c maintenance.auto=false -C "$CURRENT_LINK" fetch --prune origin
+fi
 
 ORIGIN_URL="$(git_current remote get-url origin)"
 log "origin: $ORIGIN_URL"
@@ -1455,12 +1593,11 @@ if [ -n "$CERTIFIED_SHA" ] && [ "$SHA" != "$CERTIFIED_SHA" ]; then
   die "resolved target $SHA does not exactly equal certified source $CERTIFIED_SHA"
 fi
 if [ "$DRY_RUN" -eq 0 ]; then
+  # Promotion verification materializes a receipt blob beneath releases/;
+  # acquire before it so even this pre-cut staging is fenced.
   verify_promotion_authority "$SHA" "$PROMOTION_RECEIPT_ID" \
     || die "immutable promotion receipt does not authorize exact target $SHA"
-  if [ "$PREFLIGHT" -eq 0 ]; then
-    bootstrap_production_write_lease
-    acquire_production_write_lease
-  fi
+  LEASE_CUT_READY=1
 fi
 
 # Polling mode is evaluated under the same lock as the eventual cut, after the
@@ -1579,21 +1716,29 @@ clone_and_checkout() {
   log "clone ($desc): git clone --no-checkout $src $NEW_DIR"
   # git clone creates NEW_DIR: prove its canonical parent immediately first.
   assert_release_target "$NEW_DIR"
-  run git clone --no-checkout "$src" "$NEW_DIR" || return 1
+  if [ "$DRY_RUN" -eq 1 ]; then
+    run git clone --no-checkout "$src" "$NEW_DIR" || return 1
+  else
+    guarded_production_write git clone --no-checkout "$src" "$NEW_DIR" || return 1
+  fi
 
   if [ "$OFFLINE" -eq 1 ]; then
-    run git -C "$NEW_DIR" remote set-url origin "$ORIGIN_URL" || return 1
+    guarded_or_direct git -C "$NEW_DIR" remote set-url origin "$ORIGIN_URL" || return 1
   fi
 
   # Defensive: never let a blobless partial-clone filter leak into the new
   # release regardless of source — a filtered clone can silently drop files
   # during checkout, which is the exact root cause being fixed here.
   if [ "$DRY_RUN" -ne 1 ]; then
-    git -C "$NEW_DIR" config --unset-all remote.origin.partialclonefilter 2>/dev/null || true
+    guarded_production_write git -C "$NEW_DIR" config --unset-all remote.origin.partialclonefilter 2>/dev/null || true
   fi
 
   log "checkout $SHA (detached)"
-  run git -C "$NEW_DIR" checkout --detach "$SHA" || return 1
+  if [ "$DRY_RUN" -eq 1 ]; then
+    run git -C "$NEW_DIR" checkout --detach "$SHA" || return 1
+  else
+    guarded_production_write git -C "$NEW_DIR" checkout --detach "$SHA" || return 1
+  fi
 
   if [ "$DRY_RUN" -eq 1 ]; then
     return 0
@@ -1624,7 +1769,7 @@ if ! clone_and_checkout; then
   warn "clone/checkout failed (possible git maintenance race, or a genuine object gap) — retrying once"
   # Prove the resolved parent immediately before deleting the failed clone.
   assert_release_target "$NEW_DIR"
-  run rm -rf "$NEW_DIR"
+  guarded_or_direct rm -rf "$NEW_DIR"
   sleep 5
   clone_and_checkout \
     || die "clone/checkout failed twice for $SHA — aborting (possible non-transient git maintenance/object race, or missing objects at origin)"
@@ -1642,10 +1787,9 @@ if command -v uv >/dev/null; then
   if [ "$DRY_RUN" -eq 1 ]; then
     printf '\033[35m[DRY-RUN]\033[0m (cd %s && UV_PROJECT_ENVIRONMENT=%s/venv uv sync --extra all --locked)\n' "$NEW_DIR" "$NEW_DIR"
   else
-    if ! ( cd "$NEW_DIR" && UV_PROJECT_ENVIRONMENT="$NEW_DIR/venv" uv sync --extra all --locked ); then
+    if ! guarded_production_write bash -c 'cd "$1" && UV_PROJECT_ENVIRONMENT="$1/venv" uv sync --extra all --locked' _ "$NEW_DIR"; then
       warn "uv sync --locked failed; falling back to uv venv + editable pip install"
-      ( cd "$NEW_DIR" && uv venv "$NEW_DIR/venv" \
-          && VIRTUAL_ENV="$NEW_DIR/venv" uv pip install -e ".[all]" ) \
+      guarded_production_write bash -c 'cd "$1" && uv venv "$1/venv" && VIRTUAL_ENV="$1/venv" uv pip install -e ".[all]"' _ "$NEW_DIR" \
         || die "venv build failed"
     fi
   fi
@@ -1671,9 +1815,7 @@ else
   if [ "$DRY_RUN" -eq 1 ]; then
     printf '\033[35m[DRY-RUN]\033[0m (cd %s && %s -m venv venv && venv/bin/pip install -e ".[all]")\n' "$NEW_DIR" "$FALLBACK_PYTHON"
   else
-    ( cd "$NEW_DIR" && "$FALLBACK_PYTHON" -m venv venv \
-        && "$NEW_DIR/venv/bin/pip" install --upgrade pip \
-        && "$NEW_DIR/venv/bin/pip" install -e ".[all]" ) || die "venv build failed"
+    guarded_production_write bash -c 'cd "$1" && "$2" -m venv venv && "$1/venv/bin/pip" install --upgrade pip && "$1/venv/bin/pip" install -e ".[all]"' _ "$NEW_DIR" "$FALLBACK_PYTHON" || die "venv build failed"
   fi
 fi
 heartbeat_production_write_lease
@@ -1684,7 +1826,7 @@ log "building web dist (npm ci --include=dev && npm run build --workspace web)"
 if [ "$DRY_RUN" -eq 1 ]; then
   printf '\033[35m[DRY-RUN]\033[0m (cd %s && npm ci --include=dev && npm run build --workspace web)\n' "$NEW_DIR"
 else
-  ( cd "$NEW_DIR" && npm ci --include=dev && npm run build --workspace web ) || die "web build failed"
+  guarded_production_write bash -c 'cd "$1" && npm ci --include=dev && npm run build --workspace web' _ "$NEW_DIR" || die "web build failed"
 fi
 
 # --- Verify the build BEFORE any switch ------------------------------------
@@ -1763,7 +1905,7 @@ if [ "$DRY_RUN" -eq 1 ]; then
 else
   # .previous is a release-owned file; never let a malformed path escape it.
   assert_regular_release_file "$PREV_FILE"
-  printf '%s\n' "$PREV_TARGET" > "$PREV_FILE"
+  guarded_write_text "$PREV_FILE" "${PREV_TARGET}"$'\n'
 fi
 heartbeat_production_write_lease
 
