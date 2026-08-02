@@ -675,6 +675,22 @@ def _load_jobs_payload(item: dict) -> dict[str, Any]:
         raise InstallError(f"bundled jobs.json is not valid JSON: {exc}") from exc
     if not isinstance(payload, dict) or not isinstance(payload.get("jobs"), list):
         raise InstallError("bundled jobs.json has no top-level 'jobs' list — refusing")
+    postconditions = payload.pop("job_prompt_postconditions", {})
+    if not isinstance(postconditions, dict):
+        raise InstallError("job_prompt_postconditions must be an object keyed by job id")
+    jobs_by_id = {
+        str(job.get("id")): job for job in payload["jobs"] if isinstance(job, dict)
+    }
+    for job_id, postcondition in postconditions.items():
+        job = jobs_by_id.get(str(job_id))
+        if job is None:
+            raise InstallError(f"prompt postcondition targets missing job id {job_id!r}")
+        if not isinstance(postcondition, str) or not postcondition.strip():
+            raise InstallError(f"prompt postcondition for job {job_id!r} is empty")
+        prompt = job.get("prompt")
+        if not isinstance(prompt, str):
+            raise InstallError(f"prompt postcondition target {job_id!r} has no string prompt")
+        job["prompt"] = prompt.rstrip() + "\n\n" + postcondition.strip()
     return payload
 
 
@@ -702,7 +718,6 @@ def _validate_direct_clickup_jobs(payload: dict[str, Any]) -> None:
             "skills": ["ignite-execute"],
             "skill_scope": "dev-executor",
             "workdir": "/Users/colingreig/dev/hermes-agent",
-            "prompt": "/ignite-execute --lane {lane}",
             "lane_weights": {"code": 1, "content": 1},
         },
     }
@@ -716,6 +731,21 @@ def _validate_direct_clickup_jobs(payload: dict[str, Any]) -> None:
                     f"governed fleet job {name!r} must keep direct {key}={value!r}"
                 )
         prompt = job["prompt"].casefold()
+        if not job["prompt"].startswith("/ignite-execute --lane {lane}\n\n"):
+            raise InstallError(
+                f"governed fleet job {name!r} must preserve the direct skill invocation prefix"
+            )
+        required_activity_markers = (
+            "report_activity_journal.py confirm-transition",
+            "merged-before-claim-reconciliation",
+            "ordinary-publish-closeout",
+            "db-publish-closeout",
+            "86e2gnz71",
+        )
+        if any(marker not in prompt for marker in required_activity_markers):
+            raise InstallError(
+                f"governed fleet job {name!r} lacks complete report-activity postconditions"
+            )
         if any(marker in prompt for marker in ("kanban", "swarm", "synthesizer")):
             raise InstallError(f"governed fleet job {name!r} must not route ClickUp work through kanban")
 
@@ -727,6 +757,25 @@ def _validate_direct_clickup_jobs(payload: dict[str, Any]) -> None:
         or retired_content.get("admission_retired") is not True
     ):
         raise InstallError("content-lane-executor must remain a retired, rejected identity")
+
+    lifecycle = by_name.get("clickup-lifecycle")
+    if lifecycle is None or lifecycle.get("enabled") is not True:
+        raise InstallError("governed fleet jobs must keep 'clickup-lifecycle' enabled")
+    lifecycle_prompt = lifecycle.get("prompt")
+    if not isinstance(lifecycle_prompt, str):
+        raise InstallError("clickup-lifecycle must provide a lifecycle prompt")
+    for marker in (
+        "report_activity_journal.py confirm-transition",
+        "review_handoff",
+        "clickup-lifecycle-reconciliation",
+        "expected-status 'in review'",
+        "86e2gnz71",
+    ):
+        if marker not in lifecycle_prompt:
+            raise InstallError(
+                "clickup-lifecycle is missing report-activity review postcondition: "
+                + marker
+            )
 
     for job in jobs:
         if job.get("no_agent") is True:
@@ -764,6 +813,17 @@ def _validate_direct_clickup_jobs(payload: dict[str, Any]) -> None:
     forbidden_roots = ("~/.hermes/skills", "~/.claude/skills", "~/.codex/skills")
     if any(root in prompt for root in forbidden_roots):
         raise InstallError("hermes-pr-validate must not fall back to a home-local Ignite tree")
+    for marker in (
+        "report_activity_journal.py confirm-transition",
+        "validator_complete",
+        "expected-status complete",
+        "86e2gnz71",
+    ):
+        if marker not in prompt:
+            raise InstallError(
+                "hermes-pr-validate is missing report-activity completion postcondition: "
+                + marker
+            )
 
 
 def _snapshot_path(dest: Path, snapshot_dir: Path, destination_root: Path) -> Path:

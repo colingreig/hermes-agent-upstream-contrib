@@ -55,6 +55,7 @@ long-lived agent turn that owns the lease.
 from __future__ import annotations
 
 import json
+import importlib.util
 import os
 import socket
 import sys
@@ -70,6 +71,50 @@ CLAIMS_DIR = os.path.expanduser("~/.hermes/state/claims")
 # (CLAIM_LOCK_TTL_S); match it so the two mechanisms agree on staleness.
 CLAIM_TTL_S = int(os.environ.get("HERMES_CLAIM_TTL_S", str(90 * 60)))
 _HOST = socket.gethostname()
+
+
+def _load_activity_journal():
+    """Load the sibling deployed journal without making claims depend on it."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "report_activity_journal.py")
+    try:
+        spec = importlib.util.spec_from_file_location("hermes_report_activity_journal", path)
+        if spec is None or spec.loader is None:
+            return None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    except Exception:
+        return None
+
+
+_activity_journal = _load_activity_journal()
+
+
+def _report_degraded(reason: str) -> None:
+    if _activity_journal is not None:
+        _activity_journal.mark_degraded(reason, source="queue-poller.claim_store")
+    else:
+        sys.stderr.write(f"report activity health UNKNOWN: {reason}; journal unavailable\n")
+
+
+def _report_durable_claim(task_id: str, run: str | None) -> None:
+    if _activity_journal is None:
+        _report_degraded("durable claim was not journaled because emitter is unavailable")
+        return
+    _activity_journal.safe_emit(
+        kind="claim",
+        task_id=task_id,
+        source="queue-poller.claim_store",
+        run_id=run or os.environ.get("HERMES_EXECUTOR_RUN_ID") or None,
+    )
+
+
+def _fsync_claim_dir() -> None:
+    fd = os.open(CLAIMS_DIR, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def _claim_path(task_id: str) -> str:
@@ -156,19 +201,35 @@ def acquire(task_id: str, run: str | None = None) -> bool:
     provably-live competing claim exists.
     """
     if fcntl is None:
+        _report_degraded("claim acquisition granted fail-open because fcntl is unavailable")
         return True  # non-POSIX: fail-open
-    path = _claim_path(task_id)
+    try:
+        path = _claim_path(task_id)
+    except Exception as exc:
+        _report_degraded(f"claim acquisition granted fail-open before path creation: {exc}")
+        return True
     try:
         # Fast path: atomic exclusive create. Winner of the create owns it.
         fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         try:
-            os.write(fd, _payload(task_id, run))
+            payload = _payload(task_id, run)
+            written = os.write(fd, payload)
+            if written != len(payload):
+                raise OSError(f"short claim write: {written}/{len(payload)} bytes")
+            os.fsync(fd)
         finally:
             os.close(fd)
+        _fsync_claim_dir()
+        _report_durable_claim(task_id, run)
         return True
     except FileExistsError:
         pass
-    except Exception:
+    except Exception as exc:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        _report_degraded(f"claim acquisition granted fail-open after create failure: {exc}")
         return True  # FAIL-OPEN: never block a legit claim on a store bug
     # File exists — serialise the inspect/reclaim with a brief flock so two
     # processes can't both reclaim a stale lock.
@@ -176,7 +237,8 @@ def acquire(task_id: str, run: str | None = None) -> bool:
         with open(path, "r+", encoding="utf-8") as f:
             try:
                 fcntl.flock(f, fcntl.LOCK_EX)
-            except OSError:
+            except OSError as exc:
+                _report_degraded(f"claim acquisition granted fail-open after flock failure: {exc}")
                 return True  # can't lock to inspect -> fail-open
             if _is_live(path):
                 return False  # live claim by another process — refuse
@@ -187,8 +249,11 @@ def acquire(task_id: str, run: str | None = None) -> bool:
             f.flush()
             os.fsync(f.fileno())
         os.utime(path, None)  # fresh mtime -> TTL window restarts now
+        _fsync_claim_dir()
+        _report_durable_claim(task_id, run)
         return True
-    except Exception:
+    except Exception as exc:
+        _report_degraded(f"claim acquisition granted fail-open after rewrite failure: {exc}")
         return True  # FAIL-OPEN
 
 

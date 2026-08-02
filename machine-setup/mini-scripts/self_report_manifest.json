@@ -5,10 +5,6 @@
   "description": "Declared deploy bundle for the hermes-self-report cron. This file IS the bundle the installer copies; nothing outside its 'files' list is written. Canon bytes are the live mini copies (RC4) plus ClickUp 86e2gczqw review-queue/spend/alert updates in this deploy mirror. SKILL.md is authored in Brain and installed only with --include-skill --brain-path.",
   "coexist_required": [
     {
-      "dest_abs": "~/.hermes/scripts/claim_store.py",
-      "reason": "hermes_report_build.compute_work_stoppage() does `import claim_store`; a missing copy degrades every work-stoppage verdict to UNKNOWN. Installer warns, never installs or removes it."
-    },
-    {
       "dest_abs": "~/.hermes/scripts/queue_snapshot.json",
       "reason": "Read by the claim/snapshot-freshness logic. Runtime state, outside the bundle. Installer warns, never installs or removes it."
     },
@@ -64,6 +60,30 @@
       "dest_abs": "~/.hermes/scripts/hermes_self_report_delivery_probe.py",
       "sha256": "caa52b11adf2939f302b512bf095ed7916c81bcf7e9c8541fc208e32fc76437a",
       "role": "receipt-reader probe for its own no_agent cron (offset from 0 */6 * * *): 0 fresh+sent, 1 both channels failed, 2 missing/stale/unreadable. Canon = deploy mirror bytes (live behavior + encoding=utf-8)",
+      "deploy_mode": "script"
+    },
+    {
+      "src_rel": "report_activity_journal.py",
+      "src_base": "mirror",
+      "dest_abs": "~/.hermes/scripts/report_activity_journal.py",
+      "sha256": "b0bc2deeddd006b9ce2e8b2c111206aa97ae4b2a44d25bf040e6fddeb738a9a4",
+      "role": "stdlib-only Mini lifecycle shadow outbox; durable UTC-day JSONL emission, retention, read-after-write ClickUp confirmation, and explicit UNKNOWN health without enabling continuity consumers before 86e2gnz71",
+      "deploy_mode": "script"
+    },
+    {
+      "src_rel": "claim_store.py",
+      "src_base": "mirror",
+      "dest_abs": "~/.hermes/scripts/claim_store.py",
+      "sha256": "eac6e4e63a3553c5172ca3da739f70e4ae5c5831c863d526ba681db8599133ce",
+      "role": "queue-poller durable claim store and claim-event shadow-outbox producer; emits only after the claim file and directory are fsynced and degrades visibly on fail-open paths",
+      "deploy_mode": "script"
+    },
+    {
+      "src_rel": "closeout_actor.py",
+      "src_base": "mirror",
+      "dest_abs": "~/.hermes/scripts/closeout_actor.py",
+      "sha256": "9b351e071624f6502af6dbc0769a6c157a58dc0e06c2de066d08bcdbc81b4147",
+      "role": "no-agent merged and DB-publish closeout writer; emits review handoff facts only after guarded ClickUp success and read-after-write verification",
       "deploy_mode": "script"
     },
     {
