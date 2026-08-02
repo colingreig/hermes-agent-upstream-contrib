@@ -1012,7 +1012,14 @@ def _inject_contract_failures(
 
         for contract in contracts["cron_jobs"]:
             job_id = str(contract["id"])
-            live_enabled = bool(contract["enabled"])
+            declared_enabled = bool(contract["enabled"])
+            # A disabled/retired cron contract has no artifact or staleness
+            # predicate to trip -- the checker records "disabled-as-declared"
+            # and returns immediately.  Simulate the job coming back live
+            # instead, mirroring how retired LaunchAgents are drilled by
+            # faking them loaded, so the real enabled_state_drift predicate
+            # is exercised rather than the contract being skipped.
+            live_enabled = True if not declared_enabled else declared_enabled
             jobs_path = root / f"jobs-{job_id}.json"
             _atomic_json(
                 jobs_path,
