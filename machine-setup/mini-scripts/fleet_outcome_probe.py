@@ -136,6 +136,30 @@ def _patterns_match(text: str, patterns: list[str]) -> bool:
     return any(re.search(pattern, text, re.IGNORECASE | re.MULTILINE) for pattern in patterns)
 
 
+_CANONICAL_FAILED_CRON_HEADER_RE = re.compile(
+    r"^#\s+Cron Job:\s+.+\s+\(FAILED\)\s*$",
+    re.MULTILINE,
+)
+
+
+def _canonical_failed_cron_evidence(text: str) -> str | None:
+    """Return scheduler-trusted failed-run evidence (header + ## Error).
+
+    Matches the artifact shape emitted by ``cron.scheduler.run_job`` on
+    exceptions.  Prompt text is intentionally excluded so response-only
+    contracts can classify genuine runtime failures without scanning skills.
+    """
+    header = _CANONICAL_FAILED_CRON_HEADER_RE.search(text)
+    if header is None:
+        return None
+    error_marker = "## Error"
+    if error_marker not in text:
+        return None
+    header_line = text[header.start() : header.end()]
+    error_section = text.rsplit(error_marker, 1)[1]
+    return f"{header_line}\n\n{error_marker}{error_section}"
+
+
 def _check_text_evidence(
     *,
     surface: str,
@@ -232,7 +256,10 @@ def _check_text_evidence(
             text = records[-1]
     if outcome.get("response_only"):
         marker = "## Response"
-        if marker not in text:
+        failed_evidence = _canonical_failed_cron_evidence(text)
+        if failed_evidence is not None:
+            text = failed_evidence
+        elif marker not in text:
             return [
                 _finding(
                     surface,
@@ -241,7 +268,8 @@ def _check_text_evidence(
                     f"{path} has no {marker} section",
                 )
             ]
-        text = text.rsplit(marker, 1)[1]
+        else:
+            text = text.rsplit(marker, 1)[1]
 
     forbidden = list(outcome.get("failure_patterns") or [])
     if forbidden and _patterns_match(text, forbidden):
@@ -511,13 +539,41 @@ def _check_cron_contracts(
     return findings, evidence
 
 
-def _launchctl_print(label: str) -> subprocess.CompletedProcess[str]:
+def _launchd_domains() -> tuple[str, str]:
+    uid = os.getuid()
+    return f"gui/{uid}", f"user/{uid}"
+
+
+def _launchctl_print_target(domain: str, label: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        ["launchctl", "print", f"gui/{os.getuid()}/{label}"],
+        ["launchctl", "print", f"{domain}/{label}"],
         capture_output=True,
         text=True,
         timeout=10,
     )
+
+
+def _default_launchctl(domain: str, label: str) -> subprocess.CompletedProcess[str]:
+    return _launchctl_print_target(domain, label)
+
+
+def _launch_agent_registration(
+    label: str,
+    *,
+    launchctl: Callable[[str, str], subprocess.CompletedProcess[str]],
+) -> tuple[str | None, subprocess.CompletedProcess[str] | None, subprocess.CompletedProcess[str] | None]:
+    gui_domain, user_domain = _launchd_domains()
+    gui_result = launchctl(gui_domain, label)
+    user_result = launchctl(user_domain, label)
+    gui_loaded = gui_result.returncode == 0
+    user_loaded = user_result.returncode == 0
+    if gui_loaded and user_loaded:
+        return None, gui_result, user_result
+    if gui_loaded:
+        return gui_domain, gui_result, user_result
+    if user_loaded:
+        return user_domain, gui_result, user_result
+    return None, gui_result, user_result
 
 
 def _plist_labels(path: Path) -> set[str]:
@@ -556,20 +612,35 @@ def _labels_from_launchctl_domain(text: str) -> set[str]:
     return {label for label in candidates if MONITORED_LABEL_RE.search(label)}
 
 
-def _launchctl_inventory() -> set[str]:
+def _launch_domain_inventory(domain: str) -> set[str]:
     try:
         result = subprocess.run(
-            ["launchctl", "print", f"gui/{os.getuid()}"],
+            ["launchctl", "print", domain],
             capture_output=True,
             text=True,
             timeout=15,
         )
     except (OSError, subprocess.SubprocessError) as exc:
-        raise ProbeError(f"could not inventory loaded LaunchAgents: {exc}") from exc
+        raise ProbeError(f"could not inventory loaded LaunchAgents in {domain}: {exc}") from exc
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "launchctl print failed").strip()
-        raise ProbeError(f"could not inventory loaded LaunchAgents: {detail[-500:]}")
+        raise ProbeError(
+            f"could not inventory loaded LaunchAgents in {domain}: {detail[-500:]}"
+        )
     return _labels_from_launchctl_domain(result.stdout)
+
+
+def _launchctl_inventory() -> set[str]:
+    labels: set[str] = set()
+    errors: list[str] = []
+    for domain in _launchd_domains():
+        try:
+            labels |= _launch_domain_inventory(domain)
+        except ProbeError as exc:
+            errors.append(str(exc))
+    if not labels and errors:
+        raise ProbeError(errors[-1])
+    return labels
 
 
 def _check_endpoint(
@@ -667,7 +738,7 @@ def _check_launch_contracts(
     launch_agents_dir: Path,
     home: Path,
     now: datetime,
-    launchctl: Callable[[str], subprocess.CompletedProcess[str]],
+    launchctl: Callable[[str, str], subprocess.CompletedProcess[str]],
     loaded_inventory: set[str],
 ) -> tuple[list[dict[str, str]], list[dict[str, Any]]]:
     by_label = {str(contract["label"]): contract for contract in contracts}
@@ -683,9 +754,29 @@ def _check_launch_contracts(
     for contract in contracts:
         label = str(contract["label"])
         expected = str(contract["expected"])
-        result = launchctl(label)
-        loaded = result.returncode == 0
+        loaded_domain, gui_result, user_result = _launch_agent_registration(
+            label,
+            launchctl=launchctl,
+        )
+        loaded = loaded_domain is not None
+        duplicate = (
+            gui_result is not None
+            and user_result is not None
+            and gui_result.returncode == 0
+            and user_result.returncode == 0
+        )
         plist_path = launch_agents_dir / f"{label}.plist"
+
+        if duplicate:
+            findings.append(
+                _finding(
+                    "launchd",
+                    label,
+                    "duplicate_domain_registration",
+                    f"{label} is loaded in both {_launchd_domains()[0]} and {_launchd_domains()[1]}",
+                )
+            )
+            continue
 
         if expected == "retired":
             if loaded:
@@ -702,12 +793,19 @@ def _check_launch_contracts(
         if expected != "loaded":
             raise ProbeError(f"LaunchAgent {label} has unsupported expected state {expected!r}")
         if not loaded:
+            detail_parts = []
+            for domain, result in zip(_launchd_domains(), (gui_result, user_result)):
+                if result is None:
+                    continue
+                detail = (result.stderr or result.stdout or "launchctl print failed").strip()
+                if detail:
+                    detail_parts.append(f"{domain}: {detail[-150:]}")
             findings.append(
                 _finding(
                     "launchd",
                     label,
                     "agent_not_loaded",
-                    (result.stderr or result.stdout or "launchctl print failed").strip()[-300:],
+                    " | ".join(detail_parts)[-300:] or "launchctl print failed in both domains",
                 )
             )
             continue
@@ -742,6 +840,7 @@ def _check_launch_contracts(
                 "id": label,
                 "status": "checked",
                 "outcome_kind": kind,
+                "domain": loaded_domain,
             }
         )
     return findings, evidence
@@ -755,7 +854,7 @@ def evaluate(
     launch_agents_dir: Path,
     home: Path,
     now: datetime,
-    launchctl: Callable[[str], subprocess.CompletedProcess[str]] = _launchctl_print,
+    launchctl: Callable[[str, str], subprocess.CompletedProcess[str]] = _default_launchctl,
     launch_inventory: Callable[[], set[str]] = _launchctl_inventory,
 ) -> tuple[list[dict[str, str]], list[dict[str, Any]]]:
     if contracts.get("schema_version") != 1:
@@ -903,7 +1002,7 @@ def _inject_contract_failures(
 
         for contract in contracts["cron_jobs"]:
             job_id = str(contract["id"])
-            live_enabled = True if contract["enabled"] else True
+            live_enabled = bool(contract["enabled"])
             jobs_path = root / f"jobs-{job_id}.json"
             _atomic_json(
                 jobs_path,
@@ -937,7 +1036,7 @@ def _inject_contract_failures(
             label = str(contract["label"])
             should_look_loaded = contract["expected"] == "retired"
 
-            def fake_launchctl(_label: str, loaded: bool = should_look_loaded):
+            def fake_launchctl(_domain: str, _label: str, loaded: bool = should_look_loaded):
                 return subprocess.CompletedProcess(
                     ["launchctl"],
                     0 if loaded else 113,

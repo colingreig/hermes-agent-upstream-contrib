@@ -6,6 +6,9 @@ import plistlib
 import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
+
+import pytest
 
 
 SCRIPTS = Path(__file__).resolve().parent.parent
@@ -132,8 +135,11 @@ def test_evaluate_requires_fresh_semantic_outcome_not_only_scheduler_ok(tmp_path
     module = _load_module()
     contracts, jobs_path, output_root, launch_agents, output = _fixture(tmp_path)
 
-    def launchctl(label):
-        return _completed(0 if label.endswith(".fixture") else 113)
+    def launchctl(domain, label):
+        _, user_domain = module._launchd_domains()
+        if label.endswith(".fixture"):
+            return _completed(0 if domain != user_domain else 113)
+        return _completed(113)
 
     findings, evidence = module.evaluate(
         contracts,
@@ -185,7 +191,9 @@ def test_unknown_enabled_cron_and_monitored_plist_fail_closed(tmp_path):
         launch_agents_dir=launch_agents,
         home=tmp_path,
         now=NOW,
-        launchctl=lambda label: _completed(0 if label.endswith(".fixture") else 113),
+        launchctl=lambda domain, label: _completed(
+            0 if label.endswith(".fixture") and domain != module._launchd_domains()[1] else 113
+        ),
         launch_inventory=lambda: {
             "com.colingreig.hermes.fixture",
             "com.colingreig.hermes.unknown",
@@ -566,6 +574,234 @@ def test_sentinel_contract_uses_structured_terminal_errors_not_issue_titles(tmp_
         (label, "failure_marker"),
         (label, "required_marker_missing"),
     }
+
+
+def test_response_only_canonical_failed_artifact_reports_failure_marker(tmp_path):
+    module = _load_module()
+    outcome = _canonical_contract(cron_name="content-lane-executor")["outcome"]
+    artifact = _fresh_artifact(
+        tmp_path,
+        """# Cron Job: content-lane-executor (FAILED)
+
+**Job ID:** dcab830aa41c
+**Run Time:** 2026-08-01 11:06:46
+
+## Prompt
+
+/ignite-execute --lane content
+
+## Error
+
+```
+RuntimeError: out of extra usage
+```
+""",
+    )
+    findings = module._check_text_evidence(
+        surface="cron",
+        identifier="content-lane-executor",
+        path=artifact,
+        outcome=outcome,
+        now=NOW,
+    )
+    codes = {item["code"] for item in findings}
+    assert "failure_marker" in codes
+    assert "response_section_missing" not in codes
+
+
+def test_response_only_success_ignores_failure_text_in_prompt(tmp_path):
+    module = _load_module()
+    outcome = _canonical_contract(cron_name="content-lane-executor")["outcome"]
+    artifact = _fresh_artifact(
+        tmp_path,
+        """# Cron Job: content-lane-executor
+
+## Prompt
+
+(FAILED) from an old skill example — not this run's outcome
+
+## Response
+
+No actionable tasks. swarm complete.
+""",
+    )
+    assert (
+        module._check_text_evidence(
+            surface="cron",
+            identifier="content-lane-executor",
+            path=artifact,
+            outcome=outcome,
+            now=NOW,
+        )
+        == []
+    )
+
+
+def test_response_only_malformed_artifact_reports_response_section_missing(tmp_path):
+    module = _load_module()
+    outcome = _canonical_contract(cron_name="content-lane-executor")["outcome"]
+    artifact = _fresh_artifact(
+        tmp_path,
+        """# Cron Job: content-lane-executor
+
+## Prompt
+
+Some prompt with no response or scheduler error section.
+""",
+    )
+    findings = module._check_text_evidence(
+        surface="cron",
+        identifier="content-lane-executor",
+        path=artifact,
+        outcome=outcome,
+        now=NOW,
+    )
+    assert {item["code"] for item in findings} == {"response_section_missing"}
+
+
+def test_response_only_failed_header_without_error_reports_response_section_missing(tmp_path):
+    module = _load_module()
+    outcome = _canonical_contract(cron_name="content-lane-executor")["outcome"]
+    artifact = _fresh_artifact(
+        tmp_path,
+        """# Cron Job: content-lane-executor (FAILED)
+
+**Job ID:** dcab830aa41c
+**Run Time:** 2026-08-01 11:06:46
+
+## Prompt
+
+/ignite-execute --lane content
+""",
+    )
+    findings = module._check_text_evidence(
+        surface="cron",
+        identifier="content-lane-executor",
+        path=artifact,
+        outcome=outcome,
+        now=NOW,
+    )
+    assert {item["code"] for item in findings} == {"response_section_missing"}
+
+
+def test_launchctl_inventory_returns_partial_results_when_one_domain_fails():
+    module = _load_module()
+    gui_domain, user_domain = module._launchd_domains()
+
+    def fake_inventory(domain: str) -> set[str]:
+        if domain == gui_domain:
+            raise module.ProbeError("gui inventory unavailable")
+        return {"com.colingreig.hermes.gateway"}
+
+    with mock.patch.object(module, "_launch_domain_inventory", side_effect=fake_inventory):
+        assert module._launchctl_inventory() == {"com.colingreig.hermes.gateway"}
+
+
+def test_launchctl_inventory_raises_when_both_domains_fail():
+    module = _load_module()
+
+    def fake_inventory(_domain: str) -> set[str]:
+        raise module.ProbeError("inventory unavailable")
+
+    with mock.patch.object(module, "_launch_domain_inventory", side_effect=fake_inventory):
+        with pytest.raises(module.ProbeError, match="inventory unavailable"):
+            module._launchctl_inventory()
+
+
+def test_launch_agent_registration_accepts_gui_or_user_domain():
+    module = _load_module()
+    gui_domain, user_domain = module._launchd_domains()
+    label = "ai.hermes.gateway"
+
+    def launchctl(domain, _label):
+        return _completed(0 if domain == user_domain else 113)
+
+    loaded_domain, _, _ = module._launch_agent_registration(label, launchctl=launchctl)
+    assert loaded_domain == user_domain
+
+    def launchctl_gui(domain, _label):
+        return _completed(0 if domain == gui_domain else 113)
+
+    loaded_domain, _, _ = module._launch_agent_registration(label, launchctl=launchctl_gui)
+    assert loaded_domain == gui_domain
+
+
+def test_launch_agent_registration_reports_duplicate_domains():
+    module = _load_module()
+
+    def launchctl(_domain, _label):
+        return _completed(0)
+
+    loaded_domain, gui_result, user_result = module._launch_agent_registration(
+        "ai.hermes.gateway",
+        launchctl=launchctl,
+    )
+    assert loaded_domain is None
+    assert gui_result.returncode == 0
+    assert user_result.returncode == 0
+
+
+def test_check_launch_contracts_flags_duplicate_domain_registration(tmp_path):
+    module = _load_module()
+    launch_agents = tmp_path / "LaunchAgents"
+    launch_agents.mkdir()
+    contract = {
+        "label": "ai.hermes.gateway",
+        "expected": "loaded",
+        "outcome": {"kind": "self"},
+    }
+
+    def launchctl(_domain, _label):
+        return _completed(0)
+
+    findings, evidence = module._check_launch_contracts(
+        [contract],
+        launch_agents_dir=launch_agents,
+        home=tmp_path,
+        now=NOW,
+        launchctl=launchctl,
+        loaded_inventory=set(),
+    )
+    assert {(item["id"], item["code"]) for item in findings} == {
+        ("ai.hermes.gateway", "duplicate_domain_registration"),
+    }
+    assert evidence == []
+
+
+def test_check_launch_contracts_accepts_user_domain_only_registration(tmp_path):
+    module = _load_module()
+    launch_agents = tmp_path / "LaunchAgents"
+    launch_agents.mkdir()
+    with (launch_agents / "ai.hermes.gateway.plist").open("wb") as handle:
+        plistlib.dump({"Label": "ai.hermes.gateway"}, handle)
+    contract = {
+        "label": "ai.hermes.gateway",
+        "expected": "loaded",
+        "outcome": {"kind": "self"},
+    }
+    user_domain = module._launchd_domains()[1]
+
+    def launchctl(domain, _label):
+        return _completed(0 if domain == user_domain else 113)
+
+    findings, evidence = module._check_launch_contracts(
+        [contract],
+        launch_agents_dir=launch_agents,
+        home=tmp_path,
+        now=NOW,
+        launchctl=launchctl,
+        loaded_inventory=set(),
+    )
+    assert findings == []
+    assert evidence == [
+        {
+            "surface": "launchd",
+            "id": "ai.hermes.gateway",
+            "status": "checked",
+            "outcome_kind": "self",
+            "domain": user_domain,
+        }
+    ]
 
 
 def test_launchctl_inventory_ignores_enabled_overrides_outside_services():

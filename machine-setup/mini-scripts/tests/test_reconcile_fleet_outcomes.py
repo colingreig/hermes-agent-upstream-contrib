@@ -191,6 +191,75 @@ class FleetOutcomeReconcilerTests(unittest.TestCase):
             reconciler.rollback()
         self.assertEqual((self.hermes / "scripts" / "probe.py").read_bytes(), old_script)
 
+    def test_verify_accepts_user_domain_registration(self) -> None:
+        reconciler = self.reconciler()
+        user_domain = module.Reconciler._launchd_domains()[1]
+
+        def registered(domain: str, label: str) -> bool:
+            return domain == user_domain and label == "com.colingreig.hermes.test-probe"
+
+        with mock.patch.object(reconciler, "_registered", return_value=False):
+            reconciler.install()
+        with mock.patch.object(reconciler, "_registered", side_effect=registered):
+            reconciler.verify(require_loaded=True)
+
+    def test_verify_rejects_duplicate_domain_registration(self) -> None:
+        reconciler = self.reconciler()
+        with mock.patch.object(reconciler, "_registered", return_value=False):
+            reconciler.install()
+        with mock.patch.object(reconciler, "_registered", return_value=True):
+            with self.assertRaisesRegex(
+                module.ReconcileError,
+                "duplicate domains",
+            ):
+                reconciler.verify(require_loaded=True)
+
+    def test_set_loaded_bootstraps_resolved_domain(self) -> None:
+        reconciler = self.reconciler()
+        user_domain = module.Reconciler._launchd_domains()[1]
+        bootstrap_calls: list[tuple[str, str]] = []
+        (self.launch_agents / "probe.plist").write_text(
+            (self.source / "launchd" / "probe.plist").read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+
+        def registered(domain: str, label: str) -> bool:
+            return False
+
+        def resolve(label: str) -> str:
+            self.assertEqual(label, "com.colingreig.hermes.test-probe")
+            return user_domain
+
+        def wait_registered(domain: str, label: str, expected: bool) -> bool:
+            if expected:
+                bootstrap_calls.append((domain, label))
+            return True
+
+        with (
+            mock.patch.object(reconciler, "_registered", side_effect=registered),
+            mock.patch.object(reconciler, "_resolve_launchd_domain", side_effect=resolve),
+            mock.patch.object(reconciler, "_wait_registered", side_effect=wait_registered),
+            mock.patch.object(module, "subprocess") as subprocess_module,
+        ):
+            subprocess_module.run.return_value = mock.Mock(returncode=0)
+            reconciler._set_loaded({"com.colingreig.hermes.test-probe": True})
+
+        self.assertEqual(
+            bootstrap_calls,
+            [(user_domain, "com.colingreig.hermes.test-probe")],
+        )
+        bootstrap_calls = [
+            call.args[0]
+            for call in subprocess_module.run.call_args_list
+            if call.args[0][:2] == ["launchctl", "bootstrap"]
+        ]
+        self.assertEqual(len(bootstrap_calls), 1)
+        self.assertEqual(bootstrap_calls[0][:3], ["launchctl", "bootstrap", user_domain])
+        self.assertEqual(
+            Path(bootstrap_calls[0][3]).resolve(),
+            (self.launch_agents / "probe.plist").resolve(),
+        )
+
 
 def test_repository_manifest_is_content_addressed() -> None:
     source_root = SCRIPT.parent

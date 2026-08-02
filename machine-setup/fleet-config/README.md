@@ -9,7 +9,7 @@ mini:
 |---|---|---|
 | `config-overlay.yaml` | `~/.hermes/config.yaml` | Governed **overlay** (not a replacement) — deep-merges `model`, `fallback_providers`, `delegation`, `kanban` in. Every other section (platforms, secrets wiring, security, approvals, credential_pool_strategies, ...) is left untouched. |
 | `profiles/<name>/{config.yaml,SOUL.md}` | `~/.hermes/profiles/<name>/` | Five direct-execution profiles: `coder`, `content`, `design`, `research`, `ops`. Each gets its model config, its SOUL.md persona, and the full `_PROFILE_DIRS` bootstrap tree from `hermes_cli/profiles.py` (`memories`, `sessions`, `skills`, `skins`, `logs`, `plans`, `workspace`, `cron`, `home`). The `home/` entry is a subprocess workspace, not the profile's Hermes root. |
-| `jobs.json` | `~/.hermes/cron/jobs.json` | Curated 16-job cron set (12 carried forward from the pre-freeze live config, 3 new consolidated hygiene/digest jobs). **Wholesale replace**, not a merge. |
+| `jobs.json` | `~/.hermes/cron/jobs.json` | Curated 16-job cron set (12 carried forward from the pre-freeze live config, 3 new consolidated hygiene/digest jobs, plus Purelymail poller). **Definition merge**: bundled job definitions replace the live fleet, but scheduler-owned runtime fields (`last_status`, `last_run_at`, `next_run_at`, `state`, `runtime`, `repeat.completed`, claims, …) are preserved for unchanged job ids. |
 | `skills-policy.json` | Default plus five profile-local `skills/` trees | SHA-pinned allowlist/cull policy. Preserves allowed bundled skills, archives and suppresses removals, consolidates two historical ClickUp poller references, removes the obsolete local `sentry-monitor` wrapper without touching the operational Ignite Sentinel checkout, and removes the local hub shadow of `vehicle-image-qc` only with exact hub provenance. |
 | `install_fleet_config.py` | Operator entry point (source-only manifest pin) | Verifies the whole bundle, performs the governed mutations, and records rollback receipts. The installer itself is SHA-256 pinned by the same manifest before any mutation. |
 
@@ -352,10 +352,13 @@ are intentionally untouched.
   also includes `skins`. Using the actual constant (rather than a
   hand-copied list that could drift) keeps this bundle in sync with
   `hermes profile create` automatically.
-- **jobs.json runtime fields**: `last_run_at`, `next_run_at`, `last_status`,
-  `last_error`, `last_delivery_error`, and `repeat.completed` are reset to
-  null/0 for every job (not carried over from the pre-freeze snapshot) since
-  this is a rebuild cutover, not an in-place patch. Original job `id`s are
-  preserved for the 12 kept jobs (some tooling — e.g.
-  `validator_repo_guard` callers — references `hermes-pr-validate`'s id
-  `5a76e290811d` by value); the 3 new jobs get freshly generated ids.
+- **jobs.json runtime fields**: on the initial 2026-07-29 rebuild cutover,
+  runtime fields were intentionally reset. Subsequent governed installs merge
+  bundled definitions and **preserve** scheduler-owned runtime evidence for
+  unchanged job ids (`last_run_at`, `next_run_at`, `last_status`, `last_error`,
+  `last_delivery_error`, `repeat.completed`, claims, `state`, `runtime`, …).
+  Jobs whose definitions change get fresh runtime defaults from the bundle; jobs
+  removed from the bundle are dropped. Original job `id`s are preserved for
+  the 12 kept jobs (some tooling — e.g. `validator_repo_guard` callers —
+  references `hermes-pr-validate`'s id `5a76e290811d` by value); the 3 new
+  jobs get freshly generated ids.

@@ -252,10 +252,30 @@ class Reconciler:
         return result
 
     @staticmethod
-    def _registered(label: str) -> bool:
+    def _launchd_domains() -> tuple[str, str]:
+        uid = os.getuid()
+        return f"gui/{uid}", f"user/{uid}"
+
+    @staticmethod
+    def _bootout_domain(domain: str, label: str) -> None:
+        subprocess.run(
+            ["launchctl", "bootout", f"{domain}/{label}"],
+            check=False,
+            timeout=LAUNCHCTL_TIMEOUT_SECONDS,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    @classmethod
+    def _bootout(cls, label: str) -> None:
+        for domain in cls._launchd_domains():
+            cls._bootout_domain(domain, label)
+
+    @staticmethod
+    def _registered(domain: str, label: str) -> bool:
         try:
             result = subprocess.run(
-                ["launchctl", "print", f"gui/{os.getuid()}/{label}"],
+                ["launchctl", "print", f"{domain}/{label}"],
                 check=False,
                 timeout=LAUNCHCTL_TIMEOUT_SECONDS,
                 stdout=subprocess.DEVNULL,
@@ -264,6 +284,51 @@ class Reconciler:
         except (OSError, subprocess.TimeoutExpired):
             return False
         return result.returncode == 0
+
+    def _is_loaded(self, label: str) -> bool:
+        return any(
+            self._registered(domain, label) for domain in self._launchd_domains()
+        )
+
+    def _duplicate_loaded(self, label: str) -> bool:
+        return (
+            sum(
+                1
+                for domain in self._launchd_domains()
+                if self._registered(domain, label)
+            )
+            > 1
+        )
+
+    def _resolve_launchd_domain(self, label: str) -> str:
+        """Return the domain that owns ``label``, or the session heuristic domain."""
+        gui_domain, user_domain = self._launchd_domains()
+        if self._registered(gui_domain, label):
+            return gui_domain
+        if self._registered(user_domain, label):
+            return user_domain
+        try:
+            result = subprocess.run(
+                ["launchctl", "managername"],
+                check=False,
+                timeout=LAUNCHCTL_TIMEOUT_SECONDS,
+                capture_output=True,
+                text=True,
+            )
+            manager_name = (result.stdout or "").strip().casefold()
+            if result.returncode == 0 and manager_name == "aqua":
+                return gui_domain
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+        return user_domain
+
+    def _wait_registered(self, domain: str, label: str, expected: bool) -> bool:
+        for attempt in range(LAUNCHCTL_STATE_ATTEMPTS):
+            if self._registered(domain, label) is expected:
+                return True
+            if attempt + 1 < LAUNCHCTL_STATE_ATTEMPTS:
+                time.sleep(LAUNCHCTL_STATE_INTERVAL_SECONDS)
+        return False
 
     def _labels(self) -> list[str]:
         labels: list[str] = []
@@ -298,7 +363,7 @@ class Reconciler:
         with _jobs_lock(self.jobs_path):
             jobs_bytes = self.jobs_path.read_bytes()
             self._read_jobs()
-        loaded = {label: self._registered(label) for label in self._labels()}
+        loaded = {label: self._is_loaded(label) for label in self._labels()}
         payload = _json_bytes(
             {
                 "schema_version": SCHEMA_VERSION,
@@ -355,24 +420,6 @@ class Reconciler:
             for label, loaded in dict(value.get("loaded") or {}).items()
         }
 
-    @staticmethod
-    def _bootout(label: str) -> None:
-        subprocess.run(
-            ["launchctl", "bootout", f"gui/{os.getuid()}/{label}"],
-            check=False,
-            timeout=LAUNCHCTL_TIMEOUT_SECONDS,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-
-    def _wait_registered(self, label: str, expected: bool) -> bool:
-        for attempt in range(LAUNCHCTL_STATE_ATTEMPTS):
-            if self._registered(label) is expected:
-                return True
-            if attempt + 1 < LAUNCHCTL_STATE_ATTEMPTS:
-                time.sleep(LAUNCHCTL_STATE_INTERVAL_SECONDS)
-        return False
-
     def _set_loaded(self, loaded: dict[str, bool]) -> None:
         plist_by_label: dict[str, Path] = {}
         for target in self.target_map():
@@ -382,13 +429,17 @@ class Reconciler:
             plist_by_label[str(payload["Label"])] = target
         for label, should_load in sorted(loaded.items()):
             self._bootout(label)
-            if not self._wait_registered(label, False):
-                raise ReconcileError(f"launchctl did not unload {label}")
+            for domain in self._launchd_domains():
+                if not self._wait_registered(domain, label, False):
+                    raise ReconcileError(
+                        f"launchctl did not unload {label} from {domain}"
+                    )
             if not should_load:
                 continue
             plist = plist_by_label.get(label)
             if plist is None:
                 raise ReconcileError(f"cannot reload {label}: plist is absent")
+            domain = self._resolve_launchd_domain(label)
             last_error: BaseException | None = None
             for attempt in range(1, LAUNCHCTL_BOOTSTRAP_ATTEMPTS + 1):
                 try:
@@ -396,7 +447,7 @@ class Reconciler:
                         [
                             "launchctl",
                             "bootstrap",
-                            f"gui/{os.getuid()}",
+                            domain,
                             str(plist),
                         ],
                         check=True,
@@ -411,18 +462,19 @@ class Reconciler:
                 except (OSError, subprocess.TimeoutExpired) as exc:
                     last_error = exc
                 else:
-                    if self._wait_registered(label, True):
+                    if self._wait_registered(domain, label, True):
                         last_error = None
                         break
                     last_error = ReconcileError(
-                        f"launchctl did not register {label}"
+                        f"launchctl did not register {label} in {domain}"
                     )
                 if attempt < LAUNCHCTL_BOOTSTRAP_ATTEMPTS:
                     self._bootout(label)
-                    if not self._wait_registered(label, False):
-                        raise ReconcileError(
-                            f"launchctl did not reset {label} for retry"
-                        )
+                    for retry_domain in self._launchd_domains():
+                        if not self._wait_registered(retry_domain, label, False):
+                            raise ReconcileError(
+                                f"launchctl did not reset {label} for retry"
+                            )
             if last_error is not None:
                 raise ReconcileError(f"launchctl could not load {label}") from last_error
 
@@ -441,7 +493,15 @@ class Reconciler:
             if actual != expected:
                 raise ReconcileError("governed cron fields drifted")
         if require_loaded:
-            missing = [label for label in self._labels() if not self._registered(label)]
+            duplicates = [
+                label for label in self._labels() if self._duplicate_loaded(label)
+            ]
+            if duplicates:
+                raise ReconcileError(
+                    "governed LaunchAgents are loaded in duplicate domains: "
+                    + ", ".join(duplicates)
+                )
+            missing = [label for label in self._labels() if not self._is_loaded(label)]
             if missing:
                 raise ReconcileError(
                     "governed LaunchAgents are not loaded: " + ", ".join(missing)

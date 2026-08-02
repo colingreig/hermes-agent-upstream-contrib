@@ -10,8 +10,20 @@
         "kind": "cron_output",
         "max_age_seconds": 7200,
         "response_only": true,
-        "success_patterns": ["swarm", "No actionable", "no eligible", "claimed", "in review", "blocked"],
-        "failure_patterns": ["\\(FAILED\\)", "\\(No response generated\\)", "Status: .*failed", "Traceback"]
+        "success_patterns": [
+          "swarm",
+          "No actionable",
+          "no eligible",
+          "claimed",
+          "in review",
+          "blocked"
+        ],
+        "failure_patterns": [
+          "\\(FAILED\\)",
+          "\\(No response generated\\)",
+          "Status: .*failed",
+          "Traceback"
+        ]
       }
     },
     {
@@ -23,8 +35,20 @@
         "kind": "cron_output",
         "max_age_seconds": 7200,
         "response_only": true,
-        "success_patterns": ["swarm", "No actionable", "no eligible", "claimed", "in review", "blocked"],
-        "failure_patterns": ["\\(FAILED\\)", "\\(No response generated\\)", "Status: .*failed", "Traceback"]
+        "success_patterns": [
+          "swarm",
+          "No actionable",
+          "no eligible",
+          "claimed",
+          "in review",
+          "blocked"
+        ],
+        "failure_patterns": [
+          "\\(FAILED\\)",
+          "\\(No response generated\\)",
+          "Status: .*failed",
+          "Traceback"
+        ]
       }
     },
     {
@@ -35,8 +59,17 @@
       "outcome": {
         "kind": "cron_output",
         "max_age_seconds": 3600,
-        "success_patterns": ["wakeAgent", "\\[gate\\]", "Status:\\*\\* silent"],
-        "failure_patterns": ["\\(FAILED\\)", "Status: .*failed", "Traceback", "CLICKUP_API_TOKEN not set"]
+        "success_patterns": [
+          "wakeAgent",
+          "\\[gate\\]",
+          "Status:\\*\\* silent"
+        ],
+        "failure_patterns": [
+          "\\(FAILED\\)",
+          "Status: .*failed",
+          "Traceback",
+          "CLICKUP_API_TOKEN not set"
+        ]
       }
     },
     {
@@ -47,8 +80,19 @@
       "outcome": {
         "kind": "cron_output",
         "max_age_seconds": 3600,
-        "success_patterns": ["wakeAgent", "\\[review-gate\\]", "Status:\\*\\* silent"],
-        "failure_patterns": ["\\(FAILED\\)", "Status: .*failed", "Traceback", "CLICKUP_API_TOKEN not set", "scan error", "unexpected:"]
+        "success_patterns": [
+          "wakeAgent",
+          "\\[review-gate\\]",
+          "Status:\\*\\* silent"
+        ],
+        "failure_patterns": [
+          "\\(FAILED\\)",
+          "Status: .*failed",
+          "Traceback",
+          "CLICKUP_API_TOKEN not set",
+          "scan error",
+          "unexpected:"
+        ]
       }
     },
     {
@@ -59,8 +103,18 @@
       "outcome": {
         "kind": "cron_output",
         "max_age_seconds": 10800,
-        "success_patterns": ["Status:\\*\\* silent", "review", "SLA", "wakeAgent"],
-        "failure_patterns": ["\\(FAILED\\)", "Status: .*failed", "Traceback", "scan error"]
+        "success_patterns": [
+          "Status:\\*\\* silent",
+          "review",
+          "SLA",
+          "wakeAgent"
+        ],
+        "failure_patterns": [
+          "\\(FAILED\\)",
+          "Status: .*failed",
+          "Traceback",
+          "scan error"
+        ]
       }
     },
     {
@@ -72,8 +126,21 @@
         "kind": "cron_output",
         "max_age_seconds": 7200,
         "response_only": true,
-        "success_patterns": ["ignite-validate", "PASS", "FAIL", "no.*(?:review|actionable)", "validated"],
-        "failure_patterns": ["\\(FAILED\\)", "\\(No response generated\\)", "Status: .*failed", "Traceback", "ABORT"]
+        "success_patterns": [
+          "ignite-validate",
+          "PASS",
+          "FAIL",
+          "no.*(?:review|actionable)",
+          "validated",
+          "^\\[SILENT\\]\\s*$"
+        ],
+        "failure_patterns": [
+          "\\(FAILED\\)",
+          "\\(No response generated\\)",
+          "Status: .*failed",
+          "Traceback",
+          "ABORT"
+        ]
       }
     },
     {
@@ -84,8 +151,17 @@
       "outcome": {
         "kind": "cron_output",
         "max_age_seconds": 7200,
-        "success_patterns": ["Status:\\*\\* silent \\(empty output\\)", "spend_meter.*OK", "daily spend"],
-        "failure_patterns": ["\\(FAILED\\)", "DATA UNAVAILABLE", "Status: .*failed", "Traceback"]
+        "success_patterns": [
+          "Status:\\*\\* silent \\(empty output\\)",
+          "spend_meter.*OK",
+          "daily spend"
+        ],
+        "failure_patterns": [
+          "\\(FAILED\\)",
+          "DATA UNAVAILABLE",
+          "Status: .*failed",
+          "Traceback"
+        ]
       }
     },
     {
@@ -101,12 +177,17 @@
         "required_values": {
           "schema_version": 2
         },
-        "success_patterns": ["\"classification\"\\s*:\\s*\"stable\""],
+        "success_patterns": [
+          "\"classification\"\\s*:\\s*\"stable\""
+        ],
         "required_patterns": [
           "\"available\"\\s*:\\s*true",
           "\"resource_drift\"\\s*:\\s*\\[\\]"
         ],
-        "failure_patterns": ["\"available\"\\s*:\\s*false", "\"resource_drift\"\\s*:\\s*\\[[^\\]]+\\]"]
+        "failure_patterns": [
+          "\"available\"\\s*:\\s*false",
+          "\"resource_drift\"\\s*:\\s*\\[[^\\]]+\\]"
+        ]
       }
     },
     {
@@ -127,8 +208,13 @@
           "path": "~/.hermes/state/clickup-map.json",
           "sha256_key": "map_sha256"
         },
-        "success_patterns": ["\"outcome\"\\s*:\\s*\"success\"", "\"map_sha256\""],
-        "failure_patterns": ["\"outcome\"\\s*:\\s*\"failed\""]
+        "success_patterns": [
+          "\"outcome\"\\s*:\\s*\"success\"",
+          "\"map_sha256\""
+        ],
+        "failure_patterns": [
+          "\"outcome\"\\s*:\\s*\"failed\""
+        ]
       }
     },
     {
@@ -139,8 +225,18 @@
       "outcome": {
         "kind": "cron_output",
         "max_age_seconds": 7200,
-        "success_patterns": ["Status:\\*\\* silent", "reap", "claim", "\"wakeAgent\""],
-        "failure_patterns": ["\\(FAILED\\)", "Status: .*failed", "Traceback", "ERROR"]
+        "success_patterns": [
+          "Status:\\*\\* silent",
+          "reap",
+          "claim",
+          "\"wakeAgent\""
+        ],
+        "failure_patterns": [
+          "\\(FAILED\\)",
+          "Status: .*failed",
+          "Traceback",
+          "ERROR"
+        ]
       }
     },
     {
@@ -151,8 +247,21 @@
       "outcome": {
         "kind": "cron_output",
         "max_age_seconds": 108000,
-        "success_patterns": ["Status:\\*\\* silent", "sync", "complete", "updated"],
-        "failure_patterns": ["\\(FAILED\\)", "\\bFAIL(?:ED)?\\b", "Status: .*failed", "Traceback", "\"status\"\\s*:\\s*\"(?:failed|error)\"", "\"success\"\\s*:\\s*false", "\"failures\"\\s*:\\s*\\[(?!\\s*\\])"]
+        "success_patterns": [
+          "Status:\\*\\* silent",
+          "sync",
+          "complete",
+          "updated"
+        ],
+        "failure_patterns": [
+          "\\(FAILED\\)",
+          "\\bFAIL(?:ED)?\\b",
+          "Status: .*failed",
+          "Traceback",
+          "\"status\"\\s*:\\s*\"(?:failed|error)\"",
+          "\"success\"\\s*:\\s*false",
+          "\"failures\"\\s*:\\s*\\[(?!\\s*\\])"
+        ]
       }
     },
     {
@@ -163,9 +272,21 @@
       "outcome": {
         "kind": "cron_output",
         "max_age_seconds": 3600,
-        "success_patterns": ["\"total\"\\s*:", "\"db_total\"\\s*:"],
-        "required_patterns": ["\"total\"\\s*:", "\"db_total\"\\s*:"],
-        "failure_patterns": ["\\(FAILED\\)", "Status: .*failed", "Traceback", "\\bERROR\\b", "FLIP-FAILED"]
+        "success_patterns": [
+          "\"total\"\\s*:",
+          "\"db_total\"\\s*:"
+        ],
+        "required_patterns": [
+          "\"total\"\\s*:",
+          "\"db_total\"\\s*:"
+        ],
+        "failure_patterns": [
+          "\\(FAILED\\)",
+          "Status: .*failed",
+          "Traceback",
+          "\\bERROR\\b",
+          "FLIP-FAILED"
+        ]
       }
     },
     {
@@ -177,9 +298,33 @@
         "kind": "cron_output",
         "max_age_seconds": 7200,
         "response_only": true,
-        "success_patterns": ["complete", "clean", "reconciled", "no drift", "no actionable", "Closeout Audit", "clickup_closeout_audit", "Stalled Task Reconciler", "stalled_task_reconciler", "Staleness Sweep", "staleness_sweep", "Drift Reconciliation", "drift_reconcil(?:iation|er)"],
-        "required_patterns": ["(?:clickup_closeout_audit|Closeout Audit)", "(?:stalled_task_reconciler|Stalled Task Reconciler)", "(?:staleness_sweep|Staleness Sweep)", "(?:drift_reconcil(?:iation|er)|Drift Reconciliation)"],
-        "failure_patterns": ["\\(FAILED\\)", "\\(No response generated\\)", "Status: .*failed", "Traceback"]
+        "success_patterns": [
+          "complete",
+          "clean",
+          "reconciled",
+          "no drift",
+          "no actionable",
+          "Closeout Audit",
+          "clickup_closeout_audit",
+          "Stalled Task Reconciler",
+          "stalled_task_reconciler",
+          "Staleness Sweep",
+          "staleness_sweep",
+          "Drift Reconciliation",
+          "drift_reconcil(?:iation|er)"
+        ],
+        "required_patterns": [
+          "(?:clickup_closeout_audit|Closeout Audit)",
+          "(?:stalled_task_reconciler|Stalled Task Reconciler)",
+          "(?:staleness_sweep|Staleness Sweep)",
+          "(?:drift_reconcil(?:iation|er)|Drift Reconciliation)"
+        ],
+        "failure_patterns": [
+          "\\(FAILED\\)",
+          "\\(No response generated\\)",
+          "Status: .*failed",
+          "Traceback"
+        ]
       }
     },
     {
@@ -195,8 +340,13 @@
         "required_values": {
           "status": "sent"
         },
-        "success_patterns": ["\"status\"\\s*:\\s*\"sent\"", "\"channel\""],
-        "failure_patterns": ["\"status\"\\s*:\\s*\"(?:failed|error)\""]
+        "success_patterns": [
+          "\"status\"\\s*:\\s*\"sent\"",
+          "\"channel\""
+        ],
+        "failure_patterns": [
+          "\"status\"\\s*:\\s*\"(?:failed|error)\""
+        ]
       }
     },
     {
@@ -208,24 +358,48 @@
         "kind": "cron_output",
         "max_age_seconds": 108000,
         "response_only": true,
-        "success_patterns": ["Success", "complete", "Nothing to clean", "No stale", "safety gate"],
-        "required_patterns": ["repo_gc_sweep", "cleanup_hermes_baks", "orphan_unpushed_cron"],
-        "failure_patterns": ["\\(FAILED\\)", "\\(No response generated\\)", "Status: .*failed", "Traceback"]
+        "success_patterns": [
+          "Success",
+          "complete",
+          "Nothing to clean",
+          "No stale",
+          "safety gate"
+        ],
+        "required_patterns": [
+          "repo_gc_sweep",
+          "cleanup_hermes_baks",
+          "orphan_unpushed_cron"
+        ],
+        "failure_patterns": [
+          "\\(FAILED\\)",
+          "\\(No response generated\\)",
+          "Status: .*failed",
+          "Traceback"
+        ]
       }
     },
     {
       "id": "6e25865a22a4",
       "name": "Purelymail notify-me poller",
       "enabled": true,
-      "max_age_seconds": 2700,
+      "max_age_seconds": 5400,
       "outcome": {
-        "kind": "text_artifact",
-        "path": "~/.hermes/logs/purelymail-poller.log",
-        "max_age_seconds": 2700,
-        "tail_lines": 400,
-        "run_start_pattern": "Purelymail notify-poller starting \\(dry_run=False",
-        "success_patterns": ["Purelymail notify-poller finished"],
-        "failure_patterns": ["CERTIFICATE_VERIFY_FAILED", "Mailbox poll failed", "gaierror", "Traceback"]
+        "kind": "cron_output",
+        "max_age_seconds": 5400,
+        "response_only": false,
+        "success_patterns": [
+          "ok",
+          "polled",
+          "no new",
+          "SUCCESS",
+          "idle"
+        ],
+        "failure_patterns": [
+          "\\(FAILED\\)",
+          "Traceback",
+          "ERROR",
+          "Status: .*failed"
+        ]
       }
     }
   ],
@@ -246,12 +420,17 @@
       "outcome": {
         "kind": "http",
         "url": "http://127.0.0.1:8642/health",
-        "statuses": [200],
+        "statuses": [
+          200
+        ],
         "required_values": {
           "status": "ok",
           "platform": "hermes-agent"
         },
-        "required_patterns": ["\"status\"\\s*:\\s*\"ok\"", "\"platform\"\\s*:\\s*\"hermes-agent\""],
+        "required_patterns": [
+          "\"status\"\\s*:\\s*\"ok\"",
+          "\"platform\"\\s*:\\s*\"hermes-agent\""
+        ],
         "timeout_seconds": 5
       }
     },
@@ -261,8 +440,13 @@
       "outcome": {
         "kind": "http",
         "url": "http://127.0.0.1:9119/health",
-        "statuses": [200],
-        "required_patterns": ["<title>Hermes Agent - Dashboard</title>", "HERMES_DASHBOARD_EMBEDDED_CHAT__=true"],
+        "statuses": [
+          200
+        ],
+        "required_patterns": [
+          "<title>Hermes Agent - Dashboard</title>",
+          "HERMES_DASHBOARD_EMBEDDED_CHAT__=true"
+        ],
         "timeout_seconds": 5
       }
     },
@@ -274,8 +458,13 @@
         "path": "~/.hermes/logs/daily-spend-alert.log",
         "max_age_seconds": 129600,
         "latest_record_pattern": "\\[daily_spend_alert\\]",
-        "success_patterns": ["daily_spend_alert.*(?:OK|daily spend alert)"],
-        "failure_patterns": ["FATAL", "slack send failed"]
+        "success_patterns": [
+          "daily_spend_alert.*(?:OK|daily spend alert)"
+        ],
+        "failure_patterns": [
+          "FATAL",
+          "slack send failed"
+        ]
       }
     },
     {
@@ -287,8 +476,19 @@
         "max_age_seconds": 1800,
         "tail_lines": 5,
         "latest_record_pattern": "\\[degraded-secrets-monitor\\]",
-        "success_patterns": ["degraded-secrets-monitor.*(?:healthy|alerted|recovered)"],
-        "failure_patterns": ["credential pool degraded", "FATAL-loop", "gateway parked", "unresolved placeholder", "alert delivery incomplete", "alerted \\(slack=False", "slack send failed", "clickup comment failed"]
+        "success_patterns": [
+          "degraded-secrets-monitor.*(?:healthy|alerted|recovered)"
+        ],
+        "failure_patterns": [
+          "credential pool degraded",
+          "FATAL-loop",
+          "gateway parked",
+          "unresolved placeholder",
+          "alert delivery incomplete",
+          "alerted \\(slack=False",
+          "slack send failed",
+          "clickup comment failed"
+        ]
       }
     },
     {
@@ -300,8 +500,13 @@
         "max_age_seconds": 2400,
         "tail_lines": 1,
         "latest_record_pattern": "(?:OK|WARN|DORMANT):",
-        "success_patterns": ["OK: heartbeat ping delivered"],
-        "failure_patterns": ["DORMANT", "heartbeat ping FAILED"]
+        "success_patterns": [
+          "OK: heartbeat ping delivered"
+        ],
+        "failure_patterns": [
+          "DORMANT",
+          "heartbeat ping FAILED"
+        ]
       }
     },
     {
@@ -313,9 +518,17 @@
         "max_age_seconds": 5400,
         "tail_lines": 2000,
         "run_start_pattern": "sentinel_run: secrets resolved, running monitor.py",
-        "success_patterns": ["^.*sentinel_run: secrets resolved, running monitor\\.py[ \\t]*$"],
-        "required_patterns": ["^[ \\t]*\"errors\"[ \\t]*:[ \\t]*\\[[ \\t]*\\][ \\t]*,?[ \\t]*$"],
-        "failure_patterns": ["^.*sentinel_run: FATAL:", "^[ \\t]*\"errors\"[ \\t]*:[ \\t]*\\[[ \\t\\r\\n]*\\{", "^Traceback \\(most recent call last\\):"]
+        "success_patterns": [
+          "^.*sentinel_run: secrets resolved, running monitor\\.py[ \\t]*$"
+        ],
+        "required_patterns": [
+          "^[ \\t]*\"errors\"[ \\t]*:[ \\t]*\\[[ \\t]*\\][ \\t]*,?[ \\t]*$"
+        ],
+        "failure_patterns": [
+          "^.*sentinel_run: FATAL:",
+          "^[ \\t]*\"errors\"[ \\t]*:[ \\t]*\\[[ \\t\\r\\n]*\\{",
+          "^Traceback \\(most recent call last\\):"
+        ]
       }
     },
     {
@@ -327,8 +540,16 @@
         "max_age_seconds": 129600,
         "tail_lines": 4000,
         "run_start_pattern": "sentinel_digest_run: secrets resolved",
-        "success_patterns": ["sentinel_digest_run: secrets resolved", "digest.*(?:sent|complete)", "\"(?:status|sent)\""],
-        "failure_patterns": ["sentinel_digest_run: FATAL", "timed out", "Traceback"]
+        "success_patterns": [
+          "sentinel_digest_run: secrets resolved",
+          "digest.*(?:sent|complete)",
+          "\"(?:status|sent)\""
+        ],
+        "failure_patterns": [
+          "sentinel_digest_run: FATAL",
+          "timed out",
+          "Traceback"
+        ]
       }
     },
     {
@@ -340,8 +561,13 @@
         "max_age_seconds": 129600,
         "tail_lines": 2000,
         "run_end_pattern": "^.*\\bcomplete dry_run=(?:False|True)[^\\r\\n]*$",
-        "success_patterns": ["complete dry_run=False"],
-        "failure_patterns": ["remove-failed", "Traceback"]
+        "success_patterns": [
+          "complete dry_run=False"
+        ],
+        "failure_patterns": [
+          "remove-failed",
+          "Traceback"
+        ]
       }
     },
     {
@@ -353,9 +579,19 @@
         "max_age_seconds": 129600,
         "tail_lines": 10000,
         "run_end_pattern": "BARE_WORKTREE_PRUNE_DONE",
-        "success_patterns": ["sweep-finish", "BARE_WORKTREE_PRUNE_DONE"],
-        "required_patterns": ["sweep-finish", "BARE_WORKTREE_PRUNE_DONE"],
-        "failure_patterns": ["ERROR_REMOVING", "FAILED_SAFETY_PATH_CHECK", "Traceback"]
+        "success_patterns": [
+          "sweep-finish",
+          "BARE_WORKTREE_PRUNE_DONE"
+        ],
+        "required_patterns": [
+          "sweep-finish",
+          "BARE_WORKTREE_PRUNE_DONE"
+        ],
+        "failure_patterns": [
+          "ERROR_REMOVING",
+          "FAILED_SAFETY_PATH_CHECK",
+          "Traceback"
+        ]
       }
     },
     {
@@ -366,8 +602,13 @@
         "path": "~/.hermes/logs/ignite-marketplace-sync.log",
         "max_age_seconds": 10800,
         "latest_record_pattern": "sync.sh exited",
-        "success_patterns": ["sync.sh exited 0"],
-        "failure_patterns": ["FAIL:", "sync.sh exited [1-9]"]
+        "success_patterns": [
+          "sync.sh exited 0"
+        ],
+        "failure_patterns": [
+          "FAIL:",
+          "sync.sh exited [1-9]"
+        ]
       }
     },
     {
@@ -379,9 +620,20 @@
         "max_age_seconds": 129600,
         "tail_lines": 10000,
         "run_end_pattern": "^.*backup and retention complete[^\\r\\n]*$",
-        "success_patterns": ["backup and retention complete"],
-        "required_patterns": ["running restic backup", "running retention", "backup and retention complete"],
-        "failure_patterns": ["restic backup failed", "restic retention failed", "failed to send Slack alert", "Traceback"]
+        "success_patterns": [
+          "backup and retention complete"
+        ],
+        "required_patterns": [
+          "running restic backup",
+          "running retention",
+          "backup and retention complete"
+        ],
+        "failure_patterns": [
+          "restic backup failed",
+          "restic retention failed",
+          "failed to send Slack alert",
+          "Traceback"
+        ]
       }
     },
     {
@@ -393,9 +645,16 @@
         "max_age_seconds": 7200,
         "tail_lines": 500,
         "run_start_pattern": "sweep-start",
-        "success_patterns": ["sweep-finish[^\\r\\n]*\\bfailed=0\\b"],
-        "required_patterns": ["sweep-finish[^\\r\\n]*\\bfailed=0\\b"],
-        "failure_patterns": ["sweep-finish[^\\r\\n]*\\bfailed=[1-9][0-9]*\\b", "ERROR_[A-Z_]+"]
+        "success_patterns": [
+          "sweep-finish[^\\r\\n]*\\bfailed=0\\b"
+        ],
+        "required_patterns": [
+          "sweep-finish[^\\r\\n]*\\bfailed=0\\b"
+        ],
+        "failure_patterns": [
+          "sweep-finish[^\\r\\n]*\\bfailed=[1-9][0-9]*\\b",
+          "ERROR_[A-Z_]+"
+        ]
       }
     },
     {
@@ -410,7 +669,9 @@
           "schema_version": 1,
           "source": "ignite-skills-live"
         },
-        "success_patterns": ["\"commit\"\\s*:\\s*\"[0-9a-f]{40,64}\""],
+        "success_patterns": [
+          "\"commit\"\\s*:\\s*\"[0-9a-f]{40,64}\""
+        ],
         "failure_patterns": []
       }
     },
@@ -426,7 +687,9 @@
           "schema_version": 1,
           "source": "anthropic-agent-skills"
         },
-        "success_patterns": ["\"commit\"\\s*:\\s*\"[0-9a-f]{40,64}\""],
+        "success_patterns": [
+          "\"commit\"\\s*:\\s*\"[0-9a-f]{40,64}\""
+        ],
         "failure_patterns": []
       }
     },
@@ -436,8 +699,12 @@
       "outcome": {
         "kind": "http",
         "url": "http://127.0.0.1:9222/json/version",
-        "statuses": [200],
-        "success_patterns": ["\"webSocketDebuggerUrl\""],
+        "statuses": [
+          200
+        ],
+        "success_patterns": [
+          "\"webSocketDebuggerUrl\""
+        ],
         "timeout_seconds": 5
       }
     },
@@ -453,8 +720,12 @@
           "schema_version": 1,
           "delivery": "confirmed"
         },
-        "success_patterns": ["\"status\"\\s*:\\s*\"(?:clean|alert|deduped)\""],
-        "failure_patterns": ["\"delivery\"\\s*:\\s*\"failed\""]
+        "success_patterns": [
+          "\"status\"\\s*:\\s*\"(?:clean|alert|deduped)\""
+        ],
+        "failure_patterns": [
+          "\"delivery\"\\s*:\\s*\"failed\""
+        ]
       }
     },
     {
@@ -475,8 +746,13 @@
         "required_values": {
           "status": "ok"
         },
-        "success_patterns": ["\"status\"\\s*:\\s*\"ok\""],
-        "failure_patterns": ["\"status\"\\s*:\\s*\"(?:low|check_error)\"", "\"delivery\"\\s*:\\s*\"failed\""]
+        "success_patterns": [
+          "\"status\"\\s*:\\s*\"ok\""
+        ],
+        "failure_patterns": [
+          "\"status\"\\s*:\\s*\"(?:low|check_error)\"",
+          "\"delivery\"\\s*:\\s*\"failed\""
+        ]
       }
     },
     {
@@ -488,9 +764,20 @@
         "max_age_seconds": 129600,
         "tail_lines": 2000,
         "run_end_pattern": "^.*\\bsweep-finish\\b[^\\r\\n]*$",
-        "success_patterns": ["^.*\\bsweep-finish\\b[^\\r\\n]*[ \\t]errors=0(?:[ \\t]|$)[^\\r\\n]*[ \\t]dry_run=False(?:[ \\t]|$)[^\\r\\n]*$"],
-        "required_patterns": ["^.*\\bsweep-finish\\b[^\\r\\n]*[ \\t]errors=0(?:[ \\t]|$)[^\\r\\n]*[ \\t]dry_run=False(?:[ \\t]|$)[^\\r\\n]*$"],
-        "failure_patterns": ["^.*\\bsweep-finish\\b[^\\r\\n]*[ \\t]errors=[1-9][0-9]*(?:[ \\t]|$)", "^.*\\bBOARD_SKIP_NO_DB:", "^.*\\bBOARD_SKIP_UNLISTABLE:", "^.*\\bBOARD_SKIP_TASK_LOOKUP_ERROR:", "^.*\\bBOARD_DISCOVERY_UNLISTABLE:", "^Traceback \\(most recent call last\\):"]
+        "success_patterns": [
+          "^.*\\bsweep-finish\\b[^\\r\\n]*[ \\t]errors=0(?:[ \\t]|$)[^\\r\\n]*[ \\t]dry_run=False(?:[ \\t]|$)[^\\r\\n]*$"
+        ],
+        "required_patterns": [
+          "^.*\\bsweep-finish\\b[^\\r\\n]*[ \\t]errors=0(?:[ \\t]|$)[^\\r\\n]*[ \\t]dry_run=False(?:[ \\t]|$)[^\\r\\n]*$"
+        ],
+        "failure_patterns": [
+          "^.*\\bsweep-finish\\b[^\\r\\n]*[ \\t]errors=[1-9][0-9]*(?:[ \\t]|$)",
+          "^.*\\bBOARD_SKIP_NO_DB:",
+          "^.*\\bBOARD_SKIP_UNLISTABLE:",
+          "^.*\\bBOARD_SKIP_TASK_LOOKUP_ERROR:",
+          "^.*\\bBOARD_DISCOVERY_UNLISTABLE:",
+          "^Traceback \\(most recent call last\\):"
+        ]
       }
     },
     {

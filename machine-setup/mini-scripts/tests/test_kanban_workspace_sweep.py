@@ -412,3 +412,65 @@ def test_main_refuses_protected_root(tmp_path, mod, monkeypatch):
     monkeypatch.setattr(mod.os.path, "expanduser", lambda p: str(tmp_path) if p == "~" else p)
     rc = mod.main(["--root", str(tmp_path)])
     assert rc == 2
+
+
+def test_terminal_removal_calls_rmtree_once_and_counts_bytes(tmp_path, mod, monkeypatch):
+    root = tmp_path
+    _make_db(root / "kanban.db", [("t_done", "done", "scratch", None)])
+    ws = root / "kanban" / "workspaces" / "t_done"
+    _touch_dir(ws, age_days=30)
+    calls: list[Path] = []
+    real_rmtree = mod.shutil.rmtree
+
+    def counting_rmtree(path, *args, **kwargs):
+        calls.append(Path(path))
+        real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(mod.shutil, "rmtree", counting_rmtree)
+
+    stats = mod.sweep_board(
+        "default", root / "kanban.db", root / "kanban" / "workspaces", days=14, dry_run=False,
+    )
+
+    assert not ws.exists()
+    assert len(calls) == 1
+    assert calls[0] == ws
+    assert stats["removed"] == 1
+    assert stats["errors"] == 0
+    assert stats["removed_bytes"] > 0
+
+
+def test_terminal_removal_failure_increments_errors_without_retry(tmp_path, mod, monkeypatch):
+    root = tmp_path
+    _make_db(root / "kanban.db", [("t_done", "done", "scratch", None)])
+    ws = root / "kanban" / "workspaces" / "t_done"
+    _touch_dir(ws, age_days=30)
+    calls = 0
+
+    def failing_rmtree(path, *args, **kwargs):
+        nonlocal calls
+        calls += 1
+        raise OSError("permission denied")
+
+    monkeypatch.setattr(mod.shutil, "rmtree", failing_rmtree)
+
+    stats = mod.sweep_board(
+        "default", root / "kanban.db", root / "kanban" / "workspaces", days=14, dry_run=False,
+    )
+
+    assert ws.exists()
+    assert calls == 1
+    assert stats["removed"] == 0
+    assert stats["errors"] == 1
+
+
+def test_discover_boards_pins_canonical_database_paths(tmp_path, mod):
+    root = tmp_path
+    (root / "kanban" / "boards" / "content").mkdir(parents=True)
+
+    boards = dict((label, (db_path, ws_root)) for label, db_path, ws_root in mod._discover_boards(root))
+
+    assert boards["default"][0] == root / "kanban.db"
+    assert boards["default"][1] == root / "kanban" / "workspaces"
+    assert boards["content"][0] == root / "kanban" / "boards" / "content" / "kanban.db"
+    assert boards["content"][1] == root / "kanban" / "boards" / "content" / "workspaces"

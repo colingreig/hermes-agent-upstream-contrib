@@ -86,7 +86,7 @@
       "src_rel": "jobs.json",
       "dest_abs": "~/.hermes/cron/jobs.json",
       "sha256": "4761e92859ce56a9c1ecf28059365069486738c2156bd22163f42167916f45d8",
-      "role": "curated 15-job cron set (12 kept + 3 consolidated; direct ClickUp executor prompts; hermes-pr-validate re-enabled 2026-07-31 and pinned to IGNITE_SKILLS_ROOT), wholesale-replaces the live jobs.json",
+      "role": "curated 16-job cron set (12 kept + 3 consolidated + Purelymail poller; direct ClickUp executor prompts; hermes-pr-validate re-enabled 2026-07-31 and pinned to IGNITE_SKILLS_ROOT); merges bundled definitions while preserving scheduler runtime for unchanged job ids",
       "deploy_mode": "jobs_json"
     },
     {
@@ -97,7 +97,7 @@
     },
     {
       "src_rel": "install_fleet_config.py",
-      "sha256": "0e3ee263e169cb0d62dcf4c326d4db30a11484e44005d1be7307d5432ee6b2ba",
+      "sha256": "b0d957ceb966f15388758c07cb3da7cfe280aadabd749baada61607fd9163ea9",
       "role": "source-only pin for the governed fleet installer, including private legacy root config-backup remediation and exact-mode rollback",
       "deploy_mode": "installer_source"
     }
