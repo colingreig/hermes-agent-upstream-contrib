@@ -69,10 +69,16 @@ from pathlib import Path
 _SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
 _DEFAULT_SCRIPTS_DIR = os.path.expanduser("~/.hermes/scripts")
 # insert(0) reverses iteration order, so add the fallback first and the sibling
-# directory second to keep the documented sibling-first import contract.
+# directory second to keep the documented sibling-first import contract. Remove
+# any existing occurrence before inserting: the interpreter auto-adds the
+# script's own directory to sys.path, and a bare membership check would skip
+# the sibling insert and leave the ~/.hermes/scripts fallback at the front —
+# importing the deployed worktree_safety instead of the sibling when this
+# script runs from a staging/test location.
 for _p in (_DEFAULT_SCRIPTS_DIR, _SCRIPTS_DIR):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
+    while _p in sys.path:
+        sys.path.remove(_p)
+    sys.path.insert(0, _p)
 
 # worktree_safety.py (2026-07-10 refactor) is now the single source of truth for the
 # deletion-safety predicates. This is a HARD dependency for this script: without it we
@@ -94,8 +100,11 @@ _has_origin_remote = _safety.has_origin_remote if _safety else None
 _default_ref = _safety.default_ref if _safety else None
 _commits_ahead = _safety.commits_ahead if _safety else None
 _content_landed = _safety.content_landed if _safety else None
+_content_landed_check = _safety.content_landed_check if _safety else None
 AHEAD_UNKNOWN = _safety.AHEAD_UNKNOWN if _safety else None
 HAS_WRITE_TREE = _safety.HAS_WRITE_TREE if _safety else False
+
+RECEIPT_PATH_DEFAULT = "~/.hermes/state/worktree-backstop-sweep-receipt.json"
 
 TASK_DIR_RE = re.compile(r"^ignite-[A-Za-z0-9]+$")
 RETIRE_MANIFEST_VERSION = 1
@@ -133,6 +142,15 @@ def _fmt_bytes(n: int) -> str:
     return f"{size:.1f}TB"
 
 
+def _free_gb(root: Path):
+    """Best-effort free space on the filesystem backing *root*, in GB, or None on failure.
+    Reporting/receipt input only (like _du_bytes) — must never gate a safety decision."""
+    try:
+        return shutil.disk_usage(str(root)).free / (1024 ** 3)
+    except OSError:
+        return None
+
+
 def _effective_age_days(root: Path, default_days: int, min_free_gb: float, pressure_days: int) -> int:
     """Return the age threshold to actually use for this run.
 
@@ -149,9 +167,8 @@ def _effective_age_days(root: Path, default_days: int, min_free_gb: float, press
     """
     if min_free_gb <= 0:
         return default_days
-    try:
-        free_gb = shutil.disk_usage(str(root)).free / (1024 ** 3)
-    except OSError:
+    free_gb = _free_gb(root)
+    if free_gb is None:
         return default_days
     if free_gb <= min_free_gb:
         _log(
@@ -160,6 +177,51 @@ def _effective_age_days(root: Path, default_days: int, min_free_gb: float, press
         )
         return min(default_days, pressure_days)
     return default_days
+
+
+def _prefetch_bare_mirrors(fetch_cache: dict, bare_root: "Path | None" = None) -> None:
+    """Prefetch each bare mirror under `bare_root` (default ~/.hermes/bare) once per run
+    (86e2k..., mini fetch-failure triage). Linked worktrees (`.git` is a FILE) share their
+    bare mirror's object DB/refs, so refreshing the mirror once here lets the per-candidate
+    content_landed_check() calls below reuse this result via `fetch_cache` (keyed by
+    resolved remote URL, same key space _fetch_remote() uses in worktree_safety.py) instead
+    of re-fetching the same remote once per linked worktree that shares it. Best-effort only:
+    a missing/unreadable bare root, or a per-mirror fetch failure, just means
+    content_landed_check() falls through to its own per-worktree fetch for that URL,
+    unchanged — this function never raises and never blocks the sweep.
+
+    `bare_root` is injectable (default None -> ~/.hermes/bare) so tests can point it at an
+    empty scratch dir instead of ever touching a real developer/mini bare-mirror cache."""
+    if bare_root is None:
+        bare_root = Path(os.path.expanduser("~/.hermes/bare"))
+    if not bare_root.is_dir():
+        return
+    for entry in sorted(os.listdir(bare_root)):
+        bpath = bare_root / entry
+        if not (entry.endswith(".git") and bpath.is_dir()):
+            continue
+        for remote in ("origin", "fork"):
+            url_proc = _git(["remote", "get-url", remote], bpath)
+            if url_proc is None or url_proc.returncode != 0 or not url_proc.stdout.strip():
+                continue
+            url = url_proc.stdout.strip()
+            if url in fetch_cache:
+                continue
+            fetch_proc = _git(["fetch", remote, "--quiet"], bpath, timeout=60)
+            ok = fetch_proc is not None and fetch_proc.returncode == 0
+            fetch_cache[url] = ok
+            _log(f"PREFETCH_BARE_MIRROR: {entry} remote={remote} ok={ok}")
+
+
+def _write_receipt(receipt_path: Path, payload: dict) -> None:
+    """Best-effort pressure/outcome receipt for this run — reporting only, never a safety
+    input. Written atomically via _write_json_atomic(); any failure here (e.g. an
+    unwritable state dir) is logged and swallowed so it can never abort or alter a sweep
+    that already completed its real (destructive) work."""
+    try:
+        _write_json_atomic(receipt_path, payload)
+    except Exception as exc:
+        _log(f"WARN: failed to write receipt {receipt_path}: {exc}")
 
 
 def _run_git_bytes(args, cwd, timeout=30):
@@ -474,9 +536,21 @@ def main(argv=None) -> int:
         help="fingerprint-pinned approval manifest consumed before the age sweep",
     )
     p.add_argument(
+        "--bare-root",
+        default=os.environ.get("HERMES_WORKTREE_BARE_ROOT", "~/.hermes/bare"),
+        help="bare-mirror cache prefetched once per run to memoize linked-worktree fetches "
+             "(default ~/.hermes/bare)",
+    )
+    p.add_argument(
         "--write-retire-template",
         metavar="PATH",
         help="write a read-only triage template for every candidate and exit",
+    )
+    p.add_argument(
+        "--receipt-path",
+        default=os.environ.get("HERMES_WORKTREE_BACKSTOP_RECEIPT", RECEIPT_PATH_DEFAULT),
+        help="atomic JSON pressure/outcome receipt written at the end of every run "
+             f"(default {RECEIPT_PATH_DEFAULT})",
     )
     args = p.parse_args(argv or sys.argv[1:])
 
@@ -512,18 +586,30 @@ def main(argv=None) -> int:
         root, retire_manifest, args.dry_run
     )
 
+    free_gb_start = _free_gb(root)
     effective_days = _effective_age_days(root, args.days, args.min_free_gb, args.pressure_days)
+
+    # Per-run fetch memoization (86e2k..., mini fetch-failure triage): one dict, shared by
+    # every content_landed_check() call this run makes (both the early gate below and the
+    # late re-check), keyed by resolved remote URL inside worktree_safety.py. Prefetching
+    # each bare mirror up front means the ~6 linked worktrees sharing one mirror's remote
+    # only ever fetch it once, and the early/late checks for the same worktree never
+    # re-fetch the same remote twice.
+    run_fetch_cache = {}
+    _prefetch_bare_mirrors(run_fetch_cache, bare_root=Path(os.path.expanduser(args.bare_root)))
 
     now = time.time()
     removed = 0
     removed_bytes = 0
     skipped_dirty = 0
     skipped_ahead = 0
+    skipped_fetch_failed = 0
     skipped_deliverable = 0
     skipped_recent = 0
     skipped_no_remote = 0
     skipped_claimed = 0
     landed_squash = 0
+    landed_pr_merged = 0
 
     for name in sorted(os.listdir(root)):
         if not TASK_DIR_RE.match(name):
@@ -589,9 +675,27 @@ def main(argv=None) -> int:
                 _log(f"SKIP_NO_REMOTE: {name} (commits-ahead check failed — cannot verify, protecting)")
                 continue
             if ahead > 0:
-                if _content_landed(wdir):
-                    landed_squash += 1
-                    _log(f"LANDED_SQUASH: {name} | ahead={ahead} (content already on default branch, proceeding)")
+                landed_check = _content_landed_check(wdir, fetch_cache=run_fetch_cache)
+                if landed_check.fetch_failed:
+                    # Distinct from SKIP_AHEAD_COMMITS on purpose: this means the remote
+                    # refresh itself failed (e.g. osxkeychain -25308 on a non-interactive
+                    # standalone clone) — refs may be stale, not "provably not landed".
+                    skipped_fetch_failed += 1
+                    origin_url = _git(["remote", "get-url", "origin"], wdir)
+                    origin_desc = (
+                        origin_url.stdout.strip()
+                        if origin_url is not None and origin_url.returncode == 0
+                        else "unknown"
+                    )
+                    _log(f"SKIP_FETCH_FAILED: {name} | ahead={ahead} remote=origin url={origin_desc}")
+                    continue
+                if landed_check.landed:
+                    if landed_check.via == "pr_merged":
+                        landed_pr_merged += 1
+                        _log(f"LANDED_PR_MERGED: {name} | ahead={ahead} (merged PR found on origin, proceeding)")
+                    else:
+                        landed_squash += 1
+                        _log(f"LANDED_SQUASH: {name} | ahead={ahead} (content already on default branch, proceeding)")
                 else:
                     skipped_ahead += 1
                     _log(f"SKIP_AHEAD_COMMITS: {name} | ahead={ahead}")
@@ -643,9 +747,19 @@ def main(argv=None) -> int:
             if ahead_final is AHEAD_UNKNOWN:
                 _log(f"ABORT_LATE_CHANGE: {name} (commits-ahead check failed)")
                 continue
-            if ahead_final > 0 and not _content_landed(wdir):
-                _log(f"ABORT_LATE_CHANGE: {name} (ahead={ahead_final}, not landed)")
-                continue
+            if ahead_final > 0:
+                # Local state (dirty/HEAD/ahead) is always re-verified fresh above/here —
+                # only the network fetch inside content_landed_check() is memoized via
+                # run_fetch_cache, so a genuine late change (new commits, went dirty) is
+                # still caught even though the remote refresh itself is reused.
+                late_landed_check = _content_landed_check(wdir, fetch_cache=run_fetch_cache)
+                if late_landed_check.fetch_failed:
+                    skipped_fetch_failed += 1
+                    _log(f"ABORT_LATE_CHANGE: {name} (SKIP_FETCH_FAILED, ahead={ahead_final}, remote refresh failed)")
+                    continue
+                if not late_landed_check.landed:
+                    _log(f"ABORT_LATE_CHANGE: {name} (ahead={ahead_final}, not landed)")
+                    continue
         if not str(wdir).startswith(str(root) + os.sep):
             _log(f"FAILED_SAFETY_PATH_CHECK: {name}")
             continue
@@ -672,13 +786,28 @@ def main(argv=None) -> int:
         except Exception as exc:
             _log(f"ERROR_REMOVING: {name} | {exc}")
 
+    total_removed = removed + approved_removed
+    skip_counts = {
+        "skipped_dirty": skipped_dirty,
+        "skipped_ahead": skipped_ahead,
+        "skipped_fetch_failed": skipped_fetch_failed,
+        "skipped_deliverable": skipped_deliverable,
+        "skipped_no_remote": skipped_no_remote,
+        "skipped_claimed": skipped_claimed,
+        "skipped_recent": skipped_recent,
+        "landed_squash": landed_squash,
+        "landed_pr_merged": landed_pr_merged,
+        "approved_blocked": approved_blocked,
+    }
+
     _log(
-        f"sweep-finish root={root} removed={removed + approved_removed} "
+        f"sweep-finish root={root} removed={total_removed} "
         f"removed_bytes={removed_bytes} removed_size={_fmt_bytes(removed_bytes)} "
         f"age_days={args.days} effective_age_days={effective_days} min_free_gb={args.min_free_gb} "
         f"approved_removed={approved_removed} approved_blocked={approved_blocked} "
         f"skipped_dirty={skipped_dirty} "
-        f"skipped_ahead={skipped_ahead} landed_squash={landed_squash} "
+        f"skipped_ahead={skipped_ahead} skipped_fetch_failed={skipped_fetch_failed} "
+        f"landed_squash={landed_squash} landed_pr_merged={landed_pr_merged} "
         f"skipped_deliverable={skipped_deliverable} "
         f"skipped_no_remote={skipped_no_remote} "
         f"skipped_claimed={skipped_claimed} "
@@ -686,9 +815,9 @@ def main(argv=None) -> int:
     )
 
     # Bare-mirror prune pass: clean up stale `git worktree` admin entries left behind
-    # in each bare mirror under ~/.hermes/bare (e.g. from the rmtree fallback above, or
+    # in each bare mirror under --bare-root (e.g. from the rmtree fallback above, or
     # from worktrees removed out-of-band). Only runs for real (non-dry-run) invocations.
-    bare_root = os.path.expanduser("~/.hermes/bare")
+    bare_root = os.path.expanduser(args.bare_root)
     if not args.dry_run and os.path.isdir(bare_root):
         for entry in sorted(os.listdir(bare_root)):
             bpath = os.path.join(bare_root, entry)
@@ -696,6 +825,28 @@ def main(argv=None) -> int:
                 subprocess.run(["git", "-C", bpath, "worktree", "prune"],
                                capture_output=True, text=True)
         _log("BARE_WORKTREE_PRUNE_DONE")
+
+    # Pressure receipt (86e2k..., mini fetch-failure triage): a small, atomically-written
+    # JSON summary for external monitoring/alerting, independent of log scraping. Reporting
+    # only — a write failure is logged (see _write_receipt) and never affects the return code
+    # or anything already done above.
+    pressure = bool(
+        args.min_free_gb > 0 and free_gb_start is not None and free_gb_start <= args.min_free_gb
+    )
+    _write_receipt(
+        Path(os.path.expanduser(args.receipt_path)),
+        {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "root": str(root),
+            "removed": total_removed,
+            "removed_bytes": removed_bytes,
+            "skip_counts": skip_counts,
+            "free_gb": free_gb_start,
+            "min_free_gb": args.min_free_gb,
+            "pressure": pressure,
+            "dry_run": args.dry_run,
+        },
+    )
 
     return 0
 

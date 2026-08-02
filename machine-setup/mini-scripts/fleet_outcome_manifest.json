@@ -23,7 +23,7 @@
       "destination_root": "scripts",
       "destination": "fleet_outcome_probe.py",
       "mode": "0755",
-      "sha256": "8395297c250d2f614cd0c032ac5adeb7d10783a0c167b2cf191c3f7831e7a957"
+      "sha256": "fb68299f3a3a57f9a022dc1250a08a4c95d19288e343e830bd9903a95527ddc1"
     },
     {
       "source": "verify_governed_paths.py",

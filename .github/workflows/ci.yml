@@ -120,6 +120,13 @@ jobs:
     uses: ./.github/workflows/uv-lockfile-check.yml
     secrets: inherit
 
+  disk-lifecycle-manifest-check:
+    name: Deploy manifest pin check
+    needs: detect
+    if: needs.detect.outputs.python == 'true'
+    uses: ./.github/workflows/disk-lifecycle-manifest-check.yml
+    secrets: inherit
+
   lockfile-diff:
     name: package-lock.json diff
     needs: detect
@@ -178,6 +185,7 @@ jobs:
       - pr-safety-gate
       - contributor-check
       - uv-lockfile
+      - disk-lifecycle-manifest-check
       - lockfile-diff
       - docker-lint
       - supply-chain
@@ -207,6 +215,7 @@ jobs:
               'pr-safety-gate': event == 'pull_request',
               'contributor-check': outputs['python'] == 'true',
               'uv-lockfile': True,
+              'disk-lifecycle-manifest-check': outputs['python'] == 'true',
               'lockfile-diff': event == 'pull_request' and outputs['npm_lock'] == 'true',
               'docker-lint': outputs['docker_meta'] == 'true',
               'supply-chain': event == 'pull_request' and (

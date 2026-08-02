@@ -21,6 +21,8 @@
     <string>15</string>
     <key>HERMES_WORKTREE_BACKSTOP_PRESSURE_DAYS</key>
     <string>2</string>
+    <key>GIT_CONFIG_GLOBAL</key>
+    <string>/Users/colingreig/.hermes/gitconfig</string>
   </dict>
   <key>RunAtLoad</key>
   <false/>

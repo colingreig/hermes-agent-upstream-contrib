@@ -168,7 +168,9 @@ def test_board_skipped_when_db_missing(tmp_path, mod, capsys):
     assert stats == {
         "removed": 0, "removed_bytes": 0, "orphan_removed": 0, "errors": 1,
         "skipped_active": 0, "skipped_non_scratch": 0, "skipped_path_mismatch": 0,
-        "skipped_recent": 0,
+        "skipped_recent": 0, "stale_blocked_removed": 0, "stale_blocked_archived_bytes": 0,
+        "skipped_archive_failed": 0, "stale_blocked_would_remove": 0,
+        "stale_blocked_would_archive_bytes": 0,
     }
     assert "BOARD_SKIP_NO_DB: content" in capsys.readouterr().out
 
@@ -462,6 +464,147 @@ def test_terminal_removal_failure_increments_errors_without_retry(tmp_path, mod,
     assert calls == 1
     assert stats["removed"] == 0
     assert stats["errors"] == 1
+
+
+def test_stale_blocked_disabled_by_default(tmp_path, mod):
+    # sweep_board's own default (stale_blocked_days=0) must never remove a
+    # non-terminal "blocked" workspace, no matter how old — the caller has to
+    # explicitly opt in.
+    root = tmp_path
+    _make_db(root / "kanban.db", [("t_blocked", "blocked", "scratch", None)])
+    ws = root / "kanban" / "workspaces" / "t_blocked"
+    _touch_dir(ws, age_days=999)
+
+    stats = mod.sweep_board("default", root / "kanban.db", root / "kanban" / "workspaces", days=1, dry_run=False)
+
+    assert ws.exists()
+    assert stats["skipped_active"] == 1
+    assert stats["stale_blocked_removed"] == 0
+
+
+def test_stale_blocked_eligible_archived_then_removed(tmp_path, mod):
+    root = tmp_path
+    _make_db(root / "kanban.db", [("t_blocked", "blocked", "scratch", None)])
+    ws = root / "kanban" / "workspaces" / "t_blocked"
+    _touch_dir(ws, age_days=40)
+    archive_root = root / "db-backups" / "kanban-archive"
+
+    stats = mod.sweep_board(
+        "default", root / "kanban.db", root / "kanban" / "workspaces", days=14, dry_run=False,
+        stale_blocked_days=30, archive_root=archive_root,
+    )
+
+    assert not ws.exists()
+    assert stats["stale_blocked_removed"] == 1
+    assert stats["stale_blocked_archived_bytes"] > 0
+    assert stats["skipped_active"] == 0
+
+    tars = list(archive_root.glob("t_blocked-*.tar.zst"))
+    assert len(tars) == 1
+    assert tars[0].stat().st_size > 0
+    sidecars = list(archive_root.glob("t_blocked-*.json"))
+    assert len(sidecars) == 1
+    import json as _json
+    payload = _json.loads(sidecars[0].read_text())
+    assert payload["task_id"] == "t_blocked"
+    assert payload["status"] == "blocked"
+    assert payload["workspace_path"] == str(ws)
+    assert payload["archive_path"] == str(tars[0])
+    assert "archived_at" in payload
+
+
+def test_stale_blocked_not_yet_old_enough_stays_protected(tmp_path, mod):
+    root = tmp_path
+    _make_db(root / "kanban.db", [("t_blocked", "blocked", "scratch", None)])
+    ws = root / "kanban" / "workspaces" / "t_blocked"
+    _touch_dir(ws, age_days=5)
+    archive_root = root / "db-backups" / "kanban-archive"
+
+    stats = mod.sweep_board(
+        "default", root / "kanban.db", root / "kanban" / "workspaces", days=14, dry_run=False,
+        stale_blocked_days=30, archive_root=archive_root,
+    )
+
+    assert ws.exists()
+    assert stats["skipped_active"] == 1
+    assert stats["stale_blocked_removed"] == 0
+    assert not archive_root.exists()
+
+
+def test_stale_blocked_archive_failure_skips_without_deleting(tmp_path, mod, monkeypatch):
+    root = tmp_path
+    _make_db(root / "kanban.db", [("t_blocked", "blocked", "scratch", None)])
+    ws = root / "kanban" / "workspaces" / "t_blocked"
+    _touch_dir(ws, age_days=40)
+    archive_root = root / "db-backups" / "kanban-archive"
+
+    class FailingProc:
+        returncode = 1
+        stdout = ""
+        stderr = "simulated tar failure"
+
+    monkeypatch.setattr(mod.subprocess, "run", lambda *a, **k: FailingProc())
+
+    stats = mod.sweep_board(
+        "default", root / "kanban.db", root / "kanban" / "workspaces", days=14, dry_run=False,
+        stale_blocked_days=30, archive_root=archive_root,
+    )
+
+    assert ws.exists()
+    assert stats["stale_blocked_removed"] == 0
+    assert stats["skipped_archive_failed"] == 1
+    # No partial/broken archive left behind.
+    assert list(archive_root.glob("t_blocked-*.tar.zst")) == []
+
+
+def test_stale_blocked_dry_run_reports_without_creating_tar(tmp_path, mod, capsys):
+    root = tmp_path
+    _make_db(root / "kanban.db", [("t_blocked", "blocked", "scratch", None)])
+    ws = root / "kanban" / "workspaces" / "t_blocked"
+    _touch_dir(ws, age_days=40)
+    archive_root = root / "db-backups" / "kanban-archive"
+
+    stats = mod.sweep_board(
+        "default", root / "kanban.db", root / "kanban" / "workspaces", days=14, dry_run=True,
+        stale_blocked_days=30, archive_root=archive_root,
+    )
+    output = capsys.readouterr().out
+
+    assert ws.exists()
+    assert stats["stale_blocked_removed"] == 0
+    assert stats["stale_blocked_would_remove"] == 1
+    assert stats["stale_blocked_would_archive_bytes"] > 0
+    assert "WOULD_REMOVE_STALE_BLOCKED: default/t_blocked" in output
+    assert not archive_root.exists()
+
+
+def test_main_stale_blocked_flag_env_default_and_cli_override(tmp_path, mod, monkeypatch, capsys):
+    root = tmp_path
+    _make_db(root / "kanban.db", [("t_blocked", "blocked", "scratch", None)])
+    ws = root / "kanban" / "workspaces" / "t_blocked"
+    _touch_dir(ws, age_days=40)
+
+    monkeypatch.delenv("HERMES_KANBAN_SWEEP_STALE_BLOCKED_DAYS", raising=False)
+    rc = mod.main(["--root", str(root), "--days", "1"])
+    output = capsys.readouterr().out
+    assert rc == 0
+    assert not ws.exists()
+    assert "stale_blocked_days=30" in output
+    assert "REMOVED_STALE_BLOCKED: default/t_blocked" in output
+
+
+def test_main_stale_blocked_flag_zero_disables(tmp_path, mod, capsys):
+    root = tmp_path
+    _make_db(root / "kanban.db", [("t_blocked", "blocked", "scratch", None)])
+    ws = root / "kanban" / "workspaces" / "t_blocked"
+    _touch_dir(ws, age_days=999)
+
+    rc = mod.main(["--root", str(root), "--days", "1", "--stale-blocked-days", "0"])
+    output = capsys.readouterr().out
+    assert rc == 0
+    assert ws.exists()
+    assert "stale_blocked_days=0" in output
+    assert "stale_blocked_removed=0" in output
 
 
 def test_discover_boards_pins_canonical_database_paths(tmp_path, mod):

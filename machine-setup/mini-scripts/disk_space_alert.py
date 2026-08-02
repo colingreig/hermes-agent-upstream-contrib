@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -52,13 +53,49 @@ RECEIPT_PATH = os.environ.get("HERMES_DISK_ALERT_RECEIPT_PATH") or os.path.join(
 HERMES_BIN = os.path.join(HOME, ".local/bin/hermes")
 SLACK_TARGET = "slack:hermes"
 
-MIN_FREE_GB = float(os.environ.get("HERMES_DISK_ALERT_MIN_FREE_GB", "5"))
+# Raised 5->20 (86e2k3ryc follow-up): the mini hit ENOSPC while sitting on a
+# 5GB threshold for 30+ hours of advisory-only alerts — 20GB gives the
+# pressure-sweep trigger below (and a human) real runway to act before the
+# disk is actually full.
+MIN_FREE_GB = float(os.environ.get("HERMES_DISK_ALERT_MIN_FREE_GB", "20"))
 # While genuinely low, re-alert on this cadence rather than going silent after
 # the first ping (same rationale as hermes_usage_alert.py's RC1 fix).
 LOW_DISK_COOLDOWN_S = int(os.environ.get("HERMES_DISK_ALERT_COOLDOWN_MIN", "60")) * 60
 # The "I can't even check" alert gets its own, longer cooldown so a persistently
 # broken stat doesn't spam every tick.
 CHECK_ERROR_COOLDOWN_S = int(os.environ.get("HERMES_DISK_ALERT_ERROR_COOLDOWN_MIN", "360")) * 60
+
+# Pressure-triggered remediation (86e2k3ryc follow-up): advisory Slack alerts
+# alone don't reclaim anything. Once free space drops to/under MIN_FREE_GB,
+# actually invoke the real sweeps instead of just narrating the problem.
+WORKTREE_SWEEP_PATH = os.environ.get("HERMES_DISK_ALERT_WORKTREE_SWEEP_PATH") or os.path.join(
+    HOME, ".hermes/scripts/worktree_backstop_sweep.py"
+)
+KANBAN_SWEEP_PATH = os.environ.get("HERMES_DISK_ALERT_KANBAN_SWEEP_PATH") or os.path.join(
+    HOME, ".hermes/scripts/kanban_workspace_sweep.py"
+)
+# Age gate the worktree sweep uses once its own --min-free-gb pressure check
+# trips (it always will here, since we only call it when we're already low).
+WORKTREE_SWEEP_PRESSURE_DAYS = int(os.environ.get("HERMES_DISK_ALERT_WORKTREE_PRESSURE_DAYS", "2"))
+# Receipt used purely to cool down repeated triggering — independent of, and
+# much longer than, LOW_DISK_COOLDOWN_S (which only governs the Slack ping).
+TRIGGER_RECEIPT_PATH = os.environ.get("HERMES_DISK_ALERT_TRIGGER_RECEIPT_PATH") or os.path.join(
+    HOME, ".hermes/state/disk-pressure-trigger.json"
+)
+TRIGGER_COOLDOWN_S = int(os.environ.get("HERMES_DISK_ALERT_TRIGGER_COOLDOWN_MIN", "360")) * 60
+# Sweeps do real du/git work over potentially many worktrees — generous but bounded.
+SWEEP_TIMEOUT_S = int(os.environ.get("HERMES_DISK_ALERT_SWEEP_TIMEOUT_S", "1800"))
+
+_REMOVED_BYTES_RE = re.compile(r"removed_bytes=(\d+)")
+
+
+def _fmt_bytes(n: float) -> str:
+    n = float(n)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(n) < 1024.0:
+            return f"{n:.1f}{unit}" if unit != "B" else f"{n:.0f}{unit}"
+        n /= 1024.0
+    return f"{n:.1f}PB"
 
 
 def _fmt_gb(n: float) -> str:
@@ -110,20 +147,111 @@ def _send_slack(message: str) -> subprocess.CompletedProcess:
     )
 
 
-def _build_message(free_gb: float, total_gb: float) -> str:
+def _load_trigger_receipt() -> dict:
+    try:
+        with open(TRIGGER_RECEIPT_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _run_sweep(cmd: list[str], label: str) -> dict:
+    """Run one remediation sweep. Never raises: a failed/timed-out/crashed sweep is
+    captured as a result dict, never allowed to break the alert itself."""
+    result: dict = {"label": label, "ok": False, "removed_bytes": None, "summary": None, "error": None}
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=SWEEP_TIMEOUT_S)
+        output = f"{proc.stdout or ''}\n{proc.stderr or ''}"
+        match = _REMOVED_BYTES_RE.search(output)
+        if match:
+            result["removed_bytes"] = int(match.group(1))
+        finish_lines = [ln.strip() for ln in output.splitlines() if "sweep-finish" in ln]
+        if finish_lines:
+            result["summary"] = finish_lines[-1][:300]
+        result["ok"] = proc.returncode == 0
+        if proc.returncode != 0:
+            result["error"] = f"exit {proc.returncode}"
+    except subprocess.TimeoutExpired:
+        result["error"] = f"timeout after {SWEEP_TIMEOUT_S}s"
+    except Exception as exc:  # noqa: BLE001 - deliberately broad, see docstring
+        result["error"] = str(exc)
+    return result
+
+
+def _trigger_pressure_sweeps(now: float) -> dict | None:
+    """Under disk pressure, run the real worktree/kanban sweeps instead of only
+    narrating the problem. Cooldown-gated via TRIGGER_RECEIPT_PATH (independent of,
+    and much longer than, the Slack-alert dedupe cooldown) so this doesn't re-run
+    heavy du/git work on every 5-minute tick. Returns None if skipped due to
+    cooldown; never raises."""
+    receipt = _load_trigger_receipt()
+    last_trigger = float(receipt.get("last_trigger_ts", 0) or 0)
+    if (now - last_trigger) < TRIGGER_COOLDOWN_S:
+        return None
+
+    results = [
+        _run_sweep(
+            [
+                sys.executable, WORKTREE_SWEEP_PATH,
+                "--min-free-gb", str(MIN_FREE_GB),
+                "--pressure-days", str(WORKTREE_SWEEP_PRESSURE_DAYS),
+            ],
+            "worktree",
+        ),
+        _run_sweep([sys.executable, KANBAN_SWEEP_PATH], "kanban"),
+    ]
+
+    parsed = [r["removed_bytes"] for r in results if r.get("removed_bytes") is not None]
+    total_removed_bytes = sum(parsed) if parsed else None
+
+    payload = {
+        "last_trigger_ts": now,
+        "triggered_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+        "results": results,
+        "total_removed_bytes": total_removed_bytes,
+    }
+    try:
+        _save_json(TRIGGER_RECEIPT_PATH, payload)
+    except Exception as exc:  # noqa: BLE001 - a receipt-write failure must not break the alert
+        print(f"[disk_space_alert] trigger receipt write failed: {exc}", file=sys.stderr)
+    return payload
+
+
+def _build_message(free_gb: float, total_gb: float, trigger_result: dict | None = None) -> str:
+    pressure_facts: list[str] = []
+    if trigger_result is not None:
+        results = trigger_result.get("results") or []
+        ok_labels = [r["label"] for r in results if r.get("ok")]
+        failed_labels = [r["label"] for r in results if not r.get("ok")]
+        total = trigger_result.get("total_removed_bytes")
+        if ok_labels:
+            reclaimed_str = _fmt_bytes(total) if total is not None else "unknown"
+            pressure_facts.append(
+                f"pressure sweep triggered ({', '.join(ok_labels)}): reclaimed {reclaimed_str}"
+            )
+            if total == 0:
+                pressure_facts.append(
+                    "pressure sweep reclaimed 0 bytes — reclaim path is broken"
+                )
+        if failed_labels:
+            pressure_facts.append(f"pressure sweep FAILED to run: {', '.join(failed_labels)}")
+
+    facts = pressure_facts + [
+        f"total capacity: {_fmt_gb(total_gb)}",
+        f"check path: {CHECK_PATH}",
+    ]
+
     return smb.build_alert_message(
         "🛑",
         f"Mac mini disk space low: {_fmt_gb(free_gb)} free (threshold {_fmt_gb(MIN_FREE_GB)}).",
-        facts=[
-            f"total capacity: {_fmt_gb(total_gb)}",
-            f"check path: {CHECK_PATH}",
-        ],
+        facts=facts,
         next_step=(
             "Run worktree_backstop_sweep.py / kanban_workspace_sweep.py --dry-run to see "
             "reclaimable space, or mini-release-cut.sh --prune for old releases."
         ),
         footer=f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}",
-        max_words=70,
+        max_words=100,
     )
 
 
@@ -180,13 +308,24 @@ def main() -> int:
         _write_receipt(status="ok", delivery="n/a", free_gb=round(free_gb, 2), now=now)
         return 0  # silent — healthy
 
+    # Pressure remediation runs on its own (long) cooldown, independent of the
+    # Slack-alert dedupe below — so real reclaim work happens roughly every
+    # TRIGGER_COOLDOWN_S even while the advisory ping itself stays deduped.
+    # A trigger failure must never break the alert path itself.
+    trigger_result = None
+    try:
+        trigger_result = _trigger_pressure_sweeps(now)
+    except Exception as exc:  # noqa: BLE001 - see docstring on _trigger_pressure_sweeps
+        print(f"[disk_space_alert] pressure-sweep trigger errored: {exc}", file=sys.stderr)
+        trigger_result = None
+
     last_alert = float(state.get("last_low_alert_ts", 0) or 0)
     if (now - last_alert) < LOW_DISK_COOLDOWN_S:
         # Still low, but within the re-alert cooldown — stay quiet this tick.
         _write_receipt(status="low", delivery="deduped", free_gb=round(free_gb, 2), now=now)
         return 0
 
-    msg = _build_message(free_gb, total_gb)
+    msg = _build_message(free_gb, total_gb, trigger_result)
     print(msg)
     try:
         delivery = _send_slack(msg)

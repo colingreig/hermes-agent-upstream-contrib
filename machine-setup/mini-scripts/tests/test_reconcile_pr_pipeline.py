@@ -166,7 +166,7 @@ class PipelineDeploymentTests(unittest.TestCase):
         self.assertTrue(self.real_resolve_manifest().files)
         self.assertEqual(
             spec["source_sha256"],
-            "2593e8a3f24a4340aff0999cc79a3abb19db8e58939d1d18882ef3a1f4317d09",
+            "3e232dd43bbe3dc7d3563ed941794260d9fd1891d999aed470308d4dea6bc3fc",
         )
         self.assertEqual(
             spec["deployed_sha256"],

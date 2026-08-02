@@ -164,4 +164,104 @@ def test_repository_manifest_matches_live_sources(tmp_path):
         home=home,
         mirror_root=mirror_root,
     )
-    assert len(plan) == 5
+    assert len(plan) == 7
+
+
+def test_repository_manifest_verify_hashes_passes():
+    """--verify-manifest-hashes must pass against the checked-in manifest.
+
+    Regression guard for the incident class this bundle exists to close:
+    editing a manifest-governed file without regenerating its sha256 pin
+    silently rolls back every deploy of the whole bundle.
+    """
+    manifest_path = (
+        Path(__file__).resolve().parents[1] / "disk_lifecycle_manifest.json"
+    )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    mismatches = install_mod.verify_manifest_hashes(manifest, manifest_path.parent)
+    assert mismatches == []
+
+
+def test_resolve_src_repo_base(tmp_path):
+    repo_root = tmp_path / "repo"
+    (repo_root / ".git").mkdir(parents=True)
+    (repo_root / "scripts").mkdir()
+    target = repo_root / "scripts" / "worktree_safety.py"
+    target.write_text("# repo-relative source\n")
+
+    mirror_root = repo_root / "machine-setup" / "mini-scripts"
+    mirror_root.mkdir(parents=True)
+
+    entry = {"src_rel": "scripts/worktree_safety.py", "src_base": "repo"}
+    resolved = install_mod._resolve_src(entry, mirror_root)
+    assert resolved == target
+    assert resolved.read_text() == "# repo-relative source\n"
+
+
+def test_resolve_src_repo_base_no_git_raises(tmp_path):
+    mirror_root = tmp_path / "no-repo-here" / "mini-scripts"
+    mirror_root.mkdir(parents=True)
+    entry = {"src_rel": "scripts/worktree_safety.py", "src_base": "repo"}
+    with pytest.raises(install_mod.InstallError, match="could not locate repo root"):
+        install_mod._resolve_src(entry, mirror_root)
+
+
+def test_resolve_src_unknown_base_raises(tmp_path):
+    entry = {"src_rel": "x.py", "src_base": "bogus"}
+    with pytest.raises(install_mod.InstallError, match="unknown src_base"):
+        install_mod._resolve_src(entry, tmp_path)
+
+
+def test_verify_manifest_hashes_detects_drift(bundle):
+    mismatches = install_mod.verify_manifest_hashes(bundle["manifest"], bundle["mirror"])
+    assert mismatches == []
+
+    target = bundle["mirror"] / "disk_space_alert.py"
+    target.write_text("# mutated after pin was recorded\n")
+    mismatches = install_mod.verify_manifest_hashes(bundle["manifest"], bundle["mirror"])
+    assert len(mismatches) == 1
+    assert "disk_space_alert.py" in mismatches[0]
+
+
+def test_write_manifest_hashes_updates_only_drifted_entries(tmp_path, bundle):
+    manifest_path = tmp_path / "written_manifest.json"
+    manifest_path.write_text(json.dumps(bundle["manifest"], indent=2))
+    manifest = json.loads(manifest_path.read_text())
+
+    # No drift yet: zero entries change.
+    changed = install_mod.write_manifest_hashes(manifest, manifest_path, bundle["mirror"])
+    assert changed == 0
+
+    # Mutate one source, then confirm write picks up exactly that one entry
+    # and verify then passes clean.
+    target = bundle["mirror"] / "kanban_workspace_sweep.py"
+    target.write_text("# mutated\n")
+    manifest = json.loads(manifest_path.read_text())
+    changed = install_mod.write_manifest_hashes(manifest, manifest_path, bundle["mirror"])
+    assert changed == 1
+
+    reloaded = json.loads(manifest_path.read_text())
+    assert install_mod.verify_manifest_hashes(reloaded, bundle["mirror"]) == []
+
+
+def test_cli_verify_manifest_hashes_exit_codes(tmp_path, bundle, capsys):
+    rc = install_mod.main(
+        [
+            "--manifest",
+            str(bundle["manifest_path"]),
+            "--verify-manifest-hashes",
+        ]
+    )
+    assert rc == 0
+    assert "OK" in capsys.readouterr().out
+
+    (bundle["mirror"] / "disk_space_alert.py").write_text("# mutated\n")
+    rc = install_mod.main(
+        [
+            "--manifest",
+            str(bundle["manifest_path"]),
+            "--verify-manifest-hashes",
+        ]
+    )
+    assert rc == 1
+    assert "FAILED" in capsys.readouterr().err

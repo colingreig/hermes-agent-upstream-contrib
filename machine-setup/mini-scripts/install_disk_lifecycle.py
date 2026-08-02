@@ -64,11 +64,28 @@ def _utc_stamp() -> str:
     return _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
 
+def _repo_root(start: Path) -> Path:
+    """Walk up from ``start`` to the nearest ancestor containing ``.git``.
+
+    Works for both a plain clone (``.git`` dir) and a linked worktree
+    (``.git`` file pointing at the main checkout's gitdir), so this resolves
+    correctly whether the installer runs from a normal checkout, a Conductor
+    workspace, or a mini worktree.
+    """
+    current = start.resolve()
+    for candidate in (current, *current.parents):
+        if (candidate / ".git").exists():
+            return candidate
+    raise InstallError(f"could not locate repo root (no .git found above {start})")
+
+
 def _resolve_src(entry: dict, mirror_root: Path) -> Path:
     base = entry.get("src_base")
     rel = entry["src_rel"]
     if base == "mirror":
         return mirror_root / rel
+    if base == "repo":
+        return _repo_root(mirror_root) / rel
     raise InstallError(f"entry {rel!r} has unknown src_base {base!r}")
 
 
@@ -169,6 +186,54 @@ def build_plan(
             }
         )
     return plan
+
+
+def verify_manifest_hashes(manifest: dict, mirror_root: Path) -> list[str]:
+    """Return one message per manifest entry whose sha256 pin has drifted.
+
+    Read-only: never touches the manifest file or any destination. Used by
+    ``--verify-manifest-hashes`` and by CI so drift is caught without hand-
+    computing hashes (the incident class this guards against: editing a
+    manifest-governed file without regenerating its sha256 silently rolls
+    back deploys, since ``build_plan`` aborts the whole bundle on drift).
+    """
+    mismatches: list[str] = []
+    for entry in manifest["files"]:
+        rel = entry.get("src_rel", "<missing src_rel>")
+        try:
+            src = _resolve_src(entry, mirror_root)
+        except InstallError as exc:
+            mismatches.append(str(exc))
+            continue
+        if not src.is_file():
+            mismatches.append(f"source missing for {rel!r}: {src}")
+            continue
+        actual = _sha256(src)
+        expected = entry.get("sha256")
+        if actual != expected:
+            mismatches.append(f"{rel}: manifest sha256 {expected} != source {actual}")
+    return mismatches
+
+
+def write_manifest_hashes(manifest: dict, manifest_path: Path, mirror_root: Path) -> int:
+    """Regenerate every sha256 pin in-place from the current source tree.
+
+    Returns the number of entries actually changed. Preserves key order and
+    all non-hash fields; only the ``sha256`` value is rewritten.
+    """
+    changed = 0
+    for entry in manifest["files"]:
+        src = _resolve_src(entry, mirror_root)
+        if not src.is_file():
+            raise InstallError(f"source missing for {entry['src_rel']!r}: {src}")
+        actual = _sha256(src)
+        if entry.get("sha256") != actual:
+            entry["sha256"] = actual
+            changed += 1
+    with open(manifest_path, "w", encoding="utf-8") as fh:
+        json.dump(manifest, fh, indent=2)
+        fh.write("\n")
+    return changed
 
 
 def check_coexist(manifest: dict, home: Path) -> list[str]:
@@ -348,6 +413,23 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="verify source hashes and print the plan; write nothing",
     )
+    parser.add_argument(
+        "--verify-manifest-hashes",
+        action="store_true",
+        help=(
+            "read-only: verify every sha256 pin in the manifest against the "
+            "current source tree, print any drift, and exit non-zero if any "
+            "entry drifted. Does not check dest_abs or write anything."
+        ),
+    )
+    parser.add_argument(
+        "--write-manifest-hashes",
+        action="store_true",
+        help=(
+            "regenerate every sha256 pin in the manifest from the current "
+            "source tree and write the manifest in place, then exit"
+        ),
+    )
     args = parser.parse_args(argv)
 
     manifest_path = args.manifest.resolve()
@@ -355,6 +437,32 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         manifest = load_manifest(manifest_path)
+
+        if args.write_manifest_hashes:
+            changed = write_manifest_hashes(manifest, manifest_path, mirror_root)
+            if changed:
+                print(f"wrote {changed} updated sha256 pin(s) to {manifest_path}")
+            else:
+                print(f"no drift: all sha256 pins in {manifest_path} already match the source tree")
+            return 0
+
+        if args.verify_manifest_hashes:
+            mismatches = verify_manifest_hashes(manifest, mirror_root)
+            if mismatches:
+                for msg in mismatches:
+                    print(f"FAIL {msg}", file=sys.stderr)
+                print(
+                    f"verify-manifest-hashes FAILED: {len(mismatches)} pin(s) drifted "
+                    f"in {manifest_path}",
+                    file=sys.stderr,
+                )
+                return 1
+            print(
+                f"verify-manifest-hashes OK: all {len(manifest['files'])} sha256 pins "
+                f"in {manifest_path} match the source tree"
+            )
+            return 0
+
         return install(
             manifest,
             home=args.home.resolve(),
