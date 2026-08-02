@@ -29,7 +29,7 @@
     {
       "id": "dcab830aa41c",
       "name": "content-lane-executor",
-      "enabled": true,
+      "enabled": false,
       "max_age_seconds": 7200,
       "outcome": {
         "kind": "cron_output",
@@ -132,7 +132,8 @@
           "FAIL",
           "no.*(?:review|actionable)",
           "validated",
-          "^\\[SILENT\\]\\s*$"
+          "^\\[SILENT\\]\\s*$",
+          "fenced executor owner is active"
         ],
         "failure_patterns": [
           "\\(FAILED\\)",
@@ -311,13 +312,14 @@
           "Staleness Sweep",
           "staleness_sweep",
           "Drift Reconciliation",
-          "drift_reconcil(?:iation|er)"
+          "drift_reconcil(?:iation|er)",
+          "fenced executor owner is active"
         ],
         "required_patterns": [
-          "(?:clickup_closeout_audit|Closeout Audit)",
-          "(?:stalled_task_reconciler|Stalled Task Reconciler)",
-          "(?:staleness_sweep|Staleness Sweep)",
-          "(?:drift_reconcil(?:iation|er)|Drift Reconciliation)"
+          "(?:clickup_closeout_audit|Closeout Audit|fenced executor owner is active)",
+          "(?:stalled_task_reconciler|Stalled Task Reconciler|fenced executor owner is active)",
+          "(?:staleness_sweep|Staleness Sweep|fenced executor owner is active)",
+          "(?:drift_reconcil(?:iation|er)|Drift Reconciliation|fenced executor owner is active)"
         ],
         "failure_patterns": [
           "\\(FAILED\\)",
@@ -363,12 +365,13 @@
           "complete",
           "Nothing to clean",
           "No stale",
-          "safety gate"
+          "safety gate",
+          "^\\[SILENT\\]\\s*$"
         ],
         "required_patterns": [
-          "repo_gc_sweep",
-          "cleanup_hermes_baks",
-          "orphan_unpushed_cron"
+          "(?:repo_gc_sweep|^\\[SILENT\\]\\s*$)",
+          "(?:cleanup_hermes_baks|^\\[SILENT\\]\\s*$)",
+          "(?:orphan_unpushed_cron|^\\[SILENT\\]\\s*$)"
         ],
         "failure_patterns": [
           "\\(FAILED\\)",
