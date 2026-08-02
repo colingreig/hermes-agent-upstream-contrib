@@ -638,7 +638,7 @@ def test_merge_jobs_json_preserves_runtime_for_unchanged_jobs():
     assert job["state"] == "idle"
 
 
-def test_merge_jobs_json_does_not_copy_runtime_for_changed_or_new_jobs():
+def test_merge_jobs_json_preserves_runtime_for_changed_jobs_but_not_new():
     bundled = {
         "jobs": [
             {"id": "job-a", "name": "alpha", "prompt": "run alpha v2", "last_status": None},
@@ -666,8 +666,8 @@ def test_merge_jobs_json_does_not_copy_runtime_for_changed_or_new_jobs():
     by_id = {job["id"]: job for job in merged["jobs"]}
     assert counts == {"preserved": 0, "changed": 1, "new": 1, "removed": 1}
     assert by_id["job-a"]["prompt"] == "run alpha v2"
-    assert by_id["job-a"]["last_status"] is None
-    assert "last_run_at" not in by_id["job-a"]
+    assert by_id["job-a"]["last_status"] == "ok"
+    assert by_id["job-a"]["last_run_at"] == "2026-08-01T10:00:00+00:00"
     assert by_id["job-b"]["last_status"] is None
     assert "job-old" not in by_id
 

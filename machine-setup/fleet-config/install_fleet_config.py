@@ -651,11 +651,15 @@ def merge_jobs_json(
         merged_job = dict(bundled_job)
         if live_job is None:
             counts["new"] += 1
-        elif _job_definition_for_merge(live_job) == _job_definition_for_merge(bundled_job):
-            _preserve_job_runtime(merged_job, live_job)
-            counts["preserved"] += 1
         else:
-            counts["changed"] += 1
+            # Always keep scheduler-owned runtime for continuing job ids, even
+            # when the bundled definition changes. Dropping last_status /
+            # last_run_at on a definition tweak false-alarms the fleet probe.
+            _preserve_job_runtime(merged_job, live_job)
+            if _job_definition_for_merge(live_job) == _job_definition_for_merge(bundled_job):
+                counts["preserved"] += 1
+            else:
+                counts["changed"] += 1
         merged_jobs.append(merged_job)
     counts["removed"] = len(set(live_by_id) - bundled_ids)
     result = dict(bundled)
