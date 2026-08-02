@@ -25,6 +25,12 @@ _PERSISTABLE_PROVIDER_SOURCES = frozenset({
     ("xai-oauth", "device_code"),
 })
 
+# Named OpenAI Codex account slots persist as ``device_code:<label>`` sources
+# (one per account slot under ``providers.openai-codex.accounts``).  They are
+# Hermes-owned device-code OAuth state exactly like the primary
+# ``device_code`` source and must persist their token material.
+_CODEX_NAMED_ACCOUNT_SOURCE_PREFIX = "device_code:"
+
 _SAFE_SECRETISH_METADATA_KEYS = frozenset({
     "secret_fingerprint",
     "secret_source",
@@ -108,6 +114,12 @@ def is_borrowed_credential_source(source: Any, provider_id: Any = None) -> bool:
     if normalized_source == "manual" or normalized_source.startswith("manual:"):
         return False
     normalized_provider = str(provider_id or "").strip().lower()
+    if (
+        normalized_provider == "openai-codex"
+        and normalized_source.startswith(_CODEX_NAMED_ACCOUNT_SOURCE_PREFIX)
+        and normalized_source[len(_CODEX_NAMED_ACCOUNT_SOURCE_PREFIX):].strip()
+    ):
+        return False
     return (normalized_provider, normalized_source) not in _PERSISTABLE_PROVIDER_SOURCES
 
 

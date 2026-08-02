@@ -775,16 +775,24 @@ class CredentialPool:
         Mirrors the Nous/Anthropic resync paths above.  Only applies to
         device_code-sourced entries; env/API-key-sourced entries have no
         auth.json shadow to sync from.
+
+        Each entry re-hydrates from ITS OWN account slot: the primary
+        ``device_code`` entry from the ``providers.openai-codex.tokens``
+        singleton, and each named ``device_code:<label>`` entry from
+        ``providers.openai-codex.accounts.<label>``.  A re-login of one
+        account therefore never bleeds into another account's pool entry.
         """
-        if self.provider != "openai-codex" or entry.source != "device_code":
+        account = auth_mod.codex_account_from_source(entry.source)
+        if self.provider != "openai-codex" or account is None:
             return entry
         try:
             with _auth_store_lock():
                 auth_store = _load_auth_store()
                 state = _load_provider_state(auth_store, "openai-codex")
-            if not isinstance(state, dict):
+            slot = auth_mod._codex_account_slot(state, account)
+            if not isinstance(slot, dict):
                 return entry
-            tokens = state.get("tokens")
+            tokens = slot.get("tokens")
             if not isinstance(tokens, dict):
                 return entry
             store_access = tokens.get("access_token", "")
@@ -813,8 +821,8 @@ class CredentialPool:
                     "last_error_message": None,
                     "last_error_reset_at": None,
                 }
-                if state.get("last_refresh"):
-                    field_updates["last_refresh"] = state["last_refresh"]
+                if slot.get("last_refresh"):
+                    field_updates["last_refresh"] = slot["last_refresh"]
                 updated = replace(entry, **field_updates)
                 self._replace_entry(entry, updated)
                 self._persist()
@@ -1017,8 +1025,15 @@ class CredentialPool:
         # Only sync entries that were seeded *from* a singleton.  Manually
         # added pool entries (source="manual:*") are independent credentials
         # and must not write back to the singleton.  All singleton-seeded
-        # device-code sources (nous, openai-codex, xAI) use ``device_code``.
-        if entry.source != "device_code":
+        # device-code sources (nous, openai-codex, xAI) use ``device_code``;
+        # named Codex account slots additionally use ``device_code:<label>``
+        # and write back to their own slot.
+        codex_account: Optional[str] = None
+        if self.provider == "openai-codex":
+            codex_account = auth_mod.codex_account_from_source(entry.source)
+            if codex_account is None:
+                return
+        elif entry.source != "device_code":
             return
         try:
             with _auth_store_lock():
@@ -1072,14 +1087,21 @@ class CredentialPool:
                     state = _load_provider_state(auth_store, "openai-codex")
                     if not isinstance(state, dict):
                         return
-                    tokens = state.get("tokens")
+                    # Write refreshed tokens back into the entry's OWN account
+                    # slot (primary singleton for ``device_code``, the named
+                    # slot for ``device_code:<label>``) so one account's
+                    # refresh never overwrites another slot's token chain.
+                    slot = auth_mod._codex_account_slot(state, codex_account or "")
+                    if not isinstance(slot, dict):
+                        return
+                    tokens = slot.get("tokens")
                     if not isinstance(tokens, dict):
                         return
                     tokens["access_token"] = entry.access_token
                     if entry.refresh_token:
                         tokens["refresh_token"] = entry.refresh_token
                     if entry.last_refresh:
-                        state["last_refresh"] = entry.last_refresh
+                        slot["last_refresh"] = entry.last_refresh
                     _store_provider_state(auth_store, "openai-codex", state, set_active=False)
 
                 elif self.provider == "xai-oauth":
@@ -1387,20 +1409,35 @@ class CredentialPool:
                     logger.debug(
                         "Codex OAuth refresh token is terminally invalid; clearing local token state"
                     )
+                    # Scope the cleanup to the FAILING account slot only: a
+                    # revoked named account must not clear the primary
+                    # singleton (or vice versa).  Manual entries keep the
+                    # historical primary-slot cleanup semantics.
+                    _terminal_account = auth_mod.codex_account_from_source(entry.source)
+                    _terminal_source = (
+                        auth_mod.codex_account_source(_terminal_account)
+                        if _terminal_account is not None
+                        else "device_code"
+                    )
                     try:
                         with _auth_store_lock():
                             auth_store = _load_auth_store()
                             state = _load_provider_state(auth_store, "openai-codex") or {}
                             if isinstance(state, dict):
-                                tokens = state.get("tokens") or {}
-                                if isinstance(tokens, dict):
+                                slot = auth_mod._codex_account_slot(
+                                    state,
+                                    _terminal_account
+                                    or auth_mod.CODEX_PRIMARY_ACCOUNT,
+                                )
+                                tokens = (slot or {}).get("tokens") or {}
+                                if isinstance(slot, dict) and isinstance(tokens, dict):
                                     store_refresh = str(tokens.get("refresh_token") or "").strip()
                                     entry_refresh = str(entry.refresh_token or "").strip()
                                     if not store_refresh or store_refresh == entry_refresh:
                                         tokens.pop("access_token", None)
                                         tokens.pop("refresh_token", None)
-                                        state["tokens"] = tokens
-                                        state["last_auth_error"] = {
+                                        slot["tokens"] = tokens
+                                        slot["last_auth_error"] = {
                                             "provider": "openai-codex",
                                             "code": getattr(exc, "code", "unknown"),
                                             "message": str(exc),
@@ -1416,11 +1453,11 @@ class CredentialPool:
                         )
                     removed_ids = [
                         item.id for item in self._entries
-                        if item.source == "device_code"
+                        if item.source == _terminal_source
                     ]
                     self._entries = [
                         item for item in self._entries
-                        if item.source != "device_code"
+                        if item.source != _terminal_source
                     ]
                     if self._current_id == entry.id:
                         self._current_id = None
@@ -1582,9 +1619,11 @@ class CredentialPool:
             # re-authed via `hermes model` / `hermes auth` after a 429/401,
             # leaving fresh tokens on disk while the pool entry is still
             # frozen behind last_error_reset_at (can be hours in the
-            # future for ChatGPT weekly windows).
+            # future for ChatGPT weekly windows).  Covers the primary
+            # ``device_code`` slot and named ``device_code:<label>`` slots —
+            # each syncs from its own account slot.
             if (self.provider == "openai-codex"
-                    and entry.source == "device_code"
+                    and auth_mod.codex_account_from_source(entry.source) is not None
                     and entry.last_status in {STATUS_EXHAUSTED, STATUS_DEAD}):
                 synced = self._sync_codex_entry_from_auth_store(entry)
                 if synced is not entry:
@@ -2009,7 +2048,42 @@ def _upsert_entry(entries: List[PooledCredential], provider: str, source: str, p
     return bool(duplicate_indices)
 
 
+def _normalize_codex_pool_priorities(entries: List[PooledCredential]) -> bool:
+    """Order the preferred Codex account slot first when one is set.
+
+    Opt-in: with no persisted ``preferred_account`` (or the preferred slot
+    absent from the pool) priorities are left exactly as-is, so setups that
+    never run ``hermes auth codex switch`` see zero behavior change.  When a
+    preferred slot exists in the pool, its entry moves to priority 0 and
+    every other entry keeps its relative order — fill_first selection then
+    serves the preferred account while it is available and fails over to the
+    next entry on exhaustion via the existing rotate logic.
+    """
+    try:
+        preferred = auth_mod.get_codex_preferred_account()
+    except Exception:
+        return False
+    if not preferred:
+        return False
+    preferred_source = auth_mod.codex_account_source(preferred)
+    if not any(entry.source == preferred_source for entry in entries):
+        return False
+    ordered = sorted(
+        entries,
+        key=lambda entry: (0 if entry.source == preferred_source else 1, entry.priority),
+    )
+    id_to_idx = {entry.id: idx for idx, entry in enumerate(entries)}
+    changed = False
+    for new_priority, entry in enumerate(ordered):
+        if entry.priority != new_priority:
+            entries[id_to_idx[entry.id]] = replace(entry, priority=new_priority)
+            changed = True
+    return changed
+
+
 def _normalize_pool_priorities(provider: str, entries: List[PooledCredential]) -> bool:
+    if provider == "openai-codex":
+        return _normalize_codex_pool_priorities(entries)
     if provider != "anthropic":
         return False
 
@@ -2301,13 +2375,6 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
             logger.debug("MiniMax OAuth token seed failed: %s", exc)
 
     elif provider == "openai-codex":
-        # Respect user suppression — `hermes auth remove openai-codex` marks
-        # the device_code source as suppressed so it won't be re-seeded from
-        # the Hermes auth store.  Without this gate the removal is instantly
-        # undone on the next load_pool() call.
-        if _is_suppressed(provider, "device_code"):
-            return changed, active_sources
-
         state = _load_provider_state(auth_store, "openai-codex")
         tokens = state.get("tokens") if isinstance(state, dict) else None
         # Hermes owns its own Codex auth state — we do NOT auto-import from
@@ -2316,7 +2383,19 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
         # refresh_token_reused race failures.  Users who want to adopt
         # existing Codex CLI credentials get a one-time, explicit prompt
         # via `hermes auth openai-codex`.
-        if isinstance(tokens, dict) and tokens.get("access_token"):
+        #
+        # Respect per-source user suppression — `hermes auth remove
+        # openai-codex` marks the removed slot's source as suppressed so it
+        # won't be re-seeded from the Hermes auth store.  Without this gate
+        # the removal is instantly undone on the next load_pool() call.
+        # The primary (legacy) singleton seeds first so it keeps priority 0;
+        # named account slots follow in sorted order for a deterministic,
+        # stable priority layout.
+        if (
+            isinstance(tokens, dict)
+            and tokens.get("access_token")
+            and not _is_suppressed(provider, "device_code")
+        ):
             active_sources.add("device_code")
             custom_label = str(state.get("label") or "").strip()
             changed |= _upsert_entry(
@@ -2333,6 +2412,37 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
                     "label": custom_label or label_from_token(tokens.get("access_token", ""), "device_code"),
                 },
             )
+
+        # Named account slots (``providers.openai-codex.accounts.<label>``) —
+        # one pool entry per populated slot, source ``device_code:<label>``.
+        # Mirrors the anthropic dual-source pattern above: each named source
+        # re-hydrates from its own backing slot.
+        accounts = state.get("accounts") if isinstance(state, dict) else None
+        if isinstance(accounts, dict):
+            for account_label in sorted(str(key) for key in accounts):
+                slot = accounts.get(account_label)
+                slot_tokens = slot.get("tokens") if isinstance(slot, dict) else None
+                if not (isinstance(slot_tokens, dict) and slot_tokens.get("access_token")):
+                    continue
+                source = f"device_code:{account_label}"
+                if _is_suppressed(provider, source):
+                    continue
+                active_sources.add(source)
+                slot_label = str(slot.get("label") or "").strip() or account_label
+                changed |= _upsert_entry(
+                    entries,
+                    provider,
+                    source,
+                    {
+                        "source": source,
+                        "auth_type": AUTH_TYPE_OAUTH,
+                        "access_token": slot_tokens.get("access_token", ""),
+                        "refresh_token": slot_tokens.get("refresh_token"),
+                        "base_url": "https://chatgpt.com/backend-api/codex",
+                        "last_refresh": slot.get("last_refresh"),
+                        "label": slot_label,
+                    },
+                )
 
     elif provider == "xai-oauth":
         # When the user logs in via ``hermes model`` -> xAI Grok OAuth,

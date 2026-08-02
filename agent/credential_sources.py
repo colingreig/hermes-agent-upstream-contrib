@@ -305,7 +305,26 @@ def _remove_codex_device_code(provider: str, removed) -> RemovalResult:
     from hermes_cli.auth import suppress_credential_source
 
     result = RemovalResult()
-    if _clear_auth_store_provider(provider):
+
+    # Named account slots (``device_code:<label>``) are self-contained: clear
+    # ONLY that slot under providers.openai-codex.accounts and leave the
+    # primary singleton (and every other slot) untouched.  The central
+    # dispatcher suppresses ``removed.source`` which is exactly the named
+    # slot's re-seed gate.
+    source = str(getattr(removed, "source", "") or "")
+    if source.startswith("device_code:"):
+        account = source.split(":", 1)[1]
+        if _clear_codex_account_slot(account):
+            result.cleaned.append(
+                f"Cleared {provider} OAuth tokens for account '{account}' from auth store"
+            )
+        result.hints.extend([
+            f"Suppressed openai-codex {source} source — it will not be re-seeded.",
+            f"Run `hermes auth codex login --account {account}` to re-enable if needed.",
+        ])
+        return result
+
+    if _clear_codex_primary_slot():
         result.cleaned.append(f"Cleared {provider} OAuth tokens from auth store")
     # Suppress the canonical re-seed source, not just whatever source the
     # removed entry had.  Otherwise `manual:device_code` removals wouldn't
@@ -317,6 +336,82 @@ def _remove_codex_device_code(provider: str, removed) -> RemovalResult:
         "Run `hermes auth add openai-codex` to re-enable if needed.",
     ])
     return result
+
+
+def _clear_codex_primary_slot() -> bool:
+    """Clear the PRIMARY Codex slot, preserving named account slots.
+
+    Removing the primary credential must not destroy independent named
+    accounts living under ``providers.openai-codex.accounts`` (or a
+    ``preferred_account`` pointing at one of them).  Only the primary-slot
+    fields are popped; when no named accounts remain, fall back to deleting
+    the whole provider block — byte-for-byte the legacy single-account
+    removal behavior.  Returns True if anything was cleared.
+    """
+    from hermes_cli.auth import (
+        _auth_store_lock,
+        _load_auth_store,
+        _save_auth_store,
+    )
+
+    try:
+        with _auth_store_lock():
+            auth_store = _load_auth_store()
+            providers_dict = auth_store.get("providers")
+            if not isinstance(providers_dict, dict) or "openai-codex" not in providers_dict:
+                return False
+            state = providers_dict["openai-codex"]
+            accounts = state.get("accounts") if isinstance(state, dict) else None
+            has_named_accounts = isinstance(accounts, dict) and any(
+                isinstance(slot, dict) for slot in accounts.values()
+            )
+            if not has_named_accounts:
+                # Legacy shape — nothing to preserve, delete the block.
+                del providers_dict["openai-codex"]
+                _save_auth_store(auth_store)
+                return True
+            for key in ("tokens", "last_refresh", "label", "auth_mode", "last_auth_error"):
+                state.pop(key, None)
+            # A preference pointing at the (now gone) primary slot is stale;
+            # a preference for a surviving named account is kept.
+            if str(state.get("preferred_account") or "").strip().lower() in {"", "primary"}:
+                state.pop("preferred_account", None)
+            _save_auth_store(auth_store)
+            return True
+    except Exception:
+        return False
+
+
+def _clear_codex_account_slot(account: str) -> bool:
+    """Delete one named Codex account slot from auth.json. Returns True if cleared."""
+    from hermes_cli.auth import (
+        _auth_store_lock,
+        _load_auth_store,
+        _load_provider_state,
+        _save_auth_store,
+        _store_provider_state,
+    )
+
+    normalized = str(account or "").strip().lower()
+    if not normalized:
+        return False
+    try:
+        with _auth_store_lock():
+            auth_store = _load_auth_store()
+            state = _load_provider_state(auth_store, "openai-codex")
+            if not isinstance(state, dict):
+                return False
+            accounts = state.get("accounts")
+            if not isinstance(accounts, dict) or normalized not in accounts:
+                return False
+            accounts.pop(normalized, None)
+            if str(state.get("preferred_account") or "").strip().lower() == normalized:
+                state.pop("preferred_account", None)
+            _store_provider_state(auth_store, "openai-codex", state, set_active=False)
+            _save_auth_store(auth_store)
+            return True
+    except Exception:
+        return False
 
 
 def _remove_qwen_cli(provider: str, removed) -> RemovalResult:
@@ -413,7 +508,11 @@ def _register_all_sources() -> None:
     ))
     register(RemovalStep(
         provider="openai-codex", source_id="device_code",
-        match_fn=lambda src: src == "device_code" or src.endswith(":device_code"),
+        match_fn=lambda src: (
+            src == "device_code"
+            or src.endswith(":device_code")
+            or src.startswith("device_code:")
+        ),
         remove_fn=_remove_codex_device_code,
         description="auth.json providers.openai-codex + ~/.codex/auth.json",
     ))
