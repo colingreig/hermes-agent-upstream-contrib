@@ -28,6 +28,35 @@ export HERMES_HOME
 # shellcheck disable=SC1090 # SCRIPT is calculated from this test's location.
 MINI_RELEASE_CUT_TEST_LIB=1 source "$SCRIPT"
 
+# Environment-controlled arithmetic is validated as bounded plain decimal
+# data before any release-state action. Shell-looking payloads remain inert,
+# and an invalid prune value cannot delete a release.
+NUMERIC_SENTINEL="$HERMES_HOME/releases/v-keep-on-invalid-input"
+mkdir -p "$NUMERIC_SENTINEL"
+printf 'preserve\n' > "$NUMERIC_SENTINEL/sentinel"
+VERIFY_PAYLOAD='1$(touch '"$TEST_ROOT"'/verify-timeout-payload-ran)'
+if MINI_RELEASE_VERIFY_TIMEOUT="$VERIFY_PAYLOAD" "$SCRIPT" --dry-run >/dev/null 2>&1; then
+  fail "command-substitution-shaped verify timeout was accepted"
+fi
+[ ! -e "$TEST_ROOT/verify-timeout-payload-ran" ] \
+  || fail "verify timeout payload executed"
+KEEP_PAYLOAD='0$(touch '"$TEST_ROOT"'/keep-extra-payload-ran)'
+if MINI_RELEASE_KEEP_EXTRA="$KEEP_PAYLOAD" "$SCRIPT" --dry-run --prune >/dev/null 2>&1; then
+  fail "command-substitution-shaped keep-extra value was accepted"
+fi
+[ ! -e "$TEST_ROOT/keep-extra-payload-ran" ] || fail "keep-extra payload executed"
+[ -f "$NUMERIC_SENTINEL/sentinel" ] || fail "invalid keep-extra input deleted a release"
+for bad_verify in 0 901 01 -1; do
+  if MINI_RELEASE_VERIFY_TIMEOUT="$bad_verify" "$SCRIPT" --dry-run >/dev/null 2>&1; then
+    fail "invalid verify timeout was accepted: $bad_verify"
+  fi
+done
+for bad_keep in 21 01 -1; do
+  if MINI_RELEASE_KEEP_EXTRA="$bad_keep" "$SCRIPT" --dry-run --prune >/dev/null 2>&1; then
+    fail "invalid keep-extra value was accepted: $bad_keep"
+  fi
+done
+
 # The first guarded cut can start from an older runtime. Bootstrap must carry
 # the target registry beside the target lease client, or registry validation
 # would fail before the new runtime is activated.
@@ -110,6 +139,21 @@ cleanup_production_write_lease_bootstrap
 rm "$BOOTSTRAP_CURRENT"
 unset HERMES_PRODUCTION_WRITE_LEASE_BOOTSTRAP_DIR
 
+# Normal cut authority binds the production lease to the certified target,
+# not the old runtime HEAD used only to bootstrap the lease implementation.
+LEASE_TARGET=dddddddddddddddddddddddddddddddddddddddd
+LEASE_COMMIT_CAPTURE="$TEST_ROOT/lease-commit-capture"
+(
+  production_write_lease_call() {
+    [ "$1" = acquire ] || return 1
+    printf '%s' "$3" > "$LEASE_COMMIT_CAPTURE"
+    printf '{"lease_id":"target","actor":"mini-release-cut","session_id":"session","fencing_token":1,"commit_sha":"%s"}\n' "$3"
+  }
+  acquire_production_write_lease "$LEASE_TARGET"
+) >/dev/null
+[ "$(cat "$LEASE_COMMIT_CAPTURE")" = "$LEASE_TARGET" ] \
+  || fail "normal cut lease was not bound to the certified target SHA"
+
 # A fence failure after the atomic runtime-current swap must NOT invoke a
 # stale-owner rollback. It records loss evidence and leaves recovery to the
 # successor/operator.
@@ -117,20 +161,50 @@ LEASE_NEW="$RELEASES_DIR/v-fence-new"
 LEASE_OLD="$RELEASES_DIR/v-fence-old"
 mkdir -p "$LEASE_NEW" "$LEASE_OLD"
 ln -s "$LEASE_NEW" "$HERMES_HOME/runtime-current"
+FENCE_LOSS_OUTPUT="$TEST_ROOT/fence-loss.out"
 (
-  PRODUCTION_WRITE_LEASE_JSON='{"lease_id":"test"}'
+  expected_lease='{"lease_id":"test","actor":"mini-release-cut","session_id":"session","fencing_token":28,"commit_sha":"dddddddddddddddddddddddddddddddddddddddd"}'
+  PRODUCTION_WRITE_LEASE_JSON="$expected_lease"
   NEW_DIR="$LEASE_NEW"
-  PREV_TARGET="$LEASE_OLD"
   production_write_lease_call() {
-    [ "$1" = fence-loss ] || return 1
-    : > "$TEST_ROOT/fence-loss-receipt"
-    printf '{}\n'
+    case "$1" in
+      heartbeat) return 1 ;;
+      fence-loss)
+        [ "$2" = "$expected_lease" ] || return 98
+        [ "$3" = heartbeat-refused ] || return 99
+        printf '{"receipt_id":"fence-loss-28"}\n'
+        ;;
+      *) return 1 ;;
+    esac
   }
   rollback_to_previous() { : > "$TEST_ROOT/rollback-after-fence"; return 0; }
   heartbeat_production_write_lease
-) >/dev/null 2>&1 && fail "post-swap fence failure unexpectedly succeeded"
+) >"$FENCE_LOSS_OUTPUT" 2>&1 && fail "post-swap fence failure unexpectedly succeeded"
 [ ! -f "$TEST_ROOT/rollback-after-fence" ] || fail "stale owner rolled back after fence loss"
-[ -f "$TEST_ROOT/fence-loss-receipt" ] || fail "post-swap fence loss did not record evidence"
+grep -Fq 'persisted production write fence-loss receipt: {"receipt_id":"fence-loss-28"}' "$FENCE_LOSS_OUTPUT" \
+  || fail "post-swap fence loss did not preserve valid lease JSON and report its durable receipt"
+(
+  expected_lease='{"lease_id":"test","actor":"mini-release-cut","session_id":"session","fencing_token":28,"commit_sha":"dddddddddddddddddddddddddddddddddddddddd"}'
+  PRODUCTION_WRITE_LEASE_JSON="$expected_lease"
+  PRODUCTION_WRITE_FENCE_LOSS_RECEIPT_JSON=""
+  production_write_lease_call() {
+    case "$1" in
+      heartbeat) return 1 ;;
+      fence-loss)
+        [ "$2" = "$expected_lease" ] || return 98
+        printf '{"receipt_id":"cleanup-loss-28"}\n'
+        ;;
+      *) return 1 ;;
+    esac
+  }
+  if production_write_mutation_allowed; then
+    fail "trap cleanup retained mutation authority after fence loss"
+  fi
+  [ "$PRODUCTION_WRITE_LEASE_JSON" = "$expected_lease" ] \
+    || fail "trap cleanup discarded exact lease identity after fence loss"
+  [ "$PRODUCTION_WRITE_FENCE_LOSS_RECEIPT_JSON" = '{"receipt_id":"cleanup-loss-28"}' ] \
+    || fail "trap cleanup did not retain durable fence-loss receipt output"
+) >/dev/null 2>&1
 rm "$HERMES_HOME/runtime-current"
 
 RELEASES_DIR="$(canonical_existing_dir "$TEST_ROOT/home/.hermes/releases")"
@@ -152,6 +226,7 @@ ROLLBACK_NEW="$RELEASES_DIR/v-rollback-new"
 ROLLBACK_OLD="$RELEASES_DIR/v-rollback-old"
 mkdir -p "$ROLLBACK_NEW" "$ROLLBACK_OLD"
 printf '%s\n' "$ROLLBACK_OLD" > "$PREV_FILE"
+ln -s "$ROLLBACK_NEW" "$CURRENT_LINK"
 (
   rollback_fences=0
   heartbeat_production_write_lease() {
@@ -164,7 +239,47 @@ printf '%s\n' "$ROLLBACK_OLD" > "$PREV_FILE"
 ) >/dev/null 2>&1 && fail "mid-rollback successor takeover unexpectedly succeeded"
 [ -f "$TEST_ROOT/rollback-pointer-write" ] || fail "first fenced rollback mutation did not run"
 [ ! -f "$TEST_ROOT/rollback-refresh-write" ] || fail "stale rollback mutated after successor takeover"
+rm "$CURRENT_LINK"
 rm "$PREV_FILE"
+
+# Both the normal cut and rollback call these same service waiters. Simulate a
+# wait beyond the 120-second lease TTL without wall-clock sleeping and prove
+# each loop renews synchronously rather than relying on a contending background
+# writer.
+WAIT_RELEASE="$RELEASES_DIR/v-long-verify"
+mkdir -p "$WAIT_RELEASE"
+ln -s "$WAIT_RELEASE" "$CURRENT_LINK"
+(
+  VERIFY_TIMEOUT=130
+  LEASE_HEARTBEAT_INTERVAL=30
+  SECONDS=0
+  heartbeat_count=0
+  heartbeat_production_write_lease() { heartbeat_count=$((heartbeat_count + 1)); }
+  pgrep() { return 1; }
+  gateway_platforms_ready() { return 1; }
+  port_listening() { return 1; }
+  sleep() { SECONDS=$((SECONDS + $1)); }
+  if verify_gateway "$WAIT_RELEASE" 0; then
+    fail "gateway long-wait fixture unexpectedly verified"
+  fi
+  [ "$heartbeat_count" -ge 5 ] \
+    || fail "gateway verifier did not renew through a wait beyond the lease TTL"
+) >/dev/null 2>&1
+(
+  VERIFY_TIMEOUT=130
+  LEASE_HEARTBEAT_INTERVAL=30
+  SECONDS=0
+  heartbeat_count=0
+  heartbeat_production_write_lease() { heartbeat_count=$((heartbeat_count + 1)); }
+  http_ok() { return 1; }
+  sleep() { SECONDS=$((SECONDS + $1)); }
+  if verify_dashboard; then
+    fail "dashboard long-wait fixture unexpectedly verified"
+  fi
+  [ "$heartbeat_count" -ge 5 ] \
+    || fail "dashboard verifier did not renew through a wait beyond the lease TTL"
+) >/dev/null 2>&1
+rm "$CURRENT_LINK"
 
 # The managed ClickUp wrapper is installed atomically, is executable, and a
 # later cut repairs a stale or missing command with the release-owned source.
@@ -207,13 +322,174 @@ ln -s "$TEST_ROOT/outside" "$PREV_FILE"
 expect_failure assert_regular_release_file "$PREV_FILE"
 rm "$PREV_FILE"
 
-# mkdir-based locking rejects a second release-cut owner until the first one
-# releases it. (The second call runs in a subprocess so its deliberate die()
-# does not terminate this harness.)
-acquire_cut_lock
-expect_failure acquire_cut_lock
-release_cut_lock
+# Owner-file locking rejects a live second owner and releases only the exact
+# owner bytes through the guarded path.
+(
+  PRODUCTION_WRITE_LEASE_JSON='{"lease_id":"owner","actor":"mini-release-cut","session_id":"one","fencing_token":1,"commit_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","resources":["governed-mini-scripts","runtime-release"]}'
+  guarded_production_write() { "$@"; }
+  production_write_lease_call() { return 1; }
+  acquire_cut_lock
+  expect_failure acquire_cut_lock
+  release_cut_lock
+)
 [ ! -e "$CUT_LOCK_DIR" ] || fail "release-cut lock was not removed"
+
+# A failed guarded lock removal or lease release must retain its exact
+# in-memory ownership evidence instead of reporting a false cleanup.
+(
+  CUT_LOCK_OWNER_JSON='{"schema_version":1,"lease":{"lease_id":"still-owned"}}'
+  printf '%s' "$CUT_LOCK_OWNER_JSON" > "$CUT_LOCK_DIR"
+  chmod 0600 "$CUT_LOCK_DIR"
+  LOCK_HELD=1
+  PRODUCTION_WRITE_LEASE_JSON='{"lease_id":"still-owned"}'
+  guarded_production_write() { return 1; }
+  if release_cut_lock; then
+    fail "failed guarded cut-lock removal reported success"
+  fi
+  [ "$LOCK_HELD" -eq 1 ] || fail "failed cut-lock removal cleared in-memory ownership"
+  [ -f "$CUT_LOCK_DIR" ] || fail "failed cut-lock removal removed durable ownership evidence"
+) >/dev/null 2>&1
+rm "$CUT_LOCK_DIR"
+(
+  stale='{"lease_id":"old","actor":"mini-release-cut","session_id":"old-session","fencing_token":4,"commit_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","resources":["governed-mini-scripts","runtime-release"]}'
+  PRODUCTION_WRITE_LEASE_JSON='{"lease_id":"new","actor":"mini-release-cut","session_id":"new-session","fencing_token":5,"commit_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","resources":["governed-mini-scripts","runtime-release"]}'
+  printf '{"lease":%s,"schema_version":1}' "$stale" > "$CUT_LOCK_DIR"
+  chmod 0600 "$CUT_LOCK_DIR"
+  production_write_lease_call() {
+    [ "$1" = lock-recovery-proof ] || return 1
+    printf '%s' "$3" | grep -Fq '"fencing_token":4' || return 1
+    printf '{"authorized":true,"stale_fencing_token":4,"successor_fencing_token":5}\n'
+  }
+  guarded_production_write() { "$@"; }
+  acquire_cut_lock
+  grep -Fq '"fencing_token":5' "$CUT_LOCK_DIR" \
+    || fail "successor recovery did not replace stale lock with its exact owner metadata"
+  release_cut_lock
+) >/dev/null
+[ ! -e "$CUT_LOCK_DIR" ] || fail "successor-recovered cut lock was not released"
+
+# The one-time legacy mkdir-lock migration requires a current successor proof,
+# an exact safe/empty inode snapshot, and no other cutter process. It then
+# replaces the directory with the successor's regular owner file.
+(
+  mkdir "$CUT_LOCK_DIR"
+  PRODUCTION_WRITE_LEASE_PYTHON="$SCRIPT_DIR/../../.venv/bin/python"
+  PRODUCTION_WRITE_LEASE_JSON='{"lease_id":"legacy-successor","actor":"mini-release-cut","session_id":"legacy-new","fencing_token":12,"commit_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","resources":["governed-mini-scripts","runtime-release"]}'
+  production_write_lease_call() {
+    [ "$1" = legacy-lock-recovery-proof ] || return 1
+    [[ "$3" =~ ^[1-9][0-9]*$ ]] || return 1
+    printf '{"authorized":true,"predecessor_fencing_token":11,"successor_fencing_token":12}\n'
+  }
+  guarded_production_write() { "$@"; }
+  acquire_cut_lock
+  [ -f "$CUT_LOCK_DIR" ] && [ ! -L "$CUT_LOCK_DIR" ] \
+    || fail "legacy lock migration did not install a regular successor owner file"
+  grep -Fq '"fencing_token":12' "$CUT_LOCK_DIR" \
+    || fail "legacy lock migration did not bind the successor lease"
+  release_cut_lock
+) >/dev/null
+[ ! -e "$CUT_LOCK_DIR" ] || fail "legacy-migrated cut lock was not released"
+# A same-user tool may mention the cutter path as data. Only a shell whose
+# executed script argument is mini-release-cut.sh counts as another cutter.
+(
+  mkdir "$CUT_LOCK_DIR"
+  PRODUCTION_WRITE_LEASE_PYTHON="$SCRIPT_DIR/../../.venv/bin/python"
+  PRODUCTION_WRITE_LEASE_JSON='{"lease_id":"mention-successor","actor":"mini-release-cut","session_id":"mention-new","fencing_token":13,"commit_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","resources":["governed-mini-scripts","runtime-release"]}'
+  production_write_lease_call() {
+    [ "$1" = legacy-lock-recovery-proof ] || return 1
+    printf '{"authorized":true}\n'
+  }
+  guarded_production_write() { "$@"; }
+  mention_tool="$TEST_ROOT/tool/shellcheck"
+  mkdir -p "$(dirname "$mention_tool")"
+  printf '%s\n' '#!/bin/bash' 'while :; do sleep 1; done' > "$mention_tool"
+  chmod 0700 "$mention_tool"
+  "$mention_tool" "$SCRIPT" &
+  mention_pid=$!
+  noexec_script="$TEST_ROOT/parse-only/mini-release-cut.sh"
+  mkdir -p "$(dirname "$noexec_script")"
+  mkfifo "$noexec_script"
+  /bin/bash -n "$noexec_script" &
+  noexec_pid=$!
+  trap 'kill "$mention_pid" "$noexec_pid" 2>/dev/null || true; wait "$mention_pid" "$noexec_pid" 2>/dev/null || true' EXIT
+  sleep 0.1
+  acquire_cut_lock
+  release_cut_lock
+) >/dev/null || fail "shellcheck-style cutter-path mention blocked legacy lock migration"
+[ ! -e "$CUT_LOCK_DIR" ] || fail "mention-safe legacy cut lock was not released"
+(
+  mkdir "$CUT_LOCK_DIR"
+  printf 'not empty\n' > "$CUT_LOCK_DIR/sentinel"
+  PRODUCTION_WRITE_LEASE_PYTHON="$SCRIPT_DIR/../../.venv/bin/python"
+  PRODUCTION_WRITE_LEASE_JSON='{"lease_id":"unsafe-successor","actor":"mini-release-cut","session_id":"unsafe-new","fencing_token":14,"commit_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","resources":["governed-mini-scripts","runtime-release"]}'
+  production_write_lease_call() {
+    [ "$1" = legacy-lock-recovery-proof ] || return 1
+    printf '{"authorized":true}\n'
+  }
+  guarded_production_write() { "$@"; }
+  acquire_cut_lock
+) >/dev/null 2>&1 && fail "non-empty legacy lock directory was migrated"
+[ -f "$CUT_LOCK_DIR/sentinel" ] || fail "unsafe legacy lock directory was mutated"
+rm "$CUT_LOCK_DIR/sentinel"
+rmdir "$CUT_LOCK_DIR"
+# A failed or malformed native process enumeration cannot authorize rmdir.
+(
+  mkdir "$CUT_LOCK_DIR"
+  PRODUCTION_WRITE_LEASE_PYTHON="$SCRIPT_DIR/../../.venv/bin/python"
+  PRODUCTION_WRITE_LEASE_JSON='{"lease_id":"ps-failure-successor","actor":"mini-release-cut","session_id":"ps-failure-new","fencing_token":15,"commit_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","resources":["governed-mini-scripts","runtime-release"]}'
+  production_write_lease_call() {
+    [ "$1" = legacy-lock-recovery-proof ] || return 1
+    printf '{"authorized":true}\n'
+  }
+  guarded_production_write() { "$@"; }
+  failed_ps="$TEST_ROOT/tool/ps-failure"
+  printf '%s\n' '#!/bin/bash' 'exit 42' > "$failed_ps"
+  chmod 0700 "$failed_ps"
+  LEGACY_LOCK_PS="$failed_ps"
+  acquire_cut_lock
+) >/dev/null 2>&1 && fail "failed process enumeration authorized legacy lock migration"
+[ -d "$CUT_LOCK_DIR" ] || fail "process-enumeration failure removed legacy lock directory"
+rmdir "$CUT_LOCK_DIR"
+(
+  mkdir "$CUT_LOCK_DIR"
+  PRODUCTION_WRITE_LEASE_PYTHON="$SCRIPT_DIR/../../.venv/bin/python"
+  PRODUCTION_WRITE_LEASE_JSON='{"lease_id":"live-process-successor","actor":"mini-release-cut","session_id":"live-process-new","fencing_token":16,"commit_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","resources":["governed-mini-scripts","runtime-release"]}'
+  production_write_lease_call() {
+    [ "$1" = legacy-lock-recovery-proof ] || return 1
+    printf '{"authorized":true}\n'
+  }
+  guarded_production_write() { "$@"; }
+  other_cutter="$TEST_ROOT/other/mini-release-cut.sh"
+  mkdir -p "$(dirname "$other_cutter")"
+  printf '%s\n' '#!/bin/bash' 'while :; do sleep 1; done' > "$other_cutter"
+  chmod 0700 "$other_cutter"
+  "$other_cutter" &
+  other_cutter_pid=$!
+  trap 'kill "$other_cutter_pid" 2>/dev/null || true; wait "$other_cutter_pid" 2>/dev/null || true' EXIT
+  acquire_cut_lock
+) >/dev/null 2>&1 && fail "legacy lock migrated while another cutter process was live"
+[ -d "$CUT_LOCK_DIR" ] || fail "live-cutter refusal removed the legacy lock directory"
+rmdir "$CUT_LOCK_DIR"
+(
+  live='{"lease_id":"live","actor":"mini-release-cut","session_id":"live-session","fencing_token":8,"commit_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","resources":["governed-mini-scripts","runtime-release"]}'
+  PRODUCTION_WRITE_LEASE_JSON='{"lease_id":"older","actor":"mini-release-cut","session_id":"older-session","fencing_token":7,"commit_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","resources":["governed-mini-scripts","runtime-release"]}'
+  printf '{"lease":%s,"schema_version":1}' "$live" > "$CUT_LOCK_DIR"
+  chmod 0600 "$CUT_LOCK_DIR"
+  production_write_lease_call() { return 1; }
+  guarded_production_write() { "$@"; }
+  acquire_cut_lock
+) >/dev/null 2>&1 && fail "older/successor owner removed a live newer cut lock"
+[ -f "$CUT_LOCK_DIR" ] || fail "refused live-owner cut lock was removed"
+rm "$CUT_LOCK_DIR"
+(
+  PRODUCTION_WRITE_LEASE_JSON='{"lease_id":"still-owned"}'
+  production_write_lease_call() { return 1; }
+  if release_production_write_lease; then
+    fail "failed lease release reported success"
+  fi
+  [ "$PRODUCTION_WRITE_LEASE_JSON" = '{"lease_id":"still-owned"}' ] \
+    || fail "failed lease release discarded exact ownership evidence"
+) >/dev/null 2>&1
 
 # Conditional polling accepts equality as a no-op, accepts only a strict
 # descendant as an advance, and distinguishes behind/diverged rejection.
@@ -292,6 +568,210 @@ receipt_name_hash="${receipt_name_hash%.json}"
 [ "$(sha256_file "$first_receipt")" = "$receipt_name_hash" ] \
   || fail "receipt filename is not its content SHA-256"
 cmp -s "$first_receipt" "$LAST_RECEIPT_FILE" || fail "stable receipt pointer differs from addressed receipt"
+
+# An equal-target no-op is permitted only when an immutable exact-target
+# cut/advanced/rollback receipt proves the full activation gate set. A prior
+# noop (the state left by the production incident) is not certification.
+FULL_TARGET=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+FULL_RUNTIME="$RELEASES_DIR/v-full-activation"
+mkdir -p "$FULL_RUNTIME/$(dirname "$VENDORED_REFRESH_REL")" "$(dirname "$DEPLOYED_REFRESH")"
+printf '#!/usr/bin/env python3\nprint("full activation")\n' > "$FULL_RUNTIME/$VENDORED_REFRESH_REL"
+cp "$FULL_RUNTIME/$VENDORED_REFRESH_REL" "$DEPLOYED_REFRESH"
+FULL_HASH="$(sha256_file "$FULL_RUNTIME/$VENDORED_REFRESH_REL")"
+FULL_RECEIPT_ID="$(python3 - "$RELEASES_DIR" "$FULL_RUNTIME" "$FULL_TARGET" "$FULL_HASH" <<'PY'
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+releases = Path(sys.argv[1])
+runtime = sys.argv[2]
+target = sys.argv[3]
+refresh_hash = sys.argv[4]
+payload = {
+    "schema_version": 2,
+    "event": "advanced",
+    "ref": "prod-live-patches",
+    "from_commit": "a" * 40,
+    "to_commit": target,
+    "certified_source_commit": target,
+    "promotion_authority_receipt_id": "1" * 64,
+    "runtime_target": runtime,
+    "refresh_source_sha256": refresh_hash,
+    "refresh_deployed_sha256": refresh_hash,
+    "pr_pipeline_reconciliation_receipt_id": "3" * 64,
+    "review_poll_gate_smoke": "passed",
+    "production_write_lease": {
+        "actor": "mini-release-cut",
+        "commit_sha": target,
+        "resources": ["governed-mini-scripts", "runtime-release"],
+    },
+    "prior_full_activation_receipt_id": None,
+    "detail": "full activation fixture",
+}
+encoded = (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode()
+receipt_id = hashlib.sha256(encoded).hexdigest()
+(releases / f".mini-release-receipt-{receipt_id}.json").write_bytes(encoded)
+print(receipt_id)
+PY
+)"
+[ "$(find_full_activation_receipt "$FULL_TARGET" "$FULL_RUNTIME")" = "$FULL_RECEIPT_ID" ] \
+  || fail "exact full-activation receipt was not accepted"
+python3 - "$RELEASES_DIR/.mini-release-receipt-$FULL_RECEIPT_ID.json" <<'PY'
+import hashlib, json, sys
+from pathlib import Path
+path = Path(sys.argv[1])
+payload = json.loads(path.read_text(encoding="utf-8"))
+payload["production_write_lease"]["commit_sha"] = "d" * 40
+encoded = (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode()
+bad_id = hashlib.sha256(encoded).hexdigest()
+path.with_name(f".mini-release-receipt-{bad_id}.json").write_bytes(encoded)
+PY
+# The valid receipt remains authoritative; remove it momentarily to prove the
+# mismatched lease-bound candidate cannot substitute for target authority.
+mv "$RELEASES_DIR/.mini-release-receipt-$FULL_RECEIPT_ID.json" \
+  "$RELEASES_DIR/.valid-full-receipt.saved"
+if find_full_activation_receipt "$FULL_TARGET" "$FULL_RUNTIME" >/dev/null; then
+  fail "activation receipt with a non-target lease commit was accepted"
+fi
+mv "$RELEASES_DIR/.valid-full-receipt.saved" \
+  "$RELEASES_DIR/.mini-release-receipt-$FULL_RECEIPT_ID.json"
+(
+  verify_active_release_health() { return 0; }
+  write_equal_target_noop "$FULL_RECEIPT_ID" "$FULL_TARGET" "$FULL_TARGET" "$FULL_RUNTIME"
+) >/dev/null
+python3 - "$LAST_RECEIPT_FILE" "$FULL_RECEIPT_ID" <<'PY' \
+  || fail "no-op receipt did not retain its full-activation authority"
+import json, sys
+payload = json.load(open(sys.argv[1], encoding="utf-8"))
+assert payload["event"] == "noop"
+assert payload["prior_full_activation_receipt_id"] == sys.argv[2]
+PY
+
+NOOP_COUNT_BEFORE="$(find "$RELEASES_DIR" -maxdepth 1 -type f -name '.mini-release-receipt-*.json' | wc -l | tr -d ' ')"
+printf 'drifted deployed bytes\n' > "$DEPLOYED_REFRESH"
+if (
+  verify_active_release_health() { return 0; }
+  write_equal_target_noop "$FULL_RECEIPT_ID" "$FULL_TARGET" "$FULL_TARGET" "$FULL_RUNTIME"
+) >/dev/null 2>&1; then
+  fail "equal-target drift wrote a false no-op receipt"
+fi
+NOOP_COUNT_AFTER="$(find "$RELEASES_DIR" -maxdepth 1 -type f -name '.mini-release-receipt-*.json' | wc -l | tr -d ' ')"
+[ "$NOOP_COUNT_BEFORE" = "$NOOP_COUNT_AFTER" ] \
+  || fail "equal-target drift changed immutable receipt inventory"
+cp "$FULL_RUNTIME/$VENDORED_REFRESH_REL" "$DEPLOYED_REFRESH"
+NOOP_COUNT_BEFORE="$(find "$RELEASES_DIR" -maxdepth 1 -type f -name '.mini-release-receipt-*.json' | wc -l | tr -d ' ')"
+if (
+  verify_active_release_health() { return 1; }
+  write_equal_target_noop "$FULL_RECEIPT_ID" "$FULL_TARGET" "$FULL_TARGET" "$FULL_RUNTIME"
+) >/dev/null 2>&1; then
+  fail "equal-target unhealthy services wrote a false no-op receipt"
+fi
+NOOP_COUNT_AFTER="$(find "$RELEASES_DIR" -maxdepth 1 -type f -name '.mini-release-receipt-*.json' | wc -l | tr -d ' ')"
+[ "$NOOP_COUNT_BEFORE" = "$NOOP_COUNT_AFTER" ] \
+  || fail "equal-target unhealthy services changed immutable receipt inventory"
+
+ln -s "$FULL_RUNTIME" "$CURRENT_LINK"
+mkdir -p "$(dirname "$GATEWAY_LOG")"
+# Exercise the real current-start boundary derivation against a live PID whose
+# argv uses runtime-current and whose PID/start fingerprint matches gateway.pid.
+(
+  ln -s "$SCRIPT_DIR/../../.venv" "$FULL_RUNTIME/venv"
+  "$CURRENT_LINK/venv/bin/python" -c 'import time; time.sleep(30)' gateway run &
+  fixture_gateway_pid=$!
+  trap 'kill "$fixture_gateway_pid" 2>/dev/null || true; wait "$fixture_gateway_pid" 2>/dev/null || true' EXIT
+  sleep 0.1
+  "$CURRENT_LINK/venv/bin/python" - "$fixture_gateway_pid" "$HERMES_HOME/gateway.pid" \
+    "$GATEWAY_LOG" "$TEST_ROOT/current-start-offset" <<'PY'
+import datetime
+import json
+from pathlib import Path
+import sys
+
+import psutil
+
+pid = int(sys.argv[1])
+pid_file, log_file, expected_file = map(Path, sys.argv[2:])
+created = psutil.Process(pid).create_time()
+pid_file.write_text(json.dumps({
+    "pid": pid,
+    "kind": "hermes-gateway",
+    "argv": ["gateway", "run"],
+    "start_time": int(round(created * 100)),
+}), encoding="utf-8")
+pid_file.chmod(0o600)
+old = b"2026-01-01 00:00:00,000 INFO gateway.run: Gateway running with 2 platform(s)\n"
+current_time = datetime.datetime.fromtimestamp(created + 0.01).strftime(
+    "%Y-%m-%d %H:%M:%S,%f"
+)[:-3]
+log_file.write_bytes(old + (
+    f"{current_time} INFO gateway.run: Gateway running with 1 platform(s)\n"
+).encode())
+expected_file.write_text(str(len(old)), encoding="utf-8")
+PY
+  [ "$(current_gateway_start_log_offset)" = "$(cat "$TEST_ROOT/current-start-offset")" ] \
+    || fail "live PID/start fingerprint did not derive the current gateway log boundary"
+) || fail "current gateway start boundary fixture failed"
+rm "$HERMES_HOME/gateway.pid"
+printf '%s\n' '2026-08-02 10:00:00,000 INFO gateway.run: Gateway running with 2 platform(s)' \
+  > "$GATEWAY_LOG"
+CURRENT_START_OFFSET="$(wc -c < "$GATEWAY_LOG" | tr -d ' ')"
+printf '%s\n' '2026-08-02 10:01:00,000 INFO gateway.run: Gateway running with 1 platform(s)' \
+  >> "$GATEWAY_LOG"
+if (
+  git() { printf '%s\n' "$FULL_TARGET"; }
+  pgrep() { return 0; }
+  current_gateway_start_log_offset() { printf '%s\n' "$CURRENT_START_OFFSET"; }
+  port_listening() { return 0; }
+  gateway_health_http() { return 0; }
+  http_ok() { return 0; }
+  verify_active_release_health "$FULL_TARGET" "$FULL_RUNTIME"
+) >/dev/null 2>&1; then
+  fail "stale old 2-platform readiness masked a current 1-platform gateway"
+fi
+if (
+  git() { printf '%s\n' "$FULL_TARGET"; }
+  pgrep() { return 0; }
+  current_gateway_start_log_offset() { return 1; }
+  port_listening() { return 0; }
+  gateway_health_http() { return 0; }
+  http_ok() { return 0; }
+  verify_active_release_health "$FULL_TARGET" "$FULL_RUNTIME"
+) >/dev/null 2>&1; then
+  fail "equal-target health accepted an unverifiable current-start boundary"
+fi
+printf '%s\n' '2026-08-02 10:01:01,000 INFO gateway.run: Gateway running with 2 platform(s)' \
+  >> "$GATEWAY_LOG"
+(
+  git() { printf '%s\n' "$FULL_TARGET"; }
+  pgrep() { return 0; }
+  current_gateway_start_log_offset() { printf '%s\n' "$CURRENT_START_OFFSET"; }
+  port_listening() { return 0; }
+  gateway_health_http() { return 0; }
+  http_ok() { return 0; }
+  verify_active_release_health "$FULL_TARGET" "$FULL_RUNTIME"
+) || fail "current 2-platform readiness was rejected"
+if (
+  git() { printf '%s\n' "$FULL_TARGET"; }
+  pgrep() { return 0; }
+  current_gateway_start_log_offset() { printf '%s\n' "$CURRENT_START_OFFSET"; }
+  port_listening() { return 0; }
+  gateway_health_http() { return 0; }
+  http_ok() { return 1; }
+  verify_active_release_health "$FULL_TARGET" "$FULL_RUNTIME"
+) >/dev/null 2>&1; then
+  fail "equal-target dashboard health failure was accepted"
+fi
+rm "$CURRENT_LINK"
+
+PARTIAL_TARGET=cccccccccccccccccccccccccccccccccccccccc
+PARTIAL_RUNTIME="$RELEASES_DIR/v-partial-activation"
+mkdir -p "$PARTIAL_RUNTIME"
+write_release_receipt noop "$PARTIAL_TARGET" "$PARTIAL_TARGET" "$PARTIAL_RUNTIME" \
+  "$SOURCE_HASH" "$SOURCE_HASH" "partial equal-target fixture" >/dev/null
+if find_full_activation_receipt "$PARTIAL_TARGET" "$PARTIAL_RUNTIME" >/dev/null; then
+  fail "a no-op receipt falsely certified a partial activation"
+fi
 
 # Governed refresh deployment stages the old exact bytes, atomically installs
 # the release source, and can restore bootstrap-era bytes when the old release
@@ -497,12 +977,17 @@ resolve_launchd_domain() { printf '%s\n' "$GUI_DOMAIN"; }
 # A rollback whose gateway is healthy but dashboard remains unhealthy must
 # terminate nonzero; a warning-only rollback would make this subshell succeed.
 PREVIOUS_RELEASE="$RELEASES_DIR/v1.2.3-123456789abc"
+FAILED_ROLLBACK_SOURCE="$RELEASES_DIR/v1.2.2-deadbeefdead"
+mkdir -p "$FAILED_ROLLBACK_SOURCE"
 mkdir -p "$PREVIOUS_RELEASE/scripts" "$PREVIOUS_RELEASE/$(dirname "$VENDORED_REFRESH_REL")"
 printf '#!/usr/bin/env bash\nprintf previous\n' > "$PREVIOUS_RELEASE/scripts/cu-clickup"
 chmod 0755 "$PREVIOUS_RELEASE/scripts/cu-clickup"
 printf '#!/usr/bin/env python3\nprint("previous")\n' > "$PREVIOUS_RELEASE/$VENDORED_REFRESH_REL"
 printf '%s\n' "$PREVIOUS_RELEASE" > "$PREV_FILE"
+ln -s "$FAILED_ROLLBACK_SOURCE" "$CURRENT_LINK"
 ROLLBACK_KICKSTART_LOG="$TEST_ROOT/rollback-kickstarts.log"
+: > "$TEST_ROOT/no-rollback-receipt"
+rm "$TEST_ROOT/no-rollback-receipt"
 : > "$ROLLBACK_KICKSTART_LOG"
 if (
   # shellcheck disable=SC2329 # invoked indirectly by rollback_to_previous.
@@ -514,12 +999,16 @@ if (
     [ "${1:-}" = "$GATEWAY_LABEL" ] && printf '%s\n' "$USER_DOMAIN" \
       || printf '%s\n' "$GUI_DOMAIN"
   }
-  # shellcheck disable=SC2329 # invoked indirectly by rollback_to_previous.
-  kickstart() { printf '%s\n' "${1:-}" >> "$ROLLBACK_KICKSTART_LOG"; }
+  # shellcheck disable=SC2329 # invoked indirectly by guarded_kickstart_label.
+  guarded_production_write() {
+    [ "$1" = launchctl ] && [ "$2" = kickstart ] && [ "$3" = -k ] || return 1
+    printf '%s\n' "$4" >> "$ROLLBACK_KICKSTART_LOG"
+  }
   # shellcheck disable=SC2329 # invoked indirectly by rollback_to_previous.
   verify_gateway() { return 0; }
   # shellcheck disable=SC2329 # invoked indirectly by rollback_to_previous.
   verify_dashboard() { return 1; }
+  record_rollback_receipt() { : > "$TEST_ROOT/no-rollback-receipt"; }
   rollback_to_previous 'safety harness'
 ) >/dev/null 2>&1; then
   fail 'rollback returned success despite dashboard health failure'
@@ -527,6 +1016,95 @@ fi
 [ "$(cat "$ROLLBACK_KICKSTART_LOG")" = "$USER_DOMAIN/$GATEWAY_LABEL
 $GUI_DOMAIN/$DASHBOARD_LABEL" ] \
   || fail 'rollback did not resolve gateway and dashboard kickstarts independently'
+[ ! -e "$TEST_ROOT/no-rollback-receipt" ] \
+  || fail 'failed rollback wrote a success receipt'
+
+# A successor takeover at the exact dashboard kickstart guard must prevent
+# launchctl, generation rotation, and receipt writes after the gateway restart.
+rm "$CURRENT_LINK"
+ln -s "$FAILED_ROLLBACK_SOURCE" "$CURRENT_LINK"
+printf '%s\n' "$PREVIOUS_RELEASE" > "$PREV_FILE"
+rm -f "$TEST_ROOT/dashboard-after-takeover" "$TEST_ROOT/rotate-after-takeover" \
+  "$TEST_ROOT/receipt-after-takeover"
+if (
+  heartbeat_production_write_lease() { :; }
+  install_clickup_cli() { :; }
+  rollback_governed_fleet_outcomes() { :; }
+  restore_governed_pr_pipeline_for_release() { :; }
+  rollback_governed_marketplace_skills() { :; }
+  rollback_governed_launchd_environment() { :; }
+  verify_gateway() { return 0; }
+  launchctl() {
+    [ "${3:-}" = "$GUI_DOMAIN/$DASHBOARD_LABEL" ] \
+      && : > "$TEST_ROOT/dashboard-after-takeover"
+    return 0
+  }
+  guard_count=0
+  guarded_production_write() {
+    guard_count=$((guard_count + 1))
+    [ "$guard_count" -eq 1 ] || return 77
+    "$@"
+  }
+  write_previous_target() { : > "$TEST_ROOT/rotate-after-takeover"; }
+  record_rollback_receipt() { : > "$TEST_ROOT/receipt-after-takeover"; }
+  rollback_to_previous 'dashboard guard takeover'
+) >/dev/null 2>&1; then
+  fail 'rollback succeeded after successor takeover at dashboard kickstart guard'
+fi
+[ ! -e "$TEST_ROOT/dashboard-after-takeover" ] \
+  || fail 'dashboard kickstart executed after successor takeover'
+[ ! -e "$TEST_ROOT/rotate-after-takeover" ] \
+  || fail 'rollback generation rotated after successor takeover'
+[ ! -e "$TEST_ROOT/receipt-after-takeover" ] \
+  || fail 'rollback receipt was written after successor takeover'
+
+# A fully verified explicit rollback records an immutable rollback receipt and
+# rotates .previous to the former active release, making the operator action
+# reversible. Neither action occurs before both service verifiers pass.
+rm "$CURRENT_LINK"
+ln -s "$FAILED_ROLLBACK_SOURCE" "$CURRENT_LINK"
+printf '%s\n' "$PREVIOUS_RELEASE" > "$PREV_FILE"
+(
+  heartbeat_production_write_lease() { :; }
+  guarded_kickstart_label() { :; }
+  verify_gateway() { return 0; }
+  verify_dashboard() { return 0; }
+  install_clickup_cli() { return 0; }
+  rollback_governed_fleet_outcomes() { return 0; }
+  restore_governed_pr_pipeline_for_release() { return 0; }
+  rollback_governed_marketplace_skills() { return 0; }
+  rollback_governed_launchd_environment() { return 0; }
+  release_commit_sha() {
+    if [ "$1" = "$FAILED_ROLLBACK_SOURCE" ]; then
+      printf '%s\n' aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    else
+      printf '%s\n' bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+    fi
+  }
+  PR_PIPELINE_RECEIPT_ID=3333333333333333333333333333333333333333333333333333333333333333
+  REVIEW_GATE_SMOKE_STATUS=passed
+  rollback_to_previous 'explicit --rollback fixture'
+) >/dev/null
+[ "$(readlink "$CURRENT_LINK")" = "$PREVIOUS_RELEASE" ] \
+  || fail 'verified explicit rollback did not activate the previous release'
+[ "$(cat "$PREV_FILE")" = "$FAILED_ROLLBACK_SOURCE" ] \
+  || fail 'verified explicit rollback did not rotate .previous to the former active release'
+ROLLBACK_RECEIPT_ID="$(sha256_file "$LAST_RECEIPT_FILE")"
+[ -f "$RELEASES_DIR/.mini-release-receipt-$ROLLBACK_RECEIPT_ID.json" ] \
+  || fail 'verified rollback receipt is not preserved at its content address'
+python3 - "$LAST_RECEIPT_FILE" "$FAILED_ROLLBACK_SOURCE" "$PREVIOUS_RELEASE" <<'PY' \
+  || fail 'verified rollback receipt is not truthful'
+import json, sys
+payload = json.load(open(sys.argv[1], encoding="utf-8"))
+assert payload["event"] == "rollback"
+assert payload["from_commit"] == "a" * 40
+assert payload["to_commit"] == "b" * 40
+assert payload["runtime_target"] == sys.argv[3]
+assert payload["certified_source_commit"] is None
+assert payload["promotion_authority_receipt_id"] is None
+assert payload["detail"] == "verified rollback: explicit --rollback fixture"
+PY
+printf '%s\n' "$PREVIOUS_RELEASE" > "$PREV_FILE"
 
 # Either service can fail to kickstart immediately after runtime-current is
 # switched. Both failures must restore the recorded previous target and still
@@ -534,6 +1112,7 @@ $GUI_DOMAIN/$DASHBOARD_LABEL" ] \
 NEW_RELEASE="$RELEASES_DIR/v1.2.4-abcdef123456"
 mkdir "$NEW_RELEASE"
 for failed_service in gateway dashboard; do
+  printf '%s\n' "$PREVIOUS_RELEASE" > "$PREV_FILE"
   repoint_symlink "$NEW_RELEASE" >/dev/null
   failed_target="$GUI_DOMAIN/$GATEWAY_LABEL"
   [ "$failed_service" = dashboard ] && failed_target="$GUI_DOMAIN/$DASHBOARD_LABEL"
@@ -545,21 +1124,26 @@ for failed_service in gateway dashboard; do
       kickstart_calls=$((kickstart_calls + 1))
       [ "$kickstart_calls" -ne 1 ]
     }
+    guarded_kickstart_label() { :; }
     # shellcheck disable=SC2329 # invoked indirectly by rollback_to_previous.
     verify_gateway() { return 0; }
     # shellcheck disable=SC2329 # invoked indirectly by rollback_to_previous.
     verify_dashboard() { return 0; }
+    record_rollback_receipt() { return 0; }
     kickstart_after_switch "$failed_target" "$failed_service"
   ) >/dev/null 2>&1; then
     fail "$failed_service kickstart failure returned success after rollback"
   fi
   [ "$(readlink "$CURRENT_LINK")" = "$PREVIOUS_RELEASE" ] \
     || fail "$failed_service kickstart failure left runtime-current on the new release"
+  [ "$(cat "$PREV_FILE")" = "$NEW_RELEASE" ] \
+    || fail "$failed_service automatic rollback did not preserve the failed generation"
 done
 
 # Receipt path validation failures occur after the runtime and governed script
 # have switched. They must return through the caller's rollback branch rather
 # than exiting from a nested path assertion and leaving the new release live.
+printf '%s\n' "$PREVIOUS_RELEASE" > "$PREV_FILE"
 repoint_symlink "$NEW_RELEASE" >/dev/null
 printf '#!/usr/bin/env python3\nprint("new live")\n' > "$DEPLOYED_REFRESH"
 RECEIPT_OUTSIDE="$TEST_ROOT/receipt-outside"
@@ -568,7 +1152,7 @@ rm -f "$LAST_RECEIPT_FILE"
 ln -s "$RECEIPT_OUTSIDE" "$LAST_RECEIPT_FILE"
 if (
   # shellcheck disable=SC2329 # invoked indirectly by rollback_to_previous.
-  kickstart() { :; }
+  guarded_kickstart_label() { :; }
   # shellcheck disable=SC2329 # invoked indirectly by rollback_to_previous.
   verify_gateway() { return 0; }
   # shellcheck disable=SC2329 # invoked indirectly by rollback_to_previous.
@@ -576,6 +1160,9 @@ if (
   # Keep this regression focused on runtime/refresh restoration.
   # shellcheck disable=SC2329 # invoked indirectly by rollback_to_previous.
   install_clickup_cli() { :; }
+  release_commit_sha() {
+    [ "$1" = "$NEW_RELEASE" ] && printf '%040d\n' 1 || printf '%040d\n' 2
+  }
   record_cut_receipt_or_rollback advanced \
     aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
     bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
@@ -833,7 +1420,10 @@ set -euo pipefail
 printf '%s\n' "$*" >> "$FAKE_GIT_LOG"
 case " $* " in
   *" fetch --prune origin "*)
-    [ -d "$FAKE_RELEASES_DIR/.mini-release-cut.lock" ] || exit 90
+    [ -f "$FAKE_RELEASES_DIR/.mini-release-cut.lock" ] || exit 90
+    grep -Fq '"actor":"mini-release-cut"' "$FAKE_RELEASES_DIR/.mini-release-cut.lock" || exit 91
+    grep -Fq "\"commit_sha\":\"$FAKE_CERTIFIED_SHA\"" \
+      "$FAKE_RELEASES_DIR/.mini-release-cut.lock" || exit 92
     printf 'locked\n' > "$FAKE_FETCH_MARKER"
     exit 42
     ;;
@@ -879,9 +1469,10 @@ if HOME="$PREFLIGHT_HOME" HERMES_HOME="$PREFLIGHT_HERMES" \
   FAKE_FETCH_MARKER="$PREFLIGHT_MARKER" \
   FAKE_REPO="$(cd "$SCRIPT_DIR/../.." && pwd -P)" \
   FAKE_ACTIVE_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  FAKE_CERTIFIED_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
   FAKE_REMOTE_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
   "$POLL_INSTALLER" --install \
-    --certified-sha aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+    --certified-sha bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
     --promotion-receipt-id cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc \
     >"$PREFLIGHT_ROOT/cut.out" 2>&1; then
   fail "installer accepted a failed origin fetch"
@@ -897,6 +1488,42 @@ fi
 [ ! -e "$PREFLIGHT_HERMES/releases/.mini-release-poll-control.json" ] \
   || fail "fetch failure created poll-control state before lease acquisition"
 
+cleanup_body="$(sed -n '/^cleanup_on_exit() {/,/^}$/p' "$SCRIPT")"
+# A nonzero cut after a verified automatic rollback must not let EXIT cleanup
+# delete the failed generation now recorded as .previous.
+ROLLBACK_EXIT_ROOT="$TEST_ROOT/rollback-generation-exit"
+ROLLBACK_EXIT_RELEASES="$ROLLBACK_EXIT_ROOT/releases"
+ROLLBACK_EXIT_NEW="$ROLLBACK_EXIT_RELEASES/v-failed-generation"
+ROLLBACK_EXIT_LIVE="$ROLLBACK_EXIT_RELEASES/v-restored-generation"
+mkdir -p "$ROLLBACK_EXIT_NEW" "$ROLLBACK_EXIT_LIVE"
+printf 'preserve failed generation\n' > "$ROLLBACK_EXIT_NEW/sentinel"
+printf '%s\n' "$ROLLBACK_EXIT_NEW" > "$ROLLBACK_EXIT_RELEASES/.previous"
+ln -s "$ROLLBACK_EXIT_LIVE" "$ROLLBACK_EXIT_ROOT/runtime-current"
+if (
+  eval "$cleanup_body"
+  DRY_RUN=0
+  NEW_DIR="$ROLLBACK_EXIT_NEW"
+  LEASE_CUT_READY=1
+  RELEASES_DIR="$ROLLBACK_EXIT_RELEASES"
+  PREV_FILE="$ROLLBACK_EXIT_RELEASES/.previous"
+  CURRENT_LINK="$ROLLBACK_EXIT_ROOT/runtime-current"
+  production_write_mutation_allowed() { return 0; }
+  guarded_production_write() { : > "$ROLLBACK_EXIT_ROOT/delete-attempted"; return 1; }
+  freeze_managed_poll_after_failure() { return 0; }
+  release_production_write_lease() { :; }
+  cleanup_production_write_lease_bootstrap() { :; }
+  release_cut_lock() { :; }
+  warn() { :; }
+  false
+  cleanup_on_exit
+); then
+  fail "rollback-generation cleanup unexpectedly returned success"
+fi
+[ -f "$ROLLBACK_EXIT_NEW/sentinel" ] \
+  || fail "EXIT cleanup deleted the automatic rollback generation"
+[ ! -e "$ROLLBACK_EXIT_ROOT/delete-attempted" ] \
+  || fail "EXIT cleanup attempted to delete the preserved rollback generation"
+
 # Exercise the actual EXIT cleanup function after a fence-loss result.  Both
 # a partially-built NEW_DIR and an already-existing poll authorization must
 # survive: the successor owns recovery and this stale process must not mutate
@@ -908,7 +1535,6 @@ FENCE_EXIT_POLL="$FENCE_EXIT_RELEASES/.mini-release-poll-control.json"
 mkdir -p "$FENCE_EXIT_NEW"
 printf 'keep partial release\n' > "$FENCE_EXIT_NEW/sentinel"
 printf 'keep existing authorization\n' > "$FENCE_EXIT_POLL"
-cleanup_body="$(sed -n '/^cleanup_on_exit() {/,/^}$/p' "$SCRIPT")"
 if (
   eval "$cleanup_body"
   DRY_RUN=0

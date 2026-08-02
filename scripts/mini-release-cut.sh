@@ -55,11 +55,13 @@ GUI_DOMAIN="gui/${UID_NUM}"
 USER_DOMAIN="user/${UID_NUM}"
 GATEWAY_LABEL="ai.hermes.gateway"
 DASHBOARD_LABEL="com.colingreig.hermes-dashboard"
+LEGACY_LOCK_PS=/bin/ps
 
 GATEWAY_PORT=8642
 DASHBOARD_PORT=9119
 MIN_PLATFORMS=2
 VERIFY_TIMEOUT="${MINI_RELEASE_VERIFY_TIMEOUT:-240}"          # seconds — observed real cold-boot (Slack connect + channel directory build) taking 150-180s under load; 60s caused spurious rollbacks on healthy releases
+LEASE_HEARTBEAT_INTERVAL=30                                   # seconds — comfortably below the production-write lease's 120s TTL
 # KEEP_RELEASES_EXTRA (86e2k3ryc, disk lifecycle): number of ADDITIONAL release dirs to
 # retain BEYOND the active (runtime-current target) and previous (.previous) releases,
 # which are always protected regardless of this value. Standing policy is "runtime-current
@@ -157,6 +159,24 @@ log()  { printf '\033[36m→\033[0m %s\n' "$*"; }
 ok()   { printf '\033[32m✓\033[0m %s\n' "$*"; }
 warn() { printf '\033[33m⚠\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
+
+bounded_decimal() {
+  local name="${1:?name required}" value="${2-}" minimum="${3:?minimum required}" maximum="${4:?maximum required}"
+  [[ "$value" =~ ^(0|[1-9][0-9]*)$ ]] \
+    || die "$name must be a plain decimal integer between $minimum and $maximum"
+  [ "${#value}" -le "${#maximum}" ] \
+    || die "$name must be between $minimum and $maximum"
+  value="$((10#$value))"
+  [ "$value" -ge "$minimum" ] && [ "$value" -le "$maximum" ] \
+    || die "$name must be between $minimum and $maximum"
+  printf '%s\n' "$value"
+}
+
+# Validate environment-controlled arithmetic before any release-state read or
+# write. Command substitutions, signs, whitespace, leading-zero/octal forms,
+# and unbounded retention/verification windows all fail closed as plain data.
+VERIFY_TIMEOUT="$(bounded_decimal MINI_RELEASE_VERIFY_TIMEOUT "$VERIFY_TIMEOUT" 1 900)"
+KEEP_RELEASES_EXTRA="$(bounded_decimal MINI_RELEASE_KEEP_EXTRA "$KEEP_RELEASES_EXTRA" 0 20)"
 
 # run CMD... — echo it; execute unless dry-run.
 run() {
@@ -309,7 +329,7 @@ classify_ref_advancement() {
 write_release_receipt() {
   local event="${1:-}" from_sha="${2:-}" to_sha="${3:-}"
   local runtime_dir="${4:-}" source_hash="${5:-}" deployed_hash="${6:-}"
-  local detail="${7:-}"
+  local detail="${7:-}" prior_full_receipt_id="${8:-}"
   local payload receipt_hash receipt_file tmp last_tmp
 
   case "$event" in
@@ -325,6 +345,8 @@ write_release_receipt() {
     || { warn "invalid governed refresh source SHA-256"; return 1; }
   [ -z "$deployed_hash" ] || [[ "$deployed_hash" =~ ^[0-9a-f]{64}$ ]] \
     || { warn "invalid governed refresh deployed SHA-256"; return 1; }
+  [ -z "$prior_full_receipt_id" ] || [[ "$prior_full_receipt_id" =~ ^[0-9a-f]{64}$ ]] \
+    || { warn "invalid prior full-activation receipt ID"; return 1; }
   # Receipt validation must be catchable by post-switch callers. The generic
   # path assertions deliberately call die(), which is appropriate before a
   # switch but would exit the whole process here before the caller can roll
@@ -341,14 +363,15 @@ write_release_receipt() {
   payload="$(python3 - "$event" "$REF" "$from_sha" "$to_sha" "$runtime_dir" \
     "$source_hash" "$deployed_hash" "$detail" "$CERTIFIED_SHA" \
     "$PR_PIPELINE_RECEIPT_ID" "$REVIEW_GATE_SMOKE_STATUS" \
-    "$PROMOTION_RECEIPT_ID" "$PRODUCTION_WRITE_LEASE_JSON" <<'PY'
+    "$PROMOTION_RECEIPT_ID" "$PRODUCTION_WRITE_LEASE_JSON" \
+    "$prior_full_receipt_id" <<'PY'
 import json
 import sys
 
 (
     event, ref, from_sha, to_sha, runtime_dir, source_hash, deployed_hash,
     detail, certified_sha, pipeline_receipt, review_gate_smoke,
-    promotion_receipt_id, production_write_lease,
+    promotion_receipt_id, production_write_lease, prior_full_receipt_id,
 ) = sys.argv[1:]
 print(json.dumps({
     "schema_version": 2,
@@ -364,6 +387,7 @@ print(json.dumps({
     "pr_pipeline_reconciliation_receipt_id": pipeline_receipt or None,
     "review_poll_gate_smoke": review_gate_smoke or None,
     "production_write_lease": json.loads(production_write_lease) if production_write_lease else None,
+    "prior_full_activation_receipt_id": prior_full_receipt_id or None,
     "detail": detail,
 }, sort_keys=True, separators=(",", ":")))
 PY
@@ -396,6 +420,72 @@ PY
   guarded_or_direct chmod 0644 "$last_tmp" || { guarded_or_direct rm -f "$last_tmp"; return 1; }
   guarded_or_direct mv -fh "$last_tmp" "$LAST_RECEIPT_FILE" || { guarded_or_direct rm -f "$last_tmp"; return 1; }
   ok "release receipt sha256=$receipt_hash event=$event"
+}
+
+# Print the immutable receipt ID for a prior activation that completed the
+# full gate set for this exact commit and runtime directory. A no-op receipt is
+# deliberately insufficient: it may have been written after a failed cut that
+# switched the symlink but never completed service/install/hash verification.
+find_full_activation_receipt() {
+  local target_sha="${1:-}" runtime_dir="${2:-}" candidate receipt_id
+  [[ "$target_sha" =~ ^[0-9a-f]{40,64}$ ]] || return 1
+  ( assert_release_target "$runtime_dir" ) || return 1
+  for candidate in "$RELEASES_DIR"/.mini-release-receipt-*.json; do
+    [ -f "$candidate" ] && [ ! -L "$candidate" ] || continue
+    receipt_id="${candidate##*.mini-release-receipt-}"
+    receipt_id="${receipt_id%.json}"
+    [[ "$receipt_id" =~ ^[0-9a-f]{64}$ ]] || continue
+    [ "$(sha256_file "$candidate" 2>/dev/null || true)" = "$receipt_id" ] || continue
+    if python3 - "$candidate" "$target_sha" "$runtime_dir" <<'PY'
+import json
+import re
+import sys
+
+path, target_sha, runtime_dir = sys.argv[1:]
+try:
+    payload = json.load(open(path, encoding="utf-8"))
+except (OSError, json.JSONDecodeError):
+    raise SystemExit(1)
+
+digest = re.compile(r"^[0-9a-f]{64}$")
+event = payload.get("event")
+lease = payload.get("production_write_lease")
+try:
+    lease_resources = set(lease.get("resources") or ()) if isinstance(lease, dict) else set()
+except TypeError:
+    lease_resources = set()
+valid = (
+    payload.get("schema_version") == 2
+    and event in {"cut", "advanced", "rollback"}
+    and payload.get("to_commit") == target_sha
+    and payload.get("runtime_target") == runtime_dir
+    and isinstance(payload.get("detail"), str)
+    and bool(payload["detail"])
+    and digest.fullmatch(payload.get("refresh_source_sha256") or "") is not None
+    and payload.get("refresh_deployed_sha256") == payload.get("refresh_source_sha256")
+    and digest.fullmatch(payload.get("pr_pipeline_reconciliation_receipt_id") or "") is not None
+    and payload.get("review_poll_gate_smoke") == "passed"
+    and isinstance(lease, dict)
+    and lease.get("actor") == "mini-release-cut"
+    and lease_resources == {"runtime-release", "governed-mini-scripts"}
+)
+if event in {"cut", "advanced"}:
+    valid = (
+        valid
+        and lease.get("commit_sha") == target_sha
+        and payload.get("certified_source_commit") == target_sha
+        and digest.fullmatch(payload.get("promotion_authority_receipt_id") or "") is not None
+    )
+elif event == "rollback":
+    valid = valid and lease.get("commit_sha") == payload.get("from_commit")
+raise SystemExit(0 if valid else 1)
+PY
+    then
+      printf '%s\n' "$receipt_id"
+      return 0
+    fi
+  done
+  return 1
 }
 
 # The only governed ~/.hermes/scripts write. Source and destination must both
@@ -908,26 +998,259 @@ kickstart_label() {
   kickstart "$(launchd_target "$label")"
 }
 
-# mkdir is atomic, unlike checking then creating a pid file. The lock covers
-# cuts, explicit rollbacks, and pruning so two operators cannot race the
-# runtime-current switch or delete one another's release.
+guarded_kickstart_label() {
+  local label="${1:-}" target
+  target="$(launchd_target "$label")" || return 1
+  log "guarded restart: launchctl kickstart -k $target"
+  guarded_production_write launchctl kickstart -k "$target"
+}
+
+# The owner file is created with O_EXCL inside the production mutation guard.
+# Its exact lease identity makes a stranded lock recoverable only by a proved
+# later fencing token whose predecessor is released or evidence-recovered.
 LOCK_HELD=0
+CUT_LOCK_OWNER_JSON=""
 PRODUCTION_WRITE_LEASE_JSON=""
 PRODUCTION_WRITE_LEASE_PYTHON=""
 PRODUCTION_WRITE_LEASE_ROOT=""
 PRODUCTION_WRITE_LEASE_BOOTSTRAP_DIR=""
 PRODUCTION_WRITE_LEASE_BOOTSTRAP_OWNED=0
+PRODUCTION_WRITE_FENCE_LOSS_RECEIPT_JSON=""
 acquire_cut_lock() {
   assert_release_target "$CUT_LOCK_DIR"
   if [ "$DRY_RUN" -eq 1 ]; then
-    printf '\033[35m[DRY-RUN]\033[0m mkdir %s (single-instance cut lock)\n' "$CUT_LOCK_DIR"
+    printf '\033[35m[DRY-RUN]\033[0m exclusive owner file %s (single-instance cut lock)\n' "$CUT_LOCK_DIR"
     return 0
   fi
-  if ! guarded_or_direct mkdir "$CUT_LOCK_DIR"; then
-    die "another mini-release-cut is already running (lock: $CUT_LOCK_DIR)"
+  [ -n "$PRODUCTION_WRITE_LEASE_JSON" ] \
+    || die "cannot acquire release-cut lock without a production write lease"
+  CUT_LOCK_OWNER_JSON="$(python3 - "$PRODUCTION_WRITE_LEASE_JSON" <<'PY'
+import json, sys
+lease = json.loads(sys.argv[1])
+print(json.dumps({"schema_version": 1, "lease": lease}, sort_keys=True, separators=(",", ":")))
+PY
+)" || die "could not encode release-cut lock owner"
+
+  create_cut_lock_owner() {
+    guarded_production_write python3 -c '
+import os, sys, tempfile
+path, payload = sys.argv[1:]
+parent = os.path.dirname(path)
+fd, staged = tempfile.mkstemp(prefix=".mini-release-cut.owner.", dir=parent)
+try:
+    os.fchmod(fd, 0o600)
+    os.write(fd, payload.encode("utf-8"))
+    os.fsync(fd)
+finally:
+    os.close(fd)
+try:
+    os.link(staged, path)
+except FileExistsError:
+    raise SystemExit(17)
+finally:
+    os.unlink(staged)
+' "$CUT_LOCK_DIR" "$CUT_LOCK_OWNER_JSON"
+  }
+
+  if ! create_cut_lock_owner; then
+    recover_stale_cut_lock \
+      || die "another mini-release-cut owns an unrecoverable/live lock: $CUT_LOCK_DIR"
+    create_cut_lock_owner \
+      || die "release-cut lock remained unavailable after governed stale-owner recovery"
   fi
   LOCK_HELD=1
   ok "acquired single-instance release-cut lock"
+}
+
+recover_stale_cut_lock() {
+  if [ -d "$CUT_LOCK_DIR" ] && [ ! -L "$CUT_LOCK_DIR" ]; then
+    recover_legacy_cut_lock_directory
+    return
+  fi
+  [ -f "$CUT_LOCK_DIR" ] && [ ! -L "$CUT_LOCK_DIR" ] || return 1
+  [ "$(stat -f '%u' "$CUT_LOCK_DIR" 2>/dev/null || true)" = "$UID_NUM" ] || return 1
+  [ "$(stat -f '%Lp' "$CUT_LOCK_DIR" 2>/dev/null || true)" = 600 ] || return 1
+  local owner_payload stale_lease proof
+  owner_payload="$(cat "$CUT_LOCK_DIR")" || return 1
+  stale_lease="$(python3 - "$owner_payload" <<'PY'
+import json, sys
+payload = json.loads(sys.argv[1])
+if payload.get("schema_version") != 1 or not isinstance(payload.get("lease"), dict):
+    raise SystemExit(2)
+print(json.dumps(payload["lease"], sort_keys=True, separators=(",", ":")))
+PY
+)" || return 1
+  proof="$(production_write_lease_call lock-recovery-proof \
+    "$PRODUCTION_WRITE_LEASE_JSON" "$stale_lease")" || return 1
+  guarded_production_write python3 -c '
+import os, stat, sys
+path, expected = sys.argv[1:]
+info = os.lstat(path)
+if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+    raise SystemExit(2)
+if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o022:
+    raise SystemExit(2)
+with open(path, encoding="utf-8") as handle:
+    if handle.read() != expected:
+        raise SystemExit(2)
+os.unlink(path)
+' "$CUT_LOCK_DIR" "$owner_payload" || return 1
+  ok "recovered stale release-cut lock with successor proof: $proof"
+}
+
+# One-time migration for the mkdir lock written by the predecessor cutter.
+# The empty directory has no owner payload, so recover it only when its exact
+# inode timestamp falls inside one and only one earlier terminal/recovered
+# governed lease. Both inspection and rmdir reject another cutter process.
+recover_legacy_cut_lock_directory() {
+  [ -d "$CUT_LOCK_DIR" ] && [ ! -L "$CUT_LOCK_DIR" ] || return 1
+  [ -n "$PRODUCTION_WRITE_LEASE_PYTHON" ] || return 1
+  local cutter_pid="$$" snapshot proof
+  snapshot="$("$PRODUCTION_WRITE_LEASE_PYTHON" -c '
+import os, pathlib, re, shlex, stat, subprocess, sys
+
+path = pathlib.Path(sys.argv[1])
+allowed_pid = int(sys.argv[2])
+ps_command = sys.argv[3]
+info = path.lstat()
+if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+    raise SystemExit(2)
+if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o022:
+    raise SystemExit(2)
+if any(path.iterdir()):
+    raise SystemExit(2)
+try:
+    observed = subprocess.run(
+        [ps_command, "-U", str(os.getuid()), "-o", "pid=", "-o", "command="],
+        stdin=subprocess.DEVNULL, capture_output=True, text=True,
+        encoding="utf-8", errors="strict", timeout=5, check=False,
+    )
+except (OSError, subprocess.SubprocessError, UnicodeError):
+    raise SystemExit(2)
+if observed.returncode != 0 or observed.stderr.strip():
+    raise SystemExit(2)
+if len(observed.stdout.encode("utf-8")) > 1_048_576:
+    raise SystemExit(2)
+lines = observed.stdout.splitlines()
+if not lines or len(lines) > 4096:
+    raise SystemExit(2)
+seen = set()
+allowed_seen = False
+for line in lines:
+    match = re.fullmatch(r"\s*([1-9][0-9]*)\s+(\S.*)", line)
+    if match is None:
+        raise SystemExit(2)
+    pid = int(match.group(1))
+    if pid in seen:
+        raise SystemExit(2)
+    seen.add(pid)
+    if pid == allowed_pid:
+        allowed_seen = True
+        continue
+    try:
+        argv = shlex.split(match.group(2), posix=True)
+    except ValueError:
+        raise SystemExit(2)
+    if not argv or pathlib.Path(argv[0]).name not in {"bash", "sh", "zsh"}:
+        continue
+    index = 1
+    noexec = False
+    while index < len(argv) and argv[index] == "--":
+        index += 1
+    while index < len(argv) and re.fullmatch(r"-[abefhkmnptuvxBCEHPT]+", argv[index]):
+        noexec = noexec or "n" in argv[index][1:]
+        index += 1
+    if index < len(argv) and argv[index] in {"-c", "--command"}:
+        # Command-mode shells are orchestrators, not script interpreters. An
+        # actual cutter they launch has its own visible shell/script argv and
+        # cannot acquire the already-held production lease in between scans.
+        continue
+    if index < len(argv) and argv[index] in {"-O", "+O"}:
+        if "mini-release-cut.sh" in match.group(2):
+            raise SystemExit(2)
+        continue
+    if (not noexec and index < len(argv)
+            and pathlib.Path(argv[index]).name == "mini-release-cut.sh"):
+        raise SystemExit(2)
+if not allowed_seen:
+    raise SystemExit(2)
+print(info.st_mtime_ns)
+' "$CUT_LOCK_DIR" "$cutter_pid" "$LEGACY_LOCK_PS")" || return 1
+  [[ "$snapshot" =~ ^[1-9][0-9]*$ ]] || return 1
+  proof="$(production_write_lease_call legacy-lock-recovery-proof \
+    "$PRODUCTION_WRITE_LEASE_JSON" "$snapshot")" || return 1
+  guarded_production_write "$PRODUCTION_WRITE_LEASE_PYTHON" -c '
+import os, pathlib, re, shlex, stat, subprocess, sys
+
+path = pathlib.Path(sys.argv[1])
+expected_mtime_ns = int(sys.argv[2])
+allowed_pid = int(sys.argv[3])
+ps_command = sys.argv[4]
+info = path.lstat()
+if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+    raise SystemExit(2)
+if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o022:
+    raise SystemExit(2)
+if info.st_mtime_ns != expected_mtime_ns or any(path.iterdir()):
+    raise SystemExit(2)
+try:
+    observed = subprocess.run(
+        [ps_command, "-U", str(os.getuid()), "-o", "pid=", "-o", "command="],
+        stdin=subprocess.DEVNULL, capture_output=True, text=True,
+        encoding="utf-8", errors="strict", timeout=5, check=False,
+    )
+except (OSError, subprocess.SubprocessError, UnicodeError):
+    raise SystemExit(2)
+if observed.returncode != 0 or observed.stderr.strip():
+    raise SystemExit(2)
+if len(observed.stdout.encode("utf-8")) > 1_048_576:
+    raise SystemExit(2)
+lines = observed.stdout.splitlines()
+if not lines or len(lines) > 4096:
+    raise SystemExit(2)
+seen = set()
+allowed_seen = False
+for line in lines:
+    match = re.fullmatch(r"\s*([1-9][0-9]*)\s+(\S.*)", line)
+    if match is None:
+        raise SystemExit(2)
+    pid = int(match.group(1))
+    if pid in seen:
+        raise SystemExit(2)
+    seen.add(pid)
+    if pid == allowed_pid:
+        allowed_seen = True
+        continue
+    try:
+        argv = shlex.split(match.group(2), posix=True)
+    except ValueError:
+        raise SystemExit(2)
+    if not argv or pathlib.Path(argv[0]).name not in {"bash", "sh", "zsh"}:
+        continue
+    index = 1
+    noexec = False
+    while index < len(argv) and argv[index] == "--":
+        index += 1
+    while index < len(argv) and re.fullmatch(r"-[abefhkmnptuvxBCEHPT]+", argv[index]):
+        noexec = noexec or "n" in argv[index][1:]
+        index += 1
+    if index < len(argv) and argv[index] in {"-c", "--command"}:
+        # Command-mode shells are orchestrators, not script interpreters. An
+        # actual cutter they launch has its own visible shell/script argv and
+        # cannot acquire the already-held production lease in between scans.
+        continue
+    if index < len(argv) and argv[index] in {"-O", "+O"}:
+        if "mini-release-cut.sh" in match.group(2):
+            raise SystemExit(2)
+        continue
+    if (not noexec and index < len(argv)
+            and pathlib.Path(argv[index]).name == "mini-release-cut.sh"):
+        raise SystemExit(2)
+if not allowed_seen:
+    raise SystemExit(2)
+path.rmdir()
+' "$CUT_LOCK_DIR" "$snapshot" "$cutter_pid" "$LEGACY_LOCK_PS" || return 1
+  ok "migrated legacy empty-directory release-cut lock with successor proof: $proof"
 }
 
 # shellcheck disable=SC2329 # called by the EXIT trap installed below
@@ -935,8 +1258,25 @@ release_cut_lock() {
   [ "$LOCK_HELD" -eq 1 ] || return 0
   # Prove the resolved parent again immediately before removing the lock.
   assert_release_target "$CUT_LOCK_DIR"
-  guarded_or_direct rmdir "$CUT_LOCK_DIR" || warn "could not remove release-cut lock: $CUT_LOCK_DIR"
-  LOCK_HELD=0
+  if guarded_production_write python3 -c '
+import os, stat, sys
+path, expected = sys.argv[1:]
+info = os.lstat(path)
+if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+    raise SystemExit(2)
+if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o022:
+    raise SystemExit(2)
+with open(path, encoding="utf-8") as handle:
+    if handle.read() != expected:
+        raise SystemExit(2)
+os.unlink(path)
+' "$CUT_LOCK_DIR" "$CUT_LOCK_OWNER_JSON"; then
+    LOCK_HELD=0
+    CUT_LOCK_OWNER_JSON=""
+    return 0
+  fi
+  warn "could not remove release-cut lock: $CUT_LOCK_DIR"
+  return 1
 }
 
 # Do not call ``hermes production-write-lease`` here: the currently-active
@@ -1000,9 +1340,21 @@ try:
                     raise RuntimeError("invalid guarded temporary-file kind")
             print(json.dumps({"lease": refreshed.as_dict(), "path": path}, sort_keys=True))
         elif action == "release": lease.release(**kwargs); print("{}")
+        elif action == "lock-recovery-proof":
+            stale = json.loads(sys.argv[3])
+            print(json.dumps(lease.authorize_stale_lock_recovery(
+                stale=stale, successor=data), sort_keys=True))
+        elif action == "legacy-lock-recovery-proof":
+            print(json.dumps(lease.authorize_legacy_lock_directory_recovery(
+                successor=data, directory_mtime_ns=int(sys.argv[3])), sort_keys=True))
         elif action == "fence-loss": print(json.dumps(lease.record_fence_loss(
             **kwargs, reason="Mini release cut lost its production write fence",
-            evidence={"operation": "mini-release-cut", "commit_sha": data["commit_sha"]}).copy(), sort_keys=True))
+            evidence={
+                "operation": "mini-release-cut",
+                "commit_sha": data["commit_sha"],
+                "result": "fence-lost",
+                "context": sys.argv[3] if len(sys.argv) > 3 else "unspecified",
+            }), sort_keys=True))
         else: raise RuntimeError("unknown lease action")
 except Exception as exc:
     print(f"production write lease {action} refused: {exc}", file=sys.stderr)
@@ -1011,23 +1363,34 @@ PY
 }
 
 acquire_production_write_lease() {
-  local session="mini-release-cut-${UID_NUM}-$$-${RANDOM}"
-  PRODUCTION_WRITE_LEASE_JSON="$(production_write_lease_call acquire "$session" "$SHA")" \
+  local lease_commit="${1:-$SHA}" session="mini-release-cut-${UID_NUM}-$$-${RANDOM}"
+  [[ "$lease_commit" =~ ^[0-9a-f]{40}$ ]] \
+    || die "production write lease commit must be an exact 40-character SHA"
+  PRODUCTION_WRITE_LEASE_JSON="$(production_write_lease_call acquire "$session" "$lease_commit")" \
     || die "could not acquire fenced production write lease"
   ok "acquired fenced production write lease"
 }
 
 heartbeat_production_write_lease() {
   [ -n "$PRODUCTION_WRITE_LEASE_JSON" ] || return 0
-  PRODUCTION_WRITE_LEASE_JSON="$(production_write_lease_call heartbeat "$PRODUCTION_WRITE_LEASE_JSON")" \
-    || {
-      warn "production write lease fence failed"
-      production_write_lease_call fence-loss "$PRODUCTION_WRITE_LEASE_JSON" >/dev/null \
-        || warn "could not persist production write lease fence-loss receipt"
-      # Never roll back after ownership is lost: another writer may already
-      # hold the successor fence. The successor/operator owns recovery.
-      die "production write lease heartbeat failed"
-    }
+  local prior="$PRODUCTION_WRITE_LEASE_JSON" updated="" receipt=""
+  if updated="$(production_write_lease_call heartbeat "$prior")"; then
+    PRODUCTION_WRITE_LEASE_JSON="$updated"
+    return 0
+  fi
+  warn "production write lease fence failed"
+  if receipt="$(production_write_lease_call fence-loss "$prior" "heartbeat-refused")"; then
+    PRODUCTION_WRITE_FENCE_LOSS_RECEIPT_JSON="$receipt"
+    warn "persisted production write fence-loss receipt: $receipt"
+  else
+    warn "could not persist production write lease fence-loss receipt"
+  fi
+  # Preserve the exact identity for durable incident evidence and an audited
+  # recovery. It is no longer a mutation capability: the recorded loss makes
+  # every later cleanup/release helper fail closed without substituting empty
+  # or malformed JSON.
+  PRODUCTION_WRITE_LEASE_JSON="$prior"
+  die "production write lease heartbeat failed"
 }
 
 # A failure trap is still a production writer.  Never let it persist a poll
@@ -1037,13 +1400,19 @@ heartbeat_production_write_lease() {
 # leave state untouched and report the original failure.
 production_write_mutation_allowed() {
   [ -n "$PRODUCTION_WRITE_LEASE_JSON" ] || return 1
+  [ -z "$PRODUCTION_WRITE_FENCE_LOSS_RECEIPT_JSON" ] || return 1
   local prior="$PRODUCTION_WRITE_LEASE_JSON"
   if PRODUCTION_WRITE_LEASE_JSON="$(production_write_lease_call heartbeat "$prior")"; then
     return 0
   fi
   warn "production write lease fence failed; refusing trap/cleanup mutation"
-  production_write_lease_call fence-loss "$prior" >/dev/null \
-    || warn "could not persist production write lease fence-loss receipt"
+  local receipt=""
+  if receipt="$(production_write_lease_call fence-loss "$prior" "trap-cleanup-refused")"; then
+    PRODUCTION_WRITE_FENCE_LOSS_RECEIPT_JSON="$receipt"
+    warn "persisted production write fence-loss receipt: $receipt"
+  else
+    warn "could not persist production write lease fence-loss receipt"
+  fi
   PRODUCTION_WRITE_LEASE_JSON="$prior"
   return 1
 }
@@ -1098,11 +1467,28 @@ guarded_write_text() {
     "$target" "$payload"
 }
 
+write_previous_target() {
+  local target="${1:?previous target required}" tmp
+  assert_release_target "$target"
+  [ -d "$target" ] || { warn "previous generation is not a release directory: $target"; return 1; }
+  assert_regular_release_file "$PREV_FILE"
+  tmp="$(guarded_reserve_temp "$RELEASES_DIR/.previous.swap.XXXXXX")" || return 1
+  guarded_write_text "$tmp" "${target}"$'\n' \
+    || { guarded_or_direct rm -f "$tmp"; return 1; }
+  guarded_or_direct chmod 0600 "$tmp" \
+    || { guarded_or_direct rm -f "$tmp"; return 1; }
+  guarded_or_direct mv -fh "$tmp" "$PREV_FILE" \
+    || { guarded_or_direct rm -f "$tmp"; return 1; }
+}
+
 release_production_write_lease() {
   [ -n "$PRODUCTION_WRITE_LEASE_JSON" ] || return 0
-  production_write_lease_call release "$PRODUCTION_WRITE_LEASE_JSON" >/dev/null \
-    || warn "could not release fenced production write lease"
-  PRODUCTION_WRITE_LEASE_JSON=""
+  if production_write_lease_call release "$PRODUCTION_WRITE_LEASE_JSON" >/dev/null; then
+    PRODUCTION_WRITE_LEASE_JSON=""
+    return 0
+  fi
+  warn "could not release fenced production write lease"
+  return 1
 }
 
 guarded_rollback_to_previous() {
@@ -1252,11 +1638,75 @@ gateway_platforms_ready() {
   [ -n "$count" ] && [ "$count" -ge "$MIN_PLATFORMS" ]
 }
 
+# Bind accumulated gateway.log evidence to the exact live gateway process.
+# gateway.pid carries the same PID/start fingerprint that gateway.status uses
+# to reject PID reuse. The first timestamped line at or after that process's
+# creation is the only acceptable current-start log boundary. Missing,
+# malformed, rotated-away, unsafe, or identity-mismatched evidence fails closed.
+current_gateway_start_log_offset() {
+  local runtime_python="$CURRENT_LINK/venv/bin/python"
+  [ -x "$runtime_python" ] || return 1
+  "$runtime_python" - "$HERMES_HOME/gateway.pid" "$GATEWAY_LOG" "$CURRENT_LINK" <<'PY'
+import datetime
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import sys
+
+import psutil
+
+pid_path, log_path, current_link = map(Path, sys.argv[1:])
+for path in (pid_path, log_path):
+    info = path.lstat()
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise SystemExit(2)
+    if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o022:
+        raise SystemExit(2)
+
+record = json.loads(pid_path.read_text(encoding="utf-8"))
+pid = record.get("pid")
+recorded_start = record.get("start_time")
+if record.get("kind") != "hermes-gateway" or not isinstance(pid, int) or pid <= 1:
+    raise SystemExit(2)
+if not isinstance(recorded_start, int):
+    raise SystemExit(2)
+process = psutil.Process(pid)
+created_at = process.create_time()
+if int(round(created_at * 100)) != recorded_start:
+    raise SystemExit(2)
+argv = process.cmdline()
+expected_python = str(current_link / "venv" / "bin" / "python")
+if expected_python not in argv:
+    raise SystemExit(2)
+if not any(argv[index:index + 2] == ["gateway", "run"] for index in range(len(argv) - 1)):
+    raise SystemExit(2)
+
+timestamp = re.compile(rb"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3})\b")
+offset = 0
+for line in log_path.read_bytes().splitlines(keepends=True):
+    match = timestamp.match(line)
+    if match:
+        observed = datetime.datetime.strptime(
+            match.group(1).decode("ascii"), "%Y-%m-%d %H:%M:%S,%f"
+        ).timestamp()
+        # Logging formats milliseconds while process creation has finer
+        # precision. Allow only the sub-millisecond truncation interval.
+        if observed + 0.001 >= created_at:
+            print(offset)
+            raise SystemExit(0)
+    offset += len(line)
+raise SystemExit(2)
+PY
+}
+
 # Verify the gateway came up on $1 (release dir) after a restart begun at
 # byte offset $2 in the gateway log. Polls up to VERIFY_TIMEOUT.
 verify_gateway() {
   local release_dir="${1:-}" offset="${2:-0}"
   local deadline=$((SECONDS + VERIFY_TIMEOUT))
+  local next_lease_heartbeat=$SECONDS
   local proc_ok=0 plat_ok=0 port_ok=0 link_ok=0
   if [ "$DRY_RUN" -eq 1 ]; then
     printf '\033[35m[DRY-RUN]\033[0m verify gateway: runtime-current -> %s, proc via runtime-current, >=%s platform(s), :%s listening\n' \
@@ -1265,6 +1715,10 @@ verify_gateway() {
   fi
   log "verifying gateway (up to ${VERIFY_TIMEOUT}s)…"
   while [ "$SECONDS" -lt "$deadline" ]; do
+    if [ "$SECONDS" -ge "$next_lease_heartbeat" ]; then
+      heartbeat_production_write_lease
+      next_lease_heartbeat=$((SECONDS + LEASE_HEARTBEAT_INTERVAL))
+    fi
     proc_ok=0; plat_ok=0; port_ok=0; link_ok=0
     # The LaunchAgent's ProgramArguments are generated against the
     # `runtime-current` symlink path (see hermes_cli/gateway.py's plist
@@ -1288,12 +1742,17 @@ verify_gateway() {
 
 verify_dashboard() {
   local deadline=$((SECONDS + VERIFY_TIMEOUT))
+  local next_lease_heartbeat=$SECONDS
   if [ "$DRY_RUN" -eq 1 ]; then
     printf '\033[35m[DRY-RUN]\033[0m verify dashboard: HTTP 200 on http://127.0.0.1:%s\n' "$DASHBOARD_PORT"
     return 0
   fi
   log "verifying dashboard (up to ${VERIFY_TIMEOUT}s)…"
   while [ "$SECONDS" -lt "$deadline" ]; do
+    if [ "$SECONDS" -ge "$next_lease_heartbeat" ]; then
+      heartbeat_production_write_lease
+      next_lease_heartbeat=$((SECONDS + LEASE_HEARTBEAT_INTERVAL))
+    fi
     if http_ok "http://127.0.0.1:${DASHBOARD_PORT}"; then
       ok "dashboard healthy (HTTP 200 on :${DASHBOARD_PORT})"
       return 0
@@ -1304,17 +1763,115 @@ verify_dashboard() {
   return 1
 }
 
+gateway_health_http() {
+  curl --fail --silent --show-error --max-time 5 \
+    "http://127.0.0.1:${GATEWAY_PORT}/health" 2>/dev/null \
+    | python3 -c '
+import json, sys
+value = json.load(sys.stdin)
+raise SystemExit(0 if value.get("status") == "ok" and value.get("platform") == "hermes-agent" else 1)
+' 2>/dev/null
+}
+
+verify_active_release_health() {
+  local target_sha="${1:-}" release_dir="${2:-}" observed_sha="" current_start_offset=""
+  heartbeat_production_write_lease
+  [ -L "$CURRENT_LINK" ] && [ "$(readlink "$CURRENT_LINK")" = "$release_dir" ] \
+    || { warn "equal-target health failed: runtime-current does not match $release_dir"; return 1; }
+  observed_sha="$(git -C "$release_dir" rev-parse --verify 'HEAD^{commit}' 2>/dev/null)" \
+    || { warn "equal-target health failed: active commit is unreadable"; return 1; }
+  [ "$observed_sha" = "$target_sha" ] \
+    || { warn "equal-target health failed: active commit $observed_sha != $target_sha"; return 1; }
+  pgrep -f "${CURRENT_LINK}/venv/bin/python.*gateway run" >/dev/null 2>&1 \
+    || { warn "equal-target health failed: gateway process is absent"; return 1; }
+  current_start_offset="$(current_gateway_start_log_offset)" \
+    || { warn "equal-target health failed: current gateway start boundary is unverifiable"; return 1; }
+  [[ "$current_start_offset" =~ ^(0|[1-9][0-9]*)$ ]] \
+    || { warn "equal-target health failed: current gateway start boundary is malformed"; return 1; }
+  gateway_platforms_ready "$current_start_offset" \
+    || { warn "equal-target health failed: gateway platforms are not ready"; return 1; }
+  port_listening "$GATEWAY_PORT" && gateway_health_http \
+    || { warn "equal-target health failed: gateway port/semantic HTTP health failed"; return 1; }
+  http_ok "http://127.0.0.1:${DASHBOARD_PORT}" \
+    || { warn "equal-target health failed: dashboard HTTP health failed"; return 1; }
+  heartbeat_production_write_lease
+}
+
+EQUAL_REFRESH_SOURCE_HASH=""
+EQUAL_REFRESH_DEPLOYED_HASH=""
+validate_equal_target_state() {
+  local target_sha="${1:-}" release_dir="${2:-}" receipt_id="${3:-}"
+  local receipt_file="$RELEASES_DIR/.mini-release-receipt-${receipt_id}.json"
+  [ -f "$release_dir/$VENDORED_REFRESH_REL" ] && [ ! -L "$release_dir/$VENDORED_REFRESH_REL" ] \
+    || { warn "equal-target governed refresh source is missing or symlinked"; return 1; }
+  [ -f "$DEPLOYED_REFRESH" ] && [ ! -L "$DEPLOYED_REFRESH" ] \
+    || { warn "equal-target governed refresh deployment is missing or symlinked"; return 1; }
+  EQUAL_REFRESH_SOURCE_HASH="$(sha256_file "$release_dir/$VENDORED_REFRESH_REL")" || return 1
+  EQUAL_REFRESH_DEPLOYED_HASH="$(sha256_file "$DEPLOYED_REFRESH")" || return 1
+  [ "$EQUAL_REFRESH_SOURCE_HASH" = "$EQUAL_REFRESH_DEPLOYED_HASH" ] \
+    || { warn "equal-target governed refresh bytes drift from active source"; return 1; }
+  python3 - "$receipt_file" "$target_sha" "$release_dir" \
+    "$EQUAL_REFRESH_SOURCE_HASH" <<'PY' || return 1
+import json, sys
+path, target_sha, release_dir, current_hash = sys.argv[1:]
+with open(path, encoding="utf-8") as handle:
+    payload = json.load(handle)
+assert payload.get("to_commit") == target_sha
+assert payload.get("runtime_target") == release_dir
+assert payload.get("refresh_source_sha256") == current_hash
+assert payload.get("refresh_deployed_sha256") == current_hash
+PY
+  verify_active_release_health "$target_sha" "$release_dir"
+}
+
+write_equal_target_noop() {
+  local prior_receipt_id="${1:-}" active_sha="${2:-}" target_sha="${3:-}" release_dir="${4:-}"
+  validate_equal_target_state "$target_sha" "$release_dir" "$prior_receipt_id" || return 1
+  write_release_receipt "noop" "$active_sha" "$target_sha" "$release_dir" \
+    "$EQUAL_REFRESH_SOURCE_HASH" "$EQUAL_REFRESH_DEPLOYED_HASH" \
+    "resolved ref already active; full activation receipt=$prior_receipt_id" \
+    "$prior_receipt_id"
+}
+
 # ---------------------------------------------------------------------------
 # Rollback: repoint to the recorded previous release and restart+verify.
 # ---------------------------------------------------------------------------
+release_commit_sha() {
+  local release_dir="${1:-}" value
+  assert_release_target "$release_dir"
+  value="$(git -C "$release_dir" rev-parse --verify 'HEAD^{commit}' 2>/dev/null)" || return 1
+  [[ "$value" =~ ^[0-9a-f]{40,64}$ ]] || return 1
+  printf '%s\n' "$value"
+}
+
+record_rollback_receipt() {
+  local from_dir="${1:-}" to_dir="${2:-}" reason="${3:-manual}"
+  local from_sha to_sha source_hash="" deployed_hash=""
+  from_sha="$(release_commit_sha "$from_dir")" || return 1
+  to_sha="$(release_commit_sha "$to_dir")" || return 1
+  [ -f "$to_dir/$VENDORED_REFRESH_REL" ] \
+    && source_hash="$(sha256_file "$to_dir/$VENDORED_REFRESH_REL")"
+  [ -f "$DEPLOYED_REFRESH" ] && deployed_hash="$(sha256_file "$DEPLOYED_REFRESH")"
+  # A rollback proves restoration of an already-built release. It must not
+  # inherit the failed cut's certification/promotion fields as if that failed
+  # target authorized the restored commit.
+  local CERTIFIED_SHA="" PROMOTION_RECEIPT_ID=""
+  write_release_receipt "rollback" "$from_sha" "$to_sha" "$to_dir" \
+    "$source_hash" "$deployed_hash" "verified rollback: $reason"
+}
+
 rollback_to_previous() {
   local reason="${1:-manual}"
   [ -f "$PREV_FILE" ] || die "cannot rollback: $PREV_FILE not found"
-  local prev
+  local prev from
   prev="$(cat "$PREV_FILE")"
   [ -n "$prev" ] || die "cannot rollback: $PREV_FILE is empty"
   assert_release_target "$prev"
   [ -d "$prev" ] || die "cannot rollback: previous release missing: $prev"
+  [ -L "$CURRENT_LINK" ] || die "cannot rollback: runtime-current is not a symlink"
+  from="$(readlink "$CURRENT_LINK")"
+  assert_release_target "$from"
+  [ -d "$from" ] || die "cannot rollback: active release missing: $from"
   warn "ROLLBACK ($reason) → $prev"
   local offset
   offset="$(log_offset)"
@@ -1339,11 +1896,22 @@ rollback_to_previous() {
   rollback_governed_launchd_environment "$reason" \
     || die "rollback could not restore governed launchd environment — MANUAL INTERVENTION REQUIRED"
   heartbeat_production_write_lease
-  kickstart_label "$GATEWAY_LABEL"
+  guarded_kickstart_label "$GATEWAY_LABEL" \
+    || die "rollback gateway kickstart lost its mutation guard — MANUAL INTERVENTION REQUIRED"
   if verify_gateway "$prev" "$offset"; then
     heartbeat_production_write_lease
-    kickstart_label "$DASHBOARD_LABEL"
+    guarded_kickstart_label "$DASHBOARD_LABEL" \
+      || die "rollback dashboard kickstart lost its mutation guard — MANUAL INTERVENTION REQUIRED"
     verify_dashboard || die "rollback dashboard did NOT verify healthy — MANUAL INTERVENTION REQUIRED (release: $prev)"
+    heartbeat_production_write_lease
+    # Every verified rollback advances the rollback generation. This keeps
+    # the failed/new active release as the next reversible generation instead
+    # of silently collapsing history on automatic rollback.
+    write_previous_target "$from" \
+      || die "rollback verified but could not rotate previous release — MANUAL INTERVENTION REQUIRED"
+    heartbeat_production_write_lease
+    record_rollback_receipt "$from" "$prev" "$reason" \
+      || die "rollback applied and verified but immutable receipt recording failed — MANUAL INTERVENTION REQUIRED"
     ok "rollback complete → $prev"
     return 0
   fi
@@ -1575,7 +2143,16 @@ if [ "$DRY_RUN" -eq 0 ]; then
   SHA="$(git_current rev-parse --verify "HEAD^{commit}")" \
     || die "could not resolve active runtime commit for bootstrap lease"
   bootstrap_production_write_lease
-  acquire_production_write_lease
+  if [ "$DO_ROLLBACK" -eq 1 ]; then
+    # Rollback restores an older generation, so its lease truthfully binds the
+    # currently active generation that authorizes the reversal.
+    acquire_production_write_lease "$SHA"
+  else
+    # Managed cut/preflight authority is already supplied before acquisition.
+    # Bind every heartbeat, mutation, receipt, and fence-loss record to that
+    # exact target rather than the stale active HEAD used for bootstrapping.
+    acquire_production_write_lease "$CERTIFIED_SHA"
+  fi
 fi
 
 # This trap owns both failure cleanup and lock release. NEW_DIR remains empty
@@ -1586,14 +2163,18 @@ LEASE_CUT_READY=0
 cleanup_on_exit() {
   local status=$?
   if [ "$status" -ne 0 ] && [ "$DRY_RUN" -ne 1 ] && [ -n "$NEW_DIR" ] && [ -e "$NEW_DIR" ]; then
-    local live=""
+    local live="" previous=""
     [ -L "$CURRENT_LINK" ] && live="$(readlink "$CURRENT_LINK")"
-    if [ "$live" != "$NEW_DIR" ] && production_write_mutation_allowed; then
+    [ -f "$PREV_FILE" ] && previous="$(cat "$PREV_FILE" 2>/dev/null || true)"
+    if [ "$live" != "$NEW_DIR" ] && [ "$previous" != "$NEW_DIR" ] \
+       && production_write_mutation_allowed; then
       # Prove the resolved parent immediately before removal, even on an
       # error path where values may have been partially initialized.
       assert_release_target "$NEW_DIR"
       warn "cleanup: removing partially-built release dir: $NEW_DIR"
       guarded_production_write rm -rf "$NEW_DIR"
+    elif [ "$previous" = "$NEW_DIR" ]; then
+      warn "cleanup: preserving rollback generation recorded in .previous: $NEW_DIR"
     elif [ "$live" != "$NEW_DIR" ]; then
       warn "cleanup: refusing to remove partial release without current production write fence"
     fi
@@ -1612,8 +2193,12 @@ cleanup_on_exit() {
       status=70
     fi
   fi
-  release_cut_lock
-  release_production_write_lease
+  if ! release_cut_lock; then
+    status=70
+  fi
+  if ! release_production_write_lease; then
+    status=70
+  fi
   cleanup_production_write_lease_bootstrap
   trap - EXIT
   exit "$status"
@@ -1701,8 +2286,12 @@ if [ "$IF_ADVANCED" -eq 1 ]; then
     && ACTIVE_REFRESH_DEPLOYED_HASH="$(sha256_file "$DEPLOYED_REFRESH")"
   case "$ADVANCEMENT" in
     equal)
+      FULL_ACTIVATION_RECEIPT_ID="$(find_full_activation_receipt "$SHA" "$ACTIVE_TARGET")" \
+        || die "ref '$REF' is active at $SHA but no immutable full-activation receipt proves the complete gate set; refusing false no-op certification"
+      validate_equal_target_state "$SHA" "$ACTIVE_TARGET" "$FULL_ACTIVATION_RECEIPT_ID" \
+        || die "ref '$REF' is active at $SHA but current governed bytes or service health drifted; refusing false no-op certification"
       if [ "$PREFLIGHT" -eq 1 ]; then
-        ok "release preflight passed: $REF already active at $SHA"
+        ok "release preflight passed: $REF already active and live-healthy at $SHA (full activation receipt=$FULL_ACTIVATION_RECEIPT_ID)"
         exit 0
       fi
       reconcile_governed_pr_pipeline "$CURRENT_LINK" "$SHA" \
@@ -1713,10 +2302,8 @@ if [ "$IF_ADVANCED" -eq 1 ]; then
       heartbeat_production_write_lease
       smoke_live_review_poll_gate "$CURRENT_LINK" \
         || die "active runtime root review_poll_gate smoke failed"
-      write_release_receipt "noop" "$ACTIVE_SHA" "$SHA" "$ACTIVE_TARGET" \
-        "$ACTIVE_REFRESH_SOURCE_HASH" "$ACTIVE_REFRESH_DEPLOYED_HASH" \
-        "resolved ref already active" \
-        || die "could not record no-op release receipt"
+      write_equal_target_noop "$FULL_ACTIVATION_RECEIPT_ID" "$ACTIVE_SHA" "$SHA" "$ACTIVE_TARGET" \
+        || die "equal-target governed bytes or service health drifted; no no-op receipt was written"
       ok "release poll no-op: $REF already active at $SHA"
       exit 0
       ;;
@@ -1991,8 +2578,7 @@ if [ "$DRY_RUN" -eq 1 ]; then
   printf '\033[35m[DRY-RUN]\033[0m printf %%s %s > %s\n' "$PREV_TARGET" "$PREV_FILE"
 else
   # .previous is a release-owned file; never let a malformed path escape it.
-  assert_regular_release_file "$PREV_FILE"
-  guarded_write_text "$PREV_FILE" "${PREV_TARGET}"$'\n'
+  write_previous_target "$PREV_TARGET"
 fi
 heartbeat_production_write_lease
 
