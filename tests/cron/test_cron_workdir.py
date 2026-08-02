@@ -17,6 +17,12 @@ import json
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _plumbing_jobs_bypass_admission(monkeypatch):
+    import cron.scheduler as scheduler
+    monkeypatch.setattr(scheduler, "is_executor_job", lambda _job: False)
+
+
 @pytest.fixture()
 def tmp_cron_dir(tmp_path, monkeypatch):
     """Isolate cron job storage into a temp dir so tests don't stomp on real jobs."""

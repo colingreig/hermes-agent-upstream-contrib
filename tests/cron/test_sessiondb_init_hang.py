@@ -22,11 +22,18 @@ regardless of ``shutdown(wait=False)`` — an event left permanently unset
 would hang the whole test process at interpreter exit, not just this test.
 """
 
+
 import threading
 import time
 from unittest.mock import MagicMock, patch
 
 import pytest
+
+
+@pytest.fixture(autouse=True)
+def _plumbing_jobs_bypass_admission(monkeypatch):
+    import cron.scheduler as scheduler
+    monkeypatch.setattr(scheduler, "is_executor_job", lambda _job: False)
 
 from cron.scheduler import run_job
 

@@ -17,7 +17,9 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
-def _reset_scheduler_state():
+def _reset_scheduler_state(monkeypatch):
+    import cron.scheduler as scheduler
+    monkeypatch.setattr(scheduler, "is_executor_job", lambda _job: False)
     """Every test starts from a clean slate and leaves one behind, since
     these sets are module-level globals shared across the test process."""
     import cron.scheduler as sched

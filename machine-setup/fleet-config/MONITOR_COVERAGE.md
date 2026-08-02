@@ -33,7 +33,7 @@ two scheduling planes therefore cross-watch rather than self-monitor.
 | ID | Job | Expected | Outcome proof (not exit-only) | Alarm condition |
 |---|---|---:|---|---|
 | `62714b869845` | clickup-executor | enabled | fresh saved response; rejects empty/failed turns | missing/stale/failed response |
-| `dcab830aa41c` | content-lane-executor | enabled | fresh saved response; rejects empty/failed turns | missing/stale/failed response |
+| `dcab830aa41c` | content-lane-executor | retired/rejected | no live admission or dispatch | any enabled/runtime appearance is drift |
 | `9dca144ff19b` | clickup-poll-gate | enabled | fresh `wakeAgent`/semantic-silent gate document | credential, scan, stale, or failed gate |
 | `8d3b1d53470d` | review-poll-gate | enabled | fresh `wakeAgent`/semantic-silent gate document | credential, scan, stale, or failed gate |
 | `ad0ae6b717e2` | clickup-review-sla | enabled | fresh SLA/review scan document | scan, stale, or failed result |

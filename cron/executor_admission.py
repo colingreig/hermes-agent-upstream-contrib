@@ -421,6 +421,24 @@ def acquire_executor_lease(
         current = conn.execute(
             "SELECT * FROM executor_lease WHERE singleton=1"
         ).fetchone()
+        # Old callers and new generic scheduler starts share the same
+        # executor domain during cutover.  Do not let either generation pass
+        # the other; an expired generic owner is equally uncertain.
+        try:
+            generic = conn.execute(
+                "SELECT expires_at FROM admission_leases WHERE state='active' AND admission_profile='root/executor'"
+            ).fetchone()
+        except sqlite3.OperationalError as exc:
+            if "no such table" not in str(exc).lower():
+                raise
+            generic = None
+        if generic is not None:
+            conn.execute("ROLLBACK")
+            if generic["expires_at"] < now_iso:
+                raise ExecutorAdmissionError(
+                    "generic executor lease is expired and its owner is uncertain; exact stale-owner recovery is required"
+                )
+            return None
         if current is not None and current["state"] == "active":
             conn.execute("ROLLBACK")
             if current["expires_at"] < now_iso:
@@ -885,6 +903,8 @@ def recover_executor_lease_before_execution_reap(
     identity.  A matching admission lease must also expire before either row
     is finalized.  A non-matching singleton is unrelated and remains fenced.
     """
+    if recover_generic_admission_lease_before_execution_reap(proof):
+        return True
     if proof.get("proposed_terminal_reason") not in {
         "owner_dead",
         "lease_expired_owner_dead",
@@ -1040,3 +1060,356 @@ def executor_drain_status() -> dict[str, Any]:
         "pending_wakes": [dict(row) for row in pending],
         "mutated": False,
     }
+
+
+# Generic fleet admission ---------------------------------------------------
+#
+# The original executor singleton above is deliberately retained as a
+# compatibility and recovery surface for records written before the fleet was
+# generalized.  New starts use these multi-lease tables instead.  Keeping the
+# new tables separate avoids turning a schema migration into an implicit stale
+# owner recovery: an old active singleton remains fenced and reviewable until
+# the existing exact-proof recovery flow settles it.
+
+ADMISSION_PROFILE_CAPACITY = 1
+_ADMISSION_RESOURCE_TEMPLATE = "{task_id}"
+_SENTINEL_TASK_IDS = frozenset({"", "__scheduled__", "__unclaimed__"})
+
+
+@dataclass(frozen=True)
+class AdmissionLease:
+    """One fenced generic LLM admission lease.
+
+    The first eight fields intentionally mirror :class:`ExecutorLease` so
+    scheduler cleanup and older test doubles remain structurally compatible.
+    """
+
+    task_id: str
+    job_id: str
+    owner_run_id: str
+    fencing_token: int
+    acquired_at: str
+    heartbeat_at: str
+    expires_at: str
+    ledger_execution_id: str
+    admission_profile: str = "root/legacy"
+    mutable_resources: tuple[str, ...] = ()
+
+    def as_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+def requires_llm_admission(job: dict[str, Any]) -> bool:
+    """Whether ``job`` is an LLM dispatch which must fail closed on metadata."""
+    return job.get("no_agent") is not True
+
+
+def _validate_admission_metadata(
+    job: dict[str, Any], *, task_id: Optional[str]
+) -> tuple[str, tuple[str, ...]]:
+    if not requires_llm_admission(job):
+        return "", ()
+    if bool(job.get("admission_retired", False)):
+        raise ExecutorAdmissionError(
+            f"retired LLM admission identity is not admissible: {job.get('id')}"
+        )
+    profile = job.get("admission_profile")
+    if not isinstance(profile, str) or not profile.startswith("root/") or profile == "root/":
+        raise ExecutorAdmissionError("LLM job has missing or malformed admission_profile")
+    raw_resources = job.get("mutable_resources")
+    if not isinstance(raw_resources, list) or not raw_resources:
+        raise ExecutorAdmissionError("LLM job has missing or malformed mutable_resources")
+    resolved_task = str(task_id or job.get("admission_task_id") or job.get("executor_task_id") or "__scheduled__")
+    resources: list[str] = []
+    for raw in raw_resources:
+        if not isinstance(raw, str) or not raw or raw.strip() != raw:
+            raise ExecutorAdmissionError("LLM job has malformed mutable_resources")
+        if _ADMISSION_RESOURCE_TEMPLATE in raw:
+            # A scheduled pass has not selected a ClickUp task yet.  It cannot
+            # claim same-task exclusivity, but it still needs a canonical,
+            # brace-free resource so profile/resource admission remains safe.
+            raw = raw.replace(
+                _ADMISSION_RESOURCE_TEMPLATE,
+                resolved_task if resolved_task not in _SENTINEL_TASK_IDS else "*",
+            )
+        if "{" in raw or "}" in raw:
+            raise ExecutorAdmissionError("LLM job has unsupported mutable resource template")
+        resources.append(raw)
+    if len(resources) != len(set(resources)):
+        raise ExecutorAdmissionError("LLM job declares duplicate mutable resources")
+    return profile, tuple(resources)
+
+
+def _ensure_generic_schema(conn: sqlite3.Connection) -> None:
+    """Create the additive generic admission tables without changing v2 state."""
+    def create() -> None:
+        try:
+            conn.executescript(
+                """
+                BEGIN IMMEDIATE;
+                CREATE TABLE IF NOT EXISTS admission_leases (
+                    fencing_token INTEGER PRIMARY KEY,
+                    task_id TEXT NOT NULL,
+                    job_id TEXT NOT NULL,
+                    owner_run_id TEXT NOT NULL,
+                    admission_profile TEXT NOT NULL,
+                    mutable_resources_json TEXT NOT NULL,
+                    acquired_at TEXT NOT NULL,
+                    heartbeat_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    ledger_execution_id TEXT NOT NULL UNIQUE,
+                    state TEXT NOT NULL CHECK(state IN ('active', 'finalized', 'released', 'recovered')),
+                    terminal_status TEXT,
+                    finalized_at TEXT,
+                    released_at TEXT
+                );
+                CREATE INDEX IF NOT EXISTS admission_leases_active_profile
+                    ON admission_leases(state, admission_profile);
+                CREATE INDEX IF NOT EXISTS admission_leases_active_task
+                    ON admission_leases(state, task_id);
+                CREATE TABLE IF NOT EXISTS admission_recovery_receipts (
+                    receipt_id TEXT PRIMARY KEY,
+                    fencing_token INTEGER NOT NULL UNIQUE,
+                    job_id TEXT NOT NULL,
+                    owner_run_id TEXT NOT NULL,
+                    ledger_execution_id TEXT NOT NULL,
+                    reviewed_by TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    recovered_at TEXT NOT NULL,
+                    proof_json TEXT NOT NULL
+                );
+                COMMIT;
+                """
+            )
+        except sqlite3.Error:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+    _retry_sqlite_busy(create, action="generic admission schema bootstrap")
+
+
+def _generic_connect() -> sqlite3.Connection:
+    conn = _connect()
+    try:
+        _ensure_generic_schema(conn)
+        return conn
+    except BaseException:
+        conn.close()
+        raise
+
+
+def _active_task_conflicts(task_id: str, rows: list[sqlite3.Row]) -> bool:
+    return task_id not in _SENTINEL_TASK_IDS and any(row["task_id"] == task_id for row in rows)
+
+
+def _resource_conflicts(left: tuple[str, ...], right: set[str]) -> bool:
+    """Resource wildcards represent an unresolved task and fence its family."""
+    for candidate in left:
+        family = candidate.split("*", 1)[0]
+        for active in right:
+            if candidate == active or ("*" in candidate and active.startswith(family)):
+                return True
+            if "*" in active and candidate.startswith(active.split("*", 1)[0]):
+                return True
+    return False
+
+
+def acquire_job_admission_lease(
+    *,
+    job: dict[str, Any],
+    owner_run_id: Optional[str],
+    ledger_execution_id: str,
+    task_id: Optional[str] = None,
+    lease_seconds: int = DEFAULT_LEASE_SECONDS,
+) -> Optional[AdmissionLease]:
+    """Acquire one generic admission lease or return ``None`` for contention.
+
+    An expired owner is never removed here.  It remains an explicit, fenced
+    uncertainty until the durable execution ledger proves the exact owner dead.
+    """
+    if not requires_llm_admission(job):
+        return None
+    job_id = str(job.get("id") or "")
+    run_id = str(owner_run_id or uuid.uuid4().hex)
+    if not job_id or not run_id or not ledger_execution_id:
+        raise ExecutorAdmissionError("job_id, owner_run_id and ledger_execution_id are required")
+    resolved_task = str(task_id or job.get("admission_task_id") or job.get("executor_task_id") or "__scheduled__")
+    now = _now()
+    now_iso = _iso(now)
+    expires_iso = _iso(now + timedelta(seconds=max(1, int(lease_seconds))))
+    conn = _generic_connect()
+    try:
+        deadline = time.monotonic() + _SQLITE_BUSY_DEADLINE_SECONDS
+        _begin_immediate(conn, deadline=deadline)
+        pending = conn.execute(
+            "SELECT task_id FROM pending_wakes WHERE job_id=?", (job_id,)
+        ).fetchone()
+        if resolved_task in _SENTINEL_TASK_IDS and pending is not None:
+            resolved_task = str(pending["task_id"])
+        profile, resources = _validate_admission_metadata(job, task_id=resolved_task)
+        active = conn.execute("SELECT * FROM admission_leases WHERE state='active'").fetchall()
+        if profile == "root/executor":
+            legacy = conn.execute(
+                "SELECT expires_at FROM executor_lease WHERE singleton=1 AND state='active'"
+            ).fetchone()
+            if legacy is not None:
+                conn.execute("ROLLBACK")
+                if legacy["expires_at"] < now_iso:
+                    raise ExecutorAdmissionError("legacy executor lease is expired and its owner is uncertain; exact stale-owner recovery is required")
+                return None
+        expired = [row for row in active if row["expires_at"] < now_iso]
+        if expired:
+            conn.execute("ROLLBACK")
+            raise ExecutorAdmissionError(
+                "active admission lease is expired and its owner is uncertain; exact stale-owner recovery is required"
+            )
+        active_resources = {
+            resource
+            for row in active
+            for resource in json.loads(row["mutable_resources_json"])
+        }
+        if (
+            sum(row["admission_profile"] == profile for row in active) >= ADMISSION_PROFILE_CAPACITY
+            or _resource_conflicts(resources, active_resources)
+            or _active_task_conflicts(resolved_task, active)
+        ):
+            conn.execute("ROLLBACK")
+            return None
+        token = int(conn.execute(
+            "SELECT last_fencing_token FROM admission_state WHERE singleton=1"
+        ).fetchone()[0]) + 1
+        conn.execute("UPDATE admission_state SET last_fencing_token=? WHERE singleton=1", (token,))
+        conn.execute(
+            """INSERT INTO admission_leases(
+                 fencing_token,task_id,job_id,owner_run_id,admission_profile,
+                 mutable_resources_json,acquired_at,heartbeat_at,expires_at,
+                 ledger_execution_id,state
+               ) VALUES (?,?,?,?,?,?,?,?,?,?, 'active')""",
+            (token, resolved_task, job_id, run_id, profile, json.dumps(resources), now_iso,
+             now_iso, expires_iso, str(ledger_execution_id)),
+        )
+        if pending is not None:
+            conn.execute("DELETE FROM pending_wakes WHERE job_id=?", (job_id,))
+        _commit(conn, deadline=deadline)
+        return AdmissionLease(resolved_task, job_id, run_id, token, now_iso, now_iso,
+                              expires_iso, str(ledger_execution_id), profile, resources)
+    except ExecutorAdmissionError:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
+    except (TypeError, ValueError, sqlite3.Error) as exc:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise ExecutorAdmissionError(f"generic admission acquisition failed: {exc}") from exc
+    finally:
+        conn.close()
+
+
+def _generic_cas(lease: AdmissionLease, *, action: str, assignments: str, values: tuple[Any, ...], states: tuple[str, ...]) -> None:
+    conn = _generic_connect()
+    try:
+        deadline = time.monotonic() + _SQLITE_BUSY_DEADLINE_SECONDS
+        _begin_immediate(conn, deadline=deadline)
+        placeholders = ",".join("?" for _ in states)
+        cur = conn.execute(
+            f"UPDATE admission_leases SET {assignments} WHERE fencing_token=? AND job_id=? "
+            f"AND owner_run_id=? AND ledger_execution_id=? AND state IN ({placeholders})",
+            (*values, lease.fencing_token, lease.job_id, lease.owner_run_id,
+             lease.ledger_execution_id, *states),
+        )
+        if cur.rowcount != 1:
+            conn.execute("ROLLBACK")
+            raise ExecutorAdmissionError(f"generic admission {action} rejected by fencing CAS")
+        _commit(conn, deadline=deadline)
+    except ExecutorAdmissionError:
+        raise
+    except sqlite3.Error as exc:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise ExecutorAdmissionError(f"generic admission {action} failed: {exc}") from exc
+    finally:
+        conn.close()
+
+
+def heartbeat_job_admission_lease(lease: AdmissionLease, *, lease_seconds: int = DEFAULT_LEASE_SECONDS) -> AdmissionLease:
+    now = _now()
+    now_iso = _iso(now)
+    expires_iso = _iso(now + timedelta(seconds=max(1, int(lease_seconds))))
+    conn = _generic_connect()
+    try:
+        deadline = time.monotonic() + _SQLITE_BUSY_DEADLINE_SECONDS
+        _begin_immediate(conn, deadline=deadline)
+        cur = conn.execute(
+            "UPDATE admission_leases SET heartbeat_at=?, expires_at=? WHERE fencing_token=? AND job_id=? AND owner_run_id=? AND ledger_execution_id=? AND state='active' AND expires_at>=?",
+            (now_iso, expires_iso, lease.fencing_token, lease.job_id, lease.owner_run_id, lease.ledger_execution_id, now_iso),
+        )
+        if cur.rowcount != 1:
+            conn.execute("ROLLBACK")
+            raise ExecutorAdmissionError("generic admission heartbeat rejected by fencing CAS")
+        _commit(conn, deadline=deadline)
+    except ExecutorAdmissionError:
+        raise
+    except sqlite3.Error as exc:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise ExecutorAdmissionError(f"generic admission heartbeat failed: {exc}") from exc
+    finally:
+        conn.close()
+    return AdmissionLease(**{**lease.as_dict(), "heartbeat_at": now_iso, "expires_at": expires_iso})
+
+
+def finalize_job_admission_lease(lease: AdmissionLease, *, status: str) -> None:
+    if status not in {"completed", "failed", "interrupted"}:
+        raise ExecutorAdmissionError(f"invalid admission terminal status: {status}")
+    _generic_cas(lease, action="finalization", assignments="state='finalized', terminal_status=?, finalized_at=?", values=(status, _iso(_now())), states=("active",))
+
+
+def release_job_admission_lease(lease: AdmissionLease) -> None:
+    now_iso = _iso(_now())
+    _generic_cas(lease, action="release", assignments="state='released', terminal_status=COALESCE(terminal_status, 'interrupted'), finalized_at=COALESCE(finalized_at, ?), released_at=?", values=(now_iso, now_iso), states=("active", "finalized", "recovered"))
+
+
+def recover_generic_admission_lease_before_execution_reap(proof: dict[str, Any]) -> bool:
+    """Fence one expired generic lease after exact ledger dead-owner proof."""
+    if proof.get("proposed_terminal_reason") not in {"owner_dead", "lease_expired_owner_dead"}:
+        return False
+    database = _database_path()
+    if not database.exists() and not database.is_symlink():
+        return False
+    conn = _generic_connect()
+    try:
+        now_iso = _iso(_now())
+        _begin_immediate(conn)
+        row = conn.execute(
+            "SELECT * FROM admission_leases WHERE state='active' AND job_id=? AND ledger_execution_id=?",
+            (str(proof.get("job_id")), str(proof.get("execution_id"))),
+        ).fetchone()
+        if row is None:
+            conn.execute("ROLLBACK")
+            return False
+        if row["expires_at"] >= now_iso:
+            conn.execute("ROLLBACK")
+            raise ExecutorAdmissionError("matching generic admission lease has not expired; preserving execution proof")
+        _validate_dead_owner_proof(row, proof)
+        receipt_id = uuid.uuid5(uuid.NAMESPACE_URL, json.dumps({"token": row["fencing_token"], "proof": proof}, sort_keys=True)).hex
+        cur = conn.execute(
+            "UPDATE admission_leases SET state='recovered', terminal_status='interrupted', finalized_at=? WHERE fencing_token=? AND state='active' AND expires_at<? AND job_id=? AND owner_run_id=? AND ledger_execution_id=?",
+            (now_iso, row["fencing_token"], now_iso, row["job_id"], row["owner_run_id"], row["ledger_execution_id"]),
+        )
+        if cur.rowcount != 1:
+            conn.execute("ROLLBACK")
+            raise ExecutorAdmissionError("generic admission recovery lost its fencing CAS")
+        conn.execute(
+            "INSERT INTO admission_recovery_receipts VALUES (?,?,?,?,?,?,?,?,?)",
+            (receipt_id, row["fencing_token"], row["job_id"], row["owner_run_id"], row["ledger_execution_id"], "cron-startup-reaper", "exact dead-owner proof", now_iso, json.dumps(proof, sort_keys=True)),
+        )
+        _commit(conn)
+        return True
+    except ExecutorAdmissionError:
+        raise
+    except sqlite3.Error as exc:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise ExecutorAdmissionError(f"generic admission recovery failed: {exc}") from exc
+    finally:
+        conn.close()

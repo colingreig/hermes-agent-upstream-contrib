@@ -583,7 +583,7 @@ def _validate_direct_clickup_jobs(payload: dict[str, Any]) -> None:
     """Enforce the Mini's direct ClickUp and canonical Ignite runtime contract.
 
     Hermes kanban remains a supported product surface.  This guard applies
-    only to the fleet bundle's two scheduled ClickUp executors, which must
+    only to the fleet bundle's unified scheduled ClickUp executor, which must
     enter their skills directly instead of starting a kanban swarm.  It also
     keeps the validator's Ignite helpers rooted exclusively at the
     operator-provided ``IGNITE_SKILLS_ROOT``.
@@ -599,17 +599,12 @@ def _validate_direct_clickup_jobs(payload: dict[str, Any]) -> None:
 
     expected_executors = {
         "clickup-executor": {
-            "skill": "clickup-queue-poller",
-            "skills": ["clickup-queue-poller"],
-            "skill_scope": "dev-executor",
-            "prompt": "Work the ClickUp queue now — follow the clickup-queue-poller skill.",
-        },
-        "content-lane-executor": {
             "skill": "ignite-execute",
             "skills": ["ignite-execute"],
-            "skill_scope": "content-executor",
+            "skill_scope": "dev-executor",
             "workdir": "/Users/colingreig/dev/hermes-agent",
-            "prompt": "/ignite-execute --lane content",
+            "prompt": "/ignite-execute --lane {lane}",
+            "lane_weights": {"code": 1, "content": 1},
         },
     }
     for name, expected in expected_executors.items():
@@ -624,6 +619,27 @@ def _validate_direct_clickup_jobs(payload: dict[str, Any]) -> None:
         prompt = job["prompt"].casefold()
         if any(marker in prompt for marker in ("kanban", "swarm", "synthesizer")):
             raise InstallError(f"governed fleet job {name!r} must not route ClickUp work through kanban")
+
+    retired_content = by_name.get("content-lane-executor")
+    if (
+        retired_content is None
+        or retired_content.get("enabled") is not False
+        or retired_content.get("state") != "retired"
+        or retired_content.get("admission_retired") is not True
+    ):
+        raise InstallError("content-lane-executor must remain a retired, rejected identity")
+
+    for job in jobs:
+        if job.get("no_agent") is True:
+            continue
+        profile = job.get("admission_profile")
+        resources = job.get("mutable_resources")
+        if not isinstance(profile, str) or not profile.startswith("root/"):
+            raise InstallError(f"LLM job {job['name']!r} has no valid admission_profile")
+        if not isinstance(resources, list) or not resources or not all(
+            isinstance(resource, str) and resource for resource in resources
+        ):
+            raise InstallError(f"LLM job {job['name']!r} has no valid mutable_resources")
 
     validator = by_name.get("hermes-pr-validate")
     if validator is None:
@@ -949,9 +965,9 @@ def load_skill_policy(policy_path: Path, *, bundle_root: Path) -> dict[str, Any]
     keep = _validate_skill_map("bundled.keep", bundled.get("keep"))
     if set(remove) & set(keep):
         raise InstallError("skill policy bundled remove/keep sets overlap")
-    if len(remove) != 52 or len(keep) != 21:
+    if len(remove) != 52 or len(keep) != 22:
         raise InstallError(
-            f"skill policy must classify 52 removals and 21 keeps; got {len(remove)} and {len(keep)}"
+            f"skill policy must classify 52 removals and 22 keeps; got {len(remove)} and {len(keep)}"
         )
 
     source_rel = policy.get("bundled_skills_root")

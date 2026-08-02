@@ -10,7 +10,13 @@ The first test characterizes the sequence as driven through `tick()` (proving
 the extraction didn't change `tick`'s behavior); the rest unit-test the
 extracted helper directly.
 """
+import pytest
 import cron.scheduler as s
+
+
+@pytest.fixture(autouse=True)
+def _plumbing_jobs_bypass_admission(monkeypatch):
+    monkeypatch.setattr(s, "is_executor_job", lambda _job: False)
 
 
 def _patch_pipeline(monkeypatch, *, success=True, output="out", final="final response",

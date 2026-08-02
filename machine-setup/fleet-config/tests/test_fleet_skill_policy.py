@@ -108,7 +108,7 @@ def test_policy_exactly_classifies_current_bundled_catalog():
     keep = policy["bundled"]["keep"]
 
     assert len(remove) == 52
-    assert len(keep) == 21
+    assert len(keep) == 22
     assert set(remove).isdisjoint(keep)
     assert set(remove) | set(keep) == {
         install_mod._frontmatter_name(path)
@@ -125,10 +125,10 @@ def test_policy_exactly_classifies_current_bundled_catalog():
         "clickup-queue-poller": "clickup-queue-poller",
         "hermes-self-report": "hermes-self-report",
     }
-    assert policy["profiles"]["default"]["expected_active_manifests"] == 23
-    assert policy["profiles"]["coder"]["expected_active_manifests"] == 21
-    assert policy["profiles"]["content"]["expected_active_manifests"] == 21
-    assert policy["profiles"]["ops"]["expected_active_manifests"] == 21
+    assert policy["profiles"]["default"]["expected_active_manifests"] == 24
+    assert policy["profiles"]["coder"]["expected_active_manifests"] == 22
+    assert policy["profiles"]["content"]["expected_active_manifests"] == 22
+    assert policy["profiles"]["ops"]["expected_active_manifests"] == 22
     assert policy["profiles"]["design"]["expected_active_manifests"] == 0
     assert policy["profiles"]["research"]["expected_active_manifests"] == 0
 
@@ -241,7 +241,7 @@ def test_policy_apply_is_recoverable_idempotent_and_keeps_external_skill(tmp_pat
 
     # Installer rollback restores all active skills and hub/suppression metadata.
     install_mod._rollback(steps)
-    assert len(install_mod._active_skill_manifests(default_skills)) == 79
+    assert len(install_mod._active_skill_manifests(default_skills)) == 80
     restored_lock = json.loads((default_skills / ".hub" / "lock.json").read_text(encoding="utf-8"))
     assert "vehicle-image-qc" in restored_lock["installed"]
     assert install_mod._read_suppressed(default_skills / ".curator_suppressed") == {"legacy-suppression"}
@@ -287,8 +287,8 @@ def test_policy_dry_run_reports_plan_without_mutation(tmp_path, capsys, monkeypa
     assert not (home / ".hermes" / "config.yaml").exists()
     assert not (home / ".hermes" / "cron" / "jobs.json").exists()
     out = capsys.readouterr().out
-    assert "default: archive 56, consolidate 2, suppress +52, active 79 -> 23" in out
-    assert "design: archive 0, consolidate 0, suppress +73, active 0 -> 0" in out
+    assert "default: archive 56, consolidate 2, suppress +52, active 80 -> 24" in out
+    assert "design: archive 0, consolidate 0, suppress +74, active 0 -> 0" in out
     assert "broad .no-bundled-skills marker: untouched" in out
 
 
@@ -310,7 +310,7 @@ def test_policy_accepts_exact_bundled_description_only_residue(tmp_path):
 
     assert residue not in {row["path"] for row in default["targets"]}
     assert default["current_count"] == expected_current
-    assert default["predicted_count"] == default["expected_count"] == 23
+    assert default["predicted_count"] == default["expected_count"] == 24
 
 
 def test_policy_refuses_symlinked_bundled_residue(tmp_path):

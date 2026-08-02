@@ -234,6 +234,47 @@ def test_startup_reaper_recovers_matching_executor_lease_before_ledger_proof(
     assert history[2]
 
 
+def test_startup_reaper_recovers_stale_generic_validator_lease_before_ledger(
+    monkeypatch, tmp_path
+):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    admission, database = _point_admission(monkeypatch, tmp_path)
+    clock = [admission._now()]
+    monkeypatch.setattr(admission, "_now", lambda: clock[0])
+    monkeypatch.setattr(executions, "_hermes_now", lambda: clock[0])
+    monkeypatch.setattr(executions, "_owner_liveness", lambda *_args: "dead")
+    job = {
+        "id": "validator-job", "no_agent": False,
+        "admission_profile": "root/validator",
+        "mutable_resources": ["clickup/task/{task_id}"],
+    }
+    record = executions.create_execution("validator-job", source="builtin", lease_seconds=1)
+    executions.mark_execution_running(record["id"], owner_token=record["owner_token"])
+    lease = admission.acquire_job_admission_lease(
+        job=job, task_id="task", owner_run_id="owner",
+        ledger_execution_id=record["id"], lease_seconds=1,
+    )
+    assert lease is not None
+    clock[0] += timedelta(seconds=121)
+
+    assert executions.recover_interrupted_executions() == 1
+    recovered = executions.latest_execution("validator-job")
+    assert recovered["status"] == "interrupted"
+    assert recovered["terminal_reason"] == "lease_expired_owner_dead"
+    with sqlite3.connect(database) as conn:
+        row = conn.execute(
+            "SELECT state,terminal_status FROM admission_leases WHERE fencing_token=?",
+            (lease.fencing_token,),
+        ).fetchone()
+        receipt = conn.execute(
+            "SELECT ledger_execution_id,proof_json FROM admission_recovery_receipts WHERE fencing_token=?",
+            (lease.fencing_token,),
+        ).fetchone()
+    assert row == ("recovered", "interrupted")
+    assert receipt[0] == record["id"]
+    assert json.loads(receipt[1])["execution_id"] == record["id"]
+
+
 def test_startup_reaper_does_not_recover_mismatched_executor_lease(
     monkeypatch, tmp_path
 ):
@@ -529,7 +570,7 @@ def test_run_one_job_records_running_then_terminal(monkeypatch):
     monkeypatch.setattr(scheduler, "_deliver_result", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(scheduler, "mark_job_run", lambda *_args, **_kwargs: None)
 
-    assert scheduler.run_one_job({"id": "job-3", "execution_id": "exec-3", "execution_owner_token": "owner-3"}) is True
+    assert scheduler.run_one_job({"id": "job-3", "no_agent": True, "execution_id": "exec-3", "execution_owner_token": "owner-3"}) is True
     assert events[0] == ("running", "exec-3", {"owner_token": "owner-3"})
     assert events[-1][0:2] == ("finish", "exec-3")
     assert events[-1][2]["success"] is True
@@ -1306,7 +1347,7 @@ def test_runner_terminal_reasons_cover_timeout_signal_and_gateway_child_death(mo
         monkeypatch.setattr(scheduler, "_is_interrupted", lambda _job_id: interrupted)
         monkeypatch.setattr(scheduler, "_consume_interrupted_flag", lambda _job_id: interrupted)
         job = {
-            "id": "reason", "execution_id": record["id"],
+            "id": "reason", "no_agent": True, "execution_id": record["id"],
             "execution_owner_token": record["owner_token"],
         }
         return scheduler.run_one_job(job), executions.latest_execution("reason")
@@ -1325,7 +1366,7 @@ def test_runner_terminal_reasons_cover_timeout_signal_and_gateway_child_death(mo
     monkeypatch.setattr(scheduler, "_consume_interrupted_flag", lambda _job_id: False)
     with __import__("pytest").raises(KeyboardInterrupt):
         scheduler.run_one_job({
-            "id": "signal", "execution_id": record["id"],
+            "id": "signal", "no_agent": True, "execution_id": record["id"],
             "execution_owner_token": record["owner_token"],
         })
     assert executions.latest_execution("signal")["terminal_reason"] == "signal"
@@ -1353,7 +1394,7 @@ def test_outer_runner_exception_preserves_normalized_timeout_and_interrupt_reaso
         monkeypatch.setattr(scheduler, "_is_interrupted", lambda _job_id: interrupted)
         monkeypatch.setattr(scheduler, "_consume_interrupted_flag", lambda _job_id: interrupted)
         assert scheduler.run_one_job({
-            "id": job_id,
+            "id": job_id, "no_agent": True,
             "execution_id": record["id"],
             "execution_owner_token": record["owner_token"],
         }) is False

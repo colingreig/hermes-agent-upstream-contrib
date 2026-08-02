@@ -17,6 +17,12 @@ from tools.env_passthrough import clear_env_passthrough
 from tools.credential_files import clear_credential_files
 
 
+@pytest.fixture(autouse=True)
+def _plumbing_jobs_bypass_admission(monkeypatch):
+    import cron.scheduler as scheduler
+    monkeypatch.setattr(scheduler, "is_executor_job", lambda _job: False)
+
+
 @pytest.fixture()
 def tmp_cron_dir(tmp_path, monkeypatch):
     monkeypatch.setattr("cron.jobs.CRON_DIR", tmp_path / "cron")
@@ -1266,6 +1272,12 @@ class TestRunJobSessionPersistence:
             model="test/model",
             provider="openrouter",
         )
+        # Real model path: make the fixture an explicit admitted LLM job.
+        job.update({
+            "no_agent": False,
+            "admission_profile": "root/test-persistence",
+            "mutable_resources": ["test/prompt-persistence"],
+        })
 
         prompt_write_attempts = []
 

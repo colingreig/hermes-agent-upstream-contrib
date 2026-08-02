@@ -63,9 +63,9 @@ def test_manifest_pins_governed_installer_as_source_only():
 def test_clickup_executor_jobs_use_direct_paths_with_stable_scheduling():
     jobs = _jobs_by_name()
     expected = {
-        "clickup-executor": {
-            "id": "62714b869845",
-            "prompt": "Work the ClickUp queue now — follow the clickup-queue-poller skill.",
+            "clickup-executor": {
+                "id": "62714b869845",
+                "prompt": "/ignite-execute --lane {lane}",
         },
         "content-lane-executor": {
             "id": "dcab830aa41c",
@@ -78,9 +78,16 @@ def test_clickup_executor_jobs_use_direct_paths_with_stable_scheduling():
         job = jobs[name]
         assert job["id"] == contract["id"]
         assert job["prompt"] == contract["prompt"]
+        if name == "clickup-executor":
+            assert job["lane_weights"] == {"code": 1, "content": 1}
         if "workdir" in contract:
             assert job["workdir"] == contract["workdir"]
-        assert job["enabled"] is True
+        if name == "content-lane-executor":
+            assert job["enabled"] is False
+            assert job["state"] == "retired"
+            assert job["admission_retired"] is True
+        else:
+            assert job["enabled"] is True
         assert job["schedule"] == {
             "display": "*/30 * * * *",
             "expr": "*/30 * * * *",
