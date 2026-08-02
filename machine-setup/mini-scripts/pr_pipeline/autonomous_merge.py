@@ -652,7 +652,13 @@ def _hm_save(state):
 def _emit_human_merge(repo, pr, head, task_id):
     """One-time escalation: stdout (-> Slack via the sweep cron) + best-effort
     ClickUp needs-human tag & comment. Never sets status (policy: complete is the
-    external QA gate's, not the daemon's)."""
+    external QA gate's, not the daemon's).
+
+    Also tags `human-merge-gate` alongside `needs-human` — a marker distinct
+    from other needs-human uses (e.g. validator no-measurement escalations) so
+    the cleanup pass below (_cleanup_human_merge_gate) can safely auto-clear
+    ONLY escalations that originated here once a human merges the PR, without
+    touching needs-human tags applied for unrelated reasons."""
     msg = (
         "🙋 *Hermes needs a HUMAN merge.*\n"
         f"`{repo}#{pr}` head `{(head or '')[:8]}` PASSed validation and is green + "
@@ -671,6 +677,7 @@ def _emit_human_merge(repo, pr, head, task_id):
         except Exception:
             pass
     _ops("add-tag", task_id, "needs-human")
+    _ops("add-tag", task_id, "human-merge-gate")
     body = f"/tmp/needs_human_merge_{task_id}.txt"
     try:
         with open(body, "w", encoding="utf-8") as f:
@@ -684,17 +691,104 @@ def _emit_human_merge(repo, pr, head, task_id):
         pass
 
 
+def _hm_get_task(task_id):
+    """GET a ClickUp task via the ops helper. Returns dict or None (best-effort)."""
+    try:
+        r = subprocess.run([PY, VAL_OPS, "get", task_id], capture_output=True,
+                           text=True, timeout=60, env=_shim_env())
+        if r.returncode != 0:
+            return None
+        return json.loads(r.stdout or "{}")
+    except Exception:
+        return None
+
+
+def _cleanup_human_merge_gate(store, state):
+    """Close the human-merge queue leak: _emit_human_merge tags a task
+    `needs-human` (+ `human-merge-gate`) when a green+mergeable PASS PR isn't
+    auto-merge-eligible, but nothing previously removed that tag after a human
+    actually merged the PR — the task sat in the human queue forever (found in
+    the 2026-08-02 queue audit).
+
+    For every repo#pr this daemon has ever escalated (recorded in the dedup
+    state), check whether the PR is now MERGED on GitHub and the task still
+    carries the `human-merge-gate` marker. If both hold, drop `human-merge-gate`
+    and `needs-human` and post a confirmation comment. The marker tag scopes
+    this strictly to escalations THIS function created — a needs-human tag
+    applied for any other reason (e.g. a no-measurement validator escalation)
+    is left untouched. Historical tasks tagged needs-human without the marker
+    predate this fix and are out of scope (separate one-time queue cleanup).
+    Read-only w.r.t. the PR (never merges/closes anything); best-effort on the
+    ClickUp writeback. Never raises."""
+    cleaned = []
+    for skey in list(state.keys()):
+        try:
+            if "#" not in skey:
+                continue
+            repo, prs = skey.rsplit("#", 1)
+            pr = int(prs)
+            verdict = store.get(skey) or {}
+            task_id = verdict.get("task_id")
+            if not task_id:
+                continue  # no task to clean up without an id
+            info, err = _gh_json(repo, pr, "state")
+            if err or not info:
+                continue  # infra hiccup — leave it for the next tick
+            if (info.get("state") or "").upper() != "MERGED":
+                continue  # still open (or closed unmerged) — not our signal
+            task = _hm_get_task(task_id)
+            if task is None:
+                continue
+            # _hm_get_task returns hermes_validate_ops._get_task()'s NORMALIZED
+            # shape — tags is already a flat list of name strings, not
+            # {"name": ...} dicts (that raw ClickUp shape never reaches here).
+            # Tolerate both anyway: a `t.get(...)` on a bare string would raise
+            # AttributeError, which the outer except would silently swallow,
+            # turning every real run into a no-op cleanup.
+            tags = {
+                (t if isinstance(t, str) else (t or {}).get("name") or "").lower().strip()
+                for t in (task.get("tags") or [])
+            }
+            if "human-merge-gate" not in tags:
+                continue  # not our escalation, or already cleared
+            def _ops(*args):
+                try:
+                    subprocess.run([PY, VAL_OPS, *args], capture_output=True,
+                                   text=True, timeout=60, env=_shim_env())
+                except Exception:
+                    pass
+            _ops("rm-tag", task_id, "human-merge-gate")
+            _ops("rm-tag", task_id, "needs-human")
+            msg = "hermes: human merge completed — needs-human cleared (was a merge gate)."
+            body = f"/tmp/human_merge_cleared_{task_id}.txt"
+            try:
+                with open(body, "w", encoding="utf-8") as f:
+                    f.write(msg)
+                _ops("comment", task_id, "--body", body)
+            except Exception:
+                pass
+            cleaned.append({"repo": repo, "pr": pr, "task_id": task_id})
+        except Exception:
+            continue  # one bad entry must never wedge the rest of the cleanup
+    return cleaned
+
+
 def sweep_human_merge(allowlist=None, dry_run=False):
     """Find PASS verdicts that WOULD merge but for the tier-autonomy gate, and
-    escalate each ONCE (deduped on head) for a human merge. Read-only w.r.t. the
-    PR; writes only the dedup state + best-effort ClickUp tag/comment. Never
-    raises. Returns list of {repo, pr, task_id, action='needs-human-merge', detail}.
+    escalate each ONCE (deduped on head) for a human merge. Also runs the
+    human-merge-gate cleanup pass (see _cleanup_human_merge_gate) so a
+    completed human merge clears its own needs-human tag instead of sitting in
+    the human queue forever. Read-only w.r.t. the PR; writes only the dedup
+    state + best-effort ClickUp tag/comment. Never raises. Returns list of
+    {repo, pr, task_id, action='needs-human-merge'|'human-merge-gate-cleared',
+    detail}.
     """
     if _shadow():
         return []  # whole validator in shadow — different mode, don't escalate
     if allowlist is None:
         allowlist = _load_allowlist()
     results, state, changed = [], _hm_load(), False
+    store = {}
     try:
         store = validator_verdict.load_verdicts()
         for key, verdict in store.items():
@@ -733,6 +827,25 @@ def sweep_human_merge(allowlist=None, dry_run=False):
                         "detail": f"human-merge scan fatal: {e!r}"})
     if changed and not dry_run:
         _hm_save(state)
+    if not dry_run:
+        if state and not store:
+            # Visibility: a failed/empty verdict-store load makes the cleanup
+            # pass below a silent no-op (every entry lacks a task_id lookup)
+            # even though there ARE previously-escalated repo#pr entries
+            # waiting to be checked. Surface it instead of just doing nothing.
+            print("[automerge] WARN human-merge cleanup: verdict store empty/unreadable, "
+                  f"{len(state)} escalated entr{'y' if len(state) == 1 else 'ies'} skipped",
+                  file=sys.stderr)
+        try:
+            for c in _cleanup_human_merge_gate(store, state):
+                results.append({
+                    "repo": c["repo"], "pr": c["pr"], "task_id": c["task_id"],
+                    "action": "human-merge-gate-cleared",
+                    "detail": "PR merged by a human — human-merge-gate/needs-human cleared",
+                })
+        except Exception as e:
+            results.append({"repo": "*", "pr": None, "action": "error",
+                            "detail": f"human-merge cleanup fatal: {e!r}"})
     return results
 
 
@@ -767,11 +880,14 @@ def main():
     for h in human:
         tag = h["action"].upper()
         print(f"[automerge] {tag:16} {h['repo']}#{h['pr']} — {h['detail']}")
-        if h.get("task_id"):
+        if h.get("task_id") and h["action"] == "needs-human-merge":
             print(f"             ClickUp task {h['task_id']} tagged needs-human")
+        elif h.get("task_id") and h["action"] == "human-merge-gate-cleared":
+            print(f"             ClickUp task {h['task_id']} needs-human/human-merge-gate cleared")
     print(json.dumps({"merged": len(merged), "would_merge": len(would),
                       "total": len(res), "gap_needs_revalidation": len(gaps),
-                      "needs_human_merge": len([h for h in human if h.get('action') == 'needs-human-merge'])}))
+                      "needs_human_merge": len([h for h in human if h.get('action') == 'needs-human-merge']),
+                      "human_merge_gate_cleared": len([h for h in human if h.get('action') == 'human-merge-gate-cleared'])}))
     return 0
 
 
