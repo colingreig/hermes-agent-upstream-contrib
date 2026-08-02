@@ -562,16 +562,16 @@ def test_late_failure_restores_every_distinct_profile_snapshot(bundle, monkeypat
         (profile_dir / "SOUL.md").write_bytes(soul_bytes)
         originals[profile] = (config_bytes, soul_bytes)
 
-    real_sha256 = install_mod._sha256
+    real_atomic_write = install_mod._atomic_write
 
-    def fail_after_jobs_replace(path):
+    def fail_after_jobs_merge(path, data):
         if path == jobs_dest:
-            raise OSError("simulated late failure after jobs replacement")
-        return real_sha256(path)
+            raise OSError("simulated late failure after jobs merge")
+        return real_atomic_write(path, data)
 
-    monkeypatch.setattr(install_mod, "_sha256", fail_after_jobs_replace)
+    monkeypatch.setattr(install_mod, "_atomic_write", fail_after_jobs_merge)
 
-    with pytest.raises(OSError, match="simulated late failure after jobs replacement"):
+    with pytest.raises(OSError, match="simulated late failure after jobs merge"):
         install_mod.install(
             bundle["manifest"],
             home=home,
@@ -591,7 +591,7 @@ def test_late_failure_restores_every_distinct_profile_snapshot(bundle, monkeypat
     assert len(install_dirs) == 1
     receipt = json.loads((install_dirs[0] / "install-receipt.json").read_text())
     assert receipt["result"] == "failed"
-    assert "simulated late failure after jobs replacement" in receipt["failure_detail"]
+    assert "simulated late failure after jobs merge" in receipt["failure_detail"]
     snapshot_steps = [
         step
         for step in receipt["steps"]
@@ -601,3 +601,115 @@ def test_late_failure_restores_every_distinct_profile_snapshot(bundle, monkeypat
     assert len(snapshot_paths) == 12
     assert len(set(snapshot_paths)) == 12
     assert all(step["status"] == "rolled-back" for step in snapshot_steps)
+
+
+def test_merge_jobs_json_preserves_runtime_for_unchanged_jobs():
+    bundled = {
+        "jobs": [
+            {
+                "id": "job-a",
+                "name": "alpha",
+                "prompt": "run alpha",
+                "repeat": {"times": None},
+            }
+        ]
+    }
+    live = {
+        "jobs": [
+            {
+                "id": "job-a",
+                "name": "alpha",
+                "prompt": "run alpha",
+                "state": "idle",
+                "last_status": "ok",
+                "last_run_at": "2026-08-01T10:00:00+00:00",
+                "runtime": {"last_run": "preserve"},
+                "repeat": {"completed": 3, "times": None},
+            }
+        ]
+    }
+    merged, counts = install_mod.merge_jobs_json(live, bundled)
+    job = merged["jobs"][0]
+    assert counts == {"preserved": 1, "changed": 0, "new": 0, "removed": 0}
+    assert job["last_status"] == "ok"
+    assert job["last_run_at"] == "2026-08-01T10:00:00+00:00"
+    assert job["runtime"] == {"last_run": "preserve"}
+    assert job["repeat"]["completed"] == 3
+    assert job["state"] == "idle"
+
+
+def test_merge_jobs_json_does_not_copy_runtime_for_changed_or_new_jobs():
+    bundled = {
+        "jobs": [
+            {"id": "job-a", "name": "alpha", "prompt": "run alpha v2", "last_status": None},
+            {"id": "job-b", "name": "beta", "prompt": "run beta", "last_status": None},
+        ]
+    }
+    live = {
+        "jobs": [
+            {
+                "id": "job-a",
+                "name": "alpha",
+                "prompt": "run alpha v1",
+                "last_status": "ok",
+                "last_run_at": "2026-08-01T10:00:00+00:00",
+            },
+            {
+                "id": "job-old",
+                "name": "retired",
+                "prompt": "old",
+                "last_status": "failed",
+            },
+        ]
+    }
+    merged, counts = install_mod.merge_jobs_json(live, bundled)
+    by_id = {job["id"]: job for job in merged["jobs"]}
+    assert counts == {"preserved": 0, "changed": 1, "new": 1, "removed": 1}
+    assert by_id["job-a"]["prompt"] == "run alpha v2"
+    assert by_id["job-a"]["last_status"] is None
+    assert "last_run_at" not in by_id["job-a"]
+    assert by_id["job-b"]["last_status"] is None
+    assert "job-old" not in by_id
+
+
+def test_identical_reinstall_preserves_runtime_fields(bundle):
+    jobs_path = bundle["home"] / ".hermes" / "cron" / "jobs.json"
+    live_jobs = {
+        "jobs": [
+            {
+                "id": "1",
+                "name": "synthetic-job",
+                "last_status": "ok",
+                "last_run_at": "2026-08-01T09:00:00+00:00",
+                "runtime": {"heartbeat": "fresh"},
+            }
+        ]
+    }
+    jobs_path.parent.mkdir(parents=True, exist_ok=True)
+    jobs_path.write_text(json.dumps(live_jobs, indent=2) + "\n", encoding="utf-8")
+
+    rc = install_mod.install(
+        bundle["manifest"],
+        home=bundle["home"],
+        bundle_root=bundle["bundle_root"],
+        manifest_path=bundle["manifest_path"],
+        dry_run=False,
+    )
+    assert rc == 0
+    installed = json.loads(jobs_path.read_text(encoding="utf-8"))["jobs"][0]
+    assert installed["last_status"] == "ok"
+    assert installed["last_run_at"] == "2026-08-01T09:00:00+00:00"
+    assert installed["runtime"] == {"heartbeat": "fresh"}
+
+    rc = install_mod.install(
+        bundle["manifest"],
+        home=bundle["home"],
+        bundle_root=bundle["bundle_root"],
+        manifest_path=bundle["manifest_path"],
+        dry_run=False,
+    )
+    assert rc == 0
+    reinstalled = json.loads(jobs_path.read_text(encoding="utf-8"))["jobs"][0]
+    assert reinstalled["last_status"] == "ok"
+    assert reinstalled["last_run_at"] == "2026-08-01T09:00:00+00:00"
+    assert reinstalled["runtime"] == {"heartbeat": "fresh"}

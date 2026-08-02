@@ -6,7 +6,9 @@ This script is the SOLE writer of four things on the target machine:
   1. ``~/.hermes/config.yaml``       — deep-merges ``config-overlay.yaml`` in.
   2. ``~/.hermes/profiles/<name>/``  — installs the five named profiles
                                         (config.yaml + SOUL.md + bootstrap dirs).
-  3. ``~/.hermes/cron/jobs.json``    — wholesale REPLACE with the curated set.
+  3. ``~/.hermes/cron/jobs.json``    — merges the curated set while preserving
+                                        scheduler-owned runtime fields for jobs
+                                        whose definitions are unchanged.
   4. Profile-local skill trees       — applies ``skills-policy.json`` using
                                         recoverable archives and per-skill
                                         suppression markers.
@@ -110,6 +112,22 @@ INSTALL_LOCK_NAME = ".fleet-config-install.lock"
 TEMP_WRITE_ATTEMPTS = 64
 LEGACY_CONFIG_BACKUP_NAME_RE = re.compile(
     r"^config\.yaml\.bak-fleet-config-install-\d{8}T\d{6}Z(?:-\d{2})?$"
+)
+
+JOBS_RUNTIME_DENYLIST = frozenset(
+    {
+        "last_run_at",
+        "last_status",
+        "last_error",
+        "last_delivery_error",
+        "fire_claim",
+        "run_claim",
+        "next_run_at",
+        "state",
+        "paused_at",
+        "paused_reason",
+        "lane_state",
+    }
 )
 
 
@@ -548,24 +566,101 @@ def _print_profiles_plan(items: list[dict]) -> None:
     print(f"  bootstrap dirs per profile ({', '.join(PROFILE_BOOTSTRAP_DIRS)}) for: {', '.join(names)}")
 
 
-def _print_jobs_plan(item: dict) -> None:
+def _print_jobs_plan(item: dict, *, home: Path) -> None:
     dest = item["dest"]
-    new_jobs = json.loads(item["src"].read_text(encoding="utf-8")).get("jobs", [])
+    bundled_payload = _load_jobs_payload(item)
+    bundled_jobs = bundled_payload.get("jobs", [])
     print(f"jobs.json -> {dest}:")
+    live_payload: dict[str, Any] | None = None
     if dest.is_file():
         try:
-            old_jobs = json.loads(dest.read_text(encoding="utf-8")).get("jobs", [])
+            live_payload = json.loads(dest.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
-            old_jobs = []
-        old_names = {j.get("name") for j in old_jobs}
-        new_names = {j.get("name") for j in new_jobs}
-        for name in sorted(new_names - old_names):
-            print(f"  + {name}")
-        for name in sorted(old_names - new_names):
-            print(f"  - {name}")
-        print(f"  ({len(old_jobs)} existing jobs -> {len(new_jobs)} curated jobs)")
-    else:
-        print(f"  (no existing jobs.json; installing {len(new_jobs)} jobs)")
+            live_payload = None
+    if live_payload is None:
+        print(f"  (no existing jobs.json; installing {len(bundled_jobs)} jobs)")
+        return
+    merged, counts = merge_jobs_json(live_payload, bundled_payload)
+    live_jobs = live_payload.get("jobs", [])
+    live_names = {j.get("name") for j in live_jobs if isinstance(j, dict)}
+    bundled_names = {j.get("name") for j in bundled_jobs if isinstance(j, dict)}
+    for name in sorted(bundled_names - live_names):
+        print(f"  + {name}")
+    for name in sorted(live_names - bundled_names):
+        print(f"  - {name}")
+    print(
+        "  "
+        f"({len(live_jobs)} existing jobs -> {len(merged['jobs'])} curated jobs; "
+        f"preserved={counts['preserved']} changed={counts['changed']} "
+        f"new={counts['new']} removed={counts['removed']})"
+    )
+
+
+def _job_definition_for_merge(job: dict[str, Any]) -> dict[str, Any]:
+    normalized = json.loads(json.dumps(job))
+    normalized.pop("runtime", None)
+    for key in JOBS_RUNTIME_DENYLIST:
+        normalized.pop(key, None)
+    repeat = normalized.get("repeat")
+    if isinstance(repeat, dict):
+        repeat = dict(repeat)
+        repeat.pop("completed", None)
+        normalized["repeat"] = repeat
+    return normalized
+
+
+def _preserve_job_runtime(target: dict[str, Any], source: dict[str, Any]) -> None:
+    for key in JOBS_RUNTIME_DENYLIST:
+        if key in source:
+            target[key] = source[key]
+    if "runtime" in source:
+        target["runtime"] = source["runtime"]
+    source_repeat = source.get("repeat")
+    if isinstance(source_repeat, dict) and "completed" in source_repeat:
+        target_repeat = dict(target.get("repeat") or {})
+        target_repeat["completed"] = source_repeat["completed"]
+        target["repeat"] = target_repeat
+
+
+def merge_jobs_json(
+    live: dict[str, Any] | None,
+    bundled: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, int]]:
+    """Merge bundled cron jobs while preserving scheduler runtime evidence."""
+    live_jobs_list = live.get("jobs") if isinstance(live, dict) else None
+    if not isinstance(live_jobs_list, list):
+        live_jobs_list = []
+    live_by_id = {
+        str(job["id"]): job
+        for job in live_jobs_list
+        if isinstance(job, dict) and job.get("id")
+    }
+    bundled_jobs = bundled.get("jobs", [])
+    if not isinstance(bundled_jobs, list):
+        raise InstallError("bundled jobs.json has no top-level 'jobs' list — refusing")
+
+    merged_jobs: list[dict[str, Any]] = []
+    counts = {"preserved": 0, "changed": 0, "new": 0, "removed": 0}
+    bundled_ids: set[str] = set()
+    for bundled_job in bundled_jobs:
+        if not isinstance(bundled_job, dict) or not bundled_job.get("id"):
+            raise InstallError("bundled jobs must be objects with ids")
+        job_id = str(bundled_job["id"])
+        bundled_ids.add(job_id)
+        live_job = live_by_id.get(job_id)
+        merged_job = dict(bundled_job)
+        if live_job is None:
+            counts["new"] += 1
+        elif _job_definition_for_merge(live_job) == _job_definition_for_merge(bundled_job):
+            _preserve_job_runtime(merged_job, live_job)
+            counts["preserved"] += 1
+        else:
+            counts["changed"] += 1
+        merged_jobs.append(merged_job)
+    counts["removed"] = len(set(live_by_id) - bundled_ids)
+    result = dict(bundled)
+    result["jobs"] = merged_jobs
+    return result, counts
 
 
 def _load_jobs_payload(item: dict) -> dict[str, Any]:
@@ -1560,7 +1655,7 @@ def install(
         print()
         _print_profiles_plan(plan["profiles"])
         print()
-        _print_jobs_plan(plan["jobs_json"])
+        _print_jobs_plan(plan["jobs_json"], home=home)
         if skill_policy is not None:
             print()
             _print_skill_policy_plan(skill_policy, skill_actions)
@@ -1756,16 +1851,30 @@ def install(
                 "status": "ensured",
             })
 
-        # --- Step 3: cron/jobs.json (fail-closed JSON validate) ---
+        # --- Step 3: cron/jobs.json (merge bundled definitions, preserve runtime) ---
         jobs_item = plan["jobs_json"]
         jdest = jobs_item["dest"]
-        new_bytes = jobs_item["src"].read_bytes()
+        bundled_bytes = jobs_item["src"].read_bytes()
+        if _sha256_bytes(bundled_bytes) != jobs_item["sha256"]:
+            raise InstallError(
+                f"bundled jobs.json sha256 drift for {jobs_item['src']}: "
+                f"manifest pins {jobs_item['sha256']}"
+            )
         try:
-            parsed = json.loads(new_bytes.decode("utf-8"))
+            parsed = json.loads(bundled_bytes.decode("utf-8"))
         except json.JSONDecodeError as exc:
             raise InstallError(f"bundled jobs.json is not valid JSON: {exc}") from exc
         if "jobs" not in parsed or not isinstance(parsed["jobs"], list):
             raise InstallError("bundled jobs.json has no top-level 'jobs' list — refusing")
+        live_document: dict[str, Any] | None = None
+        if jdest.is_file():
+            try:
+                live_document = json.loads(jdest.read_text(encoding="utf-8"))
+            except json.JSONDecodeError as exc:
+                raise InstallError(f"live jobs.json is not valid JSON: {exc}") from exc
+        merged, merge_counts = merge_jobs_json(live_document, parsed)
+        if manifest.get("fleet_contract") == FLEET_JOBS_CONTRACT:
+            _validate_direct_clickup_jobs(merged)
         with _protected_mutation(lease_box, home=home):
             jsnapshot = _backup(jdest, snapshot_dir, destination_root, "fleet-config-jobs", backup_stamp)
         write_lease = lease_box["value"]
@@ -1774,17 +1883,19 @@ def install(
             "dest": str(jdest),
             "snapshot": str(jsnapshot) if jsnapshot else None,
             "created": jsnapshot is None,
-            "job_count": len(parsed["jobs"]),
+            "job_count": len(merged["jobs"]),
+            "merge_counts": merge_counts,
             "status": "installing",
         }
         receipt["steps"].append(step)
-        _protected_atomic_write(lease_box, home=home, dest=jdest, data=new_bytes)
+        merged_bytes = (json.dumps(merged, indent=2) + "\n").encode("utf-8")
+        _protected_atomic_write(lease_box, home=home, dest=jdest, data=merged_bytes)
         write_lease = lease_box["value"]
-        deployed_sha = _sha256(jdest)
-        if deployed_sha != jobs_item["sha256"]:
+        deployed = json.loads(jdest.read_text(encoding="utf-8"))
+        expected_deployed, _ = merge_jobs_json(live_document, parsed)
+        if deployed != expected_deployed:
             raise InstallError(
-                f"deployed bytes for {jdest} sha256 {deployed_sha} != manifest "
-                f"{jobs_item['sha256']} — restoring snapshot"
+                f"deployed {jdest} did not match the intended jobs merge after write — restoring snapshot"
             )
         step["status"] = "installed"
 
@@ -1883,7 +1994,7 @@ def install(
         _release_production_write_lease(write_lease, home=home)
         _release_install_lock(lock_fd)
         return 1
-    print("install complete; config.yaml merged, profiles installed, jobs.json replaced, skill policy applied.")
+    print("install complete; config.yaml merged, profiles installed, jobs.json merged, skill policy applied.")
     _release_production_write_lease(write_lease, home=home)
     _release_install_lock(lock_fd)
     return 0
