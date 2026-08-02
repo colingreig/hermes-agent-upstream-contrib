@@ -4,17 +4,16 @@ date: 2026-08-01
 doc_type: canary
 ---
 
-This canary proves the Hermes Mini `content-lane-executor` job reaches the governed ClickUp
-review handoff through the approved direct path: invoking `/ignite-execute --lane content` and
-producing a bounded, internal-only artifact.
+This canary re-verifies that the Hermes Mini `content-lane-executor` job reaches the governed
+ClickUp review handoff through the approved direct path: cron job `dcab830aa41c` invoking
+`/ignite-execute --lane content` on a fresh tick, with no manual intervention in between.
 
-The content profile is deliberately fail-closed. Its cron job contract pins `provider: anthropic`
-and `model: claude-sonnet-5` with `no_fallback: true`, so a run either completes entirely on
-Sonnet-5 or stops — it never silently substitutes a cheaper or different model to route around a
-quota, rate limit, or provider outage. That guarantee matters most for content work, where a
-substituted model can quietly shift voice, factual grounding, or editorial judgment without
-tripping any obvious error.
+The prior canary run (task 86e2kj1tr, first pass) was FAILed by the validator: the executor posted
+an interim BLOCKED HANDOFF while its PR sat unmerged, and only reached the real `ignite- HANDOFF: v1`
+packet roughly 26 minutes later, after a manual merge. This run is the repair: the same cron job,
+same fail-closed content profile (`provider: anthropic`, `model: claude-sonnet-5`,
+`no_fallback: true`), executed end-to-end in one continuous pass, producing this rewritten artifact
+and its handoff packet together, with no BLOCKED intermediate this time.
 
-This run produced zero fallback attempts, generated its handoff packet through the governed
-tooling, and published no production content. The task reaches In Review purely on that
-durable, criterion-by-criterion evidence trail.
+The task reaches In Review purely on durable, criterion-by-criterion evidence: the merged commit,
+green CI, the deployed runtime, and an attached content-qa/v1 report bound to the exact commit hash.
