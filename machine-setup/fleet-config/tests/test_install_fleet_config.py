@@ -713,3 +713,35 @@ def test_identical_reinstall_preserves_runtime_fields(bundle):
     assert reinstalled["last_status"] == "ok"
     assert reinstalled["last_run_at"] == "2026-08-01T09:00:00+00:00"
     assert reinstalled["runtime"] == {"heartbeat": "fresh"}
+
+
+def test_merge_jobs_json_preserves_runtime_for_real_fleet_bundle():
+    bundled_path = Path(__file__).resolve().parents[1] / "jobs.json"
+    bundled = json.loads(bundled_path.read_text(encoding="utf-8"))
+    live_jobs = []
+    for job in bundled["jobs"]:
+        live_job = dict(job)
+        live_job["last_status"] = "ok"
+        live_job["last_run_at"] = "2026-08-01T10:00:00+00:00"
+        live_job["runtime"] = {"probe": job["id"]}
+        repeat = dict(live_job.get("repeat") or {})
+        repeat["completed"] = 7
+        live_job["repeat"] = repeat
+        live_jobs.append(live_job)
+    live = {"jobs": live_jobs}
+
+    merged, counts = install_mod.merge_jobs_json(live, bundled)
+
+    assert counts == {
+        "preserved": len(bundled["jobs"]),
+        "changed": 0,
+        "new": 0,
+        "removed": 0,
+    }
+    by_id = {job["id"]: job for job in merged["jobs"]}
+    for job in bundled["jobs"]:
+        merged_job = by_id[job["id"]]
+        assert merged_job["last_status"] == "ok"
+        assert merged_job["last_run_at"] == "2026-08-01T10:00:00+00:00"
+        assert merged_job["runtime"] == {"probe": job["id"]}
+        assert merged_job["repeat"]["completed"] == 7

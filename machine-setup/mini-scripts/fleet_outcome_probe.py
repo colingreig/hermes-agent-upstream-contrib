@@ -1002,7 +1002,7 @@ def _inject_contract_failures(
 
         for contract in contracts["cron_jobs"]:
             job_id = str(contract["id"])
-            live_enabled = True if contract["enabled"] else True
+            live_enabled = bool(contract["enabled"])
             jobs_path = root / f"jobs-{job_id}.json"
             _atomic_json(
                 jobs_path,

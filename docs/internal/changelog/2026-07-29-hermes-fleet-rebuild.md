@@ -22,7 +22,7 @@ The default agent fallback chain is now openai-codex `gpt-5.5` (Codex OAuth, sub
 
 ## Governed install and release
 
-`install_fleet_config.py` verifies sha256 hashes from `fleet_config_manifest.json`, snapshots every destination, writes atomically, and re-verifies deployed bytes. It deep-merges only four overlay keys into live `~/.hermes/config.yaml` (`model`, `fallback_providers`, `delegation`, `kanban`) so platforms, secrets wiring, approvals, and credential pool strategies stay untouched. `jobs.json` is a wholesale replace, not a merge. Production releases use manual governed cuts via `mini-release-cut.sh` with an exact certified SHA and immutable promotion receipt ID; the automatic release-poll LaunchAgent is retired for this fleet. Rollback paths are timestamped `.bak` siblings plus install receipts under `~/.hermes/logs/fleet-config-installs/`.
+`install_fleet_config.py` verifies sha256 hashes from `fleet_config_manifest.json`, snapshots every destination, writes atomically, and re-verifies deployed bytes. It deep-merges only four overlay keys into live `~/.hermes/config.yaml` (`model`, `fallback_providers`, `delegation`, `kanban`) so platforms, secrets wiring, approvals, and credential pool strategies stay untouched. `jobs.json` merges bundled definitions while preserving scheduler runtime fields for unchanged job ids (the initial rebuild cutover had no live runtime to carry forward). Production releases use manual governed cuts via `mini-release-cut.sh` with an exact certified SHA and immutable promotion receipt ID; the automatic release-poll LaunchAgent is retired for this fleet. Rollback paths are timestamped `.bak` siblings plus install receipts under `~/.hermes/logs/fleet-config-installs/`.
 
 ## What operators should expect
 

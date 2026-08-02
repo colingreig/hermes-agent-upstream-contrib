@@ -6,6 +6,9 @@ import plistlib
 import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
+
+import pytest
 
 
 SCRIPTS = Path(__file__).resolve().parent.parent
@@ -654,6 +657,55 @@ Some prompt with no response or scheduler error section.
         now=NOW,
     )
     assert {item["code"] for item in findings} == {"response_section_missing"}
+
+
+def test_response_only_failed_header_without_error_reports_response_section_missing(tmp_path):
+    module = _load_module()
+    outcome = _canonical_contract(cron_name="content-lane-executor")["outcome"]
+    artifact = _fresh_artifact(
+        tmp_path,
+        """# Cron Job: content-lane-executor (FAILED)
+
+**Job ID:** dcab830aa41c
+**Run Time:** 2026-08-01 11:06:46
+
+## Prompt
+
+/ignite-execute --lane content
+""",
+    )
+    findings = module._check_text_evidence(
+        surface="cron",
+        identifier="content-lane-executor",
+        path=artifact,
+        outcome=outcome,
+        now=NOW,
+    )
+    assert {item["code"] for item in findings} == {"response_section_missing"}
+
+
+def test_launchctl_inventory_returns_partial_results_when_one_domain_fails():
+    module = _load_module()
+    gui_domain, user_domain = module._launchd_domains()
+
+    def fake_inventory(domain: str) -> set[str]:
+        if domain == gui_domain:
+            raise module.ProbeError("gui inventory unavailable")
+        return {"com.colingreig.hermes.gateway"}
+
+    with mock.patch.object(module, "_launch_domain_inventory", side_effect=fake_inventory):
+        assert module._launchctl_inventory() == {"com.colingreig.hermes.gateway"}
+
+
+def test_launchctl_inventory_raises_when_both_domains_fail():
+    module = _load_module()
+
+    def fake_inventory(_domain: str) -> set[str]:
+        raise module.ProbeError("inventory unavailable")
+
+    with mock.patch.object(module, "_launch_domain_inventory", side_effect=fake_inventory):
+        with pytest.raises(module.ProbeError, match="inventory unavailable"):
+            module._launchctl_inventory()
 
 
 def test_launch_agent_registration_accepts_gui_or_user_domain():

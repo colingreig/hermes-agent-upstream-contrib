@@ -9,7 +9,7 @@
       "destination_root": "scripts",
       "destination": "reconcile_fleet_outcomes.py",
       "mode": "0755",
-      "sha256": "3188f0e70d2349e24f1d4066ccf55dcfe40b68a52c5c3b7ff36da787de77350b"
+      "sha256": "fed9b60fbc447201181f560c9f876b97fe2e8a1041f72dd867394a0e28c18c44"
     },
     {
       "source": "ci-health-watch-cron.py",
@@ -23,7 +23,7 @@
       "destination_root": "scripts",
       "destination": "fleet_outcome_probe.py",
       "mode": "0755",
-      "sha256": "23ad5af3b6621611801b827068a4021437102ea4a61e81e6c2f9d410b35d497e"
+      "sha256": "8395297c250d2f614cd0c032ac5adeb7d10783a0c167b2cf191c3f7831e7a957"
     },
     {
       "source": "verify_governed_paths.py",
