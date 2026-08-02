@@ -37,6 +37,7 @@ import datetime
 import html
 import json
 import os
+import subprocess
 import sys
 import urllib.parse
 import urllib.request
@@ -62,6 +63,11 @@ DEFAULT_REVIEW_BACKLOG_ALERT_THRESHOLD = 25
 
 STUCK_IN_PROGRESS_HOURS = 2.0
 MAX_SECTION_ROWS = 10
+ACTIVITY_CONTINUITY_SCHEMA = "hermes-mini-activity-continuity/v1"
+# This is intentionally flipped only after the adapter's positive, negative,
+# and cross-repository mirror tests pass. Production installation is owned by
+# ClickUp task 86e2gnz7a, not by this source-level activation.
+ACTIVITY_CONTINUITY_CONSUMER_ENABLED = True
 
 
 # ---------- spend / model ledger ----------
@@ -592,6 +598,88 @@ def build_review_backlog_alert(review_rows, review_meta, threshold):
     return None
 
 
+def load_activity_continuity(
+    strict_validator_completed,
+    *,
+    report_window_min=360,
+    enabled=ACTIVITY_CONTINUITY_CONSUMER_ENABLED,
+    script_path=None,
+    runner=subprocess.run,
+):
+    """Read the Mini continuity adapter without reaching into runtime state.
+
+    The adapter owns journal, execution-health, provenance, and ClickUp parity
+    policy. The report consumes only its machine-readable result. Once enabled,
+    every adapter failure becomes an explicit UNKNOWN System signal.
+    """
+    if not enabled:
+        return None
+    script_path = script_path or os.path.join(SCRIPT_DIR, "report_activity_continuity.py")
+    try:
+        result = runner(
+            [
+                sys.executable,
+                script_path,
+                "evaluate",
+                "--strict-validator-completed",
+                str(int(strict_validator_completed)),
+                "--report-window-min",
+                str(int(report_window_min)),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+    except Exception as exc:
+        return {
+            "schema": ACTIVITY_CONTINUITY_SCHEMA,
+            "scope": "Hermes Mac mini",
+            "state": "UNKNOWN",
+            "detail": f"continuity adapter unavailable: {type(exc).__name__}: {exc}",
+        }
+    try:
+        payload = json.loads(result.stdout)
+    except (TypeError, json.JSONDecodeError) as exc:
+        payload = None
+        parse_error = f"malformed adapter JSON: {exc}"
+    else:
+        parse_error = None
+    if (
+        result.returncode != 0
+        or not isinstance(payload, dict)
+        or payload.get("schema") != ACTIVITY_CONTINUITY_SCHEMA
+        or payload.get("scope") != "Hermes Mac mini"
+        or payload.get("state") not in {"ACTIVE", "INACTIVE", "UNKNOWN", "PROVISIONAL"}
+    ):
+        detail = parse_error or (result.stderr or "invalid adapter contract").strip()
+        return {
+            "schema": ACTIVITY_CONTINUITY_SCHEMA,
+            "scope": "Hermes Mac mini",
+            "state": "UNKNOWN",
+            "detail": f"continuity adapter rejected: {detail[:500]}",
+        }
+    return payload
+
+
+def build_activity_continuity_signal(result):
+    """Map every enabled continuity result to the System-signals lane only."""
+    if result is None:
+        return None
+    state = result.get("state", "UNKNOWN")
+    detail = str(result.get("detail") or "no continuity detail supplied")
+    concern_id = result.get("concern_id")
+    if concern_id:
+        detail = f"{detail} · concern {concern_id}"
+    return {
+        "kind": "health",
+        "name": f"Activity continuity — Hermes Mac mini: {state}",
+        "url": None,
+        "detail": detail,
+        "sub": "Hermes Mac mini lifecycle outbox",
+    }
+
+
 def build_subject(scoreboard, spend, alert_summary):
     completed = scoreboard.get("validator_completed_window", scoreboard.get("shipped", 0))
     prefix = "🚨 REVIEW BACKLOG · " if alert_summary.get("review_backlog", 0) else ""
@@ -645,6 +733,7 @@ def _bounded(rows):
 def build_report_view_model(
     header, scoreboard, spend, alerts, hermes_rows, hermes_meta, work_rows, window_min,
     review_rows=None, review_meta=None, review_threshold=DEFAULT_REVIEW_BACKLOG_ALERT_THRESHOLD,
+    activity_continuity=None,
 ):
     """Single structured report model consumed by subject, body, and JSON summary."""
     h = header or {}
@@ -679,6 +768,7 @@ def build_report_view_model(
         "hermes_meta": hermes_meta or {},
         "review_meta": review_meta,
         "review_threshold": review_threshold,
+        "activity_continuity": activity_continuity,
         "window_min": window_min,
         "subject": subject,
         "headline": build_headline_emoji_text(scoreboard, spend, alert_summary),
@@ -1321,9 +1411,16 @@ def main():
     review_alert = build_review_backlog_alert(review_rows, review_meta, args.review_backlog_alert_threshold)
     if review_alert:
         alerts.insert(0, review_alert)
+    activity_continuity = load_activity_continuity(
+        work_counts["completed"], report_window_min=args.window_min
+    )
+    activity_signal = build_activity_continuity_signal(activity_continuity)
+    if activity_signal:
+        alerts.append(activity_signal)
     model = build_report_view_model(
         header, scoreboard, spend, alerts, hermes_rows, hermes_meta, work_rows, args.window_min,
         review_rows, review_meta, args.review_backlog_alert_threshold,
+        activity_continuity,
     )
     subject = model["subject"]
 
@@ -1370,6 +1467,7 @@ def main():
         "guard_tracked_spend_usd": (round(spend["guard_total_cost"], 4) if spend.get("guard_total_cost") is not None else None),
         "guard_tracked_spend_error": spend.get("guard_error"),
         "spend_ledger_error": spend.get("error"),
+        "activity_continuity": model.get("activity_continuity"),
         **model["counts"],
         "providers_n": spend["providers_n"],
     }

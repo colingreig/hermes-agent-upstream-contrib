@@ -1,8 +1,14 @@
 {
   "bundle": "hermes-self-report",
-  "source_task": "86e2gczqw",
-  "generated": "2026-07-28",
-  "description": "Declared deploy bundle for the hermes-self-report cron. This file IS the bundle the installer copies; nothing outside its 'files' list is written. Canon bytes are the live mini copies (RC4) plus ClickUp 86e2gczqw review-queue/spend/alert updates in this deploy mirror. SKILL.md is authored in Brain and installed only with --include-skill --brain-path.",
+  "source_task": "86e2gnz71",
+  "generated": "2026-08-02",
+  "description": "Declared deploy bundle for the hermes-self-report cron. This file IS the bundle the installer copies; nothing outside its 'files' list is written. Brain authors the canonical report builder; this repository carries its exact-byte runtime mirror plus Mini-only lifecycle continuity adapter. SKILL.md is installed only with --include-skill --brain-path.",
+  "canonical_builder": {
+    "repo": "brain",
+    "path": "hermes/skills/hermes-self-report/scripts/hermes_report_build.py",
+    "runtime_mirror": "machine-setup/mini-scripts/hermes_report_build.py",
+    "sha256": "ac52d24d61392f23c237a7ef52e1e2bb0856f85d1e94cabbf2e2a47af925bf9d"
+  },
   "coexist_required": [
     {
       "dest_abs": "~/.hermes/scripts/queue_snapshot.json",
@@ -18,8 +24,8 @@
       "src_rel": "hermes_report_build.py",
       "src_base": "mirror",
       "dest_abs": "~/.hermes/scripts/hermes_report_build.py",
-      "sha256": "179ffdf865618df5c72a8eccf782c81e0893fe638f4aa2058c0e8a4c7c163e84",
-      "role": "report builder (HTML+text+subject+JSON); imports hermes_report_build_v1lib + claim_store; owns team-wide ClickUp review queue and separated spend labels",
+      "sha256": "ac52d24d61392f23c237a7ef52e1e2bb0856f85d1e94cabbf2e2a47af925bf9d",
+      "role": "exact-byte runtime mirror of Brain canonical report builder; owns HTML+text+subject+JSON, team-wide review queue, separated spend labels, and System-signal-only Activity continuity consumption",
       "deploy_mode": "script"
     },
     {
@@ -66,8 +72,16 @@
       "src_rel": "report_activity_journal.py",
       "src_base": "mirror",
       "dest_abs": "~/.hermes/scripts/report_activity_journal.py",
-      "sha256": "b0bc2deeddd006b9ce2e8b2c111206aa97ae4b2a44d25bf040e6fddeb738a9a4",
-      "role": "stdlib-only Mini lifecycle shadow outbox; durable UTC-day JSONL emission, retention, read-after-write ClickUp confirmation, and explicit UNKNOWN health without enabling continuity consumers before 86e2gnz71",
+      "sha256": "8eeed87f049ec93e78f9a5a93428f368f9526e4133afc73498a60747d478f71a",
+      "role": "stdlib-only Mini lifecycle outbox; durable UTC-day JSONL emission, public read-only half-open range API, retention, read-after-write ClickUp confirmation, deduplication, and explicit UNKNOWN health",
+      "deploy_mode": "script"
+    },
+    {
+      "src_rel": "report_activity_continuity.py",
+      "src_base": "mirror",
+      "dest_abs": "~/.hermes/scripts/report_activity_continuity.py",
+      "sha256": "bdd5aff9c1b7abe1409234603861514ab38ad0c52a8cddfadf62a24725a38c1c",
+      "role": "read-only Hermes Mac mini continuity adapter; stable UTC slots, two-window coverage, fail-closed health/provenance/ClickUp parity, and strict-completion independence",
       "deploy_mode": "script"
     },
     {
@@ -90,7 +104,7 @@
       "src_rel": "hermes/skills/hermes-self-report/SKILL.md",
       "src_base": "brain",
       "dest_abs": "~/.hermes/skills/hermes-self-report/SKILL.md",
-      "sha256": "f251b3c0825704a02eb235b2ba70853b7b31759a5a71d6837d6da9cff4696efc",
+      "sha256": "4bf76f629f057a867fdcb12353d87898ceb53b26d29142492174acba2226adf5",
       "role": "authored cron contract (Brain source of truth); installed only with --include-skill --brain-path <brain checkout>",
       "deploy_mode": "skill"
     }
