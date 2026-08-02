@@ -68,5 +68,5 @@ This is a generated index of the machine-readable [`production_mutation_registry
 - **Stranded claim reaper:** The fleet jobs file references the deployed Mini script; no tracked source file with this exact name exists in this checkout.
 - **Ignite board synchronization:** The fleet jobs file references the deployed Mini script; no tracked source file with this exact name exists in this checkout.
 - **Fleet health digest cron:** Email delivery is an external side effect, but this actor is read-only for Hermes production resources.
-- **PurelyMail notify-me poller:** Fleet jobs.json registers the Hermes cron schedule (*/15 * * * *); script bytes and deploy contract remain owned by ignite-email-infra.
+- **PurelyMail notify-me poller:** Fleet jobs.json registers the Hermes cron schedule (*/45 * * * *); script bytes and deploy contract remain owned by ignite-email-infra.
 - **PurelyMail poller deploy:** Cross-repository actor: recorded here because it writes Hermes paths, but implemented and tested in ignite-email-infra.

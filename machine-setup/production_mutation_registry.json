@@ -556,7 +556,7 @@
         "surface": "~/.hermes/deploy/purelymail-poller/ previous deployed artifact and cron output",
         "procedure": "Restore the prior verified poller release through ignite-email-infra deploy rollback; do not hand-edit live poller bytes under ~/.hermes/scripts/."
       },
-      "notes": "Fleet jobs.json registers the Hermes cron schedule (*/15 * * * *); script bytes and deploy contract remain owned by ignite-email-infra."
+      "notes": "Fleet jobs.json registers the Hermes cron schedule (*/45 * * * *); script bytes and deploy contract remain owned by ignite-email-infra."
     },
     {
       "id": "ignite-email-infra-poller-deploy",
