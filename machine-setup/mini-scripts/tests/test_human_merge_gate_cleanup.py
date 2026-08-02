@@ -48,6 +48,34 @@ def test_emit_human_merge_adds_needs_human_and_marker_tag(monkeypatch):
 
 
 def test_cleanup_clears_both_tags_when_merged_and_marker_present(monkeypatch):
+    """_hm_get_task is VAL_OPS `get` -> hermes_validate_ops._get_task(), which
+    normalizes tags to a FLAT LIST OF STRINGS (`[tg.get("name") for tg in ...]`)
+    — not `{"name": ...}` dicts. This must be the primary fixture shape: a
+    dict-shaped fixture here would mask a `t.get(...)` call that raises
+    AttributeError on the real string shape (swallowed by the per-entry
+    `except Exception: continue`, silently no-opping cleanup on every real run)."""
+    calls = _ops_recorder(monkeypatch, am)
+    monkeypatch.setattr(am, "_gh_json", lambda repo, pr, fields: ({"state": "MERGED"}, None))
+    monkeypatch.setattr(am, "_hm_get_task", lambda task_id: {
+        "id": task_id, "tags": ["needs-human", "human-merge-gate"]})
+
+    store = {"acme/widget#12": {"task_id": "86e2xxx"}}
+    state = {"acme/widget#12": "a" * 40}
+
+    cleaned = am._cleanup_human_merge_gate(store, state)
+
+    assert cleaned == [{"repo": "acme/widget", "pr": 12, "task_id": "86e2xxx"}]
+    rm_calls = [c for c in calls if c[:1] == ["rm-tag"]]
+    assert ["rm-tag", "86e2xxx", "human-merge-gate"] in rm_calls
+    assert ["rm-tag", "86e2xxx", "needs-human"] in rm_calls
+    comment_calls = [c for c in calls if c[:1] == ["comment"]]
+    assert len(comment_calls) == 1
+
+
+def test_cleanup_tolerates_dict_shaped_tags_too(monkeypatch):
+    """Defense in depth: if a future/alternate task-fetch path ever returns
+    raw ClickUp {"name": ...} tag dicts instead of the normalized string list,
+    cleanup must still work rather than silently no-op."""
     calls = _ops_recorder(monkeypatch, am)
     monkeypatch.setattr(am, "_gh_json", lambda repo, pr, fields: ({"state": "MERGED"}, None))
     monkeypatch.setattr(am, "_hm_get_task", lambda task_id: {
@@ -62,8 +90,6 @@ def test_cleanup_clears_both_tags_when_merged_and_marker_present(monkeypatch):
     rm_calls = [c for c in calls if c[:1] == ["rm-tag"]]
     assert ["rm-tag", "86e2xxx", "human-merge-gate"] in rm_calls
     assert ["rm-tag", "86e2xxx", "needs-human"] in rm_calls
-    comment_calls = [c for c in calls if c[:1] == ["comment"]]
-    assert len(comment_calls) == 1
 
 
 def test_cleanup_skips_when_pr_still_open(monkeypatch):
@@ -88,7 +114,7 @@ def test_cleanup_skips_when_marker_tag_absent(monkeypatch):
     calls = _ops_recorder(monkeypatch, am)
     monkeypatch.setattr(am, "_gh_json", lambda repo, pr, fields: ({"state": "MERGED"}, None))
     monkeypatch.setattr(am, "_hm_get_task", lambda task_id: {
-        "id": task_id, "tags": [{"name": "needs-human"}]})
+        "id": task_id, "tags": ["needs-human"]})
 
     store = {"acme/widget#12": {"task_id": "86e2xxx"}}
     state = {"acme/widget#12": "a" * 40}

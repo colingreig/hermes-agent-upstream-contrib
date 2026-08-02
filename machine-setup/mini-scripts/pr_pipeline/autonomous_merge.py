@@ -739,7 +739,16 @@ def _cleanup_human_merge_gate(store, state):
             task = _hm_get_task(task_id)
             if task is None:
                 continue
-            tags = {(t.get("name") or "").lower() for t in (task.get("tags") or [])}
+            # _hm_get_task returns hermes_validate_ops._get_task()'s NORMALIZED
+            # shape — tags is already a flat list of name strings, not
+            # {"name": ...} dicts (that raw ClickUp shape never reaches here).
+            # Tolerate both anyway: a `t.get(...)` on a bare string would raise
+            # AttributeError, which the outer except would silently swallow,
+            # turning every real run into a no-op cleanup.
+            tags = {
+                (t if isinstance(t, str) else (t or {}).get("name") or "").lower().strip()
+                for t in (task.get("tags") or [])
+            }
             if "human-merge-gate" not in tags:
                 continue  # not our escalation, or already cleared
             def _ops(*args):
@@ -819,6 +828,14 @@ def sweep_human_merge(allowlist=None, dry_run=False):
     if changed and not dry_run:
         _hm_save(state)
     if not dry_run:
+        if state and not store:
+            # Visibility: a failed/empty verdict-store load makes the cleanup
+            # pass below a silent no-op (every entry lacks a task_id lookup)
+            # even though there ARE previously-escalated repo#pr entries
+            # waiting to be checked. Surface it instead of just doing nothing.
+            print("[automerge] WARN human-merge cleanup: verdict store empty/unreadable, "
+                  f"{len(state)} escalated entr{'y' if len(state) == 1 else 'ies'} skipped",
+                  file=sys.stderr)
         try:
             for c in _cleanup_human_merge_gate(store, state):
                 results.append({
