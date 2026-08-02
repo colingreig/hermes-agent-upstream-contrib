@@ -51,7 +51,7 @@
       "destination_root": "scripts",
       "destination": "degraded_secrets_monitor.py",
       "mode": "0755",
-      "sha256": "87edb5c4394a639eb15175c49e02bde10e0dd3e6b345f041f7e60ced057475e2"
+      "sha256": "ba192c3a3dbf56f2a85ae2612598e66bf204f9cea1f35436b4688376f2697286"
     },
     {
       "source": "mcp_serve_reaper.py",
