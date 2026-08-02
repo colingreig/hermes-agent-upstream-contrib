@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "root": {
+    "max_bytes": 2147483648,
+    "max_retained_age_days": 730
+  },
+  "profile": {
+    "max_bytes": 536870912,
+    "archive_after_days": 30,
+    "prune_after_days": 365
+  },
+  "wal_checkpoint": {
+    "max_bytes": 134217728,
+    "mode": "PASSIVE",
+    "max_busy_retries": 15
+  },
+  "backup": {
+    "max_count": 14,
+    "max_bytes": 536870912,
+    "max_age_days": 30
+  }
+}
