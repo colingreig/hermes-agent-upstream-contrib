@@ -70,6 +70,27 @@ def build_auth_parser(subparsers, *, cmd_auth: Callable) -> None:
         "logout", help="Log out a provider and clear stored auth state"
     )
     auth_logout.add_argument("provider", help="Provider id")
+    auth_codex = auth_subparsers.add_parser(
+        "codex", help="Manage OpenAI Codex OAuth accounts (multi-account)"
+    )
+    codex_subparsers = auth_codex.add_subparsers(dest="codex_action")
+    codex_login = codex_subparsers.add_parser(
+        "login", help="Device-code login into a Codex account slot"
+    )
+    codex_login.add_argument(
+        "--account",
+        help="Named account slot to store tokens in (default: primary)",
+    )
+    codex_login.add_argument("--label", help="Optional display label")
+    codex_subparsers.add_parser(
+        "list", help="List Codex account slots, status, and preference"
+    )
+    codex_switch = codex_subparsers.add_parser(
+        "switch", help="Set the preferred Codex account"
+    )
+    codex_switch.add_argument(
+        "account", help="Account slot to prefer ('primary' or a named slot)"
+    )
     auth_spotify = auth_subparsers.add_parser(
         "spotify", help="Authenticate Hermes with Spotify via PKCE"
     )

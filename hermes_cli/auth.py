@@ -1771,6 +1771,9 @@ def is_provider_explicitly_configured(provider_id: str) -> bool:
             if (
                 source in {"device_code", "loopback_pkce", "hermes_pkce", "manual"}
                 or source.startswith("manual:")
+                # Named Codex account slots (device_code:<label>) are created
+                # by an explicit `hermes auth codex login --account` flow.
+                or source.startswith("device_code:")
             ):
                 return True
     except Exception:
@@ -3496,11 +3499,293 @@ def _read_codex_tokens(*, _lock: bool = True) -> Dict[str, Any]:
     }
 
 
+# --- Multi-account Codex slots ----------------------------------------------
+#
+# The legacy/primary account lives where it always has:
+# ``providers.openai-codex.tokens`` (zero-migration back-compat).  Additional
+# named accounts live under ``providers.openai-codex.accounts.<label>`` with
+# the same ``{"tokens": {...}, "last_refresh": ...}`` shape as the singleton.
+# Each populated slot seeds exactly one credential-pool entry, mirroring the
+# anthropic pattern of one named OAuth source per backing store
+# (``hermes_pkce`` / ``claude_code``): the primary slot keeps the historical
+# ``device_code`` source and each named slot gets ``device_code:<label>``.
+# ``preferred_account`` ("primary" or a slot label) records which account
+# selection should favor when it is available.
+
+CODEX_PRIMARY_ACCOUNT = "primary"
+_CODEX_ACCOUNT_SOURCE_PREFIX = "device_code:"
+_CODEX_ACCOUNT_LABEL_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+
+
+def normalize_codex_account_label(label: Any) -> str:
+    """Normalize a user-supplied Codex account label.
+
+    Returns ``CODEX_PRIMARY_ACCOUNT`` for the legacy slot aliases and the
+    lowercased label otherwise.  Raises ``AuthError`` for labels that would
+    produce ambiguous pool sources (spaces, colons, empty strings, ...).
+    """
+    normalized = str(label or "").strip().lower()
+    if normalized in {"", CODEX_PRIMARY_ACCOUNT, "default", "device_code"}:
+        return CODEX_PRIMARY_ACCOUNT
+    if not _CODEX_ACCOUNT_LABEL_RE.match(normalized):
+        raise AuthError(
+            f"Invalid Codex account label {normalized!r}. Use 1-64 characters: "
+            "lowercase letters, digits, '.', '_' or '-' (must start with a "
+            "letter or digit).",
+            provider="openai-codex",
+            code="codex_account_label_invalid",
+        )
+    return normalized
+
+
+def codex_account_source(account: Any) -> str:
+    """Return the credential-pool source string for an account slot."""
+    normalized = str(account or "").strip().lower()
+    if normalized in {"", CODEX_PRIMARY_ACCOUNT}:
+        return "device_code"
+    return f"{_CODEX_ACCOUNT_SOURCE_PREFIX}{normalized}"
+
+
+def codex_account_from_source(source: Any) -> Optional[str]:
+    """Map a pool source back to its account slot.
+
+    Returns ``CODEX_PRIMARY_ACCOUNT`` for ``device_code``, the slot label for
+    ``device_code:<label>``, and ``None`` for any other source (manual
+    entries, env seeds, ...).
+    """
+    raw = str(source or "")
+    if raw == "device_code":
+        return CODEX_PRIMARY_ACCOUNT
+    if raw.startswith(_CODEX_ACCOUNT_SOURCE_PREFIX):
+        label = raw[len(_CODEX_ACCOUNT_SOURCE_PREFIX):].strip().lower()
+        return label or None
+    return None
+
+
+def _codex_account_slot(state: Any, account: str) -> Optional[Dict[str, Any]]:
+    """Return the state dict backing an account slot (``None`` when absent).
+
+    For the primary account this is the provider state itself (its ``tokens``
+    key is the slot); for named accounts it is
+    ``state["accounts"][<label>]``.
+    """
+    if not isinstance(state, dict):
+        return None
+    if account in {"", CODEX_PRIMARY_ACCOUNT}:
+        return state
+    accounts = state.get("accounts")
+    if not isinstance(accounts, dict):
+        return None
+    slot = accounts.get(account)
+    return slot if isinstance(slot, dict) else None
+
+
+def _codex_slot_tokens(state: Any, account: str) -> Optional[Dict[str, Any]]:
+    """Return the token dict for an account slot, or ``None``."""
+    slot = _codex_account_slot(state, account)
+    if slot is None:
+        return None
+    tokens = slot.get("tokens")
+    return tokens if isinstance(tokens, dict) else None
+
+
+def get_codex_preferred_account() -> str:
+    """Return the persisted preferred account ('' when never set)."""
+    try:
+        with _auth_store_lock():
+            auth_store = _load_auth_store()
+        state = _load_provider_state(auth_store, "openai-codex")
+    except Exception:
+        return ""
+    if not isinstance(state, dict):
+        return ""
+    return str(state.get("preferred_account") or "").strip().lower()
+
+
+def set_codex_preferred_account(account: str) -> None:
+    """Persist the preferred Codex account slot ('primary' or a slot label)."""
+    normalized = normalize_codex_account_label(account)
+    with _auth_store_lock():
+        auth_store = _load_auth_store()
+        state = _load_provider_state(auth_store, "openai-codex")
+        if not isinstance(state, dict):
+            state = {}
+        if normalized != CODEX_PRIMARY_ACCOUNT and _codex_slot_tokens(state, normalized) is None:
+            raise AuthError(
+                f"No Codex account slot named {normalized!r}. Run "
+                f"`hermes auth codex login --account {normalized}` first.",
+                provider="openai-codex",
+                code="codex_account_missing",
+            )
+        state["preferred_account"] = normalized
+        _store_provider_state(auth_store, "openai-codex", state, set_active=False)
+        _save_auth_store(auth_store)
+
+
+def list_codex_accounts() -> List[Dict[str, Any]]:
+    """Describe every Codex account slot (primary first, named slots sorted)."""
+    with _auth_store_lock():
+        auth_store = _load_auth_store()
+    state = _load_provider_state(auth_store, "openai-codex")
+    preferred = ""
+    if isinstance(state, dict):
+        preferred = str(state.get("preferred_account") or "").strip().lower()
+    if not preferred:
+        preferred = CODEX_PRIMARY_ACCOUNT
+
+    def _describe(account: str) -> Dict[str, Any]:
+        slot = _codex_account_slot(state, account)
+        tokens = _codex_slot_tokens(state, account) or {}
+        access_token = str(tokens.get("access_token") or "")
+        label = ""
+        if isinstance(slot, dict):
+            label = str(slot.get("label") or "").strip()
+        return {
+            "account": account,
+            "label": label or account,
+            "source": codex_account_source(account),
+            "has_tokens": bool(access_token.strip()),
+            "last_refresh": slot.get("last_refresh") if isinstance(slot, dict) else None,
+            "preferred": account == preferred,
+        }
+
+    results = [_describe(CODEX_PRIMARY_ACCOUNT)]
+    accounts = state.get("accounts") if isinstance(state, dict) else None
+    if isinstance(accounts, dict):
+        for label in sorted(accounts):
+            if isinstance(accounts.get(label), dict):
+                results.append(_describe(str(label)))
+    return results
+
+
+def _codex_pool_source_rate_limited(pool_entries: Any, source: str) -> bool:
+    """True when the pool entry for ``source`` is dead or in a future cooldown."""
+    if not isinstance(pool_entries, list):
+        return False
+    now = time.time()
+    for entry in pool_entries:
+        if not isinstance(entry, dict) or entry.get("source") != source:
+            continue
+        status = entry.get("last_status")
+        if status == "dead":
+            return True
+        if status != "exhausted":
+            continue
+        reset_at = entry.get("last_error_reset_at")
+        if isinstance(reset_at, str):
+            try:
+                reset_at = datetime.fromisoformat(reset_at.replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                reset_at = None
+        if isinstance(reset_at, (int, float)):
+            numeric = float(reset_at)
+            if numeric > 1_000_000_000_000:
+                numeric /= 1000.0
+            if numeric > now:
+                return True
+    return False
+
+
+def _select_codex_runtime_account() -> str:
+    """Pick the account slot runtime resolution should serve.
+
+    Order: the preferred account first, then the primary slot, then the
+    remaining named slots in sorted order.  Slots without token material are
+    skipped; slots whose pool entry is dead or sitting in a future exhaustion
+    cooldown are deprioritized so a 429 on the preferred account fails over
+    to the other one automatically.  Falls back to the first populated slot
+    when every candidate is cooling down (better to surface the provider's
+    own 429 than to invent a local error).
+    """
+    try:
+        with _auth_store_lock():
+            auth_store = _load_auth_store()
+        state = _load_provider_state(auth_store, "openai-codex")
+    except Exception:
+        return CODEX_PRIMARY_ACCOUNT
+    if not isinstance(state, dict):
+        return CODEX_PRIMARY_ACCOUNT
+
+    preferred = str(state.get("preferred_account") or "").strip().lower()
+    candidates: List[str] = []
+    if preferred:
+        candidates.append(preferred)
+    candidates.append(CODEX_PRIMARY_ACCOUNT)
+    accounts = state.get("accounts") if isinstance(state, dict) else None
+    if isinstance(accounts, dict):
+        candidates.extend(sorted(str(label) for label in accounts))
+
+    seen: set = set()
+    populated: List[str] = []
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        tokens = _codex_slot_tokens(state, candidate)
+        if isinstance(tokens, dict) and str(tokens.get("access_token") or "").strip():
+            populated.append(candidate)
+    if not populated:
+        return CODEX_PRIMARY_ACCOUNT
+
+    try:
+        pool_entries = read_credential_pool("openai-codex")
+    except Exception:
+        pool_entries = []
+    for candidate in populated:
+        if not _codex_pool_source_rate_limited(pool_entries, codex_account_source(candidate)):
+            return candidate
+    return populated[0]
+
+
+def _read_codex_account_tokens(account: str, *, _lock: bool = True) -> Dict[str, Any]:
+    """Read a named account slot's tokens (mirrors ``_read_codex_tokens``)."""
+    if _lock:
+        with _auth_store_lock():
+            auth_store = _load_auth_store()
+    else:
+        auth_store = _load_auth_store()
+    state = _load_provider_state(auth_store, "openai-codex")
+    slot = _codex_account_slot(state, account)
+    tokens = _codex_slot_tokens(state, account)
+    if slot is None or not isinstance(tokens, dict):
+        raise AuthError(
+            f"No Codex credentials stored for account {account!r}. Run "
+            f"`hermes auth codex login --account {account}` to authenticate.",
+            provider="openai-codex",
+            code="codex_account_missing",
+            relogin_required=True,
+        )
+    access_token = tokens.get("access_token")
+    refresh_token = tokens.get("refresh_token")
+    if not isinstance(access_token, str) or not access_token.strip():
+        raise AuthError(
+            f"Codex account {account!r} is missing access_token. Run "
+            f"`hermes auth codex login --account {account}` to re-authenticate.",
+            provider="openai-codex",
+            code="codex_auth_missing_access_token",
+            relogin_required=True,
+        )
+    if not isinstance(refresh_token, str) or not refresh_token.strip():
+        raise AuthError(
+            f"Codex account {account!r} is missing refresh_token. Run "
+            f"`hermes auth codex login --account {account}` to re-authenticate.",
+            provider="openai-codex",
+            code="codex_auth_missing_refresh_token",
+            relogin_required=True,
+        )
+    return {
+        "tokens": tokens,
+        "last_refresh": slot.get("last_refresh"),
+    }
+
+
 def _sync_codex_pool_entries(
     auth_store: Dict[str, Any],
     tokens: Dict[str, str],
     last_refresh: Optional[str],
     previous_singleton_tokens: Optional[Dict[str, str]] = None,
+    *,
+    slot_source: str = "device_code",
 ) -> None:
     """Mirror a fresh Codex re-auth into the credential_pool OAuth entries.
 
@@ -3567,7 +3852,15 @@ def _sync_codex_pool_entries(
         if not isinstance(entry, dict):
             continue
         source = entry.get("source")
-        if source == "device_code":
+        if slot_source != "device_code":
+            # Named account slot re-auth — refresh ONLY that slot's mirror
+            # entry.  Named slots never had a manual-alias era, so the
+            # ``manual:device_code`` matching below does not apply, and the
+            # primary/other slots' entries must stay untouched (an
+            # out-of-band re-login of one account must never clobber the
+            # others).
+            refresh_this_entry = source == slot_source
+        elif source == "device_code":
             # Singleton-seeded mirror — always refresh.
             refresh_this_entry = True
         elif source == "manual:device_code":
@@ -3597,31 +3890,70 @@ def _sync_codex_pool_entries(
         entry["last_error_reset_at"] = None
 
 
-def _save_codex_tokens(tokens: Dict[str, str], last_refresh: str = None, label: str = None) -> None:
-    """Save Codex OAuth tokens to Hermes auth store (~/.hermes/auth.json)."""
+def _save_codex_tokens(
+    tokens: Dict[str, str],
+    last_refresh: str = None,
+    label: str = None,
+    *,
+    account: str = None,
+) -> None:
+    """Save Codex OAuth tokens to Hermes auth store (~/.hermes/auth.json).
+
+    ``account=None`` (or 'primary') writes the legacy/primary slot exactly as
+    before.  A named ``account`` writes that slot under
+    ``providers.openai-codex.accounts.<account>`` and mirrors the fresh pair
+    into ONLY that slot's pool entry — the primary slot and other named
+    accounts are never touched by a named-slot save.
+    """
     if last_refresh is None:
         last_refresh = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    normalized_account = normalize_codex_account_label(account)
     with _auth_store_lock():
         auth_store = _load_auth_store()
         state = _load_provider_state(auth_store, "openai-codex") or {}
-        # Capture the previous singleton tokens BEFORE overwriting them.  The
-        # pool-sync step uses this to distinguish legacy singleton-aliases
-        # (which should be refreshed) from independent accounts that
-        # ``hermes auth add openai-codex`` created (which must not be
-        # overwritten — see #39236).
-        previous_singleton_tokens = state.get("tokens") if isinstance(state.get("tokens"), dict) else None
-        state["tokens"] = tokens
-        state["last_refresh"] = last_refresh
-        state["auth_mode"] = "chatgpt"
-        if label and str(label).strip():
-            state["label"] = str(label).strip()
-        _save_provider_state(auth_store, "openai-codex", state)
-        _sync_codex_pool_entries(
-            auth_store,
-            tokens,
-            last_refresh,
-            previous_singleton_tokens=previous_singleton_tokens,
-        )
+        if normalized_account == CODEX_PRIMARY_ACCOUNT:
+            # Capture the previous singleton tokens BEFORE overwriting them.  The
+            # pool-sync step uses this to distinguish legacy singleton-aliases
+            # (which should be refreshed) from independent accounts that
+            # ``hermes auth add openai-codex`` created (which must not be
+            # overwritten — see #39236).
+            previous_singleton_tokens = state.get("tokens") if isinstance(state.get("tokens"), dict) else None
+            state["tokens"] = tokens
+            state["last_refresh"] = last_refresh
+            state["auth_mode"] = "chatgpt"
+            if label and str(label).strip():
+                state["label"] = str(label).strip()
+            _save_provider_state(auth_store, "openai-codex", state)
+            _sync_codex_pool_entries(
+                auth_store,
+                tokens,
+                last_refresh,
+                previous_singleton_tokens=previous_singleton_tokens,
+            )
+        else:
+            accounts = state.get("accounts")
+            if not isinstance(accounts, dict):
+                accounts = {}
+                state["accounts"] = accounts
+            slot = accounts.get(normalized_account)
+            if not isinstance(slot, dict):
+                slot = {}
+                accounts[normalized_account] = slot
+            slot["tokens"] = tokens
+            slot["last_refresh"] = last_refresh
+            slot["auth_mode"] = "chatgpt"
+            if label and str(label).strip():
+                slot["label"] = str(label).strip()
+            # A named-slot save must not flip active_provider — it is either
+            # an explicit `hermes auth codex login --account` (the CLI decides
+            # activation) or a token-rotation side effect.
+            _store_provider_state(auth_store, "openai-codex", state, set_active=False)
+            _sync_codex_pool_entries(
+                auth_store,
+                tokens,
+                last_refresh,
+                slot_source=codex_account_source(normalized_account),
+            )
         _save_auth_store(auth_store)
 
 
@@ -3858,6 +4190,7 @@ def resolve_codex_runtime_credentials(
     force_refresh: bool = False,
     refresh_if_expiring: bool = True,
     refresh_skew_seconds: int = CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
+    account: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Resolve runtime credentials from Hermes's own Codex token store.
 
@@ -3869,7 +4202,28 @@ def resolve_codex_runtime_credentials(
     pool seed, a partial re-auth, or pool-only restoration from a backup — gets a bare
     HTTP 401 ``Missing Authentication header`` from the wire instead of a usable
     credential. See issue #32992.
+
+    Multi-account: with ``account=None`` the preferred account (``hermes auth
+    codex switch``) is served when its slot is populated and not sitting in a
+    pool exhaustion cooldown; otherwise resolution automatically falls over to
+    the next populated slot (primary first, then named slots in sorted
+    order).  Pass an explicit ``account`` label ('primary' or a named slot)
+    to pin resolution to one slot.  Named-slot resolution refreshes and
+    persists into ITS slot only — it never clobbers the primary singleton or
+    other named accounts.
     """
+    resolved_account = (
+        normalize_codex_account_label(account)
+        if account is not None
+        else _select_codex_runtime_account()
+    )
+    if resolved_account != CODEX_PRIMARY_ACCOUNT:
+        return _resolve_codex_named_account_credentials(
+            resolved_account,
+            force_refresh=force_refresh,
+            refresh_if_expiring=refresh_if_expiring,
+            refresh_skew_seconds=refresh_skew_seconds,
+        )
     read_error: Optional[AuthError] = None
     try:
         data = _read_codex_tokens()
@@ -3964,6 +4318,71 @@ def resolve_codex_runtime_credentials(
         "base_url": base_url,
         "api_key": access_token,
         "source": "hermes-auth-store",
+        "last_refresh": data.get("last_refresh"),
+        "auth_mode": "chatgpt",
+    }
+
+
+def _resolve_codex_named_account_credentials(
+    account: str,
+    *,
+    force_refresh: bool = False,
+    refresh_if_expiring: bool = True,
+    refresh_skew_seconds: int = CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
+) -> Dict[str, Any]:
+    """Resolve runtime credentials from a named Codex account slot.
+
+    Mirrors the primary path in ``resolve_codex_runtime_credentials`` but
+    reads/refreshes/persists ``providers.openai-codex.accounts.<account>``
+    exclusively.  There is deliberately no ~/.codex CLI self-heal here — the
+    Codex CLI file belongs to the primary identity, and adopting it into a
+    named slot would silently merge two accounts.
+    """
+    data = _read_codex_account_tokens(account)
+    tokens = dict(data["tokens"])
+    access_token = str(tokens.get("access_token", "") or "").strip()
+    refresh_timeout_seconds = env_float("HERMES_CODEX_REFRESH_TIMEOUT_SECONDS", 20)
+
+    should_refresh = bool(force_refresh)
+    if (not should_refresh) and refresh_if_expiring:
+        should_refresh = _codex_access_token_is_expiring(access_token, refresh_skew_seconds)
+    if should_refresh:
+        # Re-read under lock to avoid racing with other Hermes processes
+        with _auth_store_lock(timeout_seconds=max(float(AUTH_LOCK_TIMEOUT_SECONDS), refresh_timeout_seconds + 5.0)):
+            data = _read_codex_account_tokens(account, _lock=False)
+            tokens = dict(data["tokens"])
+            access_token = str(tokens.get("access_token", "") or "").strip()
+
+            should_refresh = bool(force_refresh)
+            if (not should_refresh) and refresh_if_expiring:
+                should_refresh = _codex_access_token_is_expiring(access_token, refresh_skew_seconds)
+
+            if should_refresh:
+                refreshed = refresh_codex_oauth_pure(
+                    str(tokens.get("access_token", "") or ""),
+                    str(tokens.get("refresh_token", "") or ""),
+                    timeout_seconds=refresh_timeout_seconds,
+                )
+                tokens["access_token"] = refreshed["access_token"]
+                tokens["refresh_token"] = refreshed["refresh_token"]
+                _save_codex_tokens(
+                    tokens,
+                    refreshed.get("last_refresh"),
+                    account=account,
+                )
+                access_token = str(tokens.get("access_token", "") or "").strip()
+
+    base_url = (
+        os.getenv("HERMES_CODEX_BASE_URL", "").strip().rstrip("/")
+        or DEFAULT_CODEX_BASE_URL
+    )
+
+    return {
+        "provider": "openai-codex",
+        "base_url": base_url,
+        "api_key": access_token,
+        "source": "hermes-auth-store",
+        "account": account,
         "last_refresh": data.get("last_refresh"),
         "auth_mode": "chatgpt",
     }

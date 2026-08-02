@@ -499,6 +499,115 @@ def auth_remove_command(args) -> None:
         print(line)
 
 
+def _redact_token(token) -> str:
+    """Show enough of a token to distinguish accounts, never the value."""
+    raw = str(token or "")
+    if not raw:
+        return "(none)"
+    return f"{raw[:6]}…(len={len(raw)})"
+
+
+def auth_codex_login_command(args) -> None:
+    """`hermes auth codex login [--account <label>]` — device-code login into a slot."""
+    account = auth_mod.normalize_codex_account_label(getattr(args, "account", None))
+    creds = auth_mod._codex_device_code_login()
+    label = (getattr(args, "label", None) or "").strip() or None
+    if account == auth_mod.CODEX_PRIMARY_ACCOUNT:
+        auth_mod._save_codex_tokens(creds["tokens"], creds.get("last_refresh"), label)
+    else:
+        auth_mod._save_codex_tokens(
+            creds["tokens"], creds.get("last_refresh"), label, account=account,
+        )
+    # An explicit login re-enables a previously removed slot (same pattern as
+    # the xai-oauth login path — removal leaves a suppression marker that
+    # would otherwise block the re-seed silently).
+    source = auth_mod.codex_account_source(account)
+    auth_mod.unsuppress_credential_source("openai-codex", source)
+    auth_mod.mark_provider_active_if_unset("openai-codex")
+    # Reload the pool so the slot's entry is upserted immediately.
+    pool = load_pool("openai-codex")
+    entry = next((e for e in pool.entries() if e.source == source), None)
+    print()
+    print(f'Login successful — saved to Codex account "{account}".')
+    if entry is not None:
+        print(f'  Pool entry: id={entry.id} label="{entry.label}" source={entry.source}')
+    from hermes_constants import display_hermes_home as _dhh
+    print(f"  Auth state: {_dhh()}/auth.json")
+
+
+def auth_codex_list_command(args) -> None:
+    """`hermes auth codex list` — account slots, status, preference, selection."""
+    del args
+    accounts = auth_mod.list_codex_accounts()
+    pool = load_pool("openai-codex")
+    entries_by_source = {entry.source: entry for entry in pool.entries()}
+    selected = pool.peek()
+
+    if not any(acct["has_tokens"] for acct in accounts) and not pool.entries():
+        print("No Codex credentials stored. Run `hermes auth codex login` first.")
+        return
+
+    print("openai-codex accounts:")
+    for acct in accounts:
+        entry = entries_by_source.get(acct["source"])
+        if entry is not None:
+            token = entry.access_token
+            if entry.last_status == "dead":
+                reason = getattr(entry, "last_error_reason", None) or "terminal auth failure"
+                status = f"dead ({reason} — re-login required)"
+            else:
+                status = _format_exhausted_status(entry).strip() or "ok"
+        elif acct["has_tokens"]:
+            token = ""
+            status = "ok (not yet seeded into pool)"
+        else:
+            token = ""
+            if acct["account"] == auth_mod.CODEX_PRIMARY_ACCOUNT:
+                status = "no tokens (run `hermes auth codex login`)"
+            else:
+                status = (
+                    "no tokens (run `hermes auth codex login "
+                    f"--account {acct['account']}`)"
+                )
+        preferred_marker = "*" if acct.get("preferred") else " "
+        select_marker = ""
+        if selected is not None and entry is not None and selected.id == entry.id:
+            select_marker = "  ← pool would select"
+        print(
+            f'  {preferred_marker} {acct["account"]:<16} label="{acct["label"]}" '
+            f"token={_redact_token(token)} {status}{select_marker}".rstrip()
+        )
+    print()
+    print("  * = preferred account — change with `hermes auth codex switch <account>`")
+
+
+def auth_codex_switch_command(args) -> None:
+    """`hermes auth codex switch <account>` — persist the preferred account."""
+    account = auth_mod.normalize_codex_account_label(getattr(args, "account", None))
+    try:
+        auth_mod.set_codex_preferred_account(account)
+    except auth_mod.AuthError as exc:
+        raise SystemExit(str(exc))
+    # Reload so the pool's priority order reflects the new preference now.
+    load_pool("openai-codex")
+    print(f'Preferred Codex account set to "{account}".')
+    print("No restart needed for the codex proxy — it resolves credentials per")
+    print("request. Long-running agent sessions pick the preference up on their")
+    print("next credential-pool reload; restart them to apply it immediately.")
+
+
+def auth_codex_command(args) -> None:
+    action = str(getattr(args, "codex_action", "") or "").strip().lower()
+    if action == "login":
+        auth_codex_login_command(args)
+        return
+    if action == "switch":
+        auth_codex_switch_command(args)
+        return
+    # Default (including bare `hermes auth codex`): list.
+    auth_codex_list_command(args)
+
+
 def auth_reset_command(args) -> None:
     provider = _normalize_provider(getattr(args, "provider", ""))
     pool = load_pool(provider)
@@ -797,6 +906,9 @@ def auth_command(args) -> None:
         return
     if action == "spotify":
         auth_spotify_command(args)
+        return
+    if action == "codex":
+        auth_codex_command(args)
         return
     # No subcommand — launch interactive mode
     _interactive_auth()
