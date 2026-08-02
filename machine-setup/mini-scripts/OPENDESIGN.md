@@ -54,3 +54,20 @@ with that object merged sets `agentId: "codex"` (or `"opencode"`) plus
 
 Expect `run.json`, `export-manifest.json`, `<project>.zip`, `files/`. Exit: 0 ok,
 1 run failed, 2 usage, 70 daemon/HTTP, 75 timeout, 78 config.
+
+## Tailnet access
+
+UI/API reachable directly at `https://mac-mini-h.tail51ec1b.ts.net/` via
+`tailscale serve --bg 7456` on the mini — tailnet-only, persistent at the
+`tailscaled` level (survives daemon restarts, no LaunchAgent needed). Disable
+with `tailscale serve --https=443 off`.
+
+The daemon allow-lists that browser origin via `OD_ALLOWED_ORIGINS` in
+`com.hermes.opendesign.plist` (comma-separated list of origins).
+
+The `ssh -L 7456` tunnel remains a fallback for when Tailscale isn't
+available.
+
+Note: wiring this up overwrote a stale pre-existing `tailscale serve` mapping
+to `127.0.0.1:9118` (nothing was listening on it). Recreate manually if that
+mapping was actually wanted.

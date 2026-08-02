@@ -91,6 +91,11 @@ exec "$NODE_BIN" "$OD_ENTRY" daemon start --headless
     <!-- Headless-only knob from upstream issue #221; leave unset unless the
          packaged web sidecar refuses to boot in server mode, then try:
          <key>OD_WEB_OUTPUT_MODE</key><string>export</string> -->
+    <!-- Tailscale Serve fronts the loopback daemon at this tailnet-only
+         HTTPS URL; browser requests to /api/* arrive with this Origin and
+         must be allow-listed here (see apps/daemon/src/origin-validation.ts). -->
+    <key>OD_ALLOWED_ORIGINS</key>
+    <string>https://mac-mini-h.tail51ec1b.ts.net</string>
   </dict>
   <key>LimitLoadToSessionType</key>
   <string>Aqua</string>
