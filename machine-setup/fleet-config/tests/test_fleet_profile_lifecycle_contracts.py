@@ -13,6 +13,7 @@ JOBS_PATH = FLEET_CONFIG_ROOT / "jobs.json"
 OUTCOME_CONTRACTS_PATH = (
     FLEET_CONFIG_ROOT.parent / "mini-scripts" / "fleet_outcome_contracts.json"
 )
+RESOURCE_MANIFEST_PATH = FLEET_CONFIG_ROOT.parent / "ignite-email-infra.resource-manifest.json"
 COVERAGE_PATH = FLEET_CONFIG_ROOT / "MONITOR_COVERAGE.md"
 PROFILES = ("coder", "content", "design", "research", "ops")
 RETIRED_POLLER_JOB_ID = "6139465f559f"
@@ -167,23 +168,28 @@ def test_retired_purelymail_poller_id_is_absent_from_fleet_surfaces():
 
 def test_purelymail_poller_uses_true_cron_schedule():
     job = _jobs_by_name()["Purelymail notify-me poller"]
+    schedule_authority = json.loads(RESOURCE_MANIFEST_PATH.read_text(encoding="utf-8"))[
+        "cron_schedule_authority"
+    ]
 
     assert job["id"] == PURELYMAIL_POLLER_JOB_ID
+    assert schedule_authority["hermes_cron_job_id"] == PURELYMAIL_POLLER_JOB_ID
     assert job["script"] == "purelymail-notify-poller.py"
     assert job["no_agent"] is True
     assert job["schedule"] == {
-        "display": "*/15 * * * *",
-        "expr": "*/15 * * * *",
+        "display": schedule_authority["live_schedule_display"],
+        "expr": schedule_authority["live_schedule_expr"],
         "kind": "cron",
     }
-    assert job["schedule_display"] == "*/15 * * * *"
+    assert job["schedule_display"] == schedule_authority["live_schedule_display"]
 
     contracts = json.loads(OUTCOME_CONTRACTS_PATH.read_text(encoding="utf-8"))
     contract = next(c for c in contracts["cron_jobs"] if c["id"] == PURELYMAIL_POLLER_JOB_ID)
     assert contract["name"] == "Purelymail notify-me poller"
     assert contract["enabled"] is True
-    assert contract["outcome"]["kind"] == "text_artifact"
-    assert "purelymail-poller.log" in contract["outcome"]["path"]
+    assert contract["outcome"]["kind"] == "cron_output"
+    assert contract["outcome"]["response_only"] is False
+    assert "polled" in contract["outcome"]["success_patterns"]
 
 
 def test_all_souls_are_direct_profile_personas():
