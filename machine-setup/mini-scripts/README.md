@@ -377,8 +377,14 @@ proof packet:
   1Password resolve with a random delay in the inclusive 0–120 second window.
   `SENTINEL_START_DELAY_MAX_SECONDS=0 SENTINEL_SMOKE_ONLY=1` performs the
   secrets-resolution smoke without running the monitor or emitting Slack.
-- `degraded_secrets_monitor.py` — detects repeated secret-resolution failures
-  and unresolved placeholders. Its SDK subprocess uses the immutable
+- `degraded_secrets_monitor.py` — detects repeated secret-resolution failures,
+  unresolved placeholders, and credential providers with no usable pool entry.
+  A provider with at least one usable entry remains healthy; its unavailable
+  entries appear only in sanitized `credential_pool_diagnostics` JSON and a
+  non-alerting reduced-redundancy log line. Exhausted entries are unavailable
+  only while a stored retry window is in the future; entries without an active
+  window are immediately retryable. `dead`, `invalid`, and `error` entries
+  remain unavailable. Its SDK subprocess uses the immutable
   `~/.hermes/runtime-current/venv/bin/python` path, not the removed mutable
   `~/.hermes/hermes-agent/venv/bin/python` checkout.
 - `tests/test_op_sdk_resolve.py` — fully mocked resolver contract harness:

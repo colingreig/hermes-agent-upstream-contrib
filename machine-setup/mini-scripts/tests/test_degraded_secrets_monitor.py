@@ -2,6 +2,7 @@
 """Contract tests for degraded secret-wrapper failure detection."""
 from __future__ import annotations
 
+import base64
 from datetime import datetime, timezone
 import importlib.util
 import json
@@ -34,6 +35,11 @@ def _write_auth(path, credential_pool):
     path.write_text(
         json.dumps({"version": 1, "providers": {}, "credential_pool": credential_pool})
     )
+
+
+def _jwt(claims):
+    encoded = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=")
+    return f"header.{encoded}.signature"
 
 
 class DegradedSecretsMonitorClassifierTests(unittest.TestCase):
@@ -116,10 +122,10 @@ class DegradedSecretsMonitorCredentialPoolTests(unittest.TestCase):
             _write_auth(
                 auth_file,
                 {
-                    "nous": [
-                        {"id": "a", "last_status": "ok"},
-                        {"id": "b", "last_status": None},
-                        {"id": "c", "last_status": "cooldown"},
+                    "openrouter": [
+                        {"id": "a", "access_token": "token-a", "last_status": "ok"},
+                        {"id": "b", "access_token": "token-b", "last_status": None},
+                        {"id": "c", "access_token": "token-c", "last_status": "cooldown"},
                     ]
                 },
             )
@@ -130,15 +136,21 @@ class DegradedSecretsMonitorCredentialPoolTests(unittest.TestCase):
         self.assertEqual(result["status"], "ok")
         self.assertEqual(result["hits"], [])
 
-    def test_degraded_statuses_trigger_and_sort_hits(self):
+    def test_all_unavailable_statuses_trigger_and_sort_hits(self):
         with tempfile.TemporaryDirectory() as tmp:
             auth_file = Path(tmp) / "auth.json"
             _write_auth(
                 auth_file,
                 {
-                    "xai": [{"id": "x", "last_status": "invalid"}],
-                    "codex": [{"id": "c", "last_status": "exhausted"}],
-                    "nous": [{"id": "n", "last_status": "error"}],
+                    "xai": [{"id": "x", "access_token": "x-token", "last_status": "invalid"}],
+                    "codex": [{
+                        "id": "c",
+                        "access_token": "c-token",
+                        "last_status": "exhausted",
+                        "last_error_reset_at": "2099-01-01T00:00:00Z",
+                    }],
+                    "nous": [{"id": "n", "access_token": "n-token", "last_status": "error"}],
+                    "openrouter": [{"id": "o", "access_token": "o-token", "last_status": "dead"}],
                 },
             )
 
@@ -150,8 +162,294 @@ class DegradedSecretsMonitorCredentialPoolTests(unittest.TestCase):
             [
                 {"provider": "codex", "id": "c", "status": "exhausted"},
                 {"provider": "nous", "id": "n", "status": "error"},
+                {"provider": "openrouter", "id": "o", "status": "dead"},
                 {"provider": "xai", "id": "x", "status": "invalid"},
             ],
+        )
+
+    def test_mixed_pool_is_healthy_with_sanitized_redundancy_diagnostics(self):
+        secret = "secret-value-that-must-not-leak"
+        payload = {
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "primary",
+                        "access_token": secret,
+                        "last_status": "exhausted",
+                        "last_error_reset_at": "2026-07-27T01:00:00Z",
+                    },
+                    {"id": "backup", "access_token": "backup-secret", "last_status": "ok"},
+                ]
+            }
+        }
+
+        result = monitor.classify_credential_pool(
+            payload,
+            datetime.fromisoformat(self.NOW),
+        )
+
+        self.assertFalse(result["triggered"])
+        self.assertEqual(result["hits"], [])
+        self.assertEqual(
+            result["credential_pool_diagnostics"],
+            [
+                {
+                    "provider": "openai-codex",
+                    "total_slot_count": 2,
+                    "usable_count": 1,
+                    "unavailable_count": 1,
+                    "unavailable_slots": [
+                        {
+                            "id": "primary",
+                            "status": "exhausted",
+                            "retry_at": "2026-07-27T01:00:00+00:00",
+                        }
+                    ],
+                }
+            ],
+        )
+        self.assertNotIn(secret, repr(result))
+        self.assertNotIn("backup-secret", repr(result))
+
+    def test_expired_exhaustion_cooldown_is_usable(self):
+        now = datetime.fromisoformat(self.NOW)
+        for entry in (
+            {
+                "id": "explicit-reset",
+                "access_token": "token",
+                "last_status": "exhausted",
+                "last_error_reset_at": "2026-07-26T23:59:59Z",
+            },
+            {
+                "id": "derived-reset",
+                "access_token": "token",
+                "last_status": "exhausted",
+                "last_status_at": "2026-07-26T23:54:59Z",
+                "last_error_code": 401,
+            },
+        ):
+            with self.subTest(entry=entry["id"]):
+                result = monitor.classify_credential_pool(
+                    {"credential_pool": {"openai-codex": [entry]}},
+                    now,
+                )
+                self.assertFalse(result["triggered"])
+                self.assertEqual(result["credential_pool_diagnostics"], [])
+
+    def test_exhausted_without_future_retry_window_is_immediately_usable(self):
+        now = datetime.fromisoformat(self.NOW)
+        entries = [
+            {
+                "id": "missing-timestamps",
+                "access_token": "token",
+                "last_status": "exhausted",
+            },
+            {
+                "id": "exact-boundary",
+                "access_token": "token",
+                "last_status": "exhausted",
+                "last_error_reset_at": now.timestamp(),
+            },
+        ]
+
+        result = monitor.classify_credential_pool(
+            {"credential_pool": {"openai-codex": entries}},
+            now,
+        )
+
+        self.assertFalse(result["triggered"])
+        self.assertEqual(result["credential_pool_diagnostics"], [])
+
+    def test_refresh_token_and_api_key_fields_are_not_selectable_credentials(self):
+        result = monitor.classify_credential_pool(
+            {
+                "credential_pool": {
+                    "openai-codex": [{"id": "refresh-only", "refresh_token": "secret"}],
+                    "openrouter": [{"id": "wrong-field", "api_key": "secret"}],
+                }
+            },
+            datetime.fromisoformat(self.NOW),
+        )
+
+        self.assertTrue(result["triggered"])
+        self.assertEqual(
+            result["hits"],
+            [
+                {"provider": "openai-codex", "id": "refresh-only", "status": "missing_credential"},
+                {"provider": "openrouter", "id": "wrong-field", "status": "missing_credential"},
+            ],
+        )
+        self.assertNotIn("secret", repr(result))
+
+    def test_nous_agent_key_requires_runtime_usable_inference_jwt(self):
+        now = datetime.fromisoformat(self.NOW)
+        valid_jwt = _jwt({"scope": "inference:invoke", "exp": now.timestamp() + 3600})
+        invalid_jwt = _jwt({"scope": "billing:manage", "exp": now.timestamp() + 3600})
+        result = monitor.classify_credential_pool(
+            {
+                "credential_pool": {
+                    "nous": [
+                        {"id": "valid", "agent_key": valid_jwt},
+                        {"id": "invalid", "agent_key": invalid_jwt},
+                    ]
+                }
+            },
+            now,
+        )
+
+        self.assertFalse(result["triggered"])
+        self.assertEqual(
+            result["credential_pool_diagnostics"][0]["unavailable_slots"],
+            [{"id": "invalid", "status": "missing_credential", "retry_at": None}],
+        )
+        self.assertNotIn(valid_jwt, repr(result))
+        self.assertNotIn(invalid_jwt, repr(result))
+
+    def test_empty_provider_is_unavailable_but_absent_pool_is_not(self):
+        now = datetime.fromisoformat(self.NOW)
+
+        empty = monitor.classify_credential_pool(
+            {"credential_pool": {"openai-codex": []}},
+            now,
+        )
+        absent = monitor.classify_credential_pool({}, now)
+
+        self.assertTrue(empty["triggered"])
+        self.assertEqual(
+            empty["hits"],
+            [{"provider": "openai-codex", "id": "pool", "status": "empty"}],
+        )
+        self.assertFalse(absent["triggered"])
+        self.assertEqual(absent["status"], "absent")
+
+    def test_supported_shapes_match_runtime_has_available(self):
+        from agent.credential_pool import CredentialPool, PooledCredential
+
+        now = datetime.fromisoformat(self.NOW)
+        now_epoch = now.timestamp()
+        valid_nous_jwt = _jwt({"scp": ["inference:invoke"], "exp": now_epoch + 3600})
+        wrong_scope_jwt = _jwt({"scope": "billing:manage", "exp": now_epoch + 3600})
+        nested_scope_jwt = _jwt({"scp": [["inference:invoke"]], "exp": now_epoch + 3600})
+        malformed_scope_jwt = _jwt({"scope": {"value": "inference:invoke"}, "exp": now_epoch + 3600})
+        boundary_jwt = _jwt({"scope": "inference:invoke", "exp": now_epoch + 120})
+        fallback_expiry_jwt = _jwt({"scope": "inference:invoke"})
+        cases = [
+            ("openrouter", [{"id": "valid", "auth_type": "api_key", "access_token": "token"}]),
+            ("openrouter", [{"id": "missing", "auth_type": "api_key", "access_token": ""}]),
+            (
+                "openai-codex",
+                [{
+                    "id": "active-cooldown",
+                    "auth_type": "api_key",
+                    "access_token": "token",
+                    "last_status": "exhausted",
+                    "last_error_reset_at": now_epoch + 60,
+                }],
+            ),
+            (
+                "openai-codex",
+                [{
+                    "id": "boundary",
+                    "auth_type": "api_key",
+                    "access_token": "token",
+                    "last_status": "exhausted",
+                    "last_error_reset_at": now_epoch,
+                }],
+            ),
+            (
+                "nous",
+                [{"id": "agent", "auth_type": "api_key", "access_token": "", "agent_key": valid_nous_jwt}],
+            ),
+            (
+                "nous",
+                [{"id": "wrong-scope", "auth_type": "api_key", "access_token": wrong_scope_jwt}],
+            ),
+            (
+                "nous",
+                [{"id": "nested-scope", "auth_type": "api_key", "access_token": nested_scope_jwt}],
+            ),
+            (
+                "nous",
+                [{"id": "malformed-scope", "auth_type": "api_key", "access_token": malformed_scope_jwt}],
+            ),
+            (
+                "nous",
+                [{"id": "expiry-boundary", "auth_type": "api_key", "access_token": boundary_jwt}],
+            ),
+            (
+                "nous",
+                [{
+                    "id": "expiry-fallback",
+                    "auth_type": "api_key",
+                    "access_token": fallback_expiry_jwt,
+                    "expires_at": "2026-07-27T01:00:00Z",
+                }],
+            ),
+            (
+                "nous",
+                [{"id": "invalid-jwt", "auth_type": "api_key", "access_token": "not-a-jwt"}],
+            ),
+        ]
+
+        for provider, entries in cases:
+            with self.subTest(provider=provider, entry=entries[0]["id"]):
+                runtime_entries = [PooledCredential.from_dict(provider, entry) for entry in entries]
+                with mock.patch("agent.credential_pool.time.time", return_value=now_epoch):
+                    with mock.patch("hermes_cli.auth.time.time", return_value=now_epoch):
+                        runtime_available = CredentialPool(provider, runtime_entries).has_available()
+                monitored = monitor.classify_credential_pool(
+                    {"credential_pool": {provider: entries}},
+                    now,
+                )
+                self.assertEqual(not monitored["triggered"], runtime_available)
+
+    def test_missing_and_malformed_entries_are_unavailable(self):
+        result = monitor.classify_credential_pool(
+            {
+                "credential_pool": {
+                    "codex": [
+                        {"id": "missing", "access_token": "  ", "last_status": "ok"},
+                        "not-an-entry",
+                    ],
+                    "malformed-provider": {"id": "not-a-list"},
+                }
+            },
+            datetime.fromisoformat(self.NOW),
+        )
+
+        self.assertTrue(result["triggered"])
+        self.assertEqual(
+            result["hits"],
+            [
+                {"provider": "codex", "id": "index:1", "status": "malformed"},
+                {"provider": "codex", "id": "missing", "status": "missing_credential"},
+                {"provider": "malformed-provider", "id": "index:0", "status": "malformed"},
+            ],
+        )
+
+    def test_provider_health_isolated_from_other_providers(self):
+        result = monitor.classify_credential_pool(
+            {
+                "credential_pool": {
+                    "healthy": [{"id": "ok", "access_token": "token", "last_status": "ok"}],
+                    "partial": [
+                        {"id": "bad", "access_token": "token", "last_status": "dead"},
+                        {"id": "ok", "access_token": "token", "last_status": "ok"},
+                    ],
+                    "outage": [{"id": "bad", "access_token": "token", "last_status": "error"}],
+                }
+            },
+            datetime.fromisoformat(self.NOW),
+        )
+
+        self.assertTrue(result["triggered"])
+        self.assertEqual(
+            result["hits"],
+            [{"provider": "outage", "id": "bad", "status": "error"}],
+        )
+        self.assertEqual(
+            [item["provider"] for item in result["credential_pool_diagnostics"]],
+            ["partial"],
         )
 
     def test_missing_malformed_and_absent_auth_are_not_degraded(self):
@@ -242,6 +540,99 @@ class DegradedSecretsMonitorCredentialPoolTests(unittest.TestCase):
             [{"provider": "nous", "id": "pool-1", "status": "error"}],
         )
 
+    def test_mixed_pool_json_is_healthy_and_alert_transports_stay_silent(self):
+        secret = "mixed-pool-secret-value"
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            home = base / "home"
+            hermes_home = home / ".hermes"
+            hermes_home.mkdir(parents=True)
+            auth_file = base / "auth.json"
+            log_file = base / "gateway.error.log"
+            log_file.write_text("")
+            _write_auth(
+                auth_file,
+                {
+                    "openai-codex": [
+                        {"id": "primary", "access_token": secret, "last_status": "dead"},
+                        {"id": "backup", "access_token": "backup-token", "last_status": "ok"},
+                    ]
+                },
+            )
+            env = os.environ.copy()
+            env.update({"DRY_RUN": "1", "HOME": str(home), "HERMES_HOME": str(hermes_home)})
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SOURCE),
+                    "--json",
+                    "--alert",
+                    "--log-file",
+                    str(log_file),
+                    "--auth-file",
+                    str(auth_file),
+                    "--now",
+                    self.NOW,
+                ],
+                capture_output=True,
+                text=True,
+                cwd=SCRIPT_DIR,
+                env=env,
+                check=False,
+            )
+
+        self.assertEqual(result.returncode, 0)
+        payload = json.loads(result.stdout)
+        self.assertFalse(payload["degraded"])
+        self.assertNotIn("credential_pool_diagnostics", payload["credential_pool"])
+        self.assertEqual(
+            payload["credential_pool_diagnostics"][0]["unavailable_slots"],
+            [{"id": "primary", "status": "dead", "retry_at": None}],
+        )
+        self.assertNotIn("DRY_RUN slack", result.stdout)
+        self.assertNotIn("DRY_RUN clickup", result.stdout)
+        self.assertNotIn(secret, result.stdout + result.stderr)
+
+    def test_mixed_pool_human_output_logs_reduced_redundancy_without_alert(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            auth_file = base / "auth.json"
+            log_file = base / "gateway.error.log"
+            log_file.write_text("")
+            _write_auth(
+                auth_file,
+                {
+                    "codex": [
+                        {"id": "primary", "access_token": "token", "last_status": "invalid"},
+                        {"id": "backup", "access_token": "token", "last_status": "ok"},
+                    ]
+                },
+            )
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SOURCE),
+                    "--log-file",
+                    str(log_file),
+                    "--auth-file",
+                    str(auth_file),
+                    "--now",
+                    self.NOW,
+                ],
+                capture_output=True,
+                text=True,
+                cwd=SCRIPT_DIR,
+                check=False,
+            )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("[degraded-secrets-monitor] healthy", result.stdout)
+        self.assertIn(
+            "credential pool reduced redundancy: provider=codex usable=1/2 unavailable=primary:invalid",
+            result.stdout,
+        )
+
     def test_dry_run_alert_formats_slack_and_clickup_without_secret_resolution(self):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
@@ -251,7 +642,17 @@ class DegradedSecretsMonitorCredentialPoolTests(unittest.TestCase):
             auth_file = base / "auth.json"
             log_file = base / "gateway.error.log"
             log_file.write_text("")
-            _write_auth(auth_file, {"codex": [{"id": "pool-1", "last_status": "exhausted"}]})
+            _write_auth(
+                auth_file,
+                {
+                    "codex": [{
+                        "id": "pool-1",
+                        "access_token": "token",
+                        "last_status": "exhausted",
+                        "last_error_reset_at": "2099-01-01T00:00:00Z",
+                    }]
+                },
+            )
             env = os.environ.copy()
             env.update({"DRY_RUN": "1", "HOME": str(home), "HERMES_HOME": str(hermes_home)})
             env.pop("CLICKUP_API_TOKEN", None)
@@ -312,7 +713,10 @@ class DegradedSecretsMonitorCredentialPoolTests(unittest.TestCase):
             auth_file = base / "auth.json"
             log_file = base / "gateway.error.log"
             log_file.write_text("")
-            _write_auth(auth_file, {"codex": [{"id": "pool-1", "last_status": "ok"}]})
+            _write_auth(
+                auth_file,
+                {"codex": [{"id": "pool-1", "access_token": "token", "last_status": "ok"}]},
+            )
             env = os.environ.copy()
             env.update({"DRY_RUN": "1", "HOME": str(home), "HERMES_HOME": str(hermes_home)})
 
