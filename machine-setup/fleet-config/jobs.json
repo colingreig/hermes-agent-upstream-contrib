@@ -724,11 +724,11 @@
       "id": "6e25865a22a4",
       "name": "Purelymail notify-me poller",
       "schedule": {
-        "display": "*/15 * * * *",
-        "expr": "*/15 * * * *",
+        "display": "*/45 * * * *",
+        "expr": "*/45 * * * *",
         "kind": "cron"
       },
-      "schedule_display": "*/15 * * * *",
+      "schedule_display": "*/45 * * * *",
       "enabled": true,
       "state": "scheduled",
       "no_agent": true,

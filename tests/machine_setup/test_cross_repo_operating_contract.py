@@ -16,6 +16,7 @@ CONTRACT_PATH = MACHINE_SETUP / "cross-repo-operating-contract.md"
 MANIFEST_PATH = MACHINE_SETUP / "ignite-email-infra.resource-manifest.json"
 MANIFEST_SCHEMA_PATH = MACHINE_SETUP / "ignite-email-infra.resource-manifest.schema.json"
 REGISTRY_PATH = MACHINE_SETUP / "production_mutation_registry.json"
+JOBS_PATH = MACHINE_SETUP / "fleet-config" / "jobs.json"
 INSTALLER_PATH = MACHINE_SETUP / "fleet-config" / "install_fleet_config.py"
 MINI_RELEASE_PATH = REPO_ROOT / "scripts" / "mini-release-cut.sh"
 
@@ -55,6 +56,20 @@ def test_resource_manifest_matches_schema_and_registry_resource():
     registry = json.loads(REGISTRY_PATH.read_text(encoding="utf-8"))
     resource_ids = {row["id"] for row in registry["resources"]}
     assert manifest["registry_resource_id"] in resource_ids
+    schedule_authority = manifest["cron_schedule_authority"]
+    jobs = {
+        job["id"]: job
+        for job in json.loads(JOBS_PATH.read_text(encoding="utf-8"))["jobs"]
+    }
+    poller_job = jobs[schedule_authority["hermes_cron_job_id"]]
+    assert poller_job["name"] == schedule_authority["job_name"]
+    assert poller_job["schedule"]["expr"] == schedule_authority["live_schedule_expr"]
+    assert poller_job["schedule"]["display"] == schedule_authority["live_schedule_display"]
+    assert poller_job["schedule_display"] == schedule_authority["live_schedule_display"]
+    poller_actor = next(
+        actor for actor in registry["actors"] if actor["id"] == "purelymail-poller-cron"
+    )
+    assert schedule_authority["live_schedule_expr"] in poller_actor["notes"]
     path_ids = {entry["path"] for entry in manifest["paths"]}
     assert "~/.hermes/deploy/purelymail-poller/" in path_ids
     assert "~/.hermes/state/purelymail-poller/.lock" in path_ids
