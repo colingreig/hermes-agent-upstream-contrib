@@ -40,6 +40,8 @@ RUNTIME_JOB_FIELDS = {
     "last_delivery_error",
     "paused_at",
     "paused_reason",
+    "fire_claim",
+    "run_claim",
 }
 
 
@@ -162,7 +164,14 @@ def _semantic_overlay_matches(live: Any, overlay: Any, path: str = "") -> None:
 
 
 def _managed_job(job: dict[str, Any]) -> dict[str, Any]:
-    return {key: value for key, value in job.items() if key not in RUNTIME_JOB_FIELDS}
+    managed = {key: value for key, value in job.items() if key not in RUNTIME_JOB_FIELDS}
+    # Scheduler progress is runtime metadata, but the configured repeat limit
+    # remains governed.  Copy before removing the live completion count.
+    if isinstance(managed.get("repeat"), dict):
+        repeat = dict(managed["repeat"])
+        repeat.pop("completed", None)
+        managed["repeat"] = repeat
+    return managed
 
 
 class GovernedPathsVerifier:
