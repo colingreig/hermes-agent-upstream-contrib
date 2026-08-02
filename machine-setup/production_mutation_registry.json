@@ -476,6 +476,29 @@
       }
     },
     {
+      "id": "purelymail-poller-cron",
+      "name": "PurelyMail notify-me poller",
+      "actor_class": "cron",
+      "owning_repository": "ignite-email-infra",
+      "mutability": "mutating",
+      "entry_points": [
+        "~/.hermes/scripts/purelymail-notify-poller.py",
+        "ignite-email-infra: deploy-poller.sh (external repository)"
+      ],
+      "cron_job_ids": ["6e25865a22a4"],
+      "resources_touched": ["purelymail-poller-deploy", "cron-jobs", "governed-mini-scripts"],
+      "current_lock_or_transaction_boundary": {
+        "kind": "cron jobs advisory lock and deployed poller manifest verification",
+        "path_or_identity": "~/.hermes/cron/.jobs.lock",
+        "behavior": "The no-agent cron runs the hash-verified poller script installed by ignite-email-infra; scheduler serialization uses the cron jobs lock."
+      },
+      "rollback_surface": {
+        "surface": "~/.hermes/deploy/purelymail-poller/ previous deployed artifact and cron output",
+        "procedure": "Restore the prior verified poller release through ignite-email-infra deploy rollback; do not hand-edit live poller bytes under ~/.hermes/scripts/."
+      },
+      "notes": "Fleet jobs.json registers the Hermes cron schedule (*/15 * * * *); script bytes and deploy contract remain owned by ignite-email-infra."
+    },
+    {
       "id": "ignite-email-infra-poller-deploy",
       "name": "PurelyMail poller deploy",
       "actor_class": "ignite-email-infra-deploy",
