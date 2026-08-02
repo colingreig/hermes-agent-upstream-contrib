@@ -26,6 +26,13 @@
       "sha256": "634427e6c7c45d485183074e95e14b719b7a2065a52ea2f5022b875995548e14"
     },
     {
+      "source": "verify_governed_paths.py",
+      "destination_root": "scripts",
+      "destination": "verify_governed_paths.py",
+      "mode": "0755",
+      "sha256": "92e07351cf2bffcaedea505a641d46f0b6da3cc702c8ac4c36ddbcc5bf624473"
+    },
+    {
       "source": "fleet_outcome_contracts.json",
       "destination_root": "scripts",
       "destination": "fleet_outcome_contracts.json",

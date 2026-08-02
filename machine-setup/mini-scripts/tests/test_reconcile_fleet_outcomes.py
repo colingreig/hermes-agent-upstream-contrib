@@ -202,7 +202,7 @@ def test_repository_manifest_is_content_addressed() -> None:
             home=home,
         )
         reconciler.validate_sources()
-        assert len(reconciler.manifest["files"]) == 10
+        assert len(reconciler.manifest["files"]) == 11
         assert reconciler.manifest["cron_updates"] == [
             {
                 "id": "e835c614cfb2",

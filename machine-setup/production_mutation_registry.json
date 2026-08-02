@@ -128,6 +128,20 @@
       "rollback_surface": {
         "surface": "~/.hermes/logs/fleet-config-installs/<receipt>/destinations",
         "procedure": "Installer rollback restores planned snapshots; operator may inspect the receipt before a targeted recovery."
+      },
+      "operational_pointers": {
+        "activation": {
+          "entry_point": "machine-setup/fleet-config/install_fleet_config.py",
+          "command": "python3 install_fleet_config.py --home <home>"
+        },
+        "rollback": {
+          "entry_point": "machine-setup/fleet-config/install_fleet_config.py::_rollback",
+          "command": "automatic snapshot rollback on an install failure; inspect its receipt before targeted recovery"
+        },
+        "verification": {
+          "entry_point": "machine-setup/mini-scripts/verify_governed_paths.py",
+          "command": "python3 verify_governed_paths.py --home <home>"
+        }
       }
     },
     {
@@ -146,6 +160,52 @@
       "rollback_surface": {
         "surface": "~/.hermes/releases/.previous and .mini-release-last-receipt.json",
         "procedure": "mini-release-cut.sh --rollback repoints runtime-current to the verified previous release and restarts services."
+      },
+      "operational_pointers": {
+        "activation": {
+          "entry_point": "scripts/mini-release-cut.sh",
+          "command": "mini-release-cut.sh --ref <sha-or-ref> --certified-sha <full-sha> --promotion-receipt-id <sha256>"
+        },
+        "rollback": {
+          "entry_point": "scripts/mini-release-cut.sh",
+          "command": "mini-release-cut.sh --rollback"
+        },
+        "verification": {
+          "entry_point": "machine-setup/mini-scripts/verify_governed_paths.py",
+          "command": "python3 verify_governed_paths.py --home <home>"
+        }
+      }
+    },
+    {
+      "id": "fleet-outcomes-reconciler",
+      "name": "Fleet outcomes reconciler",
+      "actor_class": "conductor-ssh",
+      "owning_repository": "hermes-agent",
+      "mutability": "mutating",
+      "entry_points": ["machine-setup/mini-scripts/reconcile_fleet_outcomes.py"],
+      "resources_touched": ["governed-mini-scripts", "cron-jobs"],
+      "current_lock_or_transaction_boundary": {
+        "kind": "snapshot-backed reconciliation under the cron jobs advisory lock",
+        "path_or_identity": "~/.hermes/releases/fleet-outcomes and ~/.hermes/cron/.jobs.lock",
+        "behavior": "Hash-verifies every declared source, atomically replaces only manifest targets, and restores the recorded snapshot if verification fails."
+      },
+      "rollback_surface": {
+        "surface": "~/.hermes/releases/fleet-outcomes/previous and snapshots/<sha256>.json",
+        "procedure": "reconcile_fleet_outcomes.py rollback restores the exact prior scripts, LaunchAgents, and cron document from its content-addressed snapshot."
+      },
+      "operational_pointers": {
+        "activation": {
+          "entry_point": "machine-setup/mini-scripts/reconcile_fleet_outcomes.py",
+          "command": "python3 reconcile_fleet_outcomes.py install --home <home> --reload"
+        },
+        "rollback": {
+          "entry_point": "machine-setup/mini-scripts/reconcile_fleet_outcomes.py",
+          "command": "python3 reconcile_fleet_outcomes.py rollback --home <home> --reload"
+        },
+        "verification": {
+          "entry_point": "machine-setup/mini-scripts/verify_governed_paths.py",
+          "command": "python3 verify_governed_paths.py --home <home>"
+        }
       }
     },
     {
