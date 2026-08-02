@@ -4,6 +4,7 @@ from __future__ import annotations
 from datetime import timedelta
 from pathlib import Path
 import sqlite3
+import threading
 
 import pytest
 
@@ -75,6 +76,58 @@ def test_expired_owner_is_fenced_before_any_successor_mutation(monkeypatch, tmp_
     assert successor.fencing_token > owner.fencing_token
     with pytest.raises(leases.ProductionWriteLeaseError, match="ownership/fence"):
         leases.fence_mutation(lease_id=owner.lease_id, actor=owner.actor, session_id=owner.session_id, fencing_token=owner.fencing_token)
+
+
+def test_paused_owner_cannot_resume_a_protected_write_after_successor_takeover(monkeypatch, tmp_path):
+    """A guard blocks takeover while paused, then fences its resumed owner."""
+    leases = _store(monkeypatch, tmp_path)
+    owner = _acquire(leases)
+    entered = threading.Event()
+    resume = threading.Event()
+    protected = tmp_path / "write-inside-live-guard"
+
+    def paused_mutation():
+        with leases.mutation_guard(
+            lease_id=owner.lease_id, actor=owner.actor, session_id=owner.session_id,
+            fencing_token=owner.fencing_token,
+        ):
+            entered.set()
+            assert resume.wait(timeout=5)
+            protected.write_text("owned write", encoding="utf-8")
+
+    worker = threading.Thread(target=paused_mutation)
+    worker.start()
+    assert entered.wait(timeout=5)
+    # The open guard holds the SQLite writer transaction, so a successor
+    # cannot acquire/recover and write while the protected mutation is paused.
+    with pytest.raises(leases.ProductionWriteLeaseError, match="database remained busy"):
+        _acquire(leases, session="blocked-successor")
+    resume.set()
+    worker.join(timeout=5)
+    assert not worker.is_alive()
+    assert protected.read_text(encoding="utf-8") == "owned write"
+
+    owner = leases.status()["active_leases"][0]
+    # The paused writer expires and an evidence-backed operator recovery
+    # authorizes successor takeover; it must still fail at the exact write.
+    monkeypatch.setattr(
+        leases, "_now", lambda: leases.datetime.fromisoformat(owner["expires_at"]) + timedelta(seconds=1)
+    )
+    leases.recover_expired(
+        lease_id=owner["lease_id"], actor=owner["actor"], session_id=owner["session_id"],
+        fencing_token=owner["fencing_token"], recovered_by="operator",
+        reason="paused owner takeover", evidence={"proof": "owner paused after heartbeat"},
+    )
+    successor = _acquire(leases, session="successor")
+    target = tmp_path / "must-not-be-written-by-old-owner"
+    with pytest.raises(leases.ProductionWriteLeaseError, match="ownership/fence"):
+        with leases.mutation_guard(
+            lease_id=owner["lease_id"], actor=owner["actor"], session_id=owner["session_id"],
+            fencing_token=owner["fencing_token"],
+        ):
+            target.write_text("stale write", encoding="utf-8")
+    assert successor.fencing_token > owner["fencing_token"]
+    assert not target.exists()
 
 
 def test_recovery_receipt_is_immutable(monkeypatch, tmp_path):

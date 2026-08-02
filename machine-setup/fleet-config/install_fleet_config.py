@@ -48,6 +48,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import datetime as _dt
 import errno
 import fcntl
@@ -147,6 +148,38 @@ def _heartbeat_production_write_lease(lease, *, home: Path) -> Any:
         )
     except production_write_lease.ProductionWriteLeaseError as exc:
         raise InstallError(f"production write lease heartbeat failed: {exc}") from exc
+
+
+@contextmanager
+def _protected_mutation(lease_box: dict[str, Any], *, home: Path):
+    """Fence the precise durable mutation in this block, not just its phase.
+
+    ``mutation_guard`` holds the lease transaction across the filesystem
+    operation, preventing a paused owner from resuming after a successor
+    commits takeover between a heartbeat and the actual write.
+    """
+    lease = lease_box["value"]
+    try:
+        with production_write_lease.mutation_guard(
+            lease_id=lease.lease_id, actor=lease.actor, session_id=lease.session_id,
+            fencing_token=lease.fencing_token,
+            database_path=home / ".hermes" / "state" / "production-write-lease.db",
+        ) as refreshed:
+            yield
+        lease_box["value"] = refreshed
+    except production_write_lease.ProductionWriteLeaseError as exc:
+        raise InstallError(f"production write lease mutation guard failed: {exc}") from exc
+
+
+def _protected_atomic_write(lease_box: dict[str, Any], *, home: Path, dest: Path, data: bytes) -> None:
+    with _protected_mutation(lease_box, home=home):
+        _atomic_write(dest, data)
+
+
+def _refresh_lease(lease_box: dict[str, Any], *, home: Path) -> Any:
+    """Keep liveness fresh between mutations; writes still use the guard."""
+    lease_box["value"] = _heartbeat_production_write_lease(lease_box["value"], home=home)
+    return lease_box["value"]
 
 
 def _release_production_write_lease(lease, *, home: Path) -> None:
@@ -1506,7 +1539,16 @@ def install(
         print("\ndry-run: verified all source hashes; wrote nothing.")
         return 0
 
-    lock_fd = _acquire_install_lock(destination_root)
+    # Acquire before even the installer lock or receipt/snapshot directories:
+    # those are durable governed artifacts too, not harmless preparation.
+    write_lease = _acquire_production_write_lease(home=home, bundle_root=bundle_root)
+    lease_box: dict[str, Any] = {"value": write_lease}
+    try:
+        with _protected_mutation(lease_box, home=home):
+            lock_fd = _acquire_install_lock(destination_root)
+    except Exception:
+        _release_production_write_lease(lease_box["value"], home=home)
+        raise
     try:
         # Another installer may have finished while this run waited for the
         # lock, so re-plan after acquisition. In particular, skill-policy
@@ -1518,16 +1560,18 @@ def install(
             skill_policy_path=skill_policy_path,
         )
         stamp = _utc_stamp()
-        snapshot_dir = _create_snapshot_dir(destination_root, stamp)
-        backup_stamp = snapshot_dir.name
-        shutil.copy2(manifest_path, snapshot_dir / manifest_path.name)
+        with _protected_mutation(lease_box, home=home):
+            snapshot_dir = _create_snapshot_dir(destination_root, stamp)
+            backup_stamp = snapshot_dir.name
+            shutil.copy2(manifest_path, snapshot_dir / manifest_path.name)
     except Exception:
         _release_install_lock(lock_fd)
+        _release_production_write_lease(lease_box["value"], home=home)
         raise
 
     # This local lock serializes this installer; the fenced lease additionally
     # serializes it with every other registered production writer.
-    write_lease = _acquire_production_write_lease(home=home, bundle_root=bundle_root)
+    write_lease = lease_box["value"]
     receipt: dict[str, Any] = {
         "bundle": manifest.get("bundle", "fleet-config"),
         "source_task": manifest.get("source_task"),
@@ -1562,14 +1606,16 @@ def install(
         reparsed = yaml.safe_load(rendered)
         if reparsed != merged:
             raise InstallError("rendered config.yaml did not round-trip through YAML parse — refusing to write")
-        snapshot = _backup(
-            dest,
-            snapshot_dir,
-            destination_root,
-            "fleet-config",
-            backup_stamp,
-            private=True,
-        )
+        with _protected_mutation(lease_box, home=home):
+            snapshot = _backup(
+                dest,
+                snapshot_dir,
+                destination_root,
+                "fleet-config",
+                backup_stamp,
+                private=True,
+            )
+        write_lease = lease_box["value"]
         step = {
             "step": "config_overlay",
             "dest": str(dest),
@@ -1580,8 +1626,9 @@ def install(
             "status": "installing",
         }
         receipt["steps"].append(step)
-        write_lease = _heartbeat_production_write_lease(write_lease, home=home)
-        _write_private(dest, rendered.encode("utf-8"))
+        _refresh_lease(lease_box, home=home)
+        _protected_atomic_write(lease_box, home=home, dest=dest, data=rendered.encode("utf-8"))
+        write_lease = lease_box["value"]
         # Re-verify the deployed bytes parse cleanly.
         deployed = yaml.safe_load(dest.read_text(encoding="utf-8"))
         if deployed != merged:
@@ -1589,7 +1636,7 @@ def install(
         if _config_mode(dest) != SKILL_POLICY_CONFIG_MODE:
             raise InstallError(f"deployed {dest} mode is not 0600 — restoring snapshot")
         step["status"] = "installed"
-        write_lease = _heartbeat_production_write_lease(write_lease, home=home)
+        _refresh_lease(lease_box, home=home)
 
         # --- Step 1b: normalize legacy root config backup permissions ---
         # These backups pre-date the private-backup behavior in _backup and
@@ -1615,27 +1662,30 @@ def install(
                 }
                 receipt["steps"].append(mode_step)
                 if prior_mode != SKILL_POLICY_CONFIG_MODE:
-                    write_lease = _heartbeat_production_write_lease(write_lease, home=home)
-                    os.fchmod(fd, SKILL_POLICY_CONFIG_MODE)
+                    with _protected_mutation(lease_box, home=home):
+                        os.fchmod(fd, SKILL_POLICY_CONFIG_MODE)
+                    write_lease = lease_box["value"]
                     if stat.S_IMODE(os.fstat(fd).st_mode) != SKILL_POLICY_CONFIG_MODE:
                         raise InstallError(f"legacy config backup {path} mode is not 0600")
                     mode_step["status"] = "installed"
             finally:
                 os.close(fd)
-        write_lease = _heartbeat_production_write_lease(write_lease, home=home)
+        _refresh_lease(lease_box, home=home)
 
         # --- Step 2: profiles/ ---
         for item in plan["profiles"]:
             pdest = item["dest"]
             is_profile_config = pdest.name == "config.yaml"
-            psnapshot = _backup(
-                pdest,
-                snapshot_dir,
-                destination_root,
-                f"fleet-config-profile-{pdest.parent.name}",
-                backup_stamp,
-                private=is_profile_config,
-            )
+            with _protected_mutation(lease_box, home=home):
+                psnapshot = _backup(
+                    pdest,
+                    snapshot_dir,
+                    destination_root,
+                    f"fleet-config-profile-{pdest.parent.name}",
+                    backup_stamp,
+                    private=is_profile_config,
+                )
+            write_lease = lease_box["value"]
             data = item["src"].read_bytes()
             step = {
                 "step": "profile_file",
@@ -1647,11 +1697,12 @@ def install(
                 "status": "installing",
             }
             receipt["steps"].append(step)
-            write_lease = _heartbeat_production_write_lease(write_lease, home=home)
+            _refresh_lease(lease_box, home=home)
             if is_profile_config:
-                _write_private(pdest, data)
+                _protected_atomic_write(lease_box, home=home, dest=pdest, data=data)
             else:
-                _atomic_write(pdest, data)
+                _protected_atomic_write(lease_box, home=home, dest=pdest, data=data)
+            write_lease = lease_box["value"]
             deployed_sha = _sha256(pdest)
             if deployed_sha != item["sha256"]:
                 raise InstallError(
@@ -1667,15 +1718,15 @@ def install(
         for name in profile_names:
             profile_dir = home / ".hermes" / "profiles" / name
             for subdir in PROFILE_BOOTSTRAP_DIRS:
-                write_lease = _heartbeat_production_write_lease(write_lease, home=home)
-                (profile_dir / subdir).mkdir(parents=True, exist_ok=True)
+                with _protected_mutation(lease_box, home=home):
+                    (profile_dir / subdir).mkdir(parents=True, exist_ok=True)
+                write_lease = lease_box["value"]
             receipt["steps"].append({
                 "step": "profile_bootstrap_dirs",
                 "profile": name,
                 "dirs": PROFILE_BOOTSTRAP_DIRS,
                 "status": "ensured",
             })
-        write_lease = _heartbeat_production_write_lease(write_lease, home=home)
 
         # --- Step 3: cron/jobs.json (fail-closed JSON validate) ---
         jobs_item = plan["jobs_json"]
@@ -1687,7 +1738,9 @@ def install(
             raise InstallError(f"bundled jobs.json is not valid JSON: {exc}") from exc
         if "jobs" not in parsed or not isinstance(parsed["jobs"], list):
             raise InstallError("bundled jobs.json has no top-level 'jobs' list — refusing")
-        jsnapshot = _backup(jdest, snapshot_dir, destination_root, "fleet-config-jobs", backup_stamp)
+        with _protected_mutation(lease_box, home=home):
+            jsnapshot = _backup(jdest, snapshot_dir, destination_root, "fleet-config-jobs", backup_stamp)
+        write_lease = lease_box["value"]
         step = {
             "step": "jobs_json",
             "dest": str(jdest),
@@ -1697,8 +1750,8 @@ def install(
             "status": "installing",
         }
         receipt["steps"].append(step)
-        write_lease = _heartbeat_production_write_lease(write_lease, home=home)
-        _atomic_write(jdest, new_bytes)
+        _protected_atomic_write(lease_box, home=home, dest=jdest, data=new_bytes)
+        write_lease = lease_box["value"]
         deployed_sha = _sha256(jdest)
         if deployed_sha != jobs_item["sha256"]:
             raise InstallError(
@@ -1706,22 +1759,23 @@ def install(
                 f"{jobs_item['sha256']} — restoring snapshot"
             )
         step["status"] = "installed"
-        write_lease = _heartbeat_production_write_lease(write_lease, home=home)
 
         # --- Step 4: Mini-specific skill policy ---
         # Runs only after jobs.json is installed, so the direct-executor fleet
         # contract is in place before humanizer is removed from active homes.
         if skill_policy is not None:
-            write_lease = _heartbeat_production_write_lease(write_lease, home=home)
-            _apply_skill_policy(
-                skill_policy,
-                skill_actions,
-                destination_root=destination_root,
-                snapshot_dir=snapshot_dir,
-                stamp=stamp,
-                receipt_steps=receipt["steps"],
-            )
-            write_lease = _heartbeat_production_write_lease(write_lease, home=home)
+            # The policy operation includes tar snapshots, moves, deletes and
+            # receipt state; retain one guard across that single transaction.
+            with _protected_mutation(lease_box, home=home):
+                _apply_skill_policy(
+                    skill_policy,
+                    skill_actions,
+                    destination_root=destination_root,
+                    snapshot_dir=snapshot_dir,
+                    stamp=stamp,
+                    receipt_steps=receipt["steps"],
+                )
+            write_lease = lease_box["value"]
 
     except InstallError as exc:
         receipt["result"] = "failed"
@@ -1730,11 +1784,15 @@ def install(
         receipt["production_write_lease"] = write_lease.as_dict()
         if may_rollback:
             lease_box = {"value": write_lease}
-            def rollback_guard() -> bool:
+            @contextmanager
+            def rollback_guard():
                 lease_box["value"], allowed = _best_effort_fence_for_rollback(
                     lease_box["value"], home=home, receipt=receipt
                 )
-                return allowed
+                if not allowed:
+                    raise InstallError("production write lease lost before rollback mutation")
+                with _protected_mutation(lease_box, home=home):
+                    yield
             if not _rollback(receipt["steps"], guard=rollback_guard):
                 receipt["rollback_refused_after_fence_loss"] = True
             write_lease = lease_box["value"]
@@ -1754,29 +1812,42 @@ def install(
         receipt["production_write_lease"] = write_lease.as_dict()
         if may_rollback:
             lease_box = {"value": write_lease}
-            def rollback_guard() -> bool:
+            @contextmanager
+            def rollback_guard():
                 lease_box["value"], allowed = _best_effort_fence_for_rollback(
                     lease_box["value"], home=home, receipt=receipt
                 )
-                return allowed
+                if not allowed:
+                    raise InstallError("production write lease lost before rollback mutation")
+                with _protected_mutation(lease_box, home=home):
+                    yield
             if not _rollback(receipt["steps"], guard=rollback_guard):
                 receipt["rollback_refused_after_fence_loss"] = True
             write_lease = lease_box["value"]
         receipt_path = snapshot_dir / "install-receipt.json"
-        with open(receipt_path, "w", encoding="utf-8") as fh:
-            json.dump(receipt, fh, indent=2)
-            fh.write("\n")
-        print(f"receipt: {receipt_path}")
+        try:
+            _protected_atomic_write(
+                lease_box, home=home, dest=receipt_path,
+                data=(json.dumps(receipt, indent=2) + "\n").encode("utf-8"),
+            )
+            write_lease = lease_box["value"]
+            print(f"receipt: {receipt_path}")
+        except InstallError as receipt_exc:
+            # A receipt is also governed state.  Preserve the original write
+            # failure while refusing to let a stale owner create one.
+            print(f"WARNING: failure receipt refused after fence loss: {receipt_exc}", file=sys.stderr)
         print(f"install FAILED and was rolled back where possible: {receipt['failure_detail']}", file=sys.stderr)
         _release_production_write_lease(write_lease, home=home)
         _release_install_lock(lock_fd)
         raise
 
     receipt_path = snapshot_dir / "install-receipt.json"
-    receipt["production_write_lease"] = write_lease.as_dict()
-    with open(receipt_path, "w", encoding="utf-8") as fh:
-        json.dump(receipt, fh, indent=2)
-        fh.write("\n")
+    receipt["production_write_lease"] = lease_box["value"].as_dict()
+    _protected_atomic_write(
+        lease_box, home=home, dest=receipt_path,
+        data=(json.dumps(receipt, indent=2) + "\n").encode("utf-8"),
+    )
+    write_lease = lease_box["value"]
 
     print(f"receipt: {receipt_path}")
     if receipt["result"] != "success":
@@ -1792,6 +1863,14 @@ def install(
 
 def _rollback(steps: list[dict], *, guard=None) -> bool:
     """Best-effort restore of already-written destinations from their snapshots."""
+    @contextmanager
+    def boundary():
+        if guard is None:
+            yield
+        else:
+            with guard():
+                yield
+
     for rec in reversed(steps):
         if rec.get("rollback") == "chmod-mode":
             dest = rec.get("dest")
@@ -1800,19 +1879,20 @@ def _rollback(steps: list[dict], *, guard=None) -> bool:
                 continue
             path = Path(dest)
             try:
-                if guard is not None and not guard():
-                    return False
-                current = path.lstat()
-                if (current.st_dev, current.st_ino) != (rec.get("device"), rec.get("inode")):
-                    raise InstallError(f"identity changed; refusing chmod rollback for {path}")
-                fd = _open_regular_file_no_follow(path, expected=current)
-                try:
-                    os.fchmod(fd, int(prior_mode, 8))
-                finally:
-                    os.close(fd)
+                with boundary():
+                    current = path.lstat()
+                    if (current.st_dev, current.st_ino) != (rec.get("device"), rec.get("inode")):
+                        raise InstallError(f"identity changed; refusing chmod rollback for {path}")
+                    fd = _open_regular_file_no_follow(path, expected=current)
+                    try:
+                        os.fchmod(fd, int(prior_mode, 8))
+                    finally:
+                        os.close(fd)
                 rec["status"] = "rolled-back"
             except (OSError, InstallError, ValueError) as exc:  # pragma: no cover - best-effort rollback
                 print(f"  ROLLBACK WARNING: could not restore mode for {dest}: {exc}", file=sys.stderr)
+                if isinstance(exc, InstallError) and "production write lease" in str(exc):
+                    return False
             continue
         if rec.get("rollback") == "move-back":
             source = rec.get("source")
@@ -1820,41 +1900,43 @@ def _rollback(steps: list[dict], *, guard=None) -> bool:
             if not source or not archive_dest:
                 continue
             try:
-                if guard is not None and not guard():
-                    return False
-                source_path = Path(source)
-                archive_path = Path(archive_dest)
-                if archive_path.exists() and not source_path.exists():
-                    source_path.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.move(str(archive_path), str(source_path))
+                with boundary():
+                    source_path = Path(source)
+                    archive_path = Path(archive_dest)
+                    if archive_path.exists() and not source_path.exists():
+                        source_path.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.move(str(archive_path), str(source_path))
                 rec["status"] = "rolled-back"
-            except OSError as exc:  # pragma: no cover - best-effort rollback
+            except (OSError, InstallError) as exc:  # pragma: no cover - best-effort rollback
                 print(f"  ROLLBACK WARNING: could not restore {source}: {exc}", file=sys.stderr)
+                if isinstance(exc, InstallError) and "production write lease" in str(exc):
+                    return False
             continue
         snapshot = rec.get("snapshot")
         dest = rec.get("dest")
         if not dest:
             continue
         try:
-            if guard is not None and not guard():
-                return False
-            if snapshot:
-                Path(dest).parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(snapshot, dest)
-            elif rec.get("created"):
-                path = Path(dest)
-                if path.is_dir():
-                    shutil.rmtree(path)
-                elif path.exists() or path.is_symlink():
-                    path.unlink()
-                cleanup_root = rec.get("cleanup_root")
-                if cleanup_root:
-                    _remove_empty_skill_parents(path, Path(cleanup_root))
-            else:
-                continue
+            with boundary():
+                if snapshot:
+                    Path(dest).parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(snapshot, dest)
+                elif rec.get("created"):
+                    path = Path(dest)
+                    if path.is_dir():
+                        shutil.rmtree(path)
+                    elif path.exists() or path.is_symlink():
+                        path.unlink()
+                    cleanup_root = rec.get("cleanup_root")
+                    if cleanup_root:
+                        _remove_empty_skill_parents(path, Path(cleanup_root))
+                else:
+                    continue
             rec["status"] = "rolled-back"
-        except OSError as exc:  # pragma: no cover - best-effort rollback
+        except (OSError, InstallError) as exc:  # pragma: no cover - best-effort rollback
             print(f"  ROLLBACK WARNING: could not restore {dest}: {exc}", file=sys.stderr)
+            if isinstance(exc, InstallError) and "production write lease" in str(exc):
+                return False
     return True
 
 

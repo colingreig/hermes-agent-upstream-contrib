@@ -6,6 +6,7 @@ executor admission lease protects one logical agent-dispatch surface.
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 import json
@@ -321,6 +322,59 @@ def fence_mutation(*, lease_id: str, actor: str, session_id: str, fencing_token:
         fencing_token=fencing_token,
         lease_seconds=lease_seconds, database_path=database_path,
     )
+
+
+@contextmanager
+def mutation_guard(*, lease_id: str, actor: str, session_id: str, fencing_token: int,
+                   lease_seconds: int = DEFAULT_LEASE_SECONDS,
+                   database_path: Path | None = None):
+    """Hold ownership and the fencing CAS across one filesystem mutation.
+
+    A heartbeat before a write alone leaves a stale-owner gap.  The guard
+    keeps the same SQLite writer transaction used for acquisition/recovery
+    open until its body completes, so successor takeover and the filesystem
+    commit boundary cannot interleave on this host.
+    """
+    if not all(isinstance(value, str) and value for value in (lease_id, actor, session_id)) or not isinstance(fencing_token, int):
+        raise ProductionWriteLeaseError("lease identity is invalid")
+    if not isinstance(lease_seconds, int) or lease_seconds <= 0:
+        raise ProductionWriteLeaseError("lease_seconds must be a positive integer")
+    conn = _connect(database_path)
+    try:
+        _transaction(conn)
+        row = conn.execute(
+            "SELECT * FROM active_leases WHERE lease_id=? AND actor=? AND session_id=? AND fencing_token=?",
+            (lease_id, actor, session_id, fencing_token),
+        ).fetchone()
+        if row is None:
+            raise ProductionWriteLeaseError("production write lease ownership/fence no longer matches")
+        now = _now()
+        now_text = _iso(now)
+        if row["expires_at"] <= now_text:
+            raise ProductionWriteLeaseError("production write lease has expired")
+        revision = int(row["revision"]) + 1
+        expires = _iso(now + timedelta(seconds=lease_seconds))
+        cur = conn.execute(
+            "UPDATE active_leases SET heartbeat_at=?, expires_at=?, revision=? "
+            "WHERE lease_id=? AND actor=? AND session_id=? AND fencing_token=? AND revision=?",
+            (now_text, expires, revision, lease_id, actor, session_id, fencing_token, row["revision"]),
+        )
+        if cur.rowcount != 1:
+            raise ProductionWriteLeaseError("production write lease mutation guard CAS failed")
+        conn.execute(
+            "UPDATE lease_history SET heartbeat_at=?, expires_at=?, revision=? "
+            "WHERE fencing_token=? AND state='active'",
+            (now_text, expires, revision, fencing_token),
+        )
+        guarded = _row(conn.execute("SELECT * FROM active_leases WHERE lease_id=?", (lease_id,)).fetchone())
+        yield guarded
+        conn.execute("COMMIT")
+    except Exception:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
 
 
 def release(*, lease_id: str, actor: str, session_id: str, fencing_token: int, database_path: Path | None = None) -> None:
