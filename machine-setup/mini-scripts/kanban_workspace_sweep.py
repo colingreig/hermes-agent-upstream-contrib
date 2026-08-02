@@ -48,20 +48,44 @@ Safety rules (fail closed):
     dir).
   - A task whose status isn't terminal (``done`` or ``archived``) is never
     touched, regardless of age — active/blocked/in-review work is always
-    protected.
+    protected. The ONE exception is the stale-``blocked`` backstop below,
+    and even that never does a bare delete — see below.
   - A directory with NO matching task row at all (orphan — task deleted from
     the DB, or a leftover from before a schema change) is swept by age alone.
   - Age gate: only removes dirs whose mtime is older than --days (default 14
     — a bit more conservative than the worktree backstop's 7, since a scratch
     workspace can be the only copy of a swarm's handoff artifacts).
-  - --dry-run lists candidates without removing anything.
+  - Stale-``blocked`` backstop: a task can sit in ``blocked`` status
+    indefinitely (e.g. a fenced lease that never got unblocked), which makes
+    its scratch workspace immortal under the terminal-status rule above.
+    ``--stale-blocked-days`` (default 30, env
+    ``HERMES_KANBAN_SWEEP_STALE_BLOCKED_DAYS``, ``0`` disables) makes a
+    ``blocked`` workspace archive-eligible once its mtime age exceeds N days
+    — the SAME age basis (workspace directory mtime) used everywhere else in
+    this script. Because this is the one case where we give up a non-terminal
+    workspace, it is never a bare delete: the workspace is first archived to
+    ``<root>/db-backups/kanban-archive/<name>-<date>.tar.zst`` (inside the
+    restic backup include-set) with a JSON sidecar recording the task id,
+    status, original workspace path, archive path, and timestamp — the
+    read-only-DB-safe stand-in for a DB breadcrumb, so a later-resumed task
+    can trace where its workspace went even though this script never writes
+    to kanban.db. The archive is verified (non-empty file + a successful
+    ``tar -tf`` listing) BEFORE the workspace directory is removed; any
+    failure (missing tar/zstd, empty archive, failed verification) skips the
+    removal entirely (``SKIP_ARCHIVE_FAILED``) rather than ever deleting an
+    unarchived workspace.
+  - --dry-run lists candidates without removing anything, and for
+    stale-blocked candidates reports what WOULD be archived/removed without
+    creating any tar file.
   - Idempotent: safe to run repeatedly / on a schedule; a clean sweep with
     nothing to do is a normal, silent-ish outcome (still logs a summary line).
 
 Usage:
-  python3 kanban_workspace_sweep.py [--dry-run] [--days 14] [--root ~/.hermes]
+  python3 kanban_workspace_sweep.py [--dry-run] [--days 14]
+      [--stale-blocked-days 30] [--root ~/.hermes]
 """
 import argparse
+import json
 import os
 import shutil
 import sqlite3
@@ -100,6 +124,52 @@ def _fmt_bytes(n: int) -> str:
             return f"{size:.1f}{unit}"
         size /= 1024
     return f"{size:.1f}TB"
+
+
+def _archive_workspace(wdir: Path, archive_root: Path, archive_name: str):
+    """Create+verify a `tar --zstd` archive of *wdir* at
+    ``archive_root/<archive_name>.tar.zst`` BEFORE any caller is allowed to
+    delete *wdir*. Never raises. Returns (ok, archive_path, size_bytes); on
+    any failure (tar/zstd unavailable, empty archive, failed `tar -tf`
+    verification) returns ok=False and best-effort removes the partial
+    archive file so a broken artifact never sits next to good ones."""
+    archive_path = archive_root / f"{archive_name}.tar.zst"
+    try:
+        archive_root.mkdir(parents=True, exist_ok=True)
+        proc = subprocess.run(
+            ["tar", "--zstd", "-cf", str(archive_path), "-C", str(wdir.parent), wdir.name],
+            capture_output=True, text=True, timeout=300, check=False,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(f"tar create rc={proc.returncode}: {proc.stderr.strip()}")
+        if not archive_path.is_file() or archive_path.stat().st_size == 0:
+            raise RuntimeError("archive missing or empty after create")
+        verify = subprocess.run(
+            ["tar", "--zstd", "-tf", str(archive_path)],
+            capture_output=True, text=True, timeout=300, check=False,
+        )
+        if verify.returncode != 0:
+            raise RuntimeError(f"tar verify rc={verify.returncode}: {verify.stderr.strip()}")
+        return True, archive_path, archive_path.stat().st_size
+    except Exception:
+        try:
+            if archive_path.exists():
+                archive_path.unlink()
+        except Exception:
+            pass
+        return False, archive_path, 0
+
+
+def _write_archive_sidecar(archive_root: Path, archive_name: str, payload: dict) -> None:
+    """Best-effort JSON breadcrumb next to the tar archive. The sweep is
+    deliberately query_only on kanban.db (never writes there), so this
+    sidecar is the only durable record tying a removed stale-blocked
+    workspace back to its task id/status/original path for later tracing."""
+    sidecar_path = archive_root / f"{archive_name}.json"
+    try:
+        sidecar_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    except Exception as exc:
+        _log(f"WARN_SIDECAR_WRITE_FAILED: {archive_name} ({exc})")
 
 
 def _discover_boards(root: Path):
@@ -155,11 +225,16 @@ def _task_row(conn, task_id: str):
     ).fetchone()
 
 
-def sweep_board(label: str, db_path: Path, workspaces_root: Path, days: int, dry_run: bool) -> dict:
+def sweep_board(
+    label: str, db_path: Path, workspaces_root: Path, days: int, dry_run: bool,
+    stale_blocked_days: int = 0, archive_root: Path | None = None,
+) -> dict:
     stats = {
         "removed": 0, "removed_bytes": 0, "orphan_removed": 0, "errors": 0,
         "skipped_active": 0, "skipped_non_scratch": 0, "skipped_path_mismatch": 0,
-        "skipped_recent": 0,
+        "skipped_recent": 0, "stale_blocked_removed": 0, "stale_blocked_archived_bytes": 0,
+        "skipped_archive_failed": 0, "stale_blocked_would_remove": 0,
+        "stale_blocked_would_archive_bytes": 0,
     }
     try:
         has_workspaces_root = workspaces_root.is_dir()
@@ -257,6 +332,60 @@ def sweep_board(label: str, db_path: Path, workspaces_root: Path, days: int, dry
 
             status = row["status"]
             if status not in TERMINAL_STATUSES:
+                if status == "blocked" and stale_blocked_days > 0:
+                    try:
+                        # Same age basis as everywhere else in this script: the
+                        # workspace directory's own mtime.
+                        blocked_age_days = (now - wdir.stat().st_mtime) / 86400
+                    except OSError as exc:
+                        stats["errors"] += 1
+                        _log(f"BOARD_SKIP_UNLISTABLE: {label}/{name} ({exc})")
+                        return stats
+                    if blocked_age_days > stale_blocked_days:
+                        if dry_run:
+                            size = _du_bytes(wdir)
+                            stats["stale_blocked_would_remove"] += 1
+                            stats["stale_blocked_would_archive_bytes"] += size
+                            _log(
+                                f"WOULD_REMOVE_STALE_BLOCKED: {label}/{name} | "
+                                f"age_days={blocked_age_days:.1f} status=blocked size={_fmt_bytes(size)}"
+                            )
+                            continue
+                        date_str = time.strftime("%Y%m%d", time.gmtime())
+                        archive_name = f"{name}-{date_str}"
+                        if archive_root is None:
+                            stats["skipped_archive_failed"] += 1
+                            _log(f"SKIP_ARCHIVE_FAILED: {label}/{name} | no archive_root configured")
+                            continue
+                        ok, archive_path, size = _archive_workspace(wdir, archive_root, archive_name)
+                        if not ok:
+                            stats["skipped_archive_failed"] += 1
+                            _log(
+                                f"SKIP_ARCHIVE_FAILED: {label}/{name} | "
+                                f"age_days={blocked_age_days:.1f} status=blocked "
+                                f"(tar/zstd archive+verify failed — workspace left in place)"
+                            )
+                            continue
+                        _write_archive_sidecar(archive_root, archive_name, {
+                            "task_id": row["id"],
+                            "status": row["status"],
+                            "board": label,
+                            "workspace_path": str(wdir),
+                            "archive_path": str(archive_path),
+                            "archived_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                        })
+                        try:
+                            shutil.rmtree(wdir)
+                            stats["stale_blocked_removed"] += 1
+                            stats["stale_blocked_archived_bytes"] += size
+                            _log(
+                                f"REMOVED_STALE_BLOCKED: {label}/{name} | "
+                                f"age_days={blocked_age_days:.1f} archive={archive_path}"
+                            )
+                        except Exception as exc:
+                            stats["errors"] += 1
+                            _log(f"ERROR_REMOVING: {label}/{name} | {exc}")
+                        continue
                 stats["skipped_active"] += 1
                 _log(f"SKIP_ACTIVE: {label}/{name} | status={status}")
                 continue
@@ -303,9 +432,18 @@ def main(argv=None) -> int:
         "--root", default=os.environ.get("HERMES_KANBAN_HOME") or os.environ.get("HERMES_HOME", "~/.hermes"),
         help="Hermes home the kanban tree lives under (default ~/.hermes)",
     )
+    p.add_argument(
+        "--stale-blocked-days", type=int,
+        default=int(os.environ.get("HERMES_KANBAN_SWEEP_STALE_BLOCKED_DAYS", "30")),
+        help=(
+            "age threshold in days for archiving+removing a workspace whose task is "
+            "stuck in non-terminal 'blocked' status (0=disabled, default 30)"
+        ),
+    )
     args = p.parse_args(argv or sys.argv[1:])
 
     root = Path(os.path.expanduser(args.root)).resolve()
+    archive_root = root / "db-backups" / "kanban-archive"
 
     # Hard safety fence, same shape as worktree_backstop_sweep.py: never let this
     # backstop be pointed at the user's home or a canonical dev tree.
@@ -322,7 +460,9 @@ def main(argv=None) -> int:
     totals = {
         "removed": 0, "removed_bytes": 0, "orphan_removed": 0, "errors": 0,
         "skipped_active": 0, "skipped_non_scratch": 0, "skipped_path_mismatch": 0,
-        "skipped_recent": 0, "boards_swept": 0,
+        "skipped_recent": 0, "boards_swept": 0, "stale_blocked_removed": 0,
+        "stale_blocked_archived_bytes": 0, "skipped_archive_failed": 0,
+        "stale_blocked_would_remove": 0, "stale_blocked_would_archive_bytes": 0,
     }
     try:
         boards = list(_discover_boards(root))
@@ -334,12 +474,17 @@ def main(argv=None) -> int:
         boards = []
 
     for label, db_path, workspaces_root in boards:
-        stats = sweep_board(label, db_path, workspaces_root, args.days, args.dry_run)
+        stats = sweep_board(
+            label, db_path, workspaces_root, args.days, args.dry_run,
+            stale_blocked_days=args.stale_blocked_days, archive_root=archive_root,
+        )
         totals["boards_swept"] += 1
         for key in (
             "removed", "removed_bytes", "orphan_removed", "errors",
             "skipped_active", "skipped_non_scratch", "skipped_path_mismatch",
-            "skipped_recent",
+            "skipped_recent", "stale_blocked_removed", "stale_blocked_archived_bytes",
+            "skipped_archive_failed", "stale_blocked_would_remove",
+            "stale_blocked_would_archive_bytes",
         ):
             totals[key] += stats.get(key, 0)
 
@@ -347,9 +492,16 @@ def main(argv=None) -> int:
         f"sweep-finish root={root} boards_swept={totals['boards_swept']} "
         f"removed={totals['removed']} orphan_removed={totals['orphan_removed']} "
         f"removed_bytes={totals['removed_bytes']} removed_size={_fmt_bytes(totals['removed_bytes'])} "
+        f"stale_blocked_removed={totals['stale_blocked_removed']} "
+        f"stale_blocked_archived_bytes={totals['stale_blocked_archived_bytes']} "
+        f"stale_blocked_archived_size={_fmt_bytes(totals['stale_blocked_archived_bytes'])} "
+        f"stale_blocked_would_remove={totals['stale_blocked_would_remove']} "
+        f"stale_blocked_would_archive_bytes={totals['stale_blocked_would_archive_bytes']} "
+        f"skipped_archive_failed={totals['skipped_archive_failed']} "
         f"skipped_active={totals['skipped_active']} skipped_non_scratch={totals['skipped_non_scratch']} "
         f"skipped_path_mismatch={totals['skipped_path_mismatch']} skipped_recent={totals['skipped_recent']} "
-        f"errors={totals['errors']} days={args.days} dry_run={args.dry_run}"
+        f"errors={totals['errors']} days={args.days} stale_blocked_days={args.stale_blocked_days} "
+        f"dry_run={args.dry_run}"
     )
     return 1 if totals["errors"] else 0
 

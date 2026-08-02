@@ -1,0 +1,60 @@
+name: deploy manifest pin check
+
+# Blocking check for manifest-governed deploy bundles under
+# machine-setup/mini-scripts/. The installers for these bundles refuse to
+# install anything if a governed file's bytes don't match its sha256 pin
+# in the manifest — that's the safety property. The failure mode this
+# check catches is upstream of that: someone edits a governed file without
+# regenerating the matching sha256 pin. CI stays green (nothing here runs
+# the real installer), the PR merges, and the next deploy on the mini
+# silently aborts and rolls back the entire bundle on hash drift — a real
+# incident class (fixed in PR #232 for a different manifest).
+#
+# hermes-disk-lifecycle (disk_lifecycle_manifest.json): the primary target
+# of this workflow. Governs disk_space_alert.py, kanban_workspace_sweep.py,
+# scripts/worktree_backstop_sweep.py, scripts/worktree_safety.py, and three
+# LaunchAgent plists.
+#   Regenerate pins locally after touching a governed file:
+#     python3 machine-setup/mini-scripts/install_disk_lifecycle.py --write-manifest-hashes
+#
+# hermes-self-report (self_report_manifest.json): checked here too because
+# install_self_report.py's existing --dry-run already does the identical
+# read-only source-hash verification (build_plan) — no installer changes
+# needed to add it.
+#
+# Deliberately NOT checked here (would require changes to those installers,
+# out of this workflow's scope):
+#   - fleet_outcome_manifest.json — reconcile_fleet_outcomes.py's `verify`
+#     action requires a real deployed ~/.hermes + live cron/jobs.json state;
+#     its source-only hash check (validate_sources) has no standalone CLI
+#     entrypoint.
+#   - pr_pipeline/manifest.json — different schema (dual source/deployed
+#     hashes, legacy_flat_entrypoints) and its verifier (pipeline_verify.py)
+#     reads a deployed marker file, not just repo sources.
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-manifest-pin-check-${{ github.event_name == 'push' && github.sha || (github.event.pull_request.number || github.ref) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  verify:
+    name: Verify manifest sha256 pins
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Verify disk_lifecycle_manifest.json pins match the source tree
+        run: |
+          python3 machine-setup/mini-scripts/install_disk_lifecycle.py --verify-manifest-hashes
+
+      - name: Verify self_report_manifest.json pins match the source tree
+        run: |
+          python3 machine-setup/mini-scripts/install_self_report.py --dry-run

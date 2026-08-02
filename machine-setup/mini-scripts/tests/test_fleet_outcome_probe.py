@@ -209,6 +209,158 @@ def test_unknown_enabled_cron_and_monitored_plist_fail_closed(tmp_path):
     ) in {(item["surface"], item["id"], item["code"]) for item in findings}
 
 
+def test_route_alarm_timeout_expired_maps_to_delivery_failed_not_crash(tmp_path):
+    module = _load_module()
+    state_path = tmp_path / "state.json"
+    findings = [module._finding("cron", "one", "failed", "synthetic")]
+
+    def hanging_sender(_message):
+        raise subprocess.TimeoutExpired(cmd=["hermes", "send"], timeout=30)
+
+    result = module.route_alarm(
+        findings,
+        state_path=state_path,
+        now=NOW,
+        drill=True,
+        real_alert=True,
+        sender=hanging_sender,
+    )
+    assert result["action"] == "delivery-failed"
+    assert "timed out" in result["error"].lower()
+    assert not state_path.exists()
+
+
+def test_route_alarm_recovery_timeout_expired_maps_to_recovery_delivery_failed(tmp_path):
+    module = _load_module()
+    state_path = tmp_path / "state.json"
+    state_path.write_text(
+        json.dumps({"active": True, "delivered_signature": "abc123"}), encoding="utf-8"
+    )
+
+    def hanging_sender(_message):
+        raise subprocess.TimeoutExpired(cmd=["hermes", "send"], timeout=30)
+
+    result = module.route_alarm(
+        [],
+        state_path=state_path,
+        now=NOW,
+        drill=False,
+        real_alert=True,
+        sender=hanging_sender,
+    )
+    assert result["action"] == "recovery-delivery-failed"
+    assert "timed out" in result["error"].lower()
+
+
+def _stub_launchctl_print(cmd, *, loaded_label):
+    """Deterministic stand-in for real `launchctl print`, matching _fixture()'s
+    LaunchAgent contracts (``<loaded_label>`` loaded only in the gui domain,
+    everything else absent) so main()-level tests never touch the real
+    launchd session."""
+    target = cmd[2]
+    parts = target.split("/")
+    if len(parts) == 2:  # domain-only inventory call, e.g. "gui/501"
+        domain_kind = parts[0]
+        if domain_kind == "gui":
+            stdout = f"\n\tservices = {{\n\t\t1234\t0\t{loaded_label}\n\t}}\n"
+        else:
+            stdout = "\n\tservices = {\n\n\t}\n"
+        return _completed(0, stdout=stdout)
+    domain_kind, _uid, label = parts  # per-label registration check
+    if label == loaded_label and domain_kind == "gui":
+        return _completed(0)
+    return _completed(113, stderr="Could not find service")
+
+
+def test_main_writes_receipt_and_holds_exit_code_when_alarm_send_times_out(tmp_path, monkeypatch):
+    module = _load_module()
+    contracts, jobs_path, output_root, launch_agents, output = _fixture(tmp_path)
+    output.write_text("# Cron Job\nsemantic-failure\n", encoding="utf-8")
+    import os
+
+    os.utime(output, (NOW.timestamp(), NOW.timestamp()))
+
+    contracts_path = tmp_path / "contracts.json"
+    contracts_path.write_text(json.dumps(contracts), encoding="utf-8")
+    state_path = tmp_path / "state.json"
+    receipt_path = tmp_path / "receipt.json"
+
+    def flaky_run(cmd, *args, **kwargs):
+        if cmd and str(cmd[0]) == str(module.HERMES_BIN):
+            raise module.subprocess.TimeoutExpired(cmd=cmd, timeout=30)
+        if cmd and cmd[0] == "launchctl":
+            return _stub_launchctl_print(cmd, loaded_label="com.colingreig.hermes.fixture")
+        raise AssertionError(f"unexpected subprocess call in test: {cmd}")
+
+    monkeypatch.setattr(module.subprocess, "run", flaky_run)
+    monkeypatch.setattr(module, "_now", lambda: NOW)
+
+    exit_code = module.main(
+        [
+            "--contracts",
+            str(contracts_path),
+            "--jobs",
+            str(jobs_path),
+            "--output-root",
+            str(output_root),
+            "--launch-agents-dir",
+            str(launch_agents),
+            "--state",
+            str(state_path),
+            "--receipt",
+            str(receipt_path),
+        ]
+    )
+
+    assert exit_code == 1
+    assert not state_path.exists()
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["finding_count"] >= 1
+    assert receipt["alarm"]["action"] == "delivery-failed"
+    assert "timed out" in receipt["alarm"]["error"].lower()
+
+
+def test_main_clean_run_writes_clean_receipt_with_no_delivery_attempt(tmp_path, monkeypatch):
+    module = _load_module()
+    contracts, jobs_path, output_root, launch_agents, _output = _fixture(tmp_path)
+
+    contracts_path = tmp_path / "contracts.json"
+    contracts_path.write_text(json.dumps(contracts), encoding="utf-8")
+    state_path = tmp_path / "state.json"
+    receipt_path = tmp_path / "receipt.json"
+
+    def launchctl_only_run(cmd, *args, **kwargs):
+        if cmd and cmd[0] == "launchctl":
+            return _stub_launchctl_print(cmd, loaded_label="com.colingreig.hermes.fixture")
+        raise AssertionError(f"unexpected subprocess call in test: {cmd}")
+
+    monkeypatch.setattr(module.subprocess, "run", launchctl_only_run)
+    monkeypatch.setattr(module, "_now", lambda: NOW)
+
+    exit_code = module.main(
+        [
+            "--contracts",
+            str(contracts_path),
+            "--jobs",
+            str(jobs_path),
+            "--output-root",
+            str(output_root),
+            "--launch-agents-dir",
+            str(launch_agents),
+            "--state",
+            str(state_path),
+            "--receipt",
+            str(receipt_path),
+        ]
+    )
+
+    assert exit_code == 0
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["status"] == "clean"
+    assert receipt["finding_count"] == 0
+    assert receipt["alarm"]["action"] == "clean"
+
+
 def test_alarm_dedup_state_advances_only_after_confirmed_send(tmp_path):
     module = _load_module()
     state_path = tmp_path / "state.json"

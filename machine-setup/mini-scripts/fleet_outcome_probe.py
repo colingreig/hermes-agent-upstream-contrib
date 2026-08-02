@@ -945,7 +945,10 @@ def route_alarm(
             if emit_dry_run:
                 print(message)
             return {"action": "dry-run", "signature": signature}
-        result = sender(message)
+        try:
+            result = sender(message)
+        except (OSError, subprocess.SubprocessError) as exc:
+            return {"action": "delivery-failed", "signature": signature, "error": str(exc)[-500:]}
         if result.returncode != 0:
             detail = (result.stderr or result.stdout or "unknown send failure").strip()
             return {"action": "delivery-failed", "signature": signature, "error": detail[-500:]}
@@ -967,7 +970,14 @@ def route_alarm(
         if emit_dry_run:
             print(message)
         return {"action": "recovery-dry-run", "signature": previous_signature}
-    result = sender(message)
+    try:
+        result = sender(message)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {
+            "action": "recovery-delivery-failed",
+            "signature": previous_signature,
+            "error": str(exc)[-500:],
+        }
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "unknown send failure").strip()
         return {
@@ -1110,28 +1120,34 @@ def main(argv: list[str] | None = None) -> int:
         state_path = args.state
         receipt_path = args.receipt
 
-    alarm = route_alarm(
-        findings,
-        state_path=state_path,
-        now=now,
-        drill=args.drill_all,
-        real_alert=real_alert,
-        emit_dry_run=not args.json,
-    )
-    receipt = {
-        "schema_version": 1,
-        "checked_at": now.isoformat(),
-        "mode": "drill" if args.drill_all else "production",
-        "status": "alert" if findings else "clean",
-        "state_path": str(state_path),
-        "receipt_path": str(receipt_path),
-        "contract_count": len(contracts["cron_jobs"]) + len(contracts["launch_agents"]),
-        "finding_count": len(findings),
-        "findings": findings,
-        "evidence": evidence,
-        "alarm": alarm,
-    }
-    _atomic_json(receipt_path, receipt)
+    alarm: dict[str, Any] = {"action": "unreported"}
+    try:
+        alarm = route_alarm(
+            findings,
+            state_path=state_path,
+            now=now,
+            drill=args.drill_all,
+            real_alert=real_alert,
+            emit_dry_run=not args.json,
+        )
+    finally:
+        # The receipt must land even if alarm delivery raised unexpectedly
+        # (e.g. a hung `hermes send` subprocess) — a stale receipt with no
+        # alert is worse than an alert with a partial/failed-delivery receipt.
+        receipt = {
+            "schema_version": 1,
+            "checked_at": now.isoformat(),
+            "mode": "drill" if args.drill_all else "production",
+            "status": "alert" if findings else "clean",
+            "state_path": str(state_path),
+            "receipt_path": str(receipt_path),
+            "contract_count": len(contracts["cron_jobs"]) + len(contracts["launch_agents"]),
+            "finding_count": len(findings),
+            "findings": findings,
+            "evidence": evidence,
+            "alarm": alarm,
+        }
+        _atomic_json(receipt_path, receipt)
     if args.json:
         print(json.dumps(receipt, indent=2, sort_keys=True))
     elif alarm.get("action") in {"delivery-failed", "recovery-delivery-failed"}:

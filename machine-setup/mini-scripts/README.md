@@ -1116,16 +1116,54 @@ python3 machine-setup/mini-scripts/install_disk_lifecycle.py
 ```
 
 The bundle is declared in `disk_lifecycle_manifest.json` (ClickUp 86e2k6j3c).
-It copies only the five declared artifacts by name — two scripts into
+It copies only the seven declared artifacts by name — four scripts into
 `~/.hermes/scripts/` and three plists into `~/Library/LaunchAgents/` — and
-touches nothing else. `worktree_backstop_sweep.py` itself still lives under
-`scripts/` and is deployed by release cut / a separate copy step; this bundle
-governs its LaunchAgent plist only.
+touches nothing else.
+
+Each file entry has a `src_base`:
+- `"mirror"` (default historically) — resolved relative to the manifest's own
+  directory (`machine-setup/mini-scripts/`). Used for files that are vendored
+  there, e.g. `disk_space_alert.py`, `kanban_workspace_sweep.py`, and the
+  LaunchAgent plists under `launchd/`.
+- `"repo"` — resolved relative to the repo root (found by walking up from the
+  manifest directory to the nearest ancestor containing `.git`). This lets the
+  manifest govern files that live elsewhere in the tree without vendoring a
+  duplicate copy into `mini-scripts/`. `scripts/worktree_backstop_sweep.py`
+  and `scripts/worktree_safety.py` use this — before `src_base: "repo"`
+  existed, `install_disk_lifecycle.py` only understood `"mirror"`, so those
+  two files (living under top-level `scripts/`) had no governed deploy path
+  at all; `worktree_safety.py` in particular was never deployed anywhere.
 
 After the first install, load new LaunchAgents via
 `launchctl bootstrap gui/501 ~/Library/LaunchAgents/<label>.plist` (see the
 gateway-restart notes above for the bootout/bootstrap EIO-race caveat if
 reloading an existing one).
+
+Regenerate / verify the manifest's sha256 pins (do this any time a governed
+file changes — editing a governed file without regenerating its pin makes
+`build_plan` abort and roll back the *entire* bundle on the next install):
+
+```bash
+# write mode: recompute every pin from the current tree and rewrite the manifest
+python3 machine-setup/mini-scripts/install_disk_lifecycle.py --write-manifest-hashes
+
+# verify mode: read-only, exits non-zero on any drift (this is what CI runs)
+python3 machine-setup/mini-scripts/install_disk_lifecycle.py --verify-manifest-hashes
+```
+
+CI enforces this on every PR that touches Python: the `deploy manifest pin
+check` workflow
+(`.github/workflows/disk-lifecycle-manifest-check.yml`, wired into
+`ci.yml` as the `disk-lifecycle-manifest-check` job and required by
+`all-checks-pass`) runs `--verify-manifest-hashes` against
+`disk_lifecycle_manifest.json` and `install_self_report.py --dry-run`
+against `self_report_manifest.json` (that installer's existing dry-run
+already does the identical read-only source-hash check, so no code change
+was needed to cover it too). `fleet_outcome_manifest.json` and
+`pr_pipeline/manifest.json` are not covered — their verifiers require a
+live deployed `~/.hermes` state or a deployed marker file, not just repo
+sources, so they aren't CI-checkable without further changes to those
+installers.
 
 Manual scp (legacy fallback only — do not use for routine deploys):
 
@@ -1133,6 +1171,7 @@ Manual scp (legacy fallback only — do not use for routine deploys):
 scp machine-setup/mini-scripts/kanban_workspace_sweep.py mini:~/.hermes/scripts/kanban_workspace_sweep.py
 scp machine-setup/mini-scripts/disk_space_alert.py mini:~/.hermes/scripts/disk_space_alert.py
 scp scripts/worktree_backstop_sweep.py mini:~/.hermes/scripts/worktree_backstop_sweep.py
+scp scripts/worktree_safety.py mini:~/.hermes/scripts/worktree_safety.py
 scp machine-setup/mini-scripts/launchd/com.colingreig.hermes.{disk-space-alert,kanban-workspace-sweep,worktree-backstop-sweep}.plist \
   mini:~/Library/LaunchAgents/
 ```
@@ -1143,5 +1182,7 @@ install it.
 
 Tests: `machine-setup/mini-scripts/tests/test_kanban_workspace_sweep.py`,
 `machine-setup/mini-scripts/tests/test_disk_space_alert.py`,
-`machine-setup/mini-scripts/tests/test_install_disk_lifecycle.py`, and the
-pressure/size-reporting additions in `tests/scripts/test_worktree_backstop_sweep.py`.
+`machine-setup/mini-scripts/tests/test_install_disk_lifecycle.py` (covers
+`src_base: "repo"` resolution and `--write-manifest-hashes` /
+`--verify-manifest-hashes` pass/fail behavior), and the pressure/size-
+reporting additions in `tests/scripts/test_worktree_backstop_sweep.py`.
