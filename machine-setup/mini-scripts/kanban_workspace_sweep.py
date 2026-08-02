@@ -84,6 +84,8 @@ Usage:
   python3 kanban_workspace_sweep.py [--dry-run] [--days 14]
       [--stale-blocked-days 30] [--root ~/.hermes]
 """
+from __future__ import annotations
+
 import argparse
 import json
 import os
