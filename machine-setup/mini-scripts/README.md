@@ -880,17 +880,26 @@ release blocker. Brain does not deploy anything itself.
 
 | File | dest | canon |
 |---|---|---|
-| `hermes_report_build.py` | `~/.hermes/scripts/` | exact mirror of Brain canonical builder |
+| `hermes_report_build.py` | `~/.hermes/scripts/` | exact mirror of Brain canonical builder; requires the nominal six-hour UTC slot |
 | `hermes_report_build_v1lib.py` | `~/.hermes/scripts/` | live (load-bearing library) |
 | `hermes_report_build_v2.py` | `~/.hermes/scripts/` | live (compat-only orphan, retirement pending) |
 | `hermes-metrics.py` | `~/.hermes/scripts/` | live (standalone CLI, no cron caller) |
 | `postmark_send_report.py` | `~/.hermes/scripts/` | deploy-mirror bytes (live behavior + `encoding="utf-8"`) |
 | `hermes_self_report_delivery_probe.py` | `~/.hermes/scripts/` | deploy-mirror bytes (live behavior + `encoding="utf-8"`) |
-| `report_activity_journal.py` | `~/.hermes/scripts/` | durable Mini lifecycle outbox plus validated read-only range API |
-| `report_activity_continuity.py` | `~/.hermes/scripts/` | Mini-only two-window continuity, health/provenance, and bounded ClickUp parity adapter |
+| `report_activity_journal.py` | `~/.hermes/scripts/` | durable Mini lifecycle outbox, immutable required-producer set, and event-specific transition identity |
+| `report_activity_continuity.py` | `~/.hermes/scripts/` | Mini-only nominal-slot two-window continuity, health/provenance, and exact event-kind ClickUp parity adapter |
 | `claim_store.py` | `~/.hermes/scripts/` | durable queue-claim producer for the shadow outbox |
 | `closeout_actor.py` | `~/.hermes/scripts/` | verified review-handoff producer for PR and DB closeout |
 | `SKILL.md` | `~/.hermes/skills/hermes-self-report/` | live RC4 (Brain source; installed only with `--include-skill --brain-path`) |
+
+The report invocation must pass `--scheduled-slot <UTC-slot>` using the
+invocation's nominal cadence identity. Actual wall-clock `now` remains the
+health/retention/read timestamp. Late and manual reruns reuse the original
+slot; a missing, malformed, or non-boundary slot returns Activity continuity
+`UNKNOWN` with no concern ID. Required producer coverage is checked against an
+independent immutable ID set, and review/completion parity requires exact
+event-specific transition timestamps (`date_closed` for validator completion),
+never a merely later generic task update.
 
 **The installer** (`install_self_report.py`, stdlib only, `no_agent`-safe) is
 the **sole writer** of these files. It:

@@ -62,12 +62,17 @@ def _task_for(event):
         "review_handoff": "in review",
         "validator_complete": "complete",
     }[event["kind"]]
+    transition_at = (
+        event.get("clickup_transition_at")
+        or event.get("clickup_updated_at")
+        or event["ts"]
+    )
     return {
         "id": event["task_id"],
         "status": {"status": status},
-        "date_updated": "1785686400000",
+        "date_updated": transition_at,
         "date_closed": (
-            "1785686400000"
+            transition_at
             if event["kind"] == "validator_complete"
             else None
         ),
@@ -79,7 +84,7 @@ def _emit(journal, root, *, kind="claim", task="task-1", when):
         kind=kind,
         task_id=task,
         source="continuity-test",
-        clickup_updated_at=(
+        clickup_transition_at=(
             journal._iso(when) if kind != "claim" else None
         ),
         now=when,
@@ -94,6 +99,9 @@ def _evaluate(adapter, root, **overrides):
         "now": NOW,
         "state_dir": root,
         "strict_validator_completed": 0,
+        "nominal_scheduled_slot": dt.datetime(
+            2026, 8, 2, 12, 0, tzinfo=dt.timezone.utc
+        ),
         "provenance": PROVENANCE,
         "health_attestation": HEALTH,
         "writer_coverage": WRITER_COVERAGE,
@@ -103,9 +111,7 @@ def _evaluate(adapter, root, **overrides):
     return adapter.evaluate_continuity(**kwargs)
 
 
-def test_stable_slot_identity_for_scheduled_late_and_manual_invocations(
-    modules,
-):
+def test_stable_slot_identity_for_scheduled_late_and_manual_invocations(modules):
     _journal, adapter = modules
     expected = "2026-08-02T12:00:00Z"
     for value in (
@@ -122,7 +128,10 @@ def test_two_empty_complete_covered_windows_emit_one_stable_concern(
     _journal, adapter = modules
     first = _evaluate(adapter, tmp_path)
     second = adapter.evaluate_continuity(
-        now=dt.datetime(2026, 8, 2, 17, 59, tzinfo=dt.timezone.utc),
+        now=dt.datetime(2026, 8, 2, 18, 1, tzinfo=dt.timezone.utc),
+        nominal_scheduled_slot=dt.datetime(
+            2026, 8, 2, 12, 0, tzinfo=dt.timezone.utc
+        ),
         state_dir=tmp_path,
         strict_validator_completed=0,
         provenance=PROVENANCE,
@@ -135,6 +144,54 @@ def test_two_empty_complete_covered_windows_emit_one_stable_concern(
     assert first["concern_id"] == second["concern_id"]
     assert first["windows"]["previous"]["total"] == 0
     assert first["windows"]["current"]["total"] == 0
+
+
+@pytest.mark.parametrize(
+    "value",
+    [None, "", "not-a-time", "2026-08-02T13:00:00Z"],
+)
+def test_missing_or_malformed_nominal_slot_is_unknown_without_inventory_reads(
+    modules, tmp_path, monkeypatch, value
+):
+    journal, adapter = modules
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("invalid slot reached journal health")
+
+    monkeypatch.setattr(journal, "health", forbidden)
+    result = adapter.evaluate_continuity(
+        now=NOW,
+        nominal_scheduled_slot=value,
+        state_dir=tmp_path,
+        strict_validator_completed=0,
+    )
+    assert result["state"] == "UNKNOWN"
+    assert result["slot_id"] is None
+    assert result["concern_id"] is None
+    assert "nominal scheduled slot" in result["detail"]
+
+
+def test_nominal_slot_does_not_replace_actual_health_time(
+    modules, tmp_path, monkeypatch
+):
+    journal, adapter = modules
+    actual_now = dt.datetime(2026, 8, 2, 18, 1, tzinfo=dt.timezone.utc)
+    observed = []
+    real_health = journal.health
+
+    def capture_health(**kwargs):
+        observed.append(kwargs["now"])
+        return real_health(**kwargs)
+
+    monkeypatch.setattr(journal, "health", capture_health)
+    result = _evaluate(
+        adapter,
+        tmp_path,
+        now=actual_now,
+        nominal_scheduled_slot="2026-08-02T12:00:00Z",
+    )
+    assert result["slot_id"] == "2026-08-02T12:00:00Z"
+    assert observed == [actual_now]
 
 
 @pytest.mark.parametrize(
@@ -304,6 +361,100 @@ def test_clickup_disagreement_or_insufficient_timestamp_is_unknown(
     )
     assert result["state"] == "UNKNOWN"
     assert result["parity"]["status"] == "UNKNOWN"
+
+
+def test_compatible_review_status_with_later_generic_update_is_unknown(
+    modules, tmp_path
+):
+    journal, adapter = modules
+    event = _emit(
+        journal,
+        tmp_path,
+        kind="review_handoff",
+        when=dt.datetime(2026, 8, 2, 8, 0, tzinfo=dt.timezone.utc),
+    )
+    result = _evaluate(
+        adapter,
+        tmp_path,
+        events_by_task={event["task_id"]: event},
+        fetch_task=lambda task_id: {
+            "id": task_id,
+            "status": {"status": "in review"},
+            "date_updated": "2026-08-02T10:00:00Z",
+        },
+    )
+    assert result["state"] == "UNKNOWN"
+    assert result["parity"]["status"] == "UNKNOWN"
+    assert "does not equal outbox transition" in result["parity"]["reasons"][0]
+
+
+def test_exact_review_transition_timestamp_matches(modules, tmp_path):
+    journal, adapter = modules
+    event = _emit(
+        journal,
+        tmp_path,
+        kind="review_handoff",
+        when=dt.datetime(2026, 8, 2, 8, 0, tzinfo=dt.timezone.utc),
+    )
+    result = _evaluate(
+        adapter,
+        tmp_path,
+        events_by_task={event["task_id"]: event},
+    )
+    assert result["state"] == "ACTIVE"
+    assert result["parity"]["status"] == "OK"
+
+
+def test_validator_complete_before_authoritative_closure_is_unknown(
+    modules, tmp_path
+):
+    journal, adapter = modules
+    event = _emit(
+        journal,
+        tmp_path,
+        kind="validator_complete",
+        when=dt.datetime(2026, 8, 2, 8, 0, tzinfo=dt.timezone.utc),
+    )
+    result = _evaluate(
+        adapter,
+        tmp_path,
+        strict_validator_completed=1,
+        events_by_task={event["task_id"]: event},
+        fetch_task=lambda task_id: {
+            "id": task_id,
+            "status": {"status": "complete"},
+            "date_updated": "2026-08-02T11:00:00Z",
+            "date_closed": "2026-08-02T10:00:00Z",
+        },
+    )
+    assert result["state"] == "UNKNOWN"
+    assert result["parity"]["status"] == "UNKNOWN"
+
+
+def test_validator_complete_exact_date_closed_ignores_later_generic_update(
+    modules, tmp_path
+):
+    journal, adapter = modules
+    event = _emit(
+        journal,
+        tmp_path,
+        kind="validator_complete",
+        when=dt.datetime(2026, 8, 2, 8, 0, tzinfo=dt.timezone.utc),
+    )
+    result = _evaluate(
+        adapter,
+        tmp_path,
+        strict_validator_completed=1,
+        events_by_task={event["task_id"]: event},
+        fetch_task=lambda task_id: {
+            "id": task_id,
+            "status": {"status": "complete"},
+            "date_updated": "2026-08-02T11:00:00Z",
+            "date_closed": "2026-08-02T08:00:00Z",
+        },
+    )
+    assert result["state"] == "ACTIVE"
+    assert result["parity"]["status"] == "OK"
 
 
 def test_strict_validator_completion_is_independent_and_disagreement_visible(

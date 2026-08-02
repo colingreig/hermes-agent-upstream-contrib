@@ -7,7 +7,7 @@
     "repo": "brain",
     "path": "hermes/skills/hermes-self-report/scripts/hermes_report_build.py",
     "runtime_mirror": "machine-setup/mini-scripts/hermes_report_build.py",
-    "sha256": "ac52d24d61392f23c237a7ef52e1e2bb0856f85d1e94cabbf2e2a47af925bf9d"
+    "sha256": "44ebfa6ce2b88faffa8adb8c93b1189153521513fe168392cb1218a624c0ce57"
   },
   "coexist_required": [
     {
@@ -24,8 +24,8 @@
       "src_rel": "hermes_report_build.py",
       "src_base": "mirror",
       "dest_abs": "~/.hermes/scripts/hermes_report_build.py",
-      "sha256": "ac52d24d61392f23c237a7ef52e1e2bb0856f85d1e94cabbf2e2a47af925bf9d",
-      "role": "exact-byte runtime mirror of Brain canonical report builder; owns HTML+text+subject+JSON, team-wide review queue, separated spend labels, and System-signal-only Activity continuity consumption",
+      "sha256": "44ebfa6ce2b88faffa8adb8c93b1189153521513fe168392cb1218a624c0ce57",
+      "role": "exact-byte runtime mirror of Brain canonical report builder; owns HTML+text+subject+JSON, team-wide review queue, separated spend labels, and nominal-slot-bound System-signal-only Activity continuity consumption",
       "deploy_mode": "script"
     },
     {
@@ -72,16 +72,16 @@
       "src_rel": "report_activity_journal.py",
       "src_base": "mirror",
       "dest_abs": "~/.hermes/scripts/report_activity_journal.py",
-      "sha256": "8eeed87f049ec93e78f9a5a93428f368f9526e4133afc73498a60747d478f71a",
-      "role": "stdlib-only Mini lifecycle outbox; durable UTC-day JSONL emission, public read-only half-open range API, retention, read-after-write ClickUp confirmation, deduplication, and explicit UNKNOWN health",
+      "sha256": "8e47fa8ec3cda4417ebc1ecfa8983491b4b8ea9aee8b1be957b26cdbb81d7c26",
+      "role": "stdlib-only Mini lifecycle outbox; durable UTC-day JSONL emission, immutable required-producer coverage, event-specific ClickUp transition identity, read-only range API, retention, deduplication, and explicit UNKNOWN health",
       "deploy_mode": "script"
     },
     {
       "src_rel": "report_activity_continuity.py",
       "src_base": "mirror",
       "dest_abs": "~/.hermes/scripts/report_activity_continuity.py",
-      "sha256": "bdd5aff9c1b7abe1409234603861514ab38ad0c52a8cddfadf62a24725a38c1c",
-      "role": "read-only Hermes Mac mini continuity adapter; stable UTC slots, two-window coverage, fail-closed health/provenance/ClickUp parity, and strict-completion independence",
+      "sha256": "e9e42b38beec4cd1f7421c983b9d2a89be6c0ffc5f6e89df77522ab17b0876f1",
+      "role": "read-only Hermes Mac mini continuity adapter; explicit nominal UTC slots, two-window coverage, exact event-kind ClickUp parity, fail-closed health/provenance, and strict-completion independence",
       "deploy_mode": "script"
     },
     {
@@ -104,8 +104,8 @@
       "src_rel": "hermes/skills/hermes-self-report/SKILL.md",
       "src_base": "brain",
       "dest_abs": "~/.hermes/skills/hermes-self-report/SKILL.md",
-      "sha256": "4bf76f629f057a867fdcb12353d87898ceb53b26d29142492174acba2226adf5",
-      "role": "authored cron contract (Brain source of truth); installed only with --include-skill --brain-path <brain checkout>",
+      "sha256": "ab6d8111dd2003efa955b82f200d0df20745577c893d801439d2b1847252ecdd",
+      "role": "authored cron contract (Brain source of truth), including explicit nominal scheduled-slot propagation; installed only with --include-skill --brain-path <brain checkout>",
       "deploy_mode": "skill"
     }
   ]

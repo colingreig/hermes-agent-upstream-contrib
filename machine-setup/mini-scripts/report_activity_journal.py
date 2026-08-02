@@ -35,6 +35,18 @@ DEFAULT_CLICKUP = Path(
     )
 ) / "clickup" / "clickup.mjs"
 
+# Required producer identities are independent of the declarations below so a
+# missing declaration is itself a fail-closed coverage error.
+REQUIRED_PRODUCER_IDS = frozenset({
+    "queue-poller-claim",
+    "merged-before-claim-reconciliation",
+    "ordinary-publish-closeout",
+    "db-publish-closeout",
+    "closeout-actor",
+    "clickup-lifecycle-reconciliation",
+    "validator",
+})
+
 # Declarative coverage contract for every enabled Mini lifecycle writer.  The
 # health check treats an enabled row without a non-empty emitter declaration as
 # UNKNOWN.  Agent-owned paths invoke ``confirm-transition`` only after their
@@ -360,6 +372,8 @@ def _inventory_reasons(inventory: Any) -> list[str]:
             reasons.append(f"enabled producer lacks emitter declaration: {producer_id or index}")
         if producer.get("enabled") is True and producer.get("kind") not in VALID_KINDS:
             reasons.append(f"enabled producer has invalid kind: {producer_id or index}")
+    for producer_id in sorted(REQUIRED_PRODUCER_IDS - seen):
+        reasons.append(f"required producer declaration missing: {producer_id}")
     return reasons
 
 
@@ -551,18 +565,25 @@ def confirm_transition(
         task = _extract_task(fetch_task(task_id))
         observed = _status_name(task)
         expected = expected_status.strip().casefold()
+        if str(task.get("id") or "") != str(task_id):
+            raise JournalError("ClickUp confirmation returned a different task id")
         if observed != expected:
             raise JournalError(f"ClickUp confirmation mismatch: expected {expected!r}, observed {observed!r}")
-        confirmed_ts = task.get("date_updated") or task.get("updated_at")
+        if kind == "validator_complete":
+            confirmed_ts = task.get("date_closed")
+            timestamp_name = "date_closed"
+        else:
+            confirmed_ts = task.get("date_updated") or task.get("updated_at")
+            timestamp_name = "date_updated/updated_at"
         if not confirmed_ts:
-            raise JournalError("ClickUp confirmation lacks date_updated/updated_at")
+            raise JournalError(f"ClickUp confirmation lacks {timestamp_name}")
         result = safe_emit(
             kind=kind,
             task_id=task_id,
             source=source,
             run_id=run_id,
             execution_id=execution_id,
-            clickup_updated_at=str(confirmed_ts),
+            clickup_transition_at=str(confirmed_ts),
             state_dir=state_dir,
             now=now,
         )

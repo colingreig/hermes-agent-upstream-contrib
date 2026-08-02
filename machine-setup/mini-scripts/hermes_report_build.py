@@ -602,6 +602,7 @@ def load_activity_continuity(
     strict_validator_completed,
     *,
     report_window_min=360,
+    scheduled_slot=None,
     enabled=ACTIVITY_CONTINUITY_CONSUMER_ENABLED,
     script_path=None,
     runner=subprocess.run,
@@ -614,6 +615,30 @@ def load_activity_continuity(
     """
     if not enabled:
         return None
+    try:
+        parsed_slot = datetime.datetime.fromisoformat(
+            str(scheduled_slot or "").replace("Z", "+00:00")
+        )
+        if parsed_slot.tzinfo is None:
+            raise ValueError("timezone is required")
+        parsed_slot = parsed_slot.astimezone(datetime.timezone.utc)
+        if (
+            parsed_slot.hour % 6
+            or parsed_slot.minute
+            or parsed_slot.second
+            or parsed_slot.microsecond
+        ):
+            raise ValueError("slot must be an exact six-hour UTC boundary")
+        scheduled_slot = parsed_slot.isoformat(timespec="seconds").replace(
+            "+00:00", "Z"
+        )
+    except (TypeError, ValueError) as exc:
+        return {
+            "schema": ACTIVITY_CONTINUITY_SCHEMA,
+            "scope": "Hermes Mac mini",
+            "state": "UNKNOWN",
+            "detail": f"continuity adapter rejected: invalid nominal scheduled slot: {exc}",
+        }
     script_path = script_path or os.path.join(SCRIPT_DIR, "report_activity_continuity.py")
     try:
         result = runner(
@@ -625,6 +650,8 @@ def load_activity_continuity(
                 str(int(strict_validator_completed)),
                 "--report-window-min",
                 str(int(report_window_min)),
+                "--scheduled-slot",
+                scheduled_slot,
             ],
             capture_output=True,
             text=True,
@@ -1329,6 +1356,11 @@ def build_text(header, scoreboard, spend, alerts, hermes_rows, hermes_meta, work
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--window-min", type=int, default=360)
+    p.add_argument(
+        "--scheduled-slot",
+        required=True,
+        help="Nominal six-hour UTC schedule slot; late/manual reruns must reuse the original slot.",
+    )
     p.add_argument("--header-file", help="JSON: when, health, model, auth, work_stoppage, needs_attention")
     p.add_argument("--out-html", default="/tmp/hermes_report.html")
     p.add_argument("--out-text", default="/tmp/hermes_report.txt")
@@ -1412,7 +1444,9 @@ def main():
     if review_alert:
         alerts.insert(0, review_alert)
     activity_continuity = load_activity_continuity(
-        work_counts["completed"], report_window_min=args.window_min
+        work_counts["completed"],
+        report_window_min=args.window_min,
+        scheduled_slot=args.scheduled_slot,
     )
     activity_signal = build_activity_continuity_signal(activity_continuity)
     if activity_signal:
