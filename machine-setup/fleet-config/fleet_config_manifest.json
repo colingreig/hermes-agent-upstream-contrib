@@ -85,19 +85,19 @@
     {
       "src_rel": "jobs.json",
       "dest_abs": "~/.hermes/cron/jobs.json",
-      "sha256": "9abb03fc214f0c2dfee7b048b719642c179049a9169ece74c0df2a7c13514e76",
+      "sha256": "4761e92859ce56a9c1ecf28059365069486738c2156bd22163f42167916f45d8",
       "role": "curated 15-job cron set (12 kept + 3 consolidated; direct ClickUp executor prompts; hermes-pr-validate re-enabled 2026-07-31 and pinned to IGNITE_SKILLS_ROOT), wholesale-replaces the live jobs.json",
       "deploy_mode": "jobs_json"
     },
     {
       "src_rel": "skills-policy.json",
-      "sha256": "7fddaca9d40e048209a34f67f67a18804d860bd1b687ee3a7ae256dec1878a1b",
+      "sha256": "e13ca4376be7ea58c0584f3a2552578897260ffb887c02874dbda81bf90813d2",
       "role": "governed Mini-specific bundled/local/hub skill allowlist, historical-reference consolidation, obsolete sentry wrapper archival, exact hub provenance, per-profile suppression, and recoverable cull policy",
       "deploy_mode": "skill_policy"
     },
     {
       "src_rel": "install_fleet_config.py",
-      "sha256": "02c36f4d65bdb7484da46f3d8d734bc3c2ab7f49ad1800e8528f49afc1519ab1",
+      "sha256": "0e3ee263e169cb0d62dcf4c326d4db30a11484e44005d1be7307d5432ee6b2ba",
       "role": "source-only pin for the governed fleet installer, including private legacy root config-backup remediation and exact-mode rollback",
       "deploy_mode": "installer_source"
     }

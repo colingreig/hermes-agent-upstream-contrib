@@ -385,14 +385,15 @@ from cron.executions import (
     mark_execution_running,
 )
 from cron.executor_admission import (
+    AdmissionLease as ExecutorLease,
     ExecutorAdmissionError,
-    ExecutorLease,
-    acquire_executor_lease,
-    finalize_executor_lease,
-    heartbeat_executor_lease,
-    is_executor_job,
-    release_executor_lease,
+    acquire_job_admission_lease as acquire_executor_lease,
+    finalize_job_admission_lease as finalize_executor_lease,
+    heartbeat_job_admission_lease as heartbeat_executor_lease,
+    requires_llm_admission as is_executor_job,
+    release_job_admission_lease as release_executor_lease,
 )
+
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -5168,10 +5169,10 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         if is_executor_job(job):
             try:
                 executor_lease = acquire_executor_lease(
-                    job_id=job["id"],
+                    job=job,
                     owner_run_id=job.get("executor_owner_run_id"),
                     ledger_execution_id=execution_id,
-                    task_id=job.get("executor_task_id"),
+                    task_id=job.get("admission_task_id") or job.get("executor_task_id"),
                 )
             except ExecutorAdmissionError as exc:
                 logger.error(

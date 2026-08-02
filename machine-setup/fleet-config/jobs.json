@@ -12,17 +12,26 @@
       "enabled": true,
       "state": "scheduled",
       "no_agent": false,
+      "admission_profile": "root/executor",
+      "mutable_resources": [
+        "clickup/task/{task_id}",
+        "repo-bridge/task/{task_id}"
+      ],
       "deliver": "local",
-      "workdir": null,
+      "workdir": "/Users/colingreig/dev/hermes-agent",
       "model": "gpt-5.6-sol",
       "provider": "openai-codex",
       "model_snapshot": null,
       "provider_snapshot": null,
-      "skill": "clickup-queue-poller",
+      "skill": "ignite-execute",
       "skills": [
-        "clickup-queue-poller"
+        "ignite-execute"
       ],
       "skill_scope": "dev-executor",
+      "lane_weights": {
+        "code": 1,
+        "content": 1
+      },
       "max_turns": 200,
       "required_environment_variables": [
         "CLICKUP_API_TOKEN"
@@ -38,7 +47,7 @@
       "fire_claim": null,
       "base_url": null,
       "script": null,
-      "prompt": "Work the ClickUp queue now \u2014 follow the clickup-queue-poller skill.",
+      "prompt": "/ignite-execute --lane {lane}",
       "created_at": "2026-07-29T00:00:00-07:00",
       "last_run_at": null,
       "next_run_at": null,
@@ -57,9 +66,15 @@
         "kind": "cron"
       },
       "schedule_display": "*/30 * * * *",
-      "enabled": true,
-      "state": "scheduled",
+      "enabled": false,
+      "state": "retired",
       "no_agent": false,
+      "admission_retired": true,
+      "admission_profile": "root/executor",
+      "mutable_resources": [
+        "clickup/task/{task_id}",
+        "repo-bridge/task/{task_id}"
+      ],
       "deliver": "local",
       "workdir": "/Users/colingreig/dev/hermes-agent",
       "model": "claude-sonnet-5",
@@ -245,6 +260,11 @@
       "enabled": true,
       "state": "scheduled",
       "no_agent": false,
+      "admission_profile": "root/validator",
+      "mutable_resources": [
+        "clickup/task/{task_id}",
+        "repo-validation/{task_id}"
+      ],
       "deliver": "local",
       "workdir": "/Users/colingreig/dev/hermes-agent",
       "model": "gpt-5.4-mini",
@@ -563,6 +583,10 @@
       "enabled": true,
       "state": "scheduled",
       "no_agent": false,
+      "admission_profile": "root/lifecycle",
+      "mutable_resources": [
+        "clickup/task/{task_id}"
+      ],
       "deliver": "local",
       "workdir": null,
       "model": "glm-4.7",
@@ -609,6 +633,10 @@
       "enabled": true,
       "state": "scheduled",
       "no_agent": false,
+      "admission_profile": "root/ops-reporting",
+      "mutable_resources": [
+        "email-delivery"
+      ],
       "deliver": "local",
       "workdir": null,
       "model": "glm-4.7",
@@ -655,6 +683,11 @@
       "enabled": true,
       "state": "scheduled",
       "no_agent": false,
+      "admission_profile": "root/ops-maintenance",
+      "mutable_resources": [
+        "repo-worktrees",
+        "hermes-backups"
+      ],
       "deliver": "local",
       "workdir": "/Users/colingreig/dev/hermes-agent",
       "model": "glm-4.7",

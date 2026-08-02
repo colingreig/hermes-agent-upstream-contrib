@@ -12,6 +12,12 @@ from unittest.mock import patch
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _plumbing_jobs_bypass_admission(monkeypatch):
+    import cron.scheduler as scheduler
+    monkeypatch.setattr(scheduler, "is_executor_job", lambda _job: False)
+
+
 class TestPersistentPool:
     """_get_parallel_pool returns a persistent ThreadPoolExecutor."""
 

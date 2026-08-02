@@ -78,6 +78,7 @@
       "node-inspect-debugger": "software-development/node-inspect-debugger",
       "opencode": "autonomous-ai-agents/opencode",
       "plan": "software-development/plan",
+      "production-write-lease": "production-write-lease",
       "python-debugpy": "software-development/python-debugpy",
       "requesting-code-review": "software-development/requesting-code-review",
       "simplify-code": "software-development/simplify-code",
@@ -121,19 +122,19 @@
   "profiles": {
     "default": {
       "bundled_mode": "keep",
-      "expected_active_manifests": 23
+      "expected_active_manifests": 24
     },
     "coder": {
       "bundled_mode": "keep",
-      "expected_active_manifests": 21
+      "expected_active_manifests": 22
     },
     "content": {
       "bundled_mode": "keep",
-      "expected_active_manifests": 21
+      "expected_active_manifests": 22
     },
     "ops": {
       "bundled_mode": "keep",
-      "expected_active_manifests": 21
+      "expected_active_manifests": 22
     },
     "design": {
       "bundled_mode": "empty",

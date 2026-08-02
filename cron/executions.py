@@ -866,13 +866,16 @@ def recover_interrupted_executions() -> int:
                 continue
             try:
                 from cron.executor_admission import (
-                    EXECUTOR_JOB_IDS,
                     ExecutorAdmissionError,
                     recover_executor_lease_before_execution_reap,
                 )
 
-                if str(entry["job_id"]) in EXECUTOR_JOB_IDS:
-                    recover_executor_lease_before_execution_reap(entry)
+                # The compatibility wrapper returns False when this ledger row
+                # has no admission lease. Every fenced generic profile must be
+                # offered exact stale-owner recovery before its ledger proof is
+                # consumed; restricting this to executor IDs strands validators
+                # and lifecycle passes after a crash.
+                recover_executor_lease_before_execution_reap(entry)
             except ExecutorAdmissionError as exc:
                 # Do not consume the durable owner proof unless the matching
                 # singleton can be finalized first. Startup can continue and
