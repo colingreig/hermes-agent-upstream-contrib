@@ -85,7 +85,7 @@
     {
       "src_rel": "jobs.json",
       "dest_abs": "~/.hermes/cron/jobs.json",
-      "sha256": "443917b27bcf03a4b23bb4787ebaedcf7d12d960cc3c8c378be1e4bf183fde23",
+      "sha256": "9abb03fc214f0c2dfee7b048b719642c179049a9169ece74c0df2a7c13514e76",
       "role": "curated 15-job cron set (12 kept + 3 consolidated; direct ClickUp executor prompts; hermes-pr-validate re-enabled 2026-07-31 and pinned to IGNITE_SKILLS_ROOT), wholesale-replaces the live jobs.json",
       "deploy_mode": "jobs_json"
     },

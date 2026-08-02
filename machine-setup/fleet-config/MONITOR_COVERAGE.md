@@ -28,7 +28,7 @@ state. It does not change live cron or launchd state. The five-minute
 while the probe verifies CI health's semantic `"health": "OK"` result. These
 two scheduling planes therefore cross-watch rather than self-monitor.
 
-## Cron fleet: 15/15 declared
+## Cron fleet: 16/16 declared
 
 | ID | Job | Expected | Outcome proof (not exit-only) | Alarm condition |
 |---|---|---:|---|---|
@@ -47,6 +47,7 @@ two scheduling planes therefore cross-watch rather than self-monitor.
 | `777876d3eb16` | clickup-lifecycle | enabled | fresh non-empty lifecycle response | empty/failed/stale lifecycle pass |
 | `f23a03e9d1b2` | fleet-health-digest | enabled | fresh parsed delivery receipt with `status=sent` | missing/stale/failed delivery |
 | `59bdd8ebc468` | repo-maintenance | enabled | fresh non-empty maintenance response | empty/failed/stale maintenance pass |
+| `6e25865a22a4` | Purelymail notify-me poller | enabled | fresh `purelymail-poller.log` production finish (`dry_run=False` start + finished); rejects SSL/mailbox connect failures | missing/stale log, SSL/CERTIFICATE_VERIFY_FAILED, Mailbox poll failed, or Traceback |
 
 ## LaunchAgent fleet: 20 active + 1 retired
 
