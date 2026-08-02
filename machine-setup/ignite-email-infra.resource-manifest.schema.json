@@ -1,0 +1,94 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/colingreig/hermes-agent/schemas/ignite-email-infra-resource-manifest.schema.json",
+  "title": "Hermes cross-repo resource manifest",
+  "description": "Paths on the Hermes Mini that a partner repository owns. Hermes-agent records and guards these paths; the partner implements deploy/mutation.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "manifest_kind",
+    "partner_repository",
+    "registry_resource_id",
+    "paths",
+    "shared_production_write_lease"
+  ],
+  "properties": {
+    "$schema": {
+      "const": "./ignite-email-infra.resource-manifest.schema.json"
+    },
+    "schema_version": { "const": "1.0" },
+    "manifest_kind": { "const": "hermes-cross-repo-resource-manifest" },
+    "partner_repository": { "type": "string", "minLength": 1 },
+    "registry_resource_id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
+    "description": { "type": "string" },
+    "cron_schedule_authority": { "$ref": "#/$defs/cronScheduleAuthority" },
+    "runtime_lock": { "$ref": "#/$defs/runtimeLock" },
+    "paths": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/pathEntry" }
+    },
+    "shared_production_write_lease": { "$ref": "#/$defs/sharedLease" }
+  },
+  "$defs": {
+    "cronScheduleAuthority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["hermes_cron_job_id", "job_name", "live_schedule_expr"],
+      "properties": {
+        "hermes_cron_job_id": { "type": "string", "minLength": 1 },
+        "job_name": { "type": "string", "minLength": 1 },
+        "live_schedule_expr": { "type": "string", "minLength": 1 },
+        "live_schedule_display": { "type": "string" },
+        "notes": { "type": "string" }
+      }
+    },
+    "runtimeLock": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "kind", "owner", "behavior"],
+      "properties": {
+        "path": { "type": "string", "minLength": 1 },
+        "kind": { "type": "string", "minLength": 1 },
+        "owner": { "type": "string", "minLength": 1 },
+        "behavior": { "type": "string", "minLength": 1 }
+      }
+    },
+    "pathEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "path", "role", "owner_actor_id"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
+        "path": { "type": "string", "minLength": 1 },
+        "role": { "type": "string", "minLength": 1 },
+        "owner_actor_id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
+        "read_only_for": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" }
+        }
+      }
+    },
+    "sharedLease": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "database_path",
+        "registry_path",
+        "ignite_email_infra_actor_id",
+        "required_resource_id",
+        "deploy_entry_point"
+      ],
+      "properties": {
+        "database_path": { "type": "string", "minLength": 1 },
+        "registry_path": { "type": "string", "minLength": 1 },
+        "ignite_email_infra_actor_id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
+        "required_resource_id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
+        "deploy_entry_point": { "type": "string", "minLength": 1 },
+        "acquire_call_site": { "type": "string" },
+        "release_call_site": { "type": "string" }
+      }
+    }
+  }
+}

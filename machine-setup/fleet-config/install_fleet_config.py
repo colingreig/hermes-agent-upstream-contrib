@@ -67,9 +67,16 @@ from pathlib import PurePosixPath
 from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+MACHINE_SETUP = REPO_ROOT / "machine-setup"
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+if str(MACHINE_SETUP) not in sys.path:
+    sys.path.insert(0, str(MACHINE_SETUP))
 from cron import production_write_lease
+from cross_repo_poller_guard import (
+    CrossRepoPollerGuardError,
+    assert_destination_allowed,
+)
 
 try:
     import yaml
@@ -172,6 +179,11 @@ def _protected_mutation(lease_box: dict[str, Any], *, home: Path):
 
 
 def _protected_atomic_write(lease_box: dict[str, Any], *, home: Path, dest: Path, data: bytes) -> None:
+    lease = lease_box["value"]
+    try:
+        assert_destination_allowed(dest, lease_resources=lease.resources, home=home)
+    except CrossRepoPollerGuardError as exc:
+        raise InstallError(str(exc)) from exc
     with _protected_mutation(lease_box, home=home):
         _atomic_write(dest, data)
 

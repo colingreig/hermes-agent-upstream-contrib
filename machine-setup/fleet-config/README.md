@@ -37,6 +37,11 @@ unknown actors, unknown resources, partial mappings, and overlap all fail
 closed. Use `recover` only for an expired exact lease and include durable JSON
 evidence; it writes an immutable recovery receipt.
 
+The ignite-email-infra Purelymail poller boundary is documented in
+`machine-setup/cross-repo-operating-contract.md` (schedule authority cron id
+`6e25865a22a4`, live `*/45 * * * *`). Poller script deploys stay in the
+partner repo — Hermes registers the cron schedule only.
+
 ## Production release path
 
 The rebuilt fleet has one production release path: an operator manually runs
