@@ -529,6 +529,20 @@
       }
     },
     {
+      "label": "com.colingreig.hermes.codex-quota-probe",
+      "expected": "loaded",
+      "outcome": {
+        "kind": "text_artifact",
+        "path": "~/.hermes/logs/codex-quota-probe.launchd.log",
+        "max_age_seconds": 2700,
+        "tail_lines": 5,
+        "latest_record_pattern": "\\[codex-quota-probe\\]",
+        "success_patterns": [
+          "\\[codex-quota-probe\\]"
+        ]
+      }
+    },
+    {
       "label": "com.colingreig.hermes.heartbeat",
       "expected": "loaded",
       "outcome": {

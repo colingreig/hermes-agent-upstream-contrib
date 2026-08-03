@@ -387,6 +387,26 @@ proof packet:
   remain unavailable. Its SDK subprocess uses the immutable
   `~/.hermes/runtime-current/venv/bin/python` path, not the removed mutable
   `~/.hermes/hermes-agent/venv/bin/python` checkout.
+- `codex_quota_probe.py` — early-recovery probe for stale Codex quota marks
+  (86e2kxk50). A provider-supplied `reset_at` on an exhausted `openai-codex`
+  pool entry is a ceiling, not a guarantee — the account sometimes recovers
+  before it. Every 15 minutes (see the paired launchd plist) it re-checks
+  every entry still exhausted with an unexpired retry window using a single
+  cheap, zero-generation-token call (`GET .../codex/models`), and clears the
+  stale mark the moment the account proves usable again — independently per
+  entry, so clearing the primary account can never touch the backup
+  account's own exhaustion state. A still-exhausted entry is left untouched
+  and logged as a non-alerting reduced-redundancy line; a new early clear
+  sends one informational (non-paging) Slack note. Runs under the runtime
+  venv Python (needs `agent.credential_pool` / `hermes_cli.auth`), unlike
+  `degraded_secrets_monitor.py`'s deliberately stdlib-only design.
+  **Runbook:** a persistently-exhausted account with a distant `reset_at`
+  and no early-clear Slack note is normal — the drill only fires when the
+  account is *actually* usable again; check
+  `~/.hermes/logs/codex-quota-probe.launchd.log` for `still unavailable`
+  lines to confirm the probe is running and what HTTP status it is seeing.
+  A manual `hermes auth reset openai-codex` remains the immediate escape
+  hatch if the probe's classification looks wrong.
 - `tests/test_op_sdk_resolve.py` — fully mocked resolver contract harness:
   transient-then-success, exhausted transient without stale, mixed auth +
   timeout precedence, complete stale fallback, and stdout quoting bytes.

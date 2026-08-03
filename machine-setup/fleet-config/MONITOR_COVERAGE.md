@@ -49,7 +49,7 @@ two scheduling planes therefore cross-watch rather than self-monitor.
 | `59bdd8ebc468` | repo-maintenance | enabled | fresh non-empty maintenance response | empty/failed/stale maintenance pass |
 | `6e25865a22a4` | Purelymail notify-me poller | enabled | fresh `purelymail-poller.log` production finish (`dry_run=False` start + finished); rejects SSL/mailbox connect failures | missing/stale log, SSL/CERTIFICATE_VERIFY_FAILED, Mailbox poll failed, or Traceback |
 
-## LaunchAgent fleet: 22 active + 0 retired
+## LaunchAgent fleet: 23 active + 0 retired
 
 | Label | Expected | Outcome proof (not exit-only) | Alarm condition |
 |---|---:|---|---|
@@ -58,6 +58,7 @@ two scheduling planes therefore cross-watch rather than self-monitor.
 | `com.colingreig.hermes-dashboard` | loaded | semantic HTTP `:9119/health` response | endpoint failure or unloaded agent |
 | `com.colingreig.hermes.daily-spend-alert` | loaded | fresh explicit OK/alert evaluation log | stale/fatal/delivery failure |
 | `com.colingreig.hermes.degraded-secrets-monitor` | loaded | fresh healthy/alerted/recovered result; delivery-aware dedupe | stale result or incomplete alarm delivery |
+| `com.colingreig.hermes.codex-quota-probe` | loaded | fresh per-tick probe/clear log line (frozen-count 0, cleared, or still-unavailable) | stale/missing log (pool read failure prints nothing to the artifact) |
 | `com.colingreig.hermes.heartbeat` | loaded | fresh `heartbeat ping delivered` record | DORMANT, failed, or stale heartbeat |
 | `com.colingreig.hermes.ignite-sentinel` | loaded | fresh monitor-start plus semantic JSON result | fatal/stale/missing monitor result |
 | `com.colingreig.hermes.ignite-sentinel-digest` | loaded | fresh digest result/delivery marker | fatal/timeout/stale/missing digest |
