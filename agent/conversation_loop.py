@@ -88,7 +88,10 @@ logger = logging.getLogger(__name__)
 _CRON_SERVED_LEDGER = get_hermes_home() / "logs" / "writer-served.jsonl"
 
 
-def _record_cron_served_ledger(agent, model, provider, base_url, cost_result, moa_ref_cost=None):
+def _record_cron_served_ledger(
+    agent, model, provider, base_url, cost_result, moa_ref_cost=None, *,
+    model_provenance=None,
+):
     """Append one row to the writer-served ledger for a cron-platform API call.
 
     Mirrors the subset of opencode_exec.py's ``_record_served`` schema that
@@ -100,16 +103,24 @@ def _record_cron_served_ledger(agent, model, provider, base_url, cost_result, mo
         cost_usd = None
         if cost_result is not None and cost_result.amount_usd is not None:
             cost_usd = float(cost_result.amount_usd)
-            if moa_ref_cost is not None:
-                cost_usd += float(moa_ref_cost)
+        if moa_ref_cost is not None:
+            cost_usd = (cost_usd or 0.0) + float(moa_ref_cost)
         record = {
             "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "task_id": getattr(agent, "session_id", None) or "unknown",
+            "task_id": str(getattr(agent, "session_id", None) or "unknown"),
             "source": "cron_conversation_loop",
-            "served_model": model,
-            "served_provider": provider,
-            "billing_provider": provider,
-            "billing_base_url": base_url,
+            "served_model": str(model or "unknown"),
+            # App-server supplies explicit provenance. Older/non-app-server
+            # callers retain null rather than claiming a source they did not
+            # report.
+            "served_model_provenance": (
+                str(model_provenance) if model_provenance else None
+            ),
+            "served_provider": str(provider or "unknown"),
+            "billing_provider": str(provider or "unknown"),
+            # Provider adapters may expose URL objects here; normalize durable
+            # ledger metadata to JSON-safe text.
+            "billing_base_url": str(base_url or ""),
             "cost_usd": cost_usd,
             "raw_cost_usd": cost_usd,
             "billing_mode": (
@@ -2342,7 +2353,15 @@ def run_conversation(
                     # aggregator does the full acting loop). Price the aggregator
                     # turn at its REAL model/provider, read from the MoA client's
                     # resolved aggregator slot.
-                    _agg_cost_model = agent.model
+                    # Prefer the provider's response model over the requested
+                    # name. Routers may accept aliases such as ``auto`` and
+                    # report the concrete model that actually served the turn.
+                    _response_model = getattr(response, "model", None)
+                    _agg_cost_model = (
+                        _response_model.strip()
+                        if isinstance(_response_model, str) and _response_model.strip()
+                        else agent.model
+                    )
                     _agg_cost_provider = agent.provider
                     _agg_cost_base_url = agent.base_url
                     _agg_slot = getattr(_moa_client, "last_aggregator_slot", None) if _moa_client is not None else None

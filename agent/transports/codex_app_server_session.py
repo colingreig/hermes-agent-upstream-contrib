@@ -76,6 +76,14 @@ class TurnResult:
     token_usage_total: Optional[dict[str, Any]] = None
     model_context_window: Optional[int] = None
     compacted: bool = False
+    # Model provenance is deliberately separate from the requested model.
+    # The stable thread/start response reports the model/modelProvider Codex
+    # resolved. turn/start and turn/completed do not report a model, so after a
+    # live per-turn model switch the strongest truthful source is the explicit
+    # turn/start request (marked as such rather than pretending it was reported).
+    resolved_model: Optional[str] = None
+    resolved_provider: Optional[str] = None
+    model_provenance: Optional[str] = None
     # Hint to the caller that the underlying codex subprocess is likely
     # wedged (turn-level timeout fired, post-tool watchdog tripped, or
     # token-refresh failure killed the child). The caller should retire
@@ -232,6 +240,9 @@ class CodexAppServerSession:
 
         self._client: Optional[CodexAppServerClient] = None
         self._thread_id: Optional[str] = None
+        self._thread_start_requested_model: Optional[str] = None
+        self._thread_reported_model: Optional[str] = None
+        self._thread_reported_provider: Optional[str] = None
         self._interrupt_event = threading.Event()
         # Pending file-change items, keyed by item id. Populated on
         # item/started for fileChange items; consumed by the approval
@@ -297,6 +308,19 @@ class CodexAppServerSession:
                 ),
             )
         self._thread_id = thread_id
+        self._thread_start_requested_model = self._model
+        reported_model = result.get("model")
+        self._thread_reported_model = (
+            reported_model.strip()
+            if isinstance(reported_model, str) and reported_model.strip()
+            else None
+        )
+        reported_provider = result.get("modelProvider") or thread_obj.get("modelProvider")
+        self._thread_reported_provider = (
+            reported_provider.strip()
+            if isinstance(reported_provider, str) and reported_provider.strip()
+            else None
+        )
         logger.info(
             "codex app-server thread started: id=%s profile=%s cwd=%s model=%s",
             self._thread_id[:8],
@@ -415,6 +439,22 @@ class CodexAppServerSession:
             return result
         assert self._client is not None and self._thread_id is not None
         result.thread_id = self._thread_id
+        result.resolved_provider = self._thread_reported_provider
+        if (
+            self._thread_reported_model
+            and self._model == self._thread_start_requested_model
+        ):
+            result.resolved_model = self._thread_reported_model
+            result.model_provenance = "thread_start_response"
+        elif self._model:
+            # Protocol v2 has no model in TurnStartResponse, TurnStarted, or
+            # TurnCompleted. The explicit accepted request is therefore the
+            # best available source after a retained-thread model switch.
+            result.resolved_model = self._model
+            result.model_provenance = "turn_start_request"
+        elif self._thread_reported_model:
+            result.resolved_model = self._thread_reported_model
+            result.model_provenance = "thread_start_response"
 
         self._interrupt_event.clear()
         projector = CodexEventProjector()

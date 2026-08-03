@@ -50,7 +50,9 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
     inputTokens, cachedInputTokens, outputTokens, reasoningOutputTokens,
     totalTokens.
 
-    Hermes' canonical prompt bucket includes uncached input + cached input.
+    Codex's inputTokens is inclusive of cachedInputTokens. Hermes' canonical
+    input bucket is uncached-only and its prompt bucket adds cache reads, so we
+    subtract the cached subset before constructing CanonicalUsage.
     The Codex app-server protocol does not currently expose cache-write tokens,
     so that bucket remains zero on this runtime.
 
@@ -60,6 +62,10 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
     agent.session_api_calls += 1
 
     usage = getattr(turn, "token_usage_last", None)
+    served_model = getattr(turn, "resolved_model", None) or agent.model
+    model_provenance = (
+        getattr(turn, "model_provenance", None) or "requested_model_fallback"
+    )
     if not isinstance(usage, dict) or not usage:
         compressor = getattr(agent, "context_compressor", None)
         if (
@@ -76,7 +82,7 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
                     agent._ensure_db_session()
                 agent._session_db.update_token_counts(
                     agent.session_id,
-                    model=agent.model,
+                    model=served_model,
                     billing_provider=agent.provider,
                     billing_base_url=agent.base_url,
                     billing_mode="subscription_included",
@@ -87,12 +93,31 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
                     "Codex app-server api-call persistence failed (session=%s): %s",
                     agent.session_id, exc,
                 )
+        # A successful app-server request is still a served call when Codex
+        # omits thread/tokenUsage/updated. Record unknown cost rather than
+        # inventing token or pricing data.
+        if (
+            getattr(agent, "platform", None) == "cron"
+            and not getattr(turn, "interrupted", False)
+            and getattr(turn, "error", None) is None
+        ):
+            from agent.conversation_loop import _record_cron_served_ledger
+
+            _record_cron_served_ledger(
+                agent,
+                served_model,
+                agent.provider,
+                agent.base_url,
+                None,
+                model_provenance=model_provenance,
+            )
         return {}
 
     from agent.usage_pricing import CanonicalUsage, estimate_usage_cost
 
-    input_tokens = _coerce_usage_int(usage.get("inputTokens"))
+    inclusive_input_tokens = _coerce_usage_int(usage.get("inputTokens"))
     cache_read_tokens = _coerce_usage_int(usage.get("cachedInputTokens"))
+    input_tokens = max(inclusive_input_tokens - cache_read_tokens, 0)
     output_tokens = _coerce_usage_int(usage.get("outputTokens"))
     reasoning_tokens = _coerce_usage_int(usage.get("reasoningOutputTokens"))
     reported_total = _coerce_usage_int(usage.get("totalTokens"))
@@ -139,7 +164,7 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
     agent.session_reasoning_tokens += canonical_usage.reasoning_tokens
 
     cost_result = estimate_usage_cost(
-        agent.model,
+        served_model,
         canonical_usage,
         provider=agent.provider,
         base_url=agent.base_url,
@@ -149,6 +174,26 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
         agent.session_estimated_cost_usd += float(cost_result.amount_usd)
     agent.session_cost_status = cost_result.status
     agent.session_cost_source = cost_result.source
+
+    # codex_app_server returns before conversation_loop's normal accounting
+    # hook. Keep cron ledger coverage at this runtime-owned accounting seam so
+    # every successful app-server turn with usage produces the same row as the
+    # chat-completions lane.
+    if (
+        getattr(agent, "platform", None) == "cron"
+        and not getattr(turn, "interrupted", False)
+        and getattr(turn, "error", None) is None
+    ):
+        from agent.conversation_loop import _record_cron_served_ledger
+
+        _record_cron_served_ledger(
+            agent,
+            served_model,
+            agent.provider,
+            agent.base_url,
+            cost_result,
+            model_provenance=model_provenance,
+        )
 
     if agent._session_db and agent.session_id:
         try:
@@ -169,7 +214,7 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
                 billing_base_url=agent.base_url,
                 billing_mode="subscription_included"
                 if cost_result.status == "included" else None,
-                model=agent.model,
+                model=served_model,
                 api_call_count=1,
             )
         except Exception as exc:
