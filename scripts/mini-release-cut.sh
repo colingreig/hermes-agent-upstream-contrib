@@ -2269,6 +2269,163 @@ freeze_managed_poll_after_failure() {
   fi
 }
 
+# Retired release interpreters can survive their owning agent session (notably
+# `hermes mcp serve`) and retain SQLite descriptors long enough to make the
+# nested fleet-config production-write lease fail busy.  Once the immutable
+# target is built, terminate current-user `hermes mcp serve` processes with
+# executable or console-script cmdline provenance in another release
+# generation.  Mere presence in an old release cwd is not sufficient.  The
+# target generation and this cutter's complete ancestor chain are protected
+# explicitly.
+reap_stale_release_processes() {
+  local target_release="${1:?target release required}"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '\033[35m[DRY-RUN]\033[0m enumerate and terminate current-user Hermes mcp serve processes with executable/cwd/cmdline provenance under %s/* excluding %s\n' \
+      "$RELEASES_DIR" "$target_release"
+    return 0
+  fi
+  local target_python="$target_release/venv/bin/python"
+  [ -x "$target_python" ] \
+    || { warn "stale release process inventory unavailable: target Python missing: $target_python"; return 1; }
+  "$target_python" - "$RELEASES_DIR" "$target_release" <<'PY'
+import os
+from pathlib import Path
+import shlex
+import sys
+
+import psutil
+
+release_root = Path(sys.argv[1]).resolve(strict=True)
+target = Path(sys.argv[2]).resolve(strict=True)
+if target.parent != release_root:
+    print(f"refusing stale process inventory for non-release target: {target}", file=sys.stderr)
+    raise SystemExit(2)
+
+helper = psutil.Process()
+protected_pids = {helper.pid}
+protected_pids.update(parent.pid for parent in helper.parents())
+uid = os.getuid()
+matches = []
+
+
+def release_for(path_value):
+    if not path_value:
+        return None
+    try:
+        path = Path(path_value).resolve(strict=False)
+        relative = path.relative_to(release_root)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if not relative.parts:
+        return None
+    return release_root / relative.parts[0]
+
+
+def hermes_mcp_serve_signature(argv):
+    """Require an exact Hermes console-command shape, not just release cwd."""
+    for index, value in enumerate(argv):
+        try:
+            is_hermes = Path(value).name == "hermes"
+        except (OSError, TypeError, ValueError):
+            is_hermes = False
+        if is_hermes and argv[index + 1:index + 3] == ["mcp", "serve"]:
+            return True
+    return False
+
+
+for process in psutil.process_iter(["pid", "cmdline", "create_time", "exe", "cwd"]):
+    try:
+        if process.pid in protected_pids or process.uids().real != uid:
+            continue
+        argv = process.info.get("cmdline") or []
+        if not hermes_mcp_serve_signature(argv):
+            continue
+        # Executable/cmdline paths identify which release owns the process;
+        # cwd is only supporting provenance.  A target-owned Hermes process is
+        # protected even if it happens to be operating in an old release cwd.
+        identity_generations = {release_for(process.info.get("exe"))}
+        identity_generations.update(release_for(value) for value in argv)
+        if target in identity_generations:
+            continue
+        evidence = []
+        value = process.info.get("exe")
+        generation = release_for(value)
+        if generation is not None and generation != target:
+            evidence.append(f"exe={value}")
+        for value in argv:
+            generation = release_for(value)
+            if generation is not None and generation != target:
+                evidence.append(f"cmdline={value}")
+        if not evidence:
+            continue
+        # cwd is useful corroborating log evidence only after executable or
+        # argv provenance has identified a retired release.  Treating cwd as
+        # identity would kill a current/external Hermes command merely because
+        # a caller happened to launch it while inspecting an old release.
+        value = process.info.get("cwd")
+        generation = release_for(value)
+        if generation is not None and generation != target:
+            evidence.append(f"cwd={value}")
+        created = process.info.get("create_time")
+        if not isinstance(created, (int, float)):
+            continue
+        command = shlex.join(argv) if argv else "<unavailable>"
+        matches.append((process, float(created), evidence, command))
+    except (psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess, OSError):
+        continue
+
+if not matches:
+    print("[OK] no stale old-release Hermes processes found")
+    raise SystemExit(0)
+
+terminated = []
+for process, created, evidence, command in matches:
+    try:
+        if process.create_time() != created:
+            continue
+        print(
+            f"[INFO] terminating stale old-release Hermes process pid={process.pid} "
+            f"evidence={';'.join(evidence)} command={command}"
+        )
+        process.terminate()
+        terminated.append(process)
+    except (psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess):
+        continue
+
+_, alive = psutil.wait_procs(terminated, timeout=5)
+# A child owned by another parent can remain visible as a zombie until that
+# parent calls waitpid(). Zombies have already closed every descriptor and are
+# fully reaped for this release-safety purpose.
+def still_holds_resources(process):
+    try:
+        return process.status() != psutil.STATUS_ZOMBIE
+    except psutil.NoSuchProcess:
+        return False
+    except psutil.AccessDenied:
+        return True
+
+
+alive = [process for process in alive if still_holds_resources(process)]
+if alive:
+    for process in alive:
+        try:
+            print(f"[WARN] stale release process ignored SIGTERM; sending SIGKILL pid={process.pid}")
+            process.kill()
+        except psutil.NoSuchProcess:
+            pass
+    _, alive = psutil.wait_procs(alive, timeout=5)
+    alive = [process for process in alive if still_holds_resources(process)]
+if alive:
+    print(
+        "stale old-release processes survived termination: "
+        + ",".join(str(process.pid) for process in alive),
+        file=sys.stderr,
+    )
+    raise SystemExit(2)
+print(f"[OK] reaped {len(terminated)} stale old-release Hermes process(es)")
+PY
+}
+
 # The focused shell harness sources only the helpers above. This is deliberately
 # an opt-in no-op for a production invocation: it cannot cause a release cut.
 if [ "${MINI_RELEASE_CUT_TEST_LIB:-0}" = "1" ]; then
@@ -2778,6 +2935,9 @@ heartbeat_production_write_lease
 # --- Switch: atomic symlink swap + restart + verify ------------------------
 LAUNCHD_GW_OFFSET="$(log_offset)"
 repoint_symlink "$NEW_DIR"
+heartbeat_production_write_lease
+reap_stale_release_processes "$NEW_DIR" \
+  || die "could not terminate stale processes from retired release generations before governed install"
 heartbeat_production_write_lease
 if ! install_governed_marketplace_skills "$NEW_DIR"; then
   warn "governed marketplace skills install/reload failed — rolling back"
