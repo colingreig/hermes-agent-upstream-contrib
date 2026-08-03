@@ -23,8 +23,7 @@
       "destination_root": "scripts",
       "destination": "fleet_outcome_probe.py",
       "mode": "0755",
-      "sha256": "19508ca9ce6122e1c414db45f9bbc5f82b37a75fcaff9f34eee7b5fd969b58f2"
-    },
+      "sha256": "e01875a93b7acf1c28b92d80cefdc9587375e476fb6f5c5793a55045eb38c754"    },
     {
       "source": "fleet_incident_report.py",
       "destination_root": "scripts",
@@ -93,8 +92,7 @@
       "destination_root": "scripts",
       "destination": "mini_local_registry.json",
       "mode": "0644",
-      "sha256": "babe156b6717bf26ba4d5595da6ce42ba0edfab27143d82bec1b0ab8744b2f59"
-    },
+      "sha256": "f381c928375d9714ac8ee9aee006e7c1a066241d63bf33e37b5808a2483c255c"    },
     {
       "source": "hermes_usage_alert.py",
       "destination_root": "scripts",

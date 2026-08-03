@@ -1424,6 +1424,11 @@ case "${1:-}" in
       *) exit 1 ;;
     esac
     ;;
+  diff)
+    # The synthetic target has no Mini runtime changes. Change discovery must
+    # still execute successfully now that release admission fails closed.
+    exit 0
+    ;;
   show|cat-file)
     printf 'unexpected target blob read during dry run\n' >&2
     exit 97
@@ -1987,5 +1992,88 @@ if (
 ) >/dev/null 2>&1; then
   fail "receipt repair source accepted a target outside releases/"
 fi
+
+# Bundle control-plane files are governed too: changing a manifest or its
+# installer must not deadlock the release gate that is responsible for
+# deploying that bundle. An unrelated runtime source in the same target remains
+# uncovered.
+(
+  ACTIVE_SHA=active
+  SHA=target
+  git_current() {
+    case "${1:-}" in
+      diff)
+        printf '%s\n' \
+          machine-setup/mini-scripts/spend_manifest.json \
+          machine-setup/mini-scripts/install_spend.py \
+          machine-setup/mini-scripts/forgotten_runtime.py
+        ;;
+      show) printf '%s\n' '{"files":[]}' ;;
+      *) return 2 ;;
+    esac
+  }
+  [ "$(find_uncovered_mini_scripts_changes)" = \
+    'machine-setup/mini-scripts/forgotten_runtime.py' ]
+) || fail "bundle manifest/installer controls were not admitted precisely"
+
+# Release admission fails closed before build/switch when the target changes a
+# Mini runtime file that is outside every governed manifest.  The same gate is
+# a no-op for a fully covered target, so ordinary cuts remain admissible.
+if (
+  find_uncovered_mini_scripts_changes() {
+    printf '%s\n' 'machine-setup/mini-scripts/forgotten_runtime.py'
+  }
+  require_governed_mini_scripts_changes
+) >/dev/null 2>&1; then
+  fail "release admission accepted an ungoverned Mini runtime change"
+fi
+(
+  find_uncovered_mini_scripts_changes() { :; }
+  require_governed_mini_scripts_changes
+) || fail "release admission rejected a fully governed Mini runtime change set"
+
+# Change discovery is an admission input, not optional evidence. A failed diff
+# must reject the release instead of being converted into an empty change set.
+if (
+  ACTIVE_SHA=active
+  SHA=target
+  git_current() {
+    [ "${1:-}" != diff ] || return 41
+    return 2
+  }
+  require_governed_mini_scripts_changes
+) >/dev/null 2>&1; then
+  fail "release admission failed open when Mini change discovery failed"
+fi
+
+# Registry classifications are release-admission classifications too. Direct
+# sources and explicit mini-local destinations are admitted; an unrelated
+# changed runtime file remains uncovered.
+(
+  ACTIVE_SHA=active
+  SHA=target
+  git_current() {
+    case "${1:-}" in
+      diff)
+        printf '%s\n' \
+          machine-setup/mini-scripts/direct_tool.py \
+          machine-setup/mini-scripts/local_tool.py \
+          machine-setup/mini-scripts/launchd/com.example.local.plist \
+          machine-setup/mini-scripts/forgotten_runtime.py
+        ;;
+      show)
+        case "${2:-}" in
+          *:machine-setup/mini-scripts/mini_local_registry.json)
+            printf '%s\n' '{"direct_deploy":[{"src_rel":"direct_tool.py","dest":"scripts/direct_tool.py"}],"mini_local":[{"path":"scripts/local_tool.py"},{"path":"launch_agents/com.example.*","glob":true}]}'
+            ;;
+          *) printf '%s\n' '{"files":[]}' ;;
+        esac
+        ;;
+      *) return 2 ;;
+    esac
+  }
+  [ "$(find_uncovered_mini_scripts_changes)" = \
+    'machine-setup/mini-scripts/forgotten_runtime.py' ]
+) || fail "release admission ignored direct-deploy or mini-local registry classifications"
 
 printf 'mini-release-cut safety checks passed\n'

@@ -2431,17 +2431,17 @@ prune_releases() {
 }
 
 # ---------------------------------------------------------------------------
-# Ungoverned mini-scripts drift check.
+# Ungoverned mini-scripts release-admission check.
 #
 # Five bundles (self_report_manifest.json + install_self_report.py,
 # spend_manifest.json + install_spend.py,
 # disk_lifecycle_manifest.json + install_disk_lifecycle.py,
 # github_app_manifest.json + install_github_app.py, and
 # fleet_outcome_manifest.json + reconcile_fleet_outcomes.py) declare which
-# machine-setup/mini-scripts/ files are sha-pinned and governed; a fifth
-# (pr_pipeline/manifest.json) owns its whole subtree the same way. Every
-# other file under machine-setup/mini-scripts/ is a manual-copy asset (see
-# the README). The fleet-outcome reconciler runs automatically as part of this
+# machine-setup/mini-scripts/ files are sha-pinned and governed; a sixth
+# (pr_pipeline/manifest.json) owns its whole subtree the same way. Remaining
+# live Mini files must be explicitly classified by mini_local_registry.json.
+# The fleet-outcome reconciler runs automatically as part of this
 # cut. The self-report and spend installers remain explicit invocations, so a
 # file inside either of those bundles can still go undeployed if nobody re-ran
 # its installer.
@@ -2479,6 +2479,53 @@ for entry in manifest.get('files', []):
 " "$root"
 }
 
+# Print registry classifications as ``E<TAB>repo-path`` for exact paths or
+# ``G<TAB>repo-pattern`` for mini-local globs. Registry destinations are live
+# keys (scripts/... or launch_agents/...), so translate them back to their
+# release-tree source shape before comparing them with git diff output.
+classified_mini_scripts_paths() {
+  local root="${1:-machine-setup/mini-scripts}"
+  git_current show "${SHA}:${root}/mini_local_registry.json" 2>/dev/null | python3 -c "
+import json, sys
+
+root = sys.argv[1]
+try:
+    registry = json.load(sys.stdin)
+except Exception:
+    sys.exit(2)
+
+for entry in registry.get('direct_deploy', []):
+    if isinstance(entry, dict) and isinstance(entry.get('src_rel'), str):
+        print('E\\t' + root + '/' + entry['src_rel'])
+
+for entry in registry.get('mini_local', []):
+    if not isinstance(entry, dict) or not isinstance(entry.get('path'), str):
+        continue
+    live = entry['path']
+    if live.startswith('scripts/'):
+        release_path = root + '/' + live[len('scripts/'):]
+    elif live.startswith('launch_agents/'):
+        release_path = root + '/launchd/' + live[len('launch_agents/'):]
+    else:
+        continue
+    print(('G' if entry.get('glob') else 'E') + '\\t' + release_path)
+" "$root"
+}
+
+mini_registry_classifies_path() {
+  local candidate="${1:-}" classifications="${2:-}" kind pattern
+  while IFS=$'\t' read -r kind pattern; do
+    [ -n "$pattern" ] || continue
+    if [ "$kind" = "E" ] && [ "$candidate" = "$pattern" ]; then
+      return 0
+    fi
+    if [ "$kind" = "G" ] && [[ "$candidate" == $pattern ]]; then
+      return 0
+    fi
+  done <<<"$classifications"
+  return 1
+}
+
 # List (repo-relative paths, one per line) every machine-setup/mini-scripts/
 # file that changed between $ACTIVE_SHA and $SHA but is not accounted for by
 # self_report_manifest.json, spend_manifest.json,
@@ -2488,8 +2535,11 @@ for entry in manifest.get('files', []):
 # is ever deployed to the mini.
 find_uncovered_mini_scripts_changes() {
   local root="machine-setup/mini-scripts"
-  local changed covered f
-  changed="$(git_current diff --name-only "$ACTIVE_SHA" "$SHA" -- "$root" 2>/dev/null || true)"
+  local changed covered classified f
+  if ! changed="$(git_current diff --name-only "$ACTIVE_SHA" "$SHA" -- "$root" 2>/dev/null)"; then
+    warn "release admission could not discover changed Mini runtime files"
+    return 1
+  fi
   [ -n "$changed" ] || return 0
 
   covered="$(
@@ -2500,6 +2550,14 @@ find_uncovered_mini_scripts_changes() {
       covered_mini_scripts_paths "$root/github_app_manifest.json" "$root"
       covered_mini_scripts_paths "$root/fleet_outcome_manifest.json" "$root"
       printf '%s\n' \
+        "$root/self_report_manifest.json" \
+        "$root/install_self_report.py" \
+        "$root/spend_manifest.json" \
+        "$root/install_spend.py" \
+        "$root/disk_lifecycle_manifest.json" \
+        "$root/install_disk_lifecycle.py" \
+        "$root/github_app_manifest.json" \
+        "$root/install_github_app.py" \
         "$VENDORED_REFRESH_REL" \
         "$VENDORED_LAUNCHD_RECONCILER_REL" \
         "$VENDORED_SKILLS_RECONCILER_REL" \
@@ -2508,16 +2566,41 @@ find_uncovered_mini_scripts_changes() {
         "$VENDORED_FLEET_OUTCOMES_MANIFEST_REL"
     } 2>/dev/null
   )"
+  if ! classified="$(classified_mini_scripts_paths "$root")"; then
+    warn "release admission could not read the target Mini classification registry"
+    return 1
+  fi
 
   while IFS= read -r f; do
     [ -n "$f" ] || continue
     case "$f" in
       "$root"/tests/*|"$root"/README.md|"$root"/pr_pipeline/*) continue ;;
     esac
-    if ! grep -Fxq -- "$f" <<<"$covered"; then
+    if ! grep -Fxq -- "$f" <<<"$covered" \
+       && ! mini_registry_classifies_path "$f" "$classified"; then
       printf '%s\n' "$f"
     fi
   done <<<"$changed"
+}
+
+# Fail release admission before build, runtime-current switch, or any live
+# Mini-file mutation. A warning-only receipt is too late: it leaves merged
+# runtime fixes inert until somebody notices the log. Keep this helper
+# side-effect free so preflight/dry-run exercise the identical classification.
+require_governed_mini_scripts_changes() {
+  local uncovered count file
+  if ! uncovered="$(find_uncovered_mini_scripts_changes)"; then
+    warn "release admission rejected: Mini runtime change discovery/classification failed"
+    return 1
+  fi
+  [ -z "$uncovered" ] && return 0
+
+  count="$(printf '%s\n' "$uncovered" | grep -c .)"
+  warn "release admission rejected: ${count} changed Mini runtime file(s) are outside every deploy manifest:"
+  while IFS= read -r file; do
+    [ -n "$file" ] && warn "  ungoverned change: $file"
+  done <<<"$uncovered"
+  return 1
 }
 
 freeze_managed_poll_after_failure() {
@@ -2958,6 +3041,8 @@ fi
 # fetch and immutable commit resolution. This closes the check-then-cut race.
 ACTIVE_SHA="$(git_current rev-parse --verify "HEAD^{commit}")" \
   || die "could not resolve active runtime commit"
+require_governed_mini_scripts_changes \
+  || die "target release contains ungoverned Mini runtime changes; add manifest coverage or explicitly classify the file as mini-local"
 if [ "$IF_ADVANCED" -eq 1 ]; then
   ADVANCEMENT="$(classify_ref_advancement "$ACTIVE_SHA" "$SHA")"
   ACTIVE_TARGET="$(readlink "$CURRENT_LINK")"
@@ -3385,21 +3470,7 @@ else
     die "cut aborted and rolled back to previous release"
   fi
 fi
-# Honest receipt: don't claim "governed script deployment verified" while a
-# machine-setup/mini-scripts/ file changed in this release outside every
-# declared deploy manifest (self_report_manifest.json, spend_manifest.json,
-# pr_pipeline/manifest.json, or the three files vendored above). This is a
-# report-only check — it never blocks or rolls back the cut.
-UNCOVERED_MINI_SCRIPTS="$(find_uncovered_mini_scripts_changes)"
 RECEIPT_DETAIL="release cut, exact-source PR-pipeline reconciliation, and governed script deployment verified"
-if [ -n "$UNCOVERED_MINI_SCRIPTS" ]; then
-  UNCOVERED_COUNT="$(printf '%s\n' "$UNCOVERED_MINI_SCRIPTS" | grep -c .)"
-  warn "release changed machine-setup/mini-scripts/ file(s) outside every deploy manifest — NOT deployed to the mini by this cut:"
-  while IFS= read -r UNCOVERED_FILE; do
-    [ -n "$UNCOVERED_FILE" ] && warn "  ungoverned change: $UNCOVERED_FILE"
-  done <<<"$UNCOVERED_MINI_SCRIPTS"
-  RECEIPT_DETAIL="release cut complete; WARNING: ${UNCOVERED_COUNT} machine-setup/mini-scripts/ file(s) changed outside every deploy manifest (see cut log for names)"
-fi
 
 RECEIPT_EVENT="cut"
 [ "$IF_ADVANCED" -eq 1 ] && RECEIPT_EVENT="advanced"
@@ -3408,9 +3479,6 @@ record_cut_receipt_or_rollback "$RECEIPT_EVENT" "$ACTIVE_SHA" "$SHA" "$NEW_DIR" 
   "$RECEIPT_DETAIL"
 
 ok "release cut complete: runtime-current → $NEW_DIR (v${VERSION}-${SHORT_SHA})"
-if [ -n "$UNCOVERED_MINI_SCRIPTS" ]; then
-  warn "release cut complete WITH WARNINGS: ${UNCOVERED_COUNT} ungoverned mini-scripts change(s) — see above"
-fi
 
 # --- Optional prune (explicit only) ----------------------------------------
 if [ "$DO_PRUNE" -eq 1 ]; then

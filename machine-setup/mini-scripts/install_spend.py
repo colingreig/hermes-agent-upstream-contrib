@@ -110,6 +110,11 @@ def _check_dest_in_bounds(dest: Path, dest_abs: str, allowed_root: Path) -> None
        symlinked intermediate directory can't redirect the write outside
        ``allowed_root`` either.
     """
+    if allowed_root.is_symlink():
+        raise InstallError(
+            f"allowed destination root {allowed_root} is a symlink — refusing"
+        )
+
     if ".." in dest.parts:
         raise InstallError(
             f"manifest destination {dest_abs!r} contains a '..' path "
@@ -125,18 +130,18 @@ def _check_dest_in_bounds(dest: Path, dest_abs: str, allowed_root: Path) -> None
             f"which is outside {allowed_root} — refusing"
         ) from exc
 
-    resolved_root = allowed_root.resolve()
-    ancestor = normalized
-    while not ancestor.exists() and ancestor.parent != ancestor:
-        ancestor = ancestor.parent
-    resolved_ancestor = ancestor.resolve()
+    # ``strict=False`` resolves every existing symlink while preserving a
+    # not-yet-created suffix. This allows a first install into a clean home
+    # (where ``.hermes`` does not exist yet) without weakening the symlink
+    # escape check for homes or intermediate directories that do exist.
+    resolved_root = allowed_root.resolve(strict=False)
+    resolved_destination = normalized.resolve(strict=False)
     try:
-        resolved_ancestor.relative_to(resolved_root)
+        resolved_destination.relative_to(resolved_root)
     except ValueError as exc:
         raise InstallError(
-            f"manifest destination {dest_abs!r} resolves (via ancestor "
-            f"{ancestor}) to {resolved_ancestor} which is outside "
-            f"{resolved_root} — refusing"
+            f"manifest destination {dest_abs!r} resolves to "
+            f"{resolved_destination} which is outside {resolved_root} — refusing"
         ) from exc
 
 

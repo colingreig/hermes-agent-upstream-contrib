@@ -1094,20 +1094,20 @@ declared files by name and touches nothing else. Because release/reconcile
 passes are known to clobber hand edits, this manifest + installer must be the
 ONLY writer of these four files going forward.
 
-`scripts/mini-release-cut.sh`'s post-cut receipt now scans every file that
-changed in the cut release under `machine-setup/mini-scripts/` and warns by
-name if any changed file is not covered by `self_report_manifest.json`,
-`spend_manifest.json`, `disk_lifecycle_manifest.json`, `github_app_manifest.json`,
-`fleet_outcome_manifest.json`, `pr_pipeline/manifest.json`, or the three files it
-vendors directly (`clickup_workspace_refresh.py`,
-`reconcile_launchd_environment.py`, `reconcile_marketplace_skills.py`) —
-so an uncovered change is flagged instead of silently rolling up into
-"governed script deployment verified." Neither `install_self_report.py`,
-`install_spend.py`, `install_disk_lifecycle.py`, nor `install_github_app.py`
-is invoked automatically
+`scripts/mini-release-cut.sh` now scans every file changed in the target release
+under `machine-setup/mini-scripts/` **before the build or runtime switch**. It
+rejects the cut if a changed runtime file is not covered by
+`self_report_manifest.json`, `spend_manifest.json`,
+`disk_lifecycle_manifest.json`, `github_app_manifest.json`,
+`fleet_outcome_manifest.json`, `pr_pipeline/manifest.json`, or one of the
+explicit cutter-owned deployment paths. An ungoverned change therefore cannot
+ship with a warning and remain inert on the mini.
+Neither `install_self_report.py`, `install_spend.py`,
+`install_disk_lifecycle.py`, nor `install_github_app.py` is invoked automatically
 by the cut itself (they require an explicit, deliberate run — see each
-installer's usage above); the drift check only makes the receipt honest about
-what did and did not deploy.
+installer's usage above). The pre-switch admission gate proves every changed
+runtime asset has a declared deployment owner; the fleet-outcome coverage check
+then detects missing or drifted live bytes after deployment.
 
 ## GitHub App auth (GH-Cost Phase 1, ClickUp 86e2k42qu)
 

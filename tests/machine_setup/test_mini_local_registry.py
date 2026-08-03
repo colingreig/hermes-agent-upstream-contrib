@@ -9,9 +9,12 @@ contract wiring for the probe's deployment_coverage check must be present.
 """
 from __future__ import annotations
 
+import fnmatch
 import hashlib
+import importlib.util
 import json
 from pathlib import Path
+from unittest import SkipTest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MINI_SCRIPTS = REPO_ROOT / "machine-setup" / "mini-scripts"
@@ -25,6 +28,15 @@ VALID_SCHEMAS = {"dest_map", "fleet_outcome", "pr_pipeline"}
 
 def _registry() -> dict:
     return json.loads(REGISTRY_PATH.read_text(encoding="utf-8"))
+
+
+def _probe_module():
+    module_path = MINI_SCRIPTS / "fleet_outcome_probe.py"
+    spec = importlib.util.spec_from_file_location("fleet_outcome_registry_ut", module_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def test_registry_parses_with_expected_schema():
@@ -96,6 +108,44 @@ def test_mini_local_entries_have_paths_categories_and_reasons():
             assert entry.get("glob") is True, f"wildcard path must set glob: {entry['path']}"
 
 
+def test_deployment_classes_are_mutually_exclusive():
+    registry = _registry()
+    probe = _probe_module()
+    classification, findings = probe._coverage_bundle_classification(
+        registry, mirror_root=MINI_SCRIPTS, identifier="deployment-coverage"
+    )
+    assert findings == []
+
+    direct = {entry["dest"] for entry in registry["direct_deploy"]}
+    local = registry["mini_local"]
+    governed = set(classification["exact"])
+    governed_direct = sorted(
+        key for key in direct if probe._coverage_key_is_bundle_governed(key, classification)
+    )
+    assert not governed_direct, f"governed/direct overlap: {governed_direct}"
+
+    # Exercise every dynamic PR-pipeline rule as well as exact bundle paths.
+    # Literal pattern strings are valid witnesses for fnmatch, and package
+    # sentinels cover the prefix-based classification used by the live probe.
+    dynamic_witnesses = {
+        *(f"scripts/{pattern}" for pattern in classification["pr_root_patterns"]),
+        *(f"{prefix}__coverage_witness__.py" for prefix in classification["pr_package_prefixes"]),
+    }
+    assert all(
+        probe._coverage_key_is_bundle_governed(key, classification) for key in dynamic_witnesses
+    )
+    for key in sorted(governed | direct | dynamic_witnesses):
+        overlaps = [entry["path"] for entry in local if fnmatch.fnmatch(key, entry["path"])]
+        assert not overlaps, f"{key} overlaps mini_local classification(s): {overlaps}"
+
+    local_governed = sorted(
+        entry["path"]
+        for entry in local
+        if probe._coverage_key_is_bundle_governed(entry["path"], classification)
+    )
+    assert not local_governed, f"governed/mini_local overlap: {local_governed}"
+
+
 def test_fleet_outcome_manifest_ships_registry_with_current_sha():
     manifest = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
     entries = [item for item in manifest["files"] if item["source"] == "mini_local_registry.json"]
@@ -123,3 +173,46 @@ def test_contracts_wire_the_deployment_coverage_check():
     checks = [c for c in contracts["operational_checks"] if c.get("kind") == "deployment_coverage"]
     assert len(checks) == 1, "exactly one deployment_coverage operational check must be wired"
     assert checks[0]["path"] == "~/.hermes/scripts/mini_local_registry.json"
+
+
+def test_live_mini_inventory_is_complete_when_available():
+    """Prove the production declaration against the live Mini inventory.
+
+    Other hosts do not own this machine-specific inventory and skip. On the
+    Mini, every regular file must classify cleanly and every symlink must be
+    surfaced explicitly rather than disappearing from coverage.
+    """
+    home = Path.home()
+    scripts = home / ".hermes" / "scripts"
+    agents = home / "Library" / "LaunchAgents"
+    runtime = home / ".hermes" / "runtime-current"
+    if home != Path("/Users/colingreig") or not all(path.is_dir() for path in (scripts, agents, runtime)):
+        raise SkipTest("live Hermes Mini inventory is unavailable on this host")
+
+    module = _probe_module()
+    findings, evidence = module._check_deployment_coverage(
+        {
+            "id": "deployment-coverage",
+            "path": str(REGISTRY_PATH),
+            "release_root": str(REPO_ROOT),
+            "scripts_dir": str(scripts),
+            "launch_agents_dir": str(agents),
+        },
+        home=home,
+    )
+
+    symlinks = {
+        f"{prefix}/{path.relative_to(base).as_posix()}"
+        for base, prefix in ((scripts, "scripts"), (agents, "launch_agents"))
+        for path in base.rglob("*")
+        if path.is_symlink()
+    }
+    assert symlinks, "live proof must exercise fail-closed symlink inventory"
+    codes = {finding["code"] for finding in findings}
+    assert "undeclared_file" not in codes, findings
+    assert not codes.intersection(
+        {"coverage_registry_missing", "coverage_registry_invalid", "coverage_root_missing"}
+    ), findings
+    symlink_finding = next(finding for finding in findings if finding["code"] == "symlink_entry")
+    assert all(key in symlink_finding["detail"] for key in symlinks)
+    assert evidence[0]["symlink_entries"] == len(symlinks)

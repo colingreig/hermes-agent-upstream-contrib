@@ -1117,6 +1117,93 @@ def _coverage_aggregate(
     return _finding("operational", identifier, code, f"{len(ordered)} file(s): {shown}")
 
 
+def _coverage_bundle_classification(
+    registry: dict[str, Any], *, mirror_root: Path, identifier: str
+) -> tuple[dict[str, Any], list[dict[str, str]]]:
+    """Load the complete bundle-governed deployment classification."""
+    governed: dict[str, str | None] = {}
+    pr_root_patterns: list[str] = []
+    pr_root_exclusions: set[str] = set()
+    pr_package_prefixes: list[str] = []
+    findings: list[dict[str, str]] = []
+    for bundle in registry.get("bundles", []):
+        if not isinstance(bundle, dict):
+            continue
+        manifest_rel = str(bundle.get("manifest_rel") or "")
+        manifest_path = mirror_root / manifest_rel
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            findings.append(
+                _finding("operational", identifier, "coverage_manifest_unreadable", f"{manifest_path}: {exc}")
+            )
+            continue
+        # Bundle manifests are deployed alongside their governed files.
+        governed.setdefault(f"scripts/{manifest_rel}", None)
+        schema = bundle.get("schema")
+        if schema == "dest_map":
+            for entry in manifest.get("files", []):
+                if isinstance(entry, dict):
+                    key = _coverage_dest_key(entry.get("dest_abs"))
+                    if key:
+                        governed[key] = entry.get("sha256")
+        elif schema == "fleet_outcome":
+            for entry in manifest.get("files", []):
+                if not isinstance(entry, dict):
+                    continue
+                root = entry.get("destination_root")
+                prefix = "scripts" if root == "scripts" else "launch_agents" if root == "launch_agents" else None
+                if prefix and isinstance(entry.get("destination"), str):
+                    governed[f"{prefix}/{entry['destination']}"] = entry.get("sha256")
+        elif schema == "pr_pipeline":
+            for field in ("source_root_entrypoints", "legacy_flat_entrypoints"):
+                for name in manifest.get(field, []):
+                    if isinstance(name, str):
+                        governed[f"scripts/{name}"] = None
+            for name in manifest.get("expected_local_patches", {}):
+                governed[f"scripts/{name}"] = None
+            pr_root_patterns.extend(
+                pattern for pattern in manifest.get("managed_root_patterns", []) if isinstance(pattern, str)
+            )
+            pr_root_exclusions.update(
+                name for name in manifest.get("unmanaged_root_exclusions", []) if isinstance(name, str)
+            )
+            package_destination = manifest.get("package_destination")
+            if isinstance(package_destination, str) and package_destination:
+                pr_package_prefixes.append(f"scripts/{package_destination}/")
+        else:
+            findings.append(
+                _finding("operational", identifier, "coverage_registry_invalid", f"unsupported bundle schema {schema!r}")
+            )
+    return (
+        {
+            "exact": governed,
+            "pr_root_patterns": tuple(pr_root_patterns),
+            "pr_root_exclusions": frozenset(pr_root_exclusions),
+            "pr_package_prefixes": tuple(pr_package_prefixes),
+        },
+        findings,
+    )
+
+
+def _coverage_key_is_bundle_governed(key: str, classification: dict[str, Any]) -> bool:
+    """Apply the exact, package-prefix, and root-pattern rules used by the live probe."""
+    import fnmatch
+
+    if key in classification["exact"]:
+        return True
+    if any(key.startswith(prefix) for prefix in classification["pr_package_prefixes"]):
+        return True
+    if not key.startswith("scripts/"):
+        return False
+    rel = key.split("/", 1)[1]
+    return (
+        "/" not in rel
+        and rel not in classification["pr_root_exclusions"]
+        and any(fnmatch.fnmatch(rel, pattern) for pattern in classification["pr_root_patterns"])
+    )
+
+
 def _check_deployment_coverage(
     contract: dict[str, Any], *, home: Path
 ) -> tuple[list[dict[str, str]], list[dict[str, Any]]]:
@@ -1161,62 +1248,11 @@ def _check_deployment_coverage(
         str(contract.get("launch_agents_dir") or "~/Library/LaunchAgents"), home=home
     )
 
-    governed: dict[str, str | None] = {}
-    pr_root_patterns: list[str] = []
-    pr_root_exclusions: set[str] = set()
-    pr_package_prefixes: list[str] = []
-    for bundle in registry.get("bundles", []):
-        if not isinstance(bundle, dict):
-            continue
-        manifest_rel = str(bundle.get("manifest_rel") or "")
-        manifest_path = mirror_root / manifest_rel
-        try:
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            findings.append(
-                _finding("operational", identifier, "coverage_manifest_unreadable", f"{manifest_path}: {exc}")
-            )
-            continue
-        # The bundle manifest itself is deployed alongside its files (e.g.
-        # self_report_manifest.json, fleet_outcome_manifest.json land in
-        # ~/.hermes/scripts); a listed bundle's manifest is accounted for by
-        # construction, so its live copy is never "undeclared".
-        governed.setdefault(f"scripts/{manifest_rel}", None)
-        schema = bundle.get("schema")
-        if schema == "dest_map":
-            for entry in manifest.get("files", []):
-                if isinstance(entry, dict):
-                    key = _coverage_dest_key(entry.get("dest_abs"))
-                    if key:
-                        governed[key] = entry.get("sha256")
-        elif schema == "fleet_outcome":
-            for entry in manifest.get("files", []):
-                if not isinstance(entry, dict):
-                    continue
-                root = entry.get("destination_root")
-                prefix = "scripts" if root == "scripts" else "launch_agents" if root == "launch_agents" else None
-                if prefix and isinstance(entry.get("destination"), str):
-                    governed[f"{prefix}/{entry['destination']}"] = entry.get("sha256")
-        elif schema == "pr_pipeline":
-            for field in ("source_root_entrypoints", "legacy_flat_entrypoints"):
-                for name in manifest.get(field, []):
-                    if isinstance(name, str):
-                        governed[f"scripts/{name}"] = None
-            for name in manifest.get("expected_local_patches", {}):
-                governed[f"scripts/{name}"] = None
-            pr_root_patterns.extend(
-                pattern for pattern in manifest.get("managed_root_patterns", []) if isinstance(pattern, str)
-            )
-            pr_root_exclusions.update(
-                name for name in manifest.get("unmanaged_root_exclusions", []) if isinstance(name, str)
-            )
-            package_destination = manifest.get("package_destination")
-            if isinstance(package_destination, str) and package_destination:
-                pr_package_prefixes.append(f"scripts/{package_destination}/")
-        else:
-            findings.append(
-                _finding("operational", identifier, "coverage_registry_invalid", f"unsupported bundle schema {schema!r}")
-            )
+    classification, classification_findings = _coverage_bundle_classification(
+        registry, mirror_root=mirror_root, identifier=identifier
+    )
+    findings.extend(classification_findings)
+    governed: dict[str, str | None] = classification["exact"]
 
     direct = {
         str(entry.get("dest")): str(entry.get("src_rel"))
@@ -1238,6 +1274,7 @@ def _check_deployment_coverage(
     state_matches = _coverage_state_matcher(registry.get("state", {}) or {})
 
     live: dict[str, Path] = {}
+    symlink_entries: list[str] = []
     for base, prefix in ((scripts_dir, "scripts"), (agents_dir, "launch_agents")):
         if not base.is_dir():
             findings.append(
@@ -1245,9 +1282,16 @@ def _check_deployment_coverage(
             )
             continue
         for path in base.rglob("*"):
-            if path.is_symlink() or not path.is_file():
+            key = f"{prefix}/{path.relative_to(base).as_posix()}"
+            if path.is_symlink():
+                # A symlink can redirect an apparently governed filename to
+                # arbitrary bytes, and a directory symlink can hide an entire
+                # subtree from rglob. Never omit either from coverage evidence.
+                symlink_entries.append(key)
                 continue
-            live[f"{prefix}/{path.relative_to(base).as_posix()}"] = path
+            if not path.is_file():
+                continue
+            live[key] = path
 
     def _pin_accepts(key: str, actual_sha: str) -> bool:
         pin = pins.get(key)
@@ -1274,15 +1318,7 @@ def _check_deployment_coverage(
                 elif actual != expected:
                     pinned_accepted.append(key)
             continue
-        if any(key.startswith(prefix) for prefix in pr_package_prefixes):
-            continue
-        rel = key.split("/", 1)[1]
-        if (
-            key.startswith("scripts/")
-            and "/" not in rel
-            and rel not in pr_root_exclusions
-            and any(fnmatch.fnmatch(rel, pattern) for pattern in pr_root_patterns)
-        ):
+        if _coverage_key_is_bundle_governed(key, classification):
             continue
         if key in direct:
             source = mirror_root / direct[key]
@@ -1325,6 +1361,8 @@ def _check_deployment_coverage(
 
     if undeclared:
         findings.append(_coverage_aggregate(identifier, "undeclared_file", undeclared))
+    if symlink_entries:
+        findings.append(_coverage_aggregate(identifier, "symlink_entry", symlink_entries))
     if bundle_drift:
         findings.append(_coverage_aggregate(identifier, "bundle_sha_drift", bundle_drift))
     if direct_drift:
@@ -1340,6 +1378,7 @@ def _check_deployment_coverage(
             "surface": "operational",
             "id": identifier,
             "live_files": len(live),
+            "symlink_entries": len(symlink_entries),
             "governed": len(governed),
             "direct_declared": len(direct),
             "mini_local_declared": len(local_exact) + len(local_globs),
