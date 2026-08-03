@@ -72,6 +72,40 @@ class TestWeightedLaneDispatch:
         assert lane == "content"
         assert rendered["prompt"] == "ignite-execute --lane content run policy"
 
+    def test_content_dispatch_forces_fail_closed_model_pin(self, tmp_cron_dir):
+        """A weighted content run must never inherit the weak global fallback chain."""
+        from cron.jobs import create_job, update_job
+
+        job = create_job(
+            prompt="/ignite-execute --lane {lane}",
+            schedule="every 1h",
+            lane_weights={"code": 0.5, "content": 0.5},
+            no_fallback=False,
+        )
+        update_job(job["id"], {"lane_state": {"counter": 1}})
+        job["lane_state"] = {"counter": 1}
+
+        rendered, lane = _apply_weighted_lane_to_job(job)
+
+        assert lane == "content"
+        assert rendered["no_fallback"] is True
+        assert job["no_fallback"] is False
+
+    def test_code_dispatch_preserves_configured_fallback_policy(self, tmp_cron_dir):
+        from cron.jobs import create_job
+
+        job = create_job(
+            prompt="/ignite-execute --lane {lane}",
+            schedule="every 1h",
+            lane_weights={"code": 0.5, "content": 0.5},
+            no_fallback=False,
+        )
+
+        rendered, lane = _apply_weighted_lane_to_job(job)
+
+        assert lane == "code"
+        assert rendered["no_fallback"] is False
+
 
 class TestPerJobToolsetMcpMerge:
     """A per-job enabled_toolsets allowlist must not silently drop MCP servers."""
@@ -2855,6 +2889,123 @@ class TestRunJobConfigEnvVarExpansion:
         resolve_runtime.assert_called_once_with(requested="anthropic")
         fallback_chain.assert_not_called()
         mock_agent_cls.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("lane_counter", "expected_lane"),
+        [(1, "content"), (0, "code")],
+    )
+    def test_live_weighted_clickup_executor_applies_lane_fallback_policy_before_auth_resolution(
+        self, tmp_cron_dir, monkeypatch, lane_counter, expected_lane
+    ):
+        """The deployed weighted job carries its selected lane policy through run_job."""
+        import sys
+        import types
+        import hermes_cli
+        import cron.scheduler as scheduler
+        from cron.jobs import save_jobs
+
+        class FakeAuthError(Exception):
+            pass
+
+        jobs_path = (
+            Path(__file__).resolve().parents[2]
+            / "machine-setup"
+            / "fleet-config"
+            / "jobs.json"
+        )
+        fleet_jobs = json.loads(jobs_path.read_text(encoding="utf-8"))["jobs"]
+        job = dict(
+            next(item for item in fleet_jobs if item["name"] == "clickup-executor")
+        )
+        job["workdir"] = str(tmp_cron_dir)
+        job["lane_state"] = {"counter": lane_counter}
+        save_jobs([job])
+
+        monkeypatch.setenv("CLICKUP_API_TOKEN", "test-clickup-token")
+        (tmp_cron_dir / "config.yaml").write_text(
+            "model:\n"
+            "  provider: openai-codex\n"
+            "  default: gpt-5.5\n"
+            "fallback_providers:\n"
+            "  - provider: openrouter\n"
+            "    model: configured-code-fallback\n",
+            encoding="utf-8",
+        )
+        skill_dir = tmp_cron_dir / "ignite-plugin" / "skills" / "ignite-execute"
+        skill_dir.mkdir(parents=True)
+        loaded_skill = json.dumps(
+            {
+                "success": True,
+                "content": "# Ignite execute\nGovern the selected executor lane.",
+                "skill_dir": str(skill_dir),
+            }
+        )
+
+        runtime = {
+            "api_key": "test-provider-key",
+            "base_url": "https://provider.invalid",
+            "provider": "openai-codex",
+            "api_mode": "chat_completions",
+        }
+        auth_error = FakeAuthError("primary credentials unavailable")
+        resolve_runtime = MagicMock(
+            side_effect=auth_error if expected_lane == "content" else None,
+            return_value=runtime,
+        )
+        runtime_module = types.ModuleType("hermes_cli.runtime_provider")
+        setattr(runtime_module, "resolve_runtime_provider", resolve_runtime)
+        setattr(runtime_module, "format_runtime_provider_error", str)
+        auth_module = types.ModuleType("hermes_cli.auth")
+        setattr(auth_module, "AuthError", FakeAuthError)
+        mock_agent_cls = MagicMock()
+        fake_run_agent = types.ModuleType("run_agent")
+        setattr(fake_run_agent, "AIAgent", mock_agent_cls)
+        monkeypatch.setitem(sys.modules, "hermes_cli.runtime_provider", runtime_module)
+        monkeypatch.setitem(sys.modules, "hermes_cli.auth", auth_module)
+        monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+        monkeypatch.setattr(
+            hermes_cli, "runtime_provider", runtime_module, raising=False
+        )
+        monkeypatch.setattr(hermes_cli, "auth", auth_module, raising=False)
+
+        fallback_chain = MagicMock(wraps=scheduler.get_fallback_chain)
+        with (
+            patch("cron.scheduler._hermes_home", tmp_cron_dir),
+            patch("cron.scheduler._resolve_origin", return_value=None),
+            patch("hermes_cli.env_loader.load_hermes_dotenv"),
+            patch("hermes_cli.env_loader.reset_secret_source_cache"),
+            patch("hermes_state.SessionDB", return_value=MagicMock()),
+            patch("tools.skills_tool.skill_view", return_value=loaded_skill),
+            patch("tools.skill_usage.bump_use"),
+            patch("tools.mcp_tool.discover_mcp_tools", return_value=[]),
+            patch("cron.scheduler.get_fallback_chain", fallback_chain),
+        ):
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent_cls.return_value = mock_agent
+            success, _, final_response, error = run_job(job)
+
+        resolve_runtime.assert_called_once_with(requested="openai-codex")
+        if expected_lane == "content":
+            assert success is False
+            assert final_response == ""
+            assert error is not None
+            assert "no_fallback=true" in error
+            fallback_chain.assert_not_called()
+            mock_agent_cls.assert_not_called()
+        else:
+            assert success is True
+            assert error is None
+            assert final_response == "ok"
+            fallback_chain.assert_called_once()
+            kwargs = mock_agent_cls.call_args.kwargs
+            assert kwargs["no_fallback"] is False
+            assert kwargs["fallback_model"] == [
+                {"provider": "openrouter", "model": "configured-code-fallback"}
+            ]
+            assert "/ignite-execute --lane code" in (
+                mock_agent.run_conversation.call_args.args[0]
+            )
 
     def test_model_env_ref_in_config_yaml_is_expanded(self, tmp_path, monkeypatch):
         """${VAR} in config.yaml model: is expanded using env after .env is loaded."""
