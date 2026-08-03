@@ -57,7 +57,14 @@
       "destination_root": "scripts",
       "destination": "runtime_current_guard.py",
       "mode": "0755",
-      "sha256": "e88222e402320bc91d7f9f04c0fbf21a9e4843e23ff481e7af7e5db3e7315a69"
+      "sha256": "71a1cef5c64df1e6f82d2ee020b86013df92fc228b2a5382cb4c5dad26758430"
+    },
+    {
+      "source": "governed_path_trust.json",
+      "destination_root": "scripts",
+      "destination": "governed_path_trust.json",
+      "mode": "0644",
+      "sha256": "4f8ec6c60b72458c9d9c6ab52f10311acf306b28915f0cd0d91802c50343a7ac"
     },
     {
       "source": "digest_trusted_scripts.json",

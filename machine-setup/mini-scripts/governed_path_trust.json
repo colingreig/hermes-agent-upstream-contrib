@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "trusted_cutter": {
+    "source": "scripts/mini-release-cut.sh",
+    "sha256": "d2a053f178a1c714c5344e589cc193115eb968cbe753aae30397e48e15e8906b"
+  }
+}
