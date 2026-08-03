@@ -1,5 +1,6 @@
 """Tests for cron/jobs.py — schedule parsing, job CRUD, and due-job detection."""
 
+import itertools
 import threading
 from collections import Counter
 import pytest
@@ -1951,15 +1952,81 @@ class TestCronOutputRetention:
     def test_save_job_output_prunes_old_runs(self, tmp_cron_dir, monkeypatch):
         from cron.jobs import save_job_output, _job_output_dir
         monkeypatch.setattr("cron.jobs._cron_output_keep", lambda: 3)
-        seq = iter(
-            datetime(2026, 6, 25, 10, 0, 0, tzinfo=timezone.utc) + timedelta(seconds=i)
-            for i in range(8)
-        )
-        monkeypatch.setattr("cron.jobs._hermes_now", lambda: next(seq))
+        # Spaced a day apart (not seconds) so that, by the last save, the
+        # count-pruning candidates are also past the 7-day retention floor
+        # (86e2kxk4y) — genuinely old runs, not just numerically-ranked ones.
+        # _hermes_now() is called twice per save (once for the output
+        # filename, once inside _prune_job_output's age check), so a plain
+        # itertools.count-backed clock (rather than a length-8 iterator)
+        # tolerates however many times it's actually invoked.
+        tick = itertools.count(1)
+        base = datetime(2026, 6, 25, 10, 0, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: base + timedelta(days=next(tick)))
         for _ in range(8):
             save_job_output("job1", "report")
         files = sorted(_job_output_dir("job1").glob("*.md"))
         assert len(files) == 3  # only the 3 most-recent runs survive
+
+    def test_prune_keeps_recent_files_past_count_cap(self, tmp_path, monkeypatch):
+        """86e2kxk4y: a job that outruns the count cap within days must not
+        lose history sooner than the guaranteed retention floor — this is the
+        exact 2026-08-01-vanished-while-08-02-present shape."""
+        from cron.jobs import _prune_job_output
+        d = tmp_path / "job"
+        names = self._seed(d, 10)  # all timestamped 2026-06-25, i.e. "just now" below
+        fixed_now = datetime(2026, 6, 25, 10, 5, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: fixed_now)
+        # keep=3 would normally drop 7 files; the 7-day floor protects all 10
+        # since every file is minutes old.
+        assert _prune_job_output(d, keep=3, min_retention_days=7) == 0
+        assert sorted(p.name for p in d.glob("*.md")) == names
+
+    def test_prune_beyond_floor_falls_back_to_count(self, tmp_path, monkeypatch):
+        """Once files ARE past the retention floor, count-based pruning still
+        applies — the floor is a minimum guarantee, not unlimited retention."""
+        from cron.jobs import _prune_job_output
+        d = tmp_path / "job"
+        names = self._seed(d, 10)
+        far_future_now = datetime(2026, 7, 10, 10, 0, 0, tzinfo=timezone.utc)  # >7d later
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: far_future_now)
+        assert _prune_job_output(d, keep=3, min_retention_days=7) == 7
+        assert sorted(p.name for p in d.glob("*.md")) == names[-3:]
+
+    def test_prune_min_retention_days_non_positive_disables_floor(self, tmp_path, monkeypatch):
+        """min_retention_days<=0 is the explicit opt-out — pure count pruning,
+        matching pre-86e2kxk4y behavior exactly."""
+        from cron.jobs import _prune_job_output
+        d = tmp_path / "job"
+        names = self._seed(d, 10)
+        fixed_now = datetime(2026, 6, 25, 10, 5, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: fixed_now)
+        assert _prune_job_output(d, keep=3, min_retention_days=0) == 7
+        assert sorted(p.name for p in d.glob("*.md")) == names[-3:]
+
+    def test_prune_default_min_retention_days_reads_config(self, tmp_path, monkeypatch):
+        """When min_retention_days is omitted, _prune_job_output resolves it
+        from config the same way _cron_output_keep() does."""
+        from cron.jobs import _prune_job_output
+        d = tmp_path / "job"
+        self._seed(d, 10)
+        fixed_now = datetime(2026, 6, 25, 10, 5, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: fixed_now)
+        monkeypatch.setattr("cron.jobs._cron_output_min_retention_days", lambda: 0)
+        assert _prune_job_output(d, keep=3) == 7
+
+    def test_output_file_age_days_parses_filename_timestamp(self, tmp_path):
+        from cron.jobs import _output_file_age_days
+        f = tmp_path / "2026-06-25_10-00-00.md"
+        f.write_text("x")
+        now = datetime(2026, 7, 2, 10, 0, 0, tzinfo=timezone.utc)
+        assert _output_file_age_days(f, now) == pytest.approx(7.0, abs=0.01)
+
+    def test_output_file_age_days_falls_back_to_mtime_on_bad_name(self, tmp_path):
+        from cron.jobs import _output_file_age_days
+        f = tmp_path / "not-a-timestamp.md"
+        f.write_text("x")
+        age = _output_file_age_days(f)
+        assert age is not None and age >= 0
 
     def test_cron_output_keep_reads_config(self, monkeypatch):
         import cron.jobs as jobs
@@ -1974,6 +2041,22 @@ class TestCronOutputRetention:
             "hermes_cli.config.load_config", lambda: {"cron": {"output_retention": "oops"}}
         )
         assert jobs._cron_output_keep() == jobs._CRON_OUTPUT_DEFAULT_KEEP
+
+    def test_cron_output_min_retention_days_reads_config(self, monkeypatch):
+        import cron.jobs as jobs
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"cron": {"output_retention_min_days": 14}},
+        )
+        assert jobs._cron_output_min_retention_days() == 14
+
+    def test_cron_output_min_retention_days_defaults_on_bad_config(self, monkeypatch):
+        import cron.jobs as jobs
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"cron": {"output_retention_min_days": "oops"}},
+        )
+        assert jobs._cron_output_min_retention_days() == jobs._CRON_OUTPUT_DEFAULT_MIN_RETENTION_DAYS
 
 
 # =========================================================================

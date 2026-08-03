@@ -26,7 +26,7 @@
       "src_rel": "opencode_exec.py",
       "src_base": "mirror",
       "dest_abs": "~/.hermes/scripts/opencode_exec.py",
-      "sha256": "fb5b81cffb1f51b3cebf1a54a8e2d2bd500ec01f5aaf888d378f38a51d71fa16",
+      "sha256": "752319dd52b27ff7425e93d60ed9445c73747158de207931f52f0863a750afba",
       "role": "executor's code-writing delegate (STEP 4 of clickup-queue-poller/SKILL.md); invokes OpenCode, streams the JSON event log, and reports success/failure to the orchestrator; imports spend_opencode for billing-route classification and dynamically loads claim_store.py for the outcome record",
       "deploy_mode": "script"
     },

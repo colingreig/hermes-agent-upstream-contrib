@@ -79,13 +79,20 @@ def test_stamp_worked_by_hermes_posts_field_value(monkeypatch):
 
 def test_stamp_worked_by_hermes_never_raises_on_api_error(monkeypatch, capsys):
     monkeypatch.setenv(gate_mod.WORKED_BY_HERMES_OPTION_ENV, "opt-hermes-1")
+    monkeypatch.setattr(gate_mod.time, "sleep", lambda _s: None)  # 86e2kxk4z retries; keep test instant
+
+    calls = {"n": 0}
 
     def fake_urlopen(req, timeout=30):
+        calls["n"] += 1
         raise OSError("boom")
 
     monkeypatch.setattr(gate_mod.urllib.request, "urlopen", fake_urlopen)
 
     gate_mod._stamp_worked_by_hermes("task-123")  # must not raise
 
+    # A persistent connection error retries (86e2kxk4z) before giving up —
+    # confirms the stamp path is now wrapped, not just still failing once.
+    assert calls["n"] == gate_mod._CLICKUP_RETRY_MAX_ATTEMPTS
     err = capsys.readouterr().err
     assert "worked-by stamp failed" in err

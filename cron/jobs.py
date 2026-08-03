@@ -2542,6 +2542,18 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
 # most recent N files per job; a non-positive value disables pruning (opt-out).
 _CRON_OUTPUT_DEFAULT_KEEP = 50
 
+# 86e2kxk4y (2026-08-03): a pure count cap silently rotated out an entire day's
+# artifacts (2026-08-01) sooner than expected on a job that ran often enough to
+# burn through _CRON_OUTPUT_DEFAULT_KEEP files in well under 24h — incident
+# forensics need at least a week of run history, but nothing guaranteed a
+# *time* floor, only a *count* ceiling. Below this many days old, a file is
+# never pruned regardless of how far past the count cap it sits; a
+# non-positive value disables the floor (falls back to pure count-based
+# pruning, the pre-fix behavior).
+_CRON_OUTPUT_DEFAULT_MIN_RETENTION_DAYS = 7
+
+_OUTPUT_FILENAME_TS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2})\.md$")
+
 
 def _cron_output_keep() -> int:
     """Resolve the per-job output-file retention cap from config (``cron.output_retention``)."""
@@ -2554,17 +2566,59 @@ def _cron_output_keep() -> int:
         return _CRON_OUTPUT_DEFAULT_KEEP
 
 
-def _prune_job_output(job_output_dir: Path, keep: int) -> int:
-    """Remove the oldest ``*.md`` run-output files beyond *keep*. Returns count deleted.
+def _cron_output_min_retention_days() -> int:
+    """Resolve the minimum guaranteed retention window, in days, from config
+    (``cron.output_retention_min_days``). This is a FLOOR on top of the count
+    cap: a file younger than this is kept even if it is past ``_cron_output_keep()``
+    in the reverse-chronological ranking."""
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config() or {}
+        cron_cfg = cfg.get("cron", {}) if isinstance(cfg, dict) else {}
+        return int(cron_cfg.get("output_retention_min_days", _CRON_OUTPUT_DEFAULT_MIN_RETENTION_DAYS))
+    except Exception:
+        return _CRON_OUTPUT_DEFAULT_MIN_RETENTION_DAYS
+
+
+def _output_file_age_days(f: Path, now: Optional[datetime] = None) -> Optional[float]:
+    """Age in days, parsed from the ``%Y-%m-%d_%H-%M-%S.md`` filename (immune to
+    a copy/restore changing mtime). Falls back to the file's mtime if the name
+    doesn't match the expected pattern. Returns None if neither is available."""
+    now = now or _hermes_now()
+    match = _OUTPUT_FILENAME_TS_RE.match(f.name)
+    if match:
+        try:
+            stamp = datetime.strptime(match.group(1), "%Y-%m-%d_%H-%M-%S")
+            if now.tzinfo is not None and stamp.tzinfo is None:
+                stamp = stamp.replace(tzinfo=now.tzinfo)
+            return (now - stamp).total_seconds() / 86400.0
+        except ValueError:
+            pass
+    try:
+        mtime = datetime.fromtimestamp(f.stat().st_mtime, tz=now.tzinfo)
+        return (now - mtime).total_seconds() / 86400.0
+    except OSError:
+        return None
+
+
+def _prune_job_output(job_output_dir: Path, keep: int, min_retention_days: Optional[int] = None) -> int:
+    """Remove the oldest ``*.md`` run-output files beyond *keep*, but never one
+    younger than *min_retention_days* (86e2kxk4y — a guaranteed forensics
+    window takes priority over the count cap). Returns count deleted.
 
     Mirrors the quick-snapshot retention in ``hermes_cli.backup._prune_quick_snapshots``:
     output filenames are timestamp-based (``%Y-%m-%d_%H-%M-%S.md``) so a reverse
-    lexical sort orders newest-first, and everything past *keep* is the tail to
-    drop. A non-positive *keep* disables pruning. Pruning failures are swallowed
-    so they can never break output saving.
+    lexical sort orders newest-first, and everything past *keep* is the tail
+    that's ELIGIBLE to drop — eligibility becomes an actual deletion only once
+    the file is also older than *min_retention_days*. A non-positive *keep*
+    disables count-based pruning; a non-positive *min_retention_days* disables
+    the age floor (pure count-based pruning, the pre-86e2kxk4y behavior).
+    Pruning failures are swallowed so they can never break output saving.
     """
     if keep <= 0:
         return 0
+    if min_retention_days is None:
+        min_retention_days = _cron_output_min_retention_days()
     try:
         files = sorted(
             (f for f in job_output_dir.glob("*.md") if f.is_file()),
@@ -2573,8 +2627,13 @@ def _prune_job_output(job_output_dir: Path, keep: int) -> int:
         )
     except OSError:
         return 0
+    now = _hermes_now()
     deleted = 0
     for stale in files[keep:]:
+        if min_retention_days > 0:
+            age_days = _output_file_age_days(stale, now)
+            if age_days is None or age_days < min_retention_days:
+                continue
         try:
             stale.unlink()
             deleted += 1
@@ -2608,7 +2667,9 @@ def save_job_output(job_id: str, output: str):
             pass
         raise
 
-    # Bound per-job output growth so long-running deploys don't fill the disk (#52383).
+    # Bound per-job output growth so long-running deploys don't fill the disk
+    # (#52383), while guaranteeing at least _cron_output_min_retention_days()
+    # of history for incident forensics (86e2kxk4y).
     _prune_job_output(job_output_dir, _cron_output_keep())
 
     return output_file
