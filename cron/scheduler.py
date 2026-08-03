@@ -5200,6 +5200,8 @@ Executor admission check only; no agent was dispatched.
 
 ## Response
 
+Executor outcome: success-no-claim
+
 Zero ClickUp claims and zero swarms were started because another positively observed fenced executor owner is active. This scheduled tick completed as a clean no-claim.
 """
                 save_job_output(job["id"], output)

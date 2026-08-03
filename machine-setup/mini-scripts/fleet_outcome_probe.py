@@ -50,9 +50,13 @@ DEFAULT_STATE = HOME / ".hermes/state/fleet-outcome-alert-state.json"
 DEFAULT_RECEIPT = HOME / ".hermes/state/fleet-outcome-probe.json"
 DEFAULT_DRILL_STATE = HOME / ".hermes/state/fleet-outcome-drill-alert-state.json"
 DEFAULT_DRILL_RECEIPT = HOME / ".hermes/state/fleet-outcome-drill-receipt.json"
+DEFAULT_RELEASE_RECEIPT = HOME / ".hermes/releases/.mini-release-last-receipt.json"
 HERMES_BIN = HOME / ".local/bin/hermes"
 SLACK_TARGET = "slack:hermes"
 REALERT_SECONDS = 6 * 60 * 60
+NEW_FINDING_CONFIRM_SECONDS = 4 * 60
+RECOVERY_CONFIRM_SECONDS = 4 * 60
+CUTOVER_GRACE_SECONDS = 10 * 60
 MONITORED_LABEL_RE = re.compile(
     r"^(?:ai\.hermes\.|com\.hermes\.|com\.ignite\.|com\.colingreig\.(?:hermes|ignite|pull_anthropic))"
 )
@@ -906,6 +910,42 @@ def _signature(findings: list[dict[str, str]]) -> str:
     return hashlib.sha256("\n".join(keys).encode("utf-8")).hexdigest()
 
 
+def _finding_identities(findings: list[dict[str, str]]) -> list[str]:
+    """Return stable contract identities, deliberately excluding finding codes.
+
+    A contract can move through stale, missing-marker, and failure-marker states
+    during one outage.  Those are detail changes inside the same incident, not
+    three separate reasons to page Slack.
+    """
+
+    return sorted({f"{item['surface']}:{item['id']}" for item in findings})
+
+
+def _new_incident_id(now_ts: float, identities: list[str]) -> str:
+    seed = f"{now_ts:.6f}\n" + "\n".join(identities)
+    return hashlib.sha256(seed.encode("utf-8")).hexdigest()
+
+
+def _release_cut_observed_at(path: Path = DEFAULT_RELEASE_RECEIPT) -> datetime | None:
+    """Return the boundary only for a receipt that changed the live runtime."""
+
+    try:
+        receipt = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(receipt, dict) or receipt.get("schema_version") != 2:
+            return None
+        if receipt.get("event") not in {"advanced", "cut", "rollback"}:
+            return None
+        target = receipt.get("to_commit")
+        runtime_target = receipt.get("runtime_target")
+        if not isinstance(target, str) or not re.fullmatch(r"[0-9a-f]{40,64}", target):
+            return None
+        if not isinstance(runtime_target, str) or not runtime_target.startswith("/"):
+            return None
+        return datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
 def _alert_message(findings: list[dict[str, str]], *, drill: bool) -> str:
     prefix = "SYNTHETIC DRILL — " if drill else ""
     lines = [
@@ -920,11 +960,11 @@ def _alert_message(findings: list[dict[str, str]], *, drill: bool) -> str:
     return "\n".join(lines)
 
 
-def _recovery_message(previous_signature: str) -> str:
+def _recovery_message(incident_id: str) -> str:
     return (
         "✅ Hermes fleet outcome coverage recovered\n"
         "All declared cron and LaunchAgent outcome contracts are currently satisfied.\n"
-        f"Previous signature: {previous_signature[:12]}"
+        f"Incident: {incident_id[:12]}"
     )
 
 
@@ -946,45 +986,212 @@ def route_alarm(
     real_alert: bool,
     sender: Callable[[str], subprocess.CompletedProcess[str]] = _send_slack,
     emit_dry_run: bool = True,
+    cutover_at: datetime | None = None,
 ) -> dict[str, Any]:
     state = _load_optional_json(state_path)
     now_ts = now.timestamp()
+    cutover_ts = cutover_at.timestamp() if cutover_at is not None else 0.0
+    in_cutover_grace = bool(
+        cutover_at is not None
+        and -60 <= now_ts - cutover_ts < CUTOVER_GRACE_SECONDS
+    )
     if findings:
         signature = _signature(findings)
+        alert_findings = findings
+        identities = _finding_identities(findings)
+        identity_set = set(identities)
         last_signature = str(state.get("delivered_signature") or "")
         last_alert_at = float(state.get("last_alert_at") or 0)
-        if (
-            state.get("active")
-            and signature == last_signature
-            and now_ts - last_alert_at < REALERT_SECONDS
-        ):
-            return {"action": "deduped", "signature": signature}
-        message = _alert_message(findings, drill=drill)
+        if state.get("active"):
+            # Schema migration: an incident opened by the old exact-signature
+            # router owns the identities visible on the first upgraded probe.
+            delivered = set(state.get("delivered_finding_identities") or identities)
+            incident_id = str(
+                state.get("incident_id")
+                or last_signature
+                or _new_incident_id(last_alert_at or now_ts, sorted(delivered))
+            )
+            pending = dict(state.get("pending_new_findings") or {})
+            new_identities = identity_set - delivered
+            pending = {
+                key: float(pending.get(key) or now_ts)
+                for key in sorted(new_identities)
+            }
+            state.update(
+                {
+                    "incident_id": incident_id,
+                    "delivered_finding_identities": sorted(delivered),
+                    "pending_new_findings": pending,
+                }
+            )
+            state.pop("clean_since", None)
+            persistent_new = {
+                key for key, first_seen in pending.items()
+                if now_ts - first_seen >= NEW_FINDING_CONFIRM_SECONDS
+            }
+            if new_identities and (in_cutover_grace or not persistent_new):
+                if real_alert:
+                    _atomic_json(state_path, state)
+                return {
+                    "action": "cutover-suppressed" if in_cutover_grace else "new-finding-pending",
+                    "signature": signature,
+                    "incident_id": incident_id,
+                }
+            if not persistent_new and now_ts - last_alert_at < REALERT_SECONDS:
+                if real_alert and state != _load_optional_json(state_path):
+                    _atomic_json(state_path, state)
+                return {
+                    "action": "deduped",
+                    "signature": signature,
+                    "incident_id": incident_id,
+                }
+            if persistent_new:
+                alert_identities = delivered | persistent_new
+                alert_findings = [
+                    item for item in findings
+                    if f"{item['surface']}:{item['id']}" in alert_identities
+                ]
+        else:
+            incident_id = str(
+                state.get("pending_incident_id")
+                or _new_incident_id(now_ts, identities)
+            )
+            pending = dict(state.get("pending_new_findings") or {})
+            pending = {
+                key: float(pending.get(key) or now_ts)
+                for key in identities
+            }
+            if in_cutover_grace:
+                state.update(
+                    {
+                        "pending_incident_id": incident_id,
+                        "pending_incident_since": float(
+                            state.get("pending_incident_since") or now_ts
+                        ),
+                        "pending_finding_identities": identities,
+                        "pending_new_findings": pending,
+                        "pending_from_cutover": True,
+                    }
+                )
+                if real_alert:
+                    _atomic_json(state_path, state)
+                return {
+                    "action": "cutover-suppressed",
+                    "signature": signature,
+                    "incident_id": incident_id,
+                }
+            if state.get("pending_from_cutover"):
+                persistent_new = {
+                    key for key, first_seen in pending.items()
+                    if now_ts - first_seen >= NEW_FINDING_CONFIRM_SECONDS
+                }
+                state["pending_new_findings"] = pending
+                if not persistent_new:
+                    if real_alert:
+                        _atomic_json(state_path, state)
+                    return {
+                        "action": "new-finding-pending",
+                        "signature": signature,
+                        "incident_id": incident_id,
+                    }
+                alert_findings = [
+                    item for item in findings
+                    if f"{item['surface']}:{item['id']}" in persistent_new
+                ]
+            state.update(
+                {
+                    "pending_incident_id": incident_id,
+                    "pending_incident_since": float(
+                        state.get("pending_incident_since") or now_ts
+                    ),
+                    "pending_finding_identities": identities,
+                }
+            )
+            if real_alert:
+                _atomic_json(state_path, state)
+        delivery_signature = _signature(alert_findings)
+        message = _alert_message(alert_findings, drill=drill)
         if not real_alert:
             if emit_dry_run:
                 print(message)
-            return {"action": "dry-run", "signature": signature}
+            return {
+                "action": "dry-run",
+                "signature": delivery_signature,
+                "incident_id": incident_id,
+            }
         try:
             result = sender(message)
         except (OSError, subprocess.SubprocessError) as exc:
-            return {"action": "delivery-failed", "signature": signature, "error": str(exc)[-500:]}
+            return {
+                "action": "delivery-failed",
+                "signature": delivery_signature,
+                "incident_id": incident_id,
+                "error": str(exc)[-500:],
+            }
         if result.returncode != 0:
             detail = (result.stderr or result.stdout or "unknown send failure").strip()
-            return {"action": "delivery-failed", "signature": signature, "error": detail[-500:]}
+            return {
+                "action": "delivery-failed",
+                "signature": delivery_signature,
+                "incident_id": incident_id,
+                "error": detail[-500:],
+            }
         state.update(
             {
-                "delivered_signature": signature,
+                "delivered_signature": delivery_signature,
                 "last_alert_at": now_ts,
                 "active": True,
+                "incident_id": incident_id,
+                "delivered_finding_identities": sorted(
+                    set(state.get("delivered_finding_identities") or [])
+                    | set(_finding_identities(alert_findings))
+                ),
             }
         )
+        state.pop("pending_incident_id", None)
+        state.pop("pending_incident_since", None)
+        state.pop("pending_finding_identities", None)
+        state.pop("pending_from_cutover", None)
+        remaining_pending = {
+            key: value
+            for key, value in dict(state.get("pending_new_findings") or {}).items()
+            if key not in set(_finding_identities(alert_findings))
+        }
+        if remaining_pending:
+            state["pending_new_findings"] = remaining_pending
+        else:
+            state.pop("pending_new_findings", None)
+        state.pop("clean_since", None)
         _atomic_json(state_path, state)
-        return {"action": "sent", "signature": signature}
+        return {
+            "action": "sent",
+            "signature": delivery_signature,
+            "incident_id": incident_id,
+        }
 
     previous_signature = str(state.get("delivered_signature") or "")
     if not state.get("active") or not previous_signature:
+        if state.get("pending_incident_id"):
+            state.pop("pending_incident_id", None)
+            state.pop("pending_incident_since", None)
+            state.pop("pending_finding_identities", None)
+            state.pop("pending_new_findings", None)
+            state.pop("pending_from_cutover", None)
+            if real_alert:
+                _atomic_json(state_path, state)
         return {"action": "clean"}
-    message = _recovery_message(previous_signature)
+    incident_id = str(state.get("incident_id") or previous_signature)
+    clean_since = float(state.get("clean_since") or now_ts)
+    state["clean_since"] = clean_since
+    if in_cutover_grace or now_ts - clean_since < RECOVERY_CONFIRM_SECONDS:
+        if real_alert:
+            _atomic_json(state_path, state)
+        return {
+            "action": "recovery-suppressed" if in_cutover_grace else "recovery-pending",
+            "signature": previous_signature,
+            "incident_id": incident_id,
+        }
+    message = _recovery_message(incident_id)
     if not real_alert:
         if emit_dry_run:
             print(message)
@@ -1009,10 +1216,17 @@ def route_alarm(
             "active": False,
             "last_recovery_at": now_ts,
             "recovered_signature": previous_signature,
+            "recovered_incident_id": incident_id,
         }
     )
+    state.pop("clean_since", None)
+    state.pop("pending_new_findings", None)
     _atomic_json(state_path, state)
-    return {"action": "recovery-sent", "signature": previous_signature}
+    return {
+        "action": "recovery-sent",
+        "signature": previous_signature,
+        "incident_id": incident_id,
+    }
 
 
 def _inject_contract_failures(
@@ -1155,6 +1369,7 @@ def main(argv: list[str] | None = None) -> int:
             drill=args.drill_all,
             real_alert=real_alert,
             emit_dry_run=not args.json,
+            cutover_at=None if args.drill_all else _release_cut_observed_at(),
         )
     finally:
         # The receipt must land even if alarm delivery raised unexpectedly

@@ -23,7 +23,7 @@
       "destination_root": "scripts",
       "destination": "fleet_outcome_probe.py",
       "mode": "0755",
-      "sha256": "c22c23977a266bca9b284be774cc9d230446b0cfb8154f1207fb64bebcd69f5c"
+      "sha256": "97947a1c24f01eacd7585d9dd4d146d52372d799e7c463f1e83af1e4adf3b474"
     },
     {
       "source": "verify_governed_paths.py",
@@ -37,7 +37,7 @@
       "destination_root": "scripts",
       "destination": "fleet_outcome_contracts.json",
       "mode": "0644",
-      "sha256": "d1b904c20bb88eba838733b8e740b5a01fe87fbbb8959fb7f405f330875e3bb5"
+      "sha256": "62a02dc2d077bd2c2b6a09e03712461b3392f28948dd474fc57e6cf8d53e9193"
     },
     {
       "source": "hermes_usage_alert.py",
