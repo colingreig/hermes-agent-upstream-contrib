@@ -195,6 +195,25 @@ def test_verifier_rejects_materialized_prompt_postcondition_drift(tmp_path, muta
         module.GovernedPathsVerifier(home=tmp_path, fixture_safe=True).verify()
 
 
+@pytest.mark.parametrize("mutation", ["missing", "false"])
+def test_verifier_rejects_governed_executor_no_fallback_drift(tmp_path, mutation):
+    _install_fixture(tmp_path)
+    jobs_path = tmp_path / ".hermes" / "cron" / "jobs.json"
+    jobs = json.loads(jobs_path.read_text())
+    job = next(item for item in jobs["jobs"] if item["id"] == "62714b869845")
+    assert job["no_fallback"] is True
+    if mutation == "missing":
+        job.pop("no_fallback")
+    else:
+        job["no_fallback"] = False
+    jobs_path.write_text(json.dumps(jobs), encoding="utf-8")
+
+    with pytest.raises(
+        module.VerificationError, match="managed cron job drifted: 62714b869845"
+    ):
+        module.GovernedPathsVerifier(home=tmp_path, fixture_safe=True).verify()
+
+
 def test_verifier_rejects_jobs_helper_hash_drift_without_executing_it(tmp_path):
     _install_fixture(tmp_path)
     fleet_root = _copied_fleet_root(tmp_path)

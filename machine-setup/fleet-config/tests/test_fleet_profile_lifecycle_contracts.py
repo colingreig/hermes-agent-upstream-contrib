@@ -96,6 +96,7 @@ def test_clickup_executor_jobs_use_direct_paths_with_stable_scheduling():
         assert job["prompt"] == contract["prompt"]
         if name == "clickup-executor":
             assert job["lane_weights"] == {"code": 1, "content": 1}
+            assert job["no_fallback"] is True
         if "workdir" in contract:
             assert job["workdir"] == contract["workdir"]
         if name == "content-lane-executor":
