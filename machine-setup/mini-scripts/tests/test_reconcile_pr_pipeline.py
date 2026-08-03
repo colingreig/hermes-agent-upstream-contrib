@@ -164,10 +164,13 @@ class PipelineDeploymentTests(unittest.TestCase):
         current_source_sha = hashlib.sha256(PATCH_VERIFIER.read_bytes()).hexdigest()
         self.assertEqual(spec["source_sha256"], current_source_sha)
         self.assertTrue(self.real_resolve_manifest().files)
-        self.assertEqual(
-            spec["deployed_sha256"],
-            "ce51ca818e1d127a83b61694545c0fb673e749688a72dd7b0ae909522431aff5",
-        )
+        # deployed_sha256 pins the mini's intentionally-diverged local patch,
+        # which has no counterpart file in this repo to hash against. A
+        # hard-coded literal here would just duplicate manifest.json's own
+        # value and go stale every time the mini-local patch content
+        # legitimately changes (this is the same landmine PR #316 removed
+        # for the equivalent source_sha256 duplicate) -- assert shape only.
+        self.assertRegex(spec["deployed_sha256"], r"^[0-9a-f]{64}$")
         self.assertIn("Slack patch-05 MPIM/DM", spec["reason"])
 
     def test_install_has_hash_parity_and_records_source_commit(self):
