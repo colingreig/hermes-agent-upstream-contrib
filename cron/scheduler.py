@@ -419,6 +419,51 @@ SILENT_MARKER = "[SILENT]"
 _CRON_SILENCE_TOKENS = frozenset({"[SILENT]", "SILENT", "NO_REPLY", "NO REPLY"})
 _EXECUTION_HEARTBEAT_SECONDS = 30.0
 
+# Durable, structured observability trail for [SILENT] delivery-skips (ClickUp
+# 86e2kxk4t). A single agent silently reporting "nothing new" is normal and
+# intentionally stays INFO-level (see the logger.info call in
+# _deliver_cron_outcome below) — but a run of these across one job, or a
+# cluster of them fleet-wide, can also mean the claim path is broken or the
+# whole fleet went dark, and an INFO log line alone can go unread for days (as
+# happened 2026-08-02: 17 of 50 executor runs ended [SILENT] with nothing
+# louder than a log line). silent_delivery_monitor.py reads this rolling
+# JSONL to detect that abnormal-rate case and page/Slack-alert on it; this
+# helper only ever appends the observability fact, and a write failure here
+# must never affect delivery.
+CRON_SILENT_LOG_PATH_ENV = "HERMES_CRON_SILENT_LOG_PATH"
+
+
+def _cron_silent_log_path() -> Path:
+    override = os.environ.get(CRON_SILENT_LOG_PATH_ENV)
+    if override:
+        return Path(override)
+    return _get_hermes_home() / "state" / "cron-silent-deliveries.jsonl"
+
+
+def _record_silent_delivery(job_id: str, *, now: Optional[float] = None) -> None:
+    """Append one durable record of a [SILENT] delivery-skip. Best-effort:
+    never raises, never blocks or alters the delivery outcome."""
+    try:
+        path = _cron_silent_log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        record = json.dumps({
+            "job_id": job_id,
+            "at": now if now is not None else time.time(),
+        })
+        with open(path, "a", encoding="utf-8") as f:
+            if fcntl is not None:
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            try:
+                f.write(record + "\n")
+            finally:
+                if fcntl is not None:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+    except Exception:
+        logger.debug(
+            "Job '%s': failed to record [SILENT] delivery observability line",
+            job_id, exc_info=True,
+        )
+
 
 class _ExecutionLeaseHeartbeat:
     """Keep a durable execution lease alive while a worker is active."""
@@ -701,9 +746,12 @@ def _deliver_cron_outcome(
         else _summarize_cron_failure_for_delivery(job, outcome.error)
     )
     if not content.strip():
+        if outcome.success:
+            _record_silent_delivery(job["id"])
         return outcome
     if outcome.success and _is_cron_silence_response(content):
         logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
+        _record_silent_delivery(job["id"])
         return outcome
     try:
         delivery_error = _deliver_result(job, content, adapters=adapters, loop=loop)

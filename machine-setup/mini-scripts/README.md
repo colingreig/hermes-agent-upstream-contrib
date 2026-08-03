@@ -407,6 +407,27 @@ proof packet:
   lines to confirm the probe is running and what HTTP status it is seeing.
   A manual `hermes auth reset openai-codex` remains the immediate escape
   hatch if the probe's classification looks wrong.
+- `silent_delivery_monitor.py` — alarms on an abnormal rate of `[SILENT]`
+  cron delivery-skips (86e2kxk4t). `cron/scheduler.py`'s
+  `_deliver_cron_outcome` now appends one durable JSONL record per silent
+  ending to `~/.hermes/state/cron-silent-deliveries.jsonl`; this monitor
+  reads a trailing 60-minute window and fires a real Slack alert (not just
+  the pre-existing INFO log line) when either one job accumulates >= 4
+  silents in the window (a stuck claim/routing path) or the fleet
+  accumulates >= 8 silents across all jobs (a simultaneous cross-job
+  silence spike — the "total outage" shape from 2026-08-02, 17/50 executor
+  runs). Signature-based dedupe/recovery, same convention as
+  `degraded_secrets_monitor.py`: alerts once per distinct breach, goes
+  quiet on repeat checks of the same signature, and re-arms the moment the
+  rolling window drops back under both thresholds — a satisfiable alarm,
+  not a permanently-red flag. Runs on the same stdlib-only, system-Python
+  design as `degraded_secrets_monitor.py` (no repo package imports needed).
+  **Runbook** is in the script's own module docstring: diagnose a
+  single-job breach via that job's recent output/jobs.json entry; diagnose
+  a fleet-wide breach via gateway/provider health first; the alarm clears
+  itself automatically once the window recovers, or can be force-cleared
+  by truncating the JSONL log or deleting
+  `~/.hermes/state/silent-delivery-monitor.json`.
 - `tests/test_op_sdk_resolve.py` — fully mocked resolver contract harness:
   transient-then-success, exhausted transient without stale, mixed auth +
   timeout precedence, complete stale fallback, and stdout quoting bytes.
