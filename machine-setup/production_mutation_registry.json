@@ -325,6 +325,25 @@
       }
     },
     {
+      "id": "validator-live-trigger-cron",
+      "name": "Validator live trigger (fenced verdict producer)",
+      "actor_class": "cron",
+      "owning_repository": "hermes-agent",
+      "mutability": "mutating",
+      "entry_points": ["machine-setup/mini-scripts/validate_pr_live_trigger.py", "~/.hermes/scripts/validate_pr_live_trigger.py"],
+      "cron_job_ids": ["4b8e1d97c3a2"],
+      "resources_touched": ["pr-pipeline-state", "cron-jobs"],
+      "current_lock_or_transaction_boundary": {
+        "kind": "SQLite trust-store fencing lease plus validator finalize token",
+        "path_or_identity": "~/.hermes/scripts/.validator_trust.sqlite3",
+        "behavior": "The compatibility entry point delegates to pr_pipeline.validate_pr_live_trigger.safe_main, which only hands fully CI-green unheld PR heads to validate_pr.validate; every finalization goes through the lease-fenced SQLite review session and requires the job-scoped HERMES_VALIDATOR_FINALIZE_TOKEN, so no other actor can mint a merge-eligible verdict."
+      },
+      "rollback_surface": {
+        "surface": "Immutable SQLite verdict ledger",
+        "procedure": "Verdicts are immutable per PR head; correct a wrong verdict by pushing a new head (new identity) and letting the trigger re-validate — never by rewriting ledger rows."
+      }
+    },
+    {
       "id": "clickup-review-sla-cron",
       "name": "ClickUp review SLA watchdog",
       "actor_class": "cron",
