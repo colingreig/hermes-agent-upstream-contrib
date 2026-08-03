@@ -1393,7 +1393,13 @@ def _check_operational_contracts(
             if max_size and size > max_size:
                 findings.append(_finding("operational", identifier, "database_size", f"{path} is {size} bytes (limit {max_size})"))
             evidence.append({"surface": "operational", "id": identifier, "path": str(path), "size_bytes": size})
-        elif kind == "repeated_preflight_failures":
+        elif kind in {"repeated_preflight_failures", "repeated_release_drift"}:
+            # Same repeat-count shape for both: count regex matches in the
+            # tail of a log and alarm once they cross a threshold, instead of
+            # paging on the first transient hit. The finding code tracks the
+            # contract's own kind so distinct alarm classes (stale preflight
+            # vs silent release drift) stay distinguishable in incident
+            # reports even though they share this implementation.
             try:
                 text = path.read_text(encoding="utf-8", errors="replace")
             except OSError:
@@ -1401,12 +1407,26 @@ def _check_operational_contracts(
             pattern = str(contract.get("pattern") or "preflight.*(?:fail|error)")
             count = len(re.findall(pattern, text[-int(contract.get("tail_bytes", 262144)):], re.IGNORECASE))
             if count >= int(contract.get("threshold", 3)):
-                findings.append(_finding("operational", identifier, "repeated_preflight_failures", f"{count} recent matching records in {path}"))
+                findings.append(_finding("operational", identifier, kind, f"{count} recent matching records in {path}"))
             evidence.append({"surface": "operational", "id": identifier, "matches": count})
         elif kind == "governed_manifest":
             manifest = _load_optional_json(path)
+            launch_agents_dir = _expand_path(
+                str(contract.get("launch_agents_dir") or "~/Library/LaunchAgents"), home=home
+            )
             for item in manifest.get("files", []):
-                source = path.parent / str(item.get("source") or "")
+                # LaunchAgents entries deploy from a staging source (e.g.
+                # launchd/foo.plist) to a live path under ~/Library/LaunchAgents
+                # named by "destination" -- the two are never siblings on
+                # disk, so "path.parent/source" resolves to a nonexistent
+                # file and false-positives every boot. Scripts entries have
+                # no such split (their staged source *is* the deployed
+                # layout under ~/.hermes/scripts), so path.parent/source
+                # stays a deliberate staging-source integrity check there.
+                if item.get("destination_root") == "launch_agents" and isinstance(item.get("destination"), str):
+                    source = launch_agents_dir / item["destination"]
+                else:
+                    source = path.parent / str(item.get("source") or "")
                 try:
                     actual = hashlib.sha256(source.read_bytes()).hexdigest()
                 except OSError as exc:

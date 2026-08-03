@@ -457,6 +457,14 @@
       "tail_bytes": 262144
     },
     {
+      "id": "release-poll-drift",
+      "kind": "repeated_release_drift",
+      "path": "~/.hermes/logs/mini-release-poll.log",
+      "pattern": "remote prod SHA does not match governed control",
+      "threshold": 3,
+      "tail_bytes": 262144
+    },
+    {
       "id": "governed-path-integrity",
       "kind": "governed_manifest",
       "path": "~/.hermes/scripts/fleet_outcome_manifest.json"
@@ -539,7 +547,7 @@
         "path": "~/.hermes/logs/degraded-secrets-monitor.launchd.log",
         "max_age_seconds": 1800,
         "tail_lines": 5,
-        "latest_record_pattern": "\\[degraded-secrets-monitor\\]",
+        "latest_record_pattern": "\\[degraded-secrets-monitor\\] (?:healthy|FATAL-loop|gateway parked|unresolved placeholder|credential pool degraded|alerted|alert delivery incomplete|recovered)",
         "success_patterns": [
           "degraded-secrets-monitor.*(?:healthy|alerted|recovered)"
         ],
