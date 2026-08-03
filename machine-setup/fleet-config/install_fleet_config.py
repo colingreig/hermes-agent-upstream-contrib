@@ -127,6 +127,9 @@ JOBS_RUNTIME_DENYLIST = frozenset(
         "paused_at",
         "paused_reason",
         "lane_state",
+        "route_health",
+        "provider_snapshot",
+        "model_snapshot",
     }
 )
 

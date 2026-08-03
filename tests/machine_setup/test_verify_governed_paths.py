@@ -163,6 +163,20 @@ def test_verifier_ignores_runtime_claims_but_enforces_repeat_limit(tmp_path):
         module.GovernedPathsVerifier(home=tmp_path, fixture_safe=True).verify()
 
 
+def test_verifier_ignores_runtime_route_and_state_snapshots(tmp_path):
+    _install_fixture(tmp_path)
+    jobs_path = tmp_path / ".hermes" / "cron" / "jobs.json"
+    jobs = json.loads(jobs_path.read_text())
+    job = jobs["jobs"][0]
+    job["state"] = "running"
+    job["route_health"] = {"provider": "codex", "healthy": True}
+    job["provider_snapshot"] = {"provider": "codex"}
+    job["model_snapshot"] = {"model": "gpt-5.6-sol"}
+    jobs_path.write_text(json.dumps(jobs), encoding="utf-8")
+
+    module.GovernedPathsVerifier(home=tmp_path, fixture_safe=True).verify()
+
+
 def test_verifier_accepts_scheduler_lane_state_and_equivalent_lane_weight_ratio(tmp_path):
     _install_fixture(tmp_path)
     jobs_path = tmp_path / ".hermes" / "cron" / "jobs.json"
@@ -195,17 +209,17 @@ def test_verifier_rejects_materialized_prompt_postcondition_drift(tmp_path, muta
         module.GovernedPathsVerifier(home=tmp_path, fixture_safe=True).verify()
 
 
-@pytest.mark.parametrize("mutation", ["missing", "false"])
+@pytest.mark.parametrize("mutation", ["missing", "true"])
 def test_verifier_rejects_governed_executor_no_fallback_drift(tmp_path, mutation):
     _install_fixture(tmp_path)
     jobs_path = tmp_path / ".hermes" / "cron" / "jobs.json"
     jobs = json.loads(jobs_path.read_text())
     job = next(item for item in jobs["jobs"] if item["id"] == "62714b869845")
-    assert job["no_fallback"] is True
+    assert job["no_fallback"] is False
     if mutation == "missing":
         job.pop("no_fallback")
     else:
-        job["no_fallback"] = False
+        job["no_fallback"] = True
     jobs_path.write_text(json.dumps(jobs), encoding="utf-8")
 
     with pytest.raises(

@@ -44,6 +44,10 @@ RUNTIME_JOB_FIELDS = {
     "fire_claim",
     "run_claim",
     "lane_state",
+    "route_health",
+    "provider_snapshot",
+    "model_snapshot",
+    "state",
 }
 
 

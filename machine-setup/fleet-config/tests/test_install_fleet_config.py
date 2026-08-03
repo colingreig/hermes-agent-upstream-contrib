@@ -910,6 +910,10 @@ def test_merge_jobs_json_preserves_runtime_for_real_fleet_bundle():
         live_job["last_status"] = "ok"
         live_job["last_run_at"] = "2026-08-01T10:00:00+00:00"
         live_job["runtime"] = {"probe": job["id"]}
+        live_job["state"] = "idle"
+        live_job["route_health"] = {"probe": job["id"]}
+        live_job["provider_snapshot"] = {"probe": job["id"]}
+        live_job["model_snapshot"] = {"probe": job["id"]}
         repeat = dict(live_job.get("repeat") or {})
         repeat["completed"] = 7
         live_job["repeat"] = repeat
@@ -930,6 +934,10 @@ def test_merge_jobs_json_preserves_runtime_for_real_fleet_bundle():
         assert merged_job["last_status"] == "ok"
         assert merged_job["last_run_at"] == "2026-08-01T10:00:00+00:00"
         assert merged_job["runtime"] == {"probe": job["id"]}
+        assert merged_job["state"] == "idle"
+        assert merged_job["route_health"] == {"probe": job["id"]}
+        assert merged_job["provider_snapshot"] == {"probe": job["id"]}
+        assert merged_job["model_snapshot"] == {"probe": job["id"]}
         assert merged_job["repeat"]["completed"] == 7
 
 
@@ -937,9 +945,9 @@ def test_merge_jobs_json_restores_governed_executor_no_fallback_pin():
     bundled_path = Path(__file__).resolve().parents[1] / "jobs.json"
     fleet_jobs = json.loads(bundled_path.read_text(encoding="utf-8"))["jobs"]
     governed = dict(next(job for job in fleet_jobs if job["id"] == "62714b869845"))
-    assert governed["no_fallback"] is True
+    assert governed["no_fallback"] is False
     live = dict(governed)
-    live["no_fallback"] = False
+    live["no_fallback"] = True
     live["last_status"] = "ok"
 
     merged, counts = install_mod.merge_jobs_json(
@@ -947,5 +955,5 @@ def test_merge_jobs_json_restores_governed_executor_no_fallback_pin():
     )
 
     assert counts == {"preserved": 0, "changed": 1, "new": 0, "removed": 0}
-    assert merged["jobs"][0]["no_fallback"] is True
+    assert merged["jobs"][0]["no_fallback"] is False
     assert merged["jobs"][0]["last_status"] == "ok"
