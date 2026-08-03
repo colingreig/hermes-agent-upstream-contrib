@@ -36,14 +36,14 @@ instead of spamming every tick) instead of silently reporting all-clear.
 from __future__ import annotations
 
 import json
+import importlib.util
 import os
+from pathlib import Path
 import re
 import subprocess
 import sys
 import time
 from typing import Any
-
-import slack_msg_builder as smb
 
 HOME = os.path.expanduser("~")
 LOGS = [
@@ -301,6 +301,17 @@ def _scan_cron_errors(state, now: float | None = None):
 
 
 def _build_alert(kind: str, events: list[dict[str, Any]], now: float) -> str:
+    script_root = Path(__file__).resolve().parent
+    formatter = script_root / "slack_msg_builder.py"
+    if not formatter.is_file():
+        # The source bundle retains the shared formatter under pr_pipeline;
+        # release installation flattens it beside this script.
+        formatter = script_root / "pr_pipeline" / "slack_msg_builder.py"
+    spec = importlib.util.spec_from_file_location("slack_msg_builder", formatter)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load Slack formatter: {formatter}")
+    smb = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(smb)
     meta = GROUP_META[kind]
     facts = [f"{len(events)} new signal(s) since the last check."]
     labels = {}
@@ -338,6 +349,17 @@ def _send_slack(message: str) -> subprocess.CompletedProcess[str]:
 
 
 def main():
+    if "--probe" in sys.argv[1:]:
+        # Pure collector: no state, receipt, cooldown, or Slack mutation.
+        state: dict[str, Any] = {}
+        events: list[dict[str, Any]] = []
+        for path in LOGS:
+            matches, _offset = _scan_new_lines(path, 0)
+            events.extend(matches)
+        events.extend(_scan_cron_errors(state))
+        print(json.dumps({"status": "alert" if events else "clean", "events": events}, sort_keys=True))
+        return 1 if events else 0
+
     if os.environ.get("HERMES_USAGE_ALERT_DISABLE") == "1":
         return 0
 

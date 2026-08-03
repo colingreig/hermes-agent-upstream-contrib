@@ -8,7 +8,7 @@
     {
       "src_rel": "config-overlay.yaml",
       "dest_abs": "~/.hermes/config.yaml",
-      "sha256": "cc0b3c57fb1d2b0a6a8d5e05196e6327ec134f949192c361d5b5a6520cfc3037",
+      "sha256": "78dabfcc8c2e7c724a323532fde66657c4f8d5a9993f18e7299beb52bf654fe1",
       "role": "governed overlay deep-merged into the live config.yaml (model/fallback_providers/delegation/browser CDP/kanban dispatch)",
       "deploy_mode": "config_overlay"
     },
@@ -85,8 +85,8 @@
     {
       "src_rel": "jobs.json",
       "dest_abs": "~/.hermes/cron/jobs.json",
-      "sha256": "68180623c0f4d9f1fd4ce22acab90ba8dce7d170d4607b8abb10b047616708d1",
-      "role": "curated 17-job cron set (12 kept + 3 consolidated + Purelymail poller; direct ClickUp executor prompts; hermes-pr-validate re-enabled 2026-07-31 and pinned to IGNITE_SKILLS_ROOT); merges bundled definitions while preserving scheduler runtime for unchanged job ids; validator-live-trigger added 2026-08-03 (86e2m44np) as the deterministic fenced validate_pr.py producer with job-scoped HERMES_VALIDATOR_FINALIZE_TOKEN",
+      "sha256": "11cb707cf2813da065ba1702673c31fbfaaf811f88ef47880a87414708ee1ad9",
+      "role": "curated 18-job cron set (five LLM jobs plus thirteen no-agent jobs, including the deterministic fleet-health-digest, Purelymail poller, and five-minute governed-path verifier); direct ClickUp executor prompts; hermes-pr-validate re-enabled 2026-07-31 and pinned to IGNITE_SKILLS_ROOT; merges bundled definitions while preserving scheduler runtime for unchanged job ids; validator-live-trigger added 2026-08-03 (86e2m44np) as the deterministic fenced validate_pr.py producer with job-scoped HERMES_VALIDATOR_FINALIZE_TOKEN",
       "deploy_mode": "jobs_json"
     },
     {
@@ -103,7 +103,7 @@
     },
     {
       "src_rel": "install_fleet_config.py",
-      "sha256": "b4d69d2d2528d47f76a0b82bf19c02d2af7ab58c2132625b734e1a4ab6b52eaa",
+      "sha256": "4a1df4dd5b68b705ed97640d31aad29e34db112c6e6a8e1ed232aa914e4cbceb",
       "role": "source-only pin for the governed fleet installer, including private legacy root config-backup remediation and exact-mode rollback",
       "deploy_mode": "installer_source"
     }

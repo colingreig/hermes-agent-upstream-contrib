@@ -196,6 +196,17 @@ class TestPerJobToolsetMcpMerge:
         result = _resolve_cron_enabled_toolsets(job, self.CFG)
         assert set(result) == {"web", "terminal"} | self._enabled_names()
 
+    def test_fleet_digest_resolved_toolsets_exclude_globally_enabled_mcps(self):
+        from pathlib import Path
+        import json
+
+        jobs_path = Path(__file__).resolve().parents[2] / "machine-setup" / "fleet-config" / "jobs.json"
+        jobs = json.loads(jobs_path.read_text(encoding="utf-8"))["jobs"]
+        job = next(item for item in jobs if item["name"] == "fleet-health-digest")
+        result = _resolve_cron_enabled_toolsets(job, self.CFG)
+        assert result == []
+        assert not (set(result) & self._enabled_names())
+
     def test_resolver_empty_per_job_falls_through_to_platform(self):
         # No per-job list -> must delegate to _get_platform_tools (the platform
         # fallback), NOT the per-job merge. Stub the platform resolver and assert

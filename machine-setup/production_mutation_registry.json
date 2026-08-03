@@ -5,7 +5,7 @@
   "unknown_path_policy": {
     "default": "fail-closed",
     "rule": "A production mutation is unsupported unless its actor, target resource, lock or transaction boundary, and rollback surface are present in this registry. Callers must reject an unknown path before it writes.",
-    "enforcement_status": "This inventory is authoritative. Runtime lease enforcement is live at the fleet-config installer, the mini release cut, and the state DB lifecycle operator's apply mode (cron/production_write_lease.py rejects any actor or resource set absent from this registry); fleet drain admission (cron/fleet_drain.py) uses the mutability declarations to decide which no-agent crons may run during a drain. Remaining cron actors declare their lock boundaries here but do not yet acquire the shared lease, and mutability declarations are contract rather than enforcement for actors that bypass the lease entirely: on 2026-08-02 the fleet-health-digest cron agent, registered read-only, repointed runtime-current with no lease, no fence-loss receipt, and no detection. Closing that class needs the per-resource deny/verify layer (86e2m5drb for runtime-current) and deploy-path drift enforcement (86e2m2c1g) on top of this lease layer.",
+    "enforcement_status": "This inventory is authoritative. Runtime lease enforcement is live at the fleet-config installer, mini release cut, and state DB lifecycle operator. The production tool dispatcher resolves write_file/patch targets before mutation. Only the intended macOS Hermes Mini context (/Users/colingreig/.hermes) activates the OS filesystem sandbox denying runtime-current, releases, and governed scripts unless the cutter session holds the matching lease; that context fails closed when sandbox-exec is unavailable, while unsupported platforms and other Hermes homes preserve normal terminal behavior. The regex shell hook is defense-in-depth only and is marked mandatory/fail-closed. Fleet-health-digest is a deterministic no-agent cron script executed under its exact hash-pinned release interpreter; it has no agent toolsets or delegation surface and emits delivery truth only in cron output. The five-minute verifier uses Apple Python only for a governed stdlib selector, which deterministically chooses a release-absolute interpreter with PyYAML from non-symlinked immutable release directories without consulting runtime-current or an environment-supplied path; selection failure is closed.",
     "follow_on_hook_points": [
       {
         "task": "86e2kmucr",
@@ -112,7 +112,7 @@
       "id": "email-delivery",
       "path": "Postmark delivery to colin@colingreig.com",
       "description": "The explicit fleet health digest delivery side effect.",
-      "concurrency_model": "one cron invocation; Postmark sender owns delivery retry and receipts"
+      "concurrency_model": "one no-agent cron invocation; fixed Postmark sender with fixed Slack fallback and cron-output delivery evidence"
     },
     {
       "id": "purelymail-poller-deploy",
@@ -490,24 +490,43 @@
       }
     },
     {
+      "id": "verify-governed-paths-cron",
+      "name": "Governed production path verifier",
+      "actor_class": "cron",
+      "owning_repository": "hermes-agent",
+      "mutability": "read-only",
+      "entry_points": ["machine-setup/mini-scripts/verify_governed_paths.sh", "machine-setup/mini-scripts/verify_governed_paths_launcher.py", "machine-setup/mini-scripts/verify_governed_paths.py", "~/.hermes/scripts/verify_governed_paths.sh", "~/.hermes/scripts/verify_governed_paths_launcher.py", "~/.hermes/scripts/verify_governed_paths.py"],
+      "cron_job_ids": ["a6e2d5b00123"],
+      "resources_touched": ["runtime-release", "governed-mini-scripts", "fleet-config", "cron-jobs"],
+      "current_lock_or_transaction_boundary": {
+        "kind": "read-only manifest and pointer verification",
+        "path_or_identity": "~/.hermes/state/governed-paths-verification.json",
+        "behavior": "Runs every five minutes without an agent. Apple Python runs only a manifest-pinned stdlib launcher, which ignores runtime-current and deterministically selects the newest non-symlinked governed release interpreter that imports PyYAML; the full verifier then preflights runtime-current and persists the exact failure reason before alert delivery."
+      },
+      "rollback_surface": {
+        "surface": "read-only verification receipt",
+        "procedure": "Repair through the governed cutter or installer; the verifier never repairs production paths itself."
+      }
+    },
+    {
       "id": "fleet-health-digest-cron",
       "name": "Fleet health digest cron",
       "actor_class": "cron",
       "owning_repository": "hermes-agent",
       "mutability": "read-only",
-      "entry_points": ["cron/scheduler.py", "machine-setup/fleet-config/jobs.json"],
+      "entry_points": ["cron/scheduler.py", "machine-setup/fleet-config/jobs.json", "machine-setup/mini-scripts/governed_interpreter.py", "machine-setup/mini-scripts/fleet_health_digest.py", "machine-setup/mini-scripts/hermes_self_report_delivery_probe.py", "machine-setup/mini-scripts/hermes_validate_size_monitor.py", "machine-setup/mini-scripts/ignite_model_deprecation_check.py", "machine-setup/mini-scripts/supabase_rls_guard.py", "machine-setup/mini-scripts/hermes_usage_alert.py"],
       "cron_job_ids": ["f23a03e9d1b2"],
       "resources_touched": ["email-delivery", "cron-jobs"],
       "current_lock_or_transaction_boundary": {
-        "kind": "cron jobs advisory lock",
-        "path_or_identity": "~/.hermes/cron/.jobs.lock",
-        "behavior": "The prompt explicitly forbids config, skill, cron, and ClickUp writes; scheduler-only job metadata remains serialized by the cron lock."
+        "kind": "cron jobs advisory lock plus release-agnostic governed interpreter selector",
+        "path_or_identity": "~/.hermes/cron/.jobs.lock and ~/.hermes/releases/v*-<commit>/venv/bin/python",
+        "behavior": "On every run the scheduler ignores runtime-current and environment hints, rejects symlinks at every releases/release/venv/bin/python provenance component, and selects the newest release-absolute interpreter that imports PyYAML and onepassword (falling back to an older retained release). The hash-manifested no-agent digest runs five read-only probe modes in memory and includes every non-clean result before permitting only fixed Postmark or Slack fallback delivery."
       },
       "rollback_surface": {
-        "surface": "Digest email and sender receipt",
-        "procedure": "No Hermes-owned production resource is changed by the digest; delivery correction is a subsequent digest or sender retry."
+        "surface": "Digest delivery only",
+        "procedure": "No Hermes-owned production resource or receipt is changed by the digest; delivery correction is a subsequent digest or sender retry."
       },
-      "notes": "Email delivery is an external side effect, but this actor is read-only for Hermes production resources. That declaration is contract, not enforcement: on 2026-08-02 this agent repointed runtime-current (a resource it does not touch here) with no lease and no detection. Runtime-current deny/verify enforcement is tracked by 86e2m5drb."
+      "notes": "Email/fixed-channel delivery is the sole side effect. The no-agent script imports the deterministic report builder through its in-memory compose API, hash-verifies and executes the delivery, skill-size, model-deprecation, Supabase RLS, and usage checks in read-only probe mode under the selected interpreter, and folds every non-clean exit/output into the digest. It never creates a body artifact, check state, alert receipt, or duplicate check delivery. The fleet outcome probe verifies the digest's fresh cron output JSON (`status=sent` and a fixed channel). Recipient, fallback target, and body-file inputs remain unavailable."
     },
     {
       "id": "repo-maintenance-cron",

@@ -1,0 +1,32 @@
+{
+  "interpreter_selector": "release-python-pyyaml-onepassword-v1",
+  "schema_version": 3,
+  "scripts": {
+    "hermes_self_report_delivery_probe.py": {
+      "arguments": [],
+      "sha256": "caa52b11adf2939f302b512bf095ed7916c81bcf7e9c8541fc208e32fc76437a"
+    },
+    "hermes_usage_alert.py": {
+      "arguments": [
+        "--probe"
+      ],
+      "sha256": "396972cd6890db6ebaae1be47c2227f80dc7b617798bc1c2676d0ff073192b9f"
+    },
+    "hermes_validate_size_monitor.py": {
+      "arguments": [
+        "--probe"
+      ],
+      "sha256": "7946d3ca5e6087e5b8409806080f2c9a0e7a80e9d2c06d17d4fdb27d949a233d"
+    },
+    "ignite_model_deprecation_check.py": {
+      "arguments": [],
+      "sha256": "222b920e14f42611a52ee53f809fcad3dfeef9df46043f1c41d8cc51e71ec19f"
+    },
+    "supabase_rls_guard.py": {
+      "arguments": [
+        "--probe"
+      ],
+      "sha256": "e977ac5203d9200e71c64680b008b5d28c6964deb02303991409489f650f672c"
+    }
+  }
+}

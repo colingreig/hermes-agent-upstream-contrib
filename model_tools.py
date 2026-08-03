@@ -1196,6 +1196,21 @@ def handle_function_call(
         if function_name in _AGENT_LOOP_TOOLS:
             return json.dumps({"error": f"{function_name} must be handled by the agent loop"})
 
+        # Mechanical production boundary. Unlike pre-tool shell hooks this
+        # checks resolved file-tool targets in-process and fails closed if the
+        # policy itself cannot be evaluated.
+        if function_name in {"write_file", "patch"}:
+            try:
+                from tools.governed_paths import check_file_mutation
+
+                governed_block = check_file_mutation(
+                    function_name, function_args, session_id or "", task_id=task_id or "default"
+                )
+            except Exception as governed_error:
+                governed_block = f"governed path enforcement failed closed: {governed_error}"
+            if governed_block:
+                return json.dumps({"error": governed_block}, ensure_ascii=False)
+
         # Check plugin hooks for a block/approve directive (unless caller
         # already checked — e.g. run_agent._invoke_tool passes skip=True to
         # avoid double-firing the hook).

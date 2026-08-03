@@ -239,16 +239,28 @@ falls back to `~/.hermes/skills`, `~/.claude/skills`, or `~/.codex/skills`;
 a missing canonical module is a fail-closed job error, not a reason to create
 a home-local copy or symlink.
 
-- **3 new consolidated jobs**: `clickup-lifecycle` (every 30m; folds
+- **3 consolidated jobs**: `clickup-lifecycle` (every 30m; folds
   clickup-closeout-audit + clickup-stalled-reconciler + clickup-reconciler +
   staleness-sweep), `fleet-health-digest` (every 6h; folds hermes-self-report
   + delivery-probe + skill-size-monitor + model-deprecation-check +
   supabase-rls-guard + hermes-usage-alert), `repo-maintenance` (daily 04:00;
   folds repo-worktree-gc + cleanup-hermes-baks + orphan-unpushed-monitor).
-  Each is an LLM-orchestrated job (not `no_agent`) whose prompt runs the
-  original per-check scripts via Bash, in order, and folds any non-clean
-  result into its report — the underlying scripts are unchanged, only the
-  cron entry that invoked them standalone is retired.
+  `clickup-lifecycle` and `repo-maintenance` remain LLM-orchestrated jobs whose
+  prompts run their original per-check scripts via Bash. `fleet-health-digest`
+  is instead a deterministic `no_agent` job: the scheduler invokes
+  `fleet_health_digest.py` directly under the release-agnostic governed selector
+  `release-python-pyyaml-onepassword-v1`. On every tick the scheduler ignores
+  `runtime-current` and environment hints, requires physical non-symlink release,
+  `venv`, and `bin` directories, then securely permits the standard final venv
+  Python symlink so execution retains venv `sys.prefix` and site-packages. It
+  selects the newest capable retained release (falling back across
+  pruning/rollover), and the digest hash-verifies and runs the five folded checks
+  in read-only probe mode. Probe/API/auth/malformed-response failures are
+  non-clean folded findings rather than empty-clean results. Only non-clean results are appended to
+  the in-memory report. Its sole side effect is fixed
+  Postmark delivery (or the fixed Slack fallback). It writes no body artifact,
+  check state, or delivery receipt; the fleet outcome probe evaluates its fresh
+  cron output.
 - **8 dropped outright**: `email-triage`, `clickup-email-triage-gate`, `w`,
   `alpha`, `Spam-gate label accrual`, `legacy job`, `run {lane}`,
   `clickup-executor-2`.

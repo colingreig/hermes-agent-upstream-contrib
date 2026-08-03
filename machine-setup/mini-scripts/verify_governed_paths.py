@@ -14,16 +14,12 @@ import json
 import os
 import stat
 import sys
+import tempfile
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from fractions import Fraction
 from pathlib import Path
 from typing import Any
-
-try:
-    import yaml
-except ImportError:  # pragma: no cover - installed with the fleet installer
-    print("verify_governed_paths.py requires PyYAML", file=sys.stderr)
-    raise
 
 
 SCRIPT_ROOT = Path(__file__).resolve().parent
@@ -114,6 +110,15 @@ def _materialize_fleet_jobs(
 
 
 def _load_yaml(path: Path, label: str) -> dict[str, Any]:
+    # Import only after the stdlib-only runtime-release preflight. The deployed
+    # monitor therefore still reports a broken pointer when the release venv
+    # (and its PyYAML) is unavailable.
+    try:
+        import yaml
+    except ImportError as exc:
+        raise VerificationError(
+            "PyYAML unavailable after runtime-current preflight; full governed config verification cannot run"
+        ) from exc
     if not path.is_file() or path.is_symlink():
         raise VerificationError(f"{label} missing or symlinked: {path}")
     try:
@@ -125,6 +130,32 @@ def _load_yaml(path: Path, label: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise VerificationError(f"{label} must be a YAML object: {path}")
     return value
+
+
+def _atomic_json(path: Path, value: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(value, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _failure_code(reason: str) -> str:
+    if reason.startswith("runtime-current"):
+        return "runtime_current_broken"
+    if reason.startswith("releases root") or reason.startswith("release "):
+        return "runtime_release_broken"
+    return "governed_path_drift"
 
 
 def _plain_file(path: Path, label: str) -> None:
@@ -200,6 +231,10 @@ def _semantic_overlay_matches(live: Any, overlay: Any, path: str = "") -> None:
             if key not in live:
                 raise VerificationError(f"managed config value missing at {next_path}")
             _semantic_overlay_matches(live[key], expected, next_path)
+        return
+    if path == "hooks.pre_tool_call" and isinstance(overlay, list):
+        if not isinstance(live, list) or any(item not in live for item in overlay):
+            raise VerificationError("managed config hook missing at hooks.pre_tool_call")
         return
     if live != overlay:
         raise VerificationError(f"managed config value drifted at {path or '<root>'}")
@@ -471,6 +506,12 @@ def _parser() -> argparse.ArgumentParser:
         help="declare an isolated fixture run; never consult launchd, git, or external state",
     )
     parser.add_argument("--json", action="store_true", help="emit machine-readable findings")
+    parser.add_argument("--quiet", action="store_true", help="emit nothing on a healthy verification")
+    parser.add_argument(
+        "--receipt",
+        type=Path,
+        help="persist the exact outcome (defaults beneath <home>/.hermes/state)",
+    )
     return parser
 
 
@@ -482,17 +523,40 @@ def main(argv: list[str] | None = None) -> int:
         fleet_root=args.fleet_root,
         fixture_safe=args.fixture_safe,
     )
+    receipt = args.receipt or args.home / ".hermes" / "state" / "governed-paths-verification.json"
     try:
         findings = verifier.verify()
     except VerificationError as exc:
+        failure_code = _failure_code(str(exc))
+        _atomic_json(
+            receipt,
+            {
+                "schema_version": 1,
+                "status": "failed",
+                "failure_code": failure_code,
+                "failure_reason": str(exc),
+                "checked_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
         if args.json:
-            print(json.dumps({"ok": False, "error": str(exc)}, sort_keys=True))
+            print(json.dumps({"ok": False, "failure_code": failure_code, "error": str(exc)}, sort_keys=True))
         else:
-            print(f"FAIL verify-governed-paths: {exc}", file=sys.stderr)
+            label = "RUNTIME_CURRENT_BROKEN" if failure_code == "runtime_current_broken" else failure_code.upper()
+            print(f"FAIL verify-governed-paths [{label}]: {exc}", file=sys.stderr)
         return 1
+    _atomic_json(
+        receipt,
+        {
+            "schema_version": 1,
+            "status": "ok",
+            "failure_code": None,
+            "failure_reason": None,
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
     if args.json:
         print(json.dumps({"ok": True, "checks": [item.__dict__ for item in findings]}, sort_keys=True))
-    else:
+    elif not args.quiet:
         for finding in findings:
             print(f"OK {finding.check}: {finding.detail}")
     return 0

@@ -1353,25 +1353,7 @@ def build_text(header, scoreboard, spend, alerts, hermes_rows, hermes_meta, work
     return build_text_view(model)
 
 
-def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--window-min", type=int, default=360)
-    p.add_argument(
-        "--scheduled-slot",
-        required=True,
-        help="Nominal six-hour UTC schedule slot; late/manual reruns must reuse the original slot.",
-    )
-    p.add_argument("--header-file", help="JSON: when, health, model, auth, work_stoppage, needs_attention")
-    p.add_argument("--out-html", default="/tmp/hermes_report.html")
-    p.add_argument("--out-text", default="/tmp/hermes_report.txt")
-    p.add_argument("--out-subject", default="/tmp/hermes_report_subject.txt")
-    p.add_argument("--served-ledger", default=SERVED_LEDGER_DEFAULT)
-    p.add_argument("--clickup-team-id", default=os.environ.get("CLICKUP_TEAM_ID", DEFAULT_CLICKUP_TEAM_ID))
-    p.add_argument("--review-backlog-alert-threshold", type=int,
-                   default=int(os.environ.get("HERMES_REVIEW_BACKLOG_ALERT_THRESHOLD", DEFAULT_REVIEW_BACKLOG_ALERT_THRESHOLD)),
-                   help="Prominent alert threshold for workspace-wide review backlog (default: 25).")
-    args = p.parse_args()
-
+def _compose(args):
     header = {}
     if args.header_file and os.path.exists(args.header_file):
         try:
@@ -1461,17 +1443,7 @@ def main():
     html_body = render_html_view(model)
     text_body = build_text_view(model)
 
-    with open(args.out_html, "w", encoding="utf-8") as f:
-        f.write(html_body)
-    with open(args.out_text, "w", encoding="utf-8") as f:
-        f.write(text_body)
-    with open(args.out_subject, "w", encoding="utf-8") as f:
-        f.write(subject)
-
     summary = {
-        "out_html": args.out_html,
-        "out_text": args.out_text,
-        "out_subject": args.out_subject,
         "hermes_list_n": len(hermes_rows),
         "work_list_n": len(work_rows),
         "workspace_review_queue_n": len(review_rows) if not review_meta.get("error") else None,
@@ -1505,6 +1477,49 @@ def main():
         **model["counts"],
         "providers_n": spend["providers_n"],
     }
+    return {"subject": subject, "text_body": text_body, "html_body": html_body, "summary": summary}
+
+
+def compose_report(*, scheduled_slot, window_min=360, served_ledger=SERVED_LEDGER_DEFAULT,
+                   clickup_team_id=None, review_backlog_alert_threshold=None):
+    """Compose a fresh digest entirely in memory; collectors are read-only."""
+    return _compose(argparse.Namespace(
+        window_min=window_min,
+        scheduled_slot=scheduled_slot,
+        header_file=None,
+        served_ledger=served_ledger,
+        clickup_team_id=clickup_team_id or os.environ.get("CLICKUP_TEAM_ID", DEFAULT_CLICKUP_TEAM_ID),
+        review_backlog_alert_threshold=(
+            review_backlog_alert_threshold
+            if review_backlog_alert_threshold is not None
+            else int(os.environ.get("HERMES_REVIEW_BACKLOG_ALERT_THRESHOLD", DEFAULT_REVIEW_BACKLOG_ALERT_THRESHOLD))
+        ),
+    ))
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--window-min", type=int, default=360)
+    p.add_argument("--scheduled-slot", required=True,
+                   help="Nominal six-hour UTC schedule slot; late/manual reruns must reuse the original slot.")
+    p.add_argument("--header-file", help="JSON: when, health, model, auth, work_stoppage, needs_attention")
+    p.add_argument("--out-html", default="/tmp/hermes_report.html")
+    p.add_argument("--out-text", default="/tmp/hermes_report.txt")
+    p.add_argument("--out-subject", default="/tmp/hermes_report_subject.txt")
+    p.add_argument("--served-ledger", default=SERVED_LEDGER_DEFAULT)
+    p.add_argument("--clickup-team-id", default=os.environ.get("CLICKUP_TEAM_ID", DEFAULT_CLICKUP_TEAM_ID))
+    p.add_argument("--review-backlog-alert-threshold", type=int,
+                   default=int(os.environ.get("HERMES_REVIEW_BACKLOG_ALERT_THRESHOLD", DEFAULT_REVIEW_BACKLOG_ALERT_THRESHOLD)),
+                   help="Prominent alert threshold for workspace-wide review backlog (default: 25).")
+    args = p.parse_args()
+    report = _compose(args)
+    for path, content in ((args.out_html, report["html_body"]),
+                          (args.out_text, report["text_body"]),
+                          (args.out_subject, report["subject"])):
+        with open(path, "w", encoding="utf-8") as output:
+            output.write(content)
+    summary = dict(report["summary"], out_html=args.out_html, out_text=args.out_text,
+                   out_subject=args.out_subject)
     print(json.dumps(summary, indent=2))
 
 

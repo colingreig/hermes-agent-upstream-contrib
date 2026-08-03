@@ -107,6 +107,7 @@ PROFILE_BOOTSTRAP_DIRS = [
 
 SKILL_POLICY_PROFILES = ("default", "coder", "content", "ops", "design", "research")
 SKILL_POLICY_CONFIG_MODE = 0o600
+GOVERNED_RUNTIME_GUARD_COMMAND = "/usr/bin/python3 /Users/colingreig/.hermes/scripts/runtime_current_guard.py"
 
 # Governance for skills that appear in an installed skills tree without being
 # classified by skills-policy.json — most importantly the ones Hermes writes
@@ -453,10 +454,11 @@ def _verify_sources(manifest: dict, bundle_root: Path) -> list[dict]:
 # Overlay deep-merge (config.yaml)
 # ---------------------------------------------------------------------------
 
-def merge_overlay(base: dict, overlay: dict) -> dict:
+def merge_overlay(base: dict, overlay: dict, _path: tuple[str, ...] = ()) -> dict:
     """Deep-merge ``overlay`` onto ``base`` and return a NEW dict.
 
-    See the module docstring for the exact three-case rule. ``base`` is never
+    See the module docstring for the merge rule and the additive
+    ``hooks.pre_tool_call`` exception. ``base`` is never
     mutated in place — callers get a fresh merged dict back so the original
     live-config dict remains available for diffing/backup.
     """
@@ -465,12 +467,23 @@ def merge_overlay(base: dict, overlay: dict) -> dict:
         if isinstance(value, dict):
             if value:
                 existing = result.get(key)
-                result[key] = merge_overlay(existing if isinstance(existing, dict) else {}, value)
+                result[key] = merge_overlay(
+                    existing if isinstance(existing, dict) else {},
+                    value,
+                    _path + (str(key),),
+                )
             else:
                 # Explicit empty-dict overlay = reset this section to empty.
                 result[key] = {}
+        elif _path + (str(key),) == ("hooks", "pre_tool_call") and isinstance(value, list):
+            # Hook ownership is split across governed bundles. Preserve existing
+            # entries and append this bundle's exact declaration once.
+            existing = result.get(key)
+            preserved = list(existing) if isinstance(existing, list) else []
+            result[key] = preserved + [item for item in value if item not in preserved]
         else:
-            # Scalars and lists replace wholesale (never appended/merged).
+            # Scalars and lists replace wholesale (never appended/merged),
+            # except for the explicitly additive hook list above.
             result[key] = value
     return result
 
@@ -2215,6 +2228,37 @@ def install(
                     receipt_steps=receipt["steps"],
                 )
             write_lease = lease_box["value"]
+
+        # --- Step 5: exact governed hook approval (never global auto-accept) ---
+        approval_dest = home / ".hermes" / "shell-hooks-allowlist.json"
+        approval_current: dict[str, Any] = {"approvals": []}
+        if approval_dest.is_file() and not approval_dest.is_symlink():
+            try:
+                loaded = json.loads(approval_dest.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict) and isinstance(loaded.get("approvals"), list):
+                    approval_current = loaded
+            except (OSError, json.JSONDecodeError) as exc:
+                raise InstallError(f"refusing to merge invalid shell hook allowlist {approval_dest}: {exc}") from exc
+        approvals = list(approval_current["approvals"])
+        if not any(isinstance(row, dict) and row.get("event") == "pre_tool_call"
+                   and row.get("command") == GOVERNED_RUNTIME_GUARD_COMMAND for row in approvals):
+            approvals.append({"event": "pre_tool_call", "command": GOVERNED_RUNTIME_GUARD_COMMAND,
+                              "approved_at": "governed:fleet-config-manifest",
+                              "script_mtime_at_approval": None})
+        approval_merged = {**approval_current, "approvals": approvals}
+        approval_data = (json.dumps(approval_merged, indent=2, sort_keys=True) + "\n").encode("utf-8")
+        with _protected_mutation(lease_box, home=home):
+            approval_snapshot = _backup(approval_dest, snapshot_dir, destination_root,
+                                        "fleet-config-hook-approval", backup_stamp, private=True)
+        approval_step = {"step": "governed_shell_hook_approval", "dest": str(approval_dest),
+                         "snapshot": str(approval_snapshot) if approval_snapshot else None,
+                         "created": approval_snapshot is None, "mode": "0600", "status": "installing"}
+        receipt["steps"].append(approval_step)
+        _protected_atomic_write(lease_box, home=home, dest=approval_dest, data=approval_data)
+        if json.loads(approval_dest.read_text(encoding="utf-8")) != approval_merged:
+            raise InstallError("deployed governed shell hook approval did not verify")
+        approval_step["status"] = "installed"
+        _refresh_lease(lease_box, home=home)
 
     except InstallError as exc:
         receipt["result"] = "failed"

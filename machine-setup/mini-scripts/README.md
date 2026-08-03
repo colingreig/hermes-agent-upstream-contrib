@@ -965,6 +965,7 @@ release blocker. Brain does not deploy anything itself.
 | `hermes_report_build_v2.py` | `~/.hermes/scripts/` | live (compat-only orphan, retirement pending) |
 | `hermes-metrics.py` | `~/.hermes/scripts/` | live (standalone CLI, no cron caller) |
 | `postmark_send_report.py` | `~/.hermes/scripts/` | deploy-mirror bytes (live behavior + `encoding="utf-8"`) |
+| `fleet_health_digest.py` | `~/.hermes/scripts/` | no-agent, in-memory compose + fixed-recipient/fixed-fallback delivery; no filesystem artifacts or receipts |
 | `hermes_self_report_delivery_probe.py` | `~/.hermes/scripts/` | deploy-mirror bytes (live behavior + `encoding="utf-8"`) |
 | `report_activity_journal.py` | `~/.hermes/scripts/` | durable Mini lifecycle outbox, immutable required-producer set, and event-specific transition identity |
 | `report_activity_continuity.py` | `~/.hermes/scripts/` | Mini-only nominal-slot two-window continuity, health/provenance, and exact event-kind ClickUp parity adapter |
@@ -1029,17 +1030,18 @@ uncertain input is `UNKNOWN` (or `PROVISIONAL` for incomplete coverage), and the
 report renders the result only under System signals. Validator-completed remains
 the strict PASS + terminal status + in-window `date_closed` metric; outbox
 completion events are parity evidence only. Scope is the Hermes Mac mini, with
-the post-ClickUp/pre-append crash residual stated explicitly. Production Mini
-installation, scheduled delivery receipts, hash attestation, and provenance-
-footer verification remain owned by `86e2gnz7a`.
+the post-ClickUp/pre-append crash residual stated explicitly. Production Mini installation, hash attestation, and provenance-footer
+verification remain owned by `86e2gnz7a`.
 
-**Delivery-probe cron.** `hermes_self_report_delivery_probe.py` runs as its own
-`no_agent` cron job (offset from the `0 */6 * * *` report tick). It reads the
-receipt `~/.hermes/logs/hermes-self-report-last-send.json` and exits `0`
-(fresh + sent), `1` (both channels failed), or `2` (missing / stale / unreadable)
-— no LLM, no send. The postmark sender's fallback target `slack:D0BA2PM9CFM` is
-a Slack DM channel id (not a secret); `hermes send --list` on the mini is the
-source of truth if it rotates.
+**Digest delivery monitoring.** The scheduled digest is the deterministic
+`fleet_health_digest.py` `no_agent` entry point. It accepts no recipient,
+fallback-target, or body-file arguments, composes into memory, and sends only
+to `colin@colingreig.com` (or fixed Slack DM `slack:D0BA2PM9CFM`). It writes no
+body artifact or receipt. Delivery truth is therefore the scheduler's fresh
+cron output JSON (`status=sent` plus the fixed channel), as declared in
+`fleet_outcome_contracts.json`; there is no separately scheduled delivery-probe
+job. `hermes_self_report_delivery_probe.py` remains a compatibility utility for
+legacy generic-sender receipts only and is not evidence for the current digest.
 
 ## hermes-spend-guard bundle (ClickUp 86e2hdxcb)
 
