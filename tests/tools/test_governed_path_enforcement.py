@@ -2,10 +2,13 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 import json
+import shutil
 import sqlite3
 import subprocess
 import sys
 from pathlib import Path
+
+import pytest
 
 import model_tools
 from tools import governed_paths
@@ -104,6 +107,10 @@ def test_matching_cutter_lease_allows_file_mutation_policy(tmp_path, monkeypatch
     ) is None
 
 
+@pytest.mark.skipif(
+    sys.platform != "darwin" or shutil.which("sandbox-exec") is None,
+    reason="requires the macOS sandbox-exec implementation",
+)
 def test_actual_os_sandbox_blocks_shell_variable_and_python_concatenation(tmp_path, monkeypatch):
     hermes = tmp_path / ".hermes"
     hermes.mkdir()
@@ -123,6 +130,10 @@ def test_actual_os_sandbox_blocks_shell_variable_and_python_concatenation(tmp_pa
         assert pointer.read_text(encoding="utf-8") == "safe"
 
 
+@pytest.mark.skipif(
+    sys.platform != "darwin" or shutil.which("sandbox-exec") is None,
+    reason="requires the macOS sandbox-exec implementation",
+)
 def test_digest_os_sandbox_is_read_only_without_parent_identity(tmp_path, monkeypatch):
     target = tmp_path / "ordinary.txt"
     target.write_text("safe", encoding="utf-8")

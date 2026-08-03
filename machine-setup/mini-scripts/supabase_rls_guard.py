@@ -133,7 +133,7 @@ def _exposures(ref, token):
 
 def _load_state():
     try:
-        with open(STATE_PATH) as f:
+        with open(STATE_PATH, encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return {}
@@ -141,7 +141,7 @@ def _load_state():
 
 def _save_state(state):
     tmp = STATE_PATH + ".tmp"
-    with open(tmp, "w") as f:
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2)
     os.replace(tmp, STATE_PATH)
 

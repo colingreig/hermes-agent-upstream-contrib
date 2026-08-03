@@ -65,7 +65,7 @@
       "destination_root": "scripts",
       "destination": "digest_trusted_scripts.json",
       "mode": "0644",
-      "sha256": "edfdf18f1736c5a4c10492d9fc4a3859a897db96765beba19780a9be290fe131"
+      "sha256": "ed5cba4e78101ee1cfdce9daa0d089d6bed863cb7b079953d48f6a84edc21a86"
     },
     {
       "source": "hermes_self_report_delivery_probe.py",
@@ -205,7 +205,7 @@
       "destination_root": "scripts",
       "destination": "supabase_rls_guard.py",
       "mode": "0755",
-      "sha256": "e977ac5203d9200e71c64680b008b5d28c6964deb02303991409489f650f672c"
+      "sha256": "fee1c085fc0ba16795f4f65421d26f4d54bc0199afeebf628f7cbaaba1782ae2"
     }
   ],
   "cron_updates": [

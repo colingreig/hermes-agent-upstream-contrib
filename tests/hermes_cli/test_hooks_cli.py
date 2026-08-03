@@ -102,10 +102,11 @@ class TestHooksTest:
         # Same top-level keys _serialize_payload produces at runtime
         assert set(seen.keys()) == {
             "hook_event_name", "tool_name", "tool_input",
-            "session_id", "cwd", "extra",
+            "session_id", "parent_session_id", "cwd", "extra",
         }
-        # parent_session_id was routed to top-level session_id (matches runtime)
+        # Child hooks expose both the compatibility session_id and explicit parent.
         assert seen["session_id"] == "parent-sess"
+        assert seen["parent_session_id"] == "parent-sess"
         assert "parent_session_id" not in seen["extra"]
         # subagent_stop has no tool, so tool_name / tool_input are null
         assert seen["tool_name"] is None
