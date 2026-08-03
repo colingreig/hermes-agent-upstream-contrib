@@ -66,12 +66,64 @@ from agent.retry_utils import (
 )
 from agent.trajectory import has_incomplete_scratchpad
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
-from hermes_constants import PARTIAL_STREAM_STUB_ID
+from hermes_constants import PARTIAL_STREAM_STUB_ID, get_hermes_home
 from hermes_logging import set_session_context
 from tools.skill_provenance import set_current_write_origin
 from utils import base_url_host_matches, env_var_enabled
 
 logger = logging.getLogger(__name__)
+
+# WRITER-SERVED LEDGER, CRON LANE (86e2ky2e9): ~/.hermes/logs/writer-served.jsonl
+# was, until now, only written by the opencode writer/content delegate
+# (machine-setup/mini-scripts/opencode_exec.py's _record_served) — so any cron
+# job that runs the normal in-process agent conversation loop instead of
+# delegating to opencode (this includes the ClickUp executor lane) served
+# calls that showed up in agent.log ("API call #N: model=... provider=...")
+# but never produced a ledger row, leaving spend/provider accounting blind to
+# the whole executor lane. This appends a compatible row (same file, a subset
+# of the opencode schema — hermes_report_build.py's parser reads every field
+# with .get(), so omitted writer-cascade-only fields like "armed" or
+# "expected_primary_model" are harmless) for every cron-platform API call that
+# returns usage. Fail-open: a ledger-write error must never break a turn.
+_CRON_SERVED_LEDGER = get_hermes_home() / "logs" / "writer-served.jsonl"
+
+
+def _record_cron_served_ledger(agent, model, provider, base_url, cost_result, moa_ref_cost=None):
+    """Append one row to the writer-served ledger for a cron-platform API call.
+
+    Mirrors the subset of opencode_exec.py's ``_record_served`` schema that
+    hermes_report_build.py actually reads (served_model/served_provider/
+    cost_usd/billing_mode/ok), keyed by the cron session id so rows are
+    traceable back to the job that produced them.
+    """
+    try:
+        cost_usd = None
+        if cost_result is not None and cost_result.amount_usd is not None:
+            cost_usd = float(cost_result.amount_usd)
+            if moa_ref_cost is not None:
+                cost_usd += float(moa_ref_cost)
+        record = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "task_id": getattr(agent, "session_id", None) or "unknown",
+            "source": "cron_conversation_loop",
+            "served_model": model,
+            "served_provider": provider,
+            "billing_provider": provider,
+            "billing_base_url": base_url,
+            "cost_usd": cost_usd,
+            "raw_cost_usd": cost_usd,
+            "billing_mode": (
+                "subscription_included"
+                if cost_result is not None and cost_result.status == "included"
+                else None
+            ),
+            "ok": True,
+        }
+        _CRON_SERVED_LEDGER.parent.mkdir(parents=True, exist_ok=True)
+        with open(_CRON_SERVED_LEDGER, "a", encoding="utf-8") as _lf:
+            _lf.write(json.dumps(record) + "\n")
+    except Exception as exc:  # noqa: BLE001 - a ledger-write failure must never break a turn
+        logger.debug("cron writer-served ledger append failed (fail-open): %r", exc)
 
 # Stable prefix of the local interrupt status string emitted when a turn is
 # cancelled while waiting on the provider. Surfaces (ACP, TUI) match on this
@@ -2316,6 +2368,15 @@ def run_conversation(
                             pass
                     agent.session_cost_status = cost_result.status
                     agent.session_cost_source = cost_result.source
+
+                    # Cron jobs (executor lane included) don't go through the
+                    # opencode writer delegate, so without this they never
+                    # produce a writer-served ledger row (86e2ky2e9).
+                    if getattr(agent, "platform", None) == "cron":
+                        _record_cron_served_ledger(
+                            agent, _agg_cost_model, _agg_cost_provider,
+                            _agg_cost_base_url, cost_result, _moa_ref_cost,
+                        )
 
                     # Persist token counts to session DB for /insights.
                     # Do this for every platform with a session_id so non-CLI
