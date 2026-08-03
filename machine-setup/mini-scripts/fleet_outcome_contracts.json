@@ -96,6 +96,28 @@
       }
     },
     {
+      "id": "4b8e1d97c3a2",
+      "name": "validator-live-trigger",
+      "enabled": true,
+      "max_age_seconds": 7200,
+      "outcome": {
+        "kind": "cron_output",
+        "max_age_seconds": 7200,
+        "success_patterns": [
+          "\\[validator-trigger\\]",
+          "\"validated\":",
+          "Status:\\*\\* silent"
+        ],
+        "failure_patterns": [
+          "\\(FAILED\\)",
+          "Status: .*failed",
+          "Traceback",
+          "FINALIZE TOKEN ABSENT",
+          "unexpected trigger error"
+        ]
+      }
+    },
+    {
       "id": "ad0ae6b717e2",
       "name": "clickup-review-sla",
       "enabled": true,
