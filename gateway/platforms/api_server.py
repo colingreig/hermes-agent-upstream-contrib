@@ -120,6 +120,8 @@ def _hermes_version() -> str:
 # Default settings
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8642
+API_SERVER_BIND_ATTEMPTS = 5
+API_SERVER_BIND_RETRY_DELAY_SECONDS = 1.0
 MAX_STORED_RESPONSES = 100
 MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversations with tool calls
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
@@ -133,6 +135,30 @@ def _coerce_port(value: Any, default: int = DEFAULT_PORT) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def _describe_listener_owner(port: int) -> str:
+    """Best-effort owner label for an occupied listen port."""
+    try:
+        import psutil
+
+        for connection in psutil.net_connections(kind="tcp"):
+            local = connection.laddr
+            local_port = getattr(local, "port", None)
+            if local_port is None and isinstance(local, tuple) and len(local) >= 2:
+                local_port = local[1]
+            if local_port != port or connection.status != psutil.CONN_LISTEN:
+                continue
+            if connection.pid is None:
+                return "pid=unknown"
+            try:
+                name = psutil.Process(connection.pid).name()
+            except Exception:
+                name = "unknown"
+            return f"pid={connection.pid} name={name}"
+    except Exception:
+        pass
+    return "unknown"
 
 
 _TRUE_REQUEST_BOOL_STRINGS = frozenset({"1", "true", "yes", "on"})
@@ -5373,41 +5399,81 @@ class APIServerAdapter(BasePlatformAdapter):
             #   - Linux: SO_REUSEADDR only permits rebinding past TIME_WAIT
             #     (a second live listener needs SO_REUSEPORT, never set), so
             #     keep the default (enabled) for instant restart rebinds.
-            self._site = web.TCPSite(
-                self._runner,
-                self._host,
-                self._port,
-                reuse_address=False if sys.platform == "darwin" else None,
-            )
-            try:
-                await self._site.start()
-            except OSError as exc:
+            bind_error: Optional[OSError] = None
+            bind_attempts_used = 0
+            for attempt in range(1, API_SERVER_BIND_ATTEMPTS + 1):
+                bind_attempts_used = attempt
+                self._site = web.TCPSite(
+                    self._runner,
+                    self._host,
+                    self._port,
+                    reuse_address=False if sys.platform == "darwin" else None,
+                )
+                try:
+                    await self._site.start()
+                    bind_error = None
+                    break
+                except OSError as exc:
+                    bind_error = exc
+                    # TCPSite registers itself with AppRunner before the
+                    # actual socket bind. Unregister every failed attempt so
+                    # retrying cannot accumulate half-started sites.
+                    failed_site = self._site
+                    self._site = None
+                    try:
+                        await failed_site.stop()
+                    except Exception:
+                        logger.debug(
+                            "[%s] Failed to clean up bind attempt %d/%d",
+                            self.name,
+                            attempt,
+                            API_SERVER_BIND_ATTEMPTS,
+                            exc_info=True,
+                        )
+                    if (
+                        getattr(exc, "errno", None) != errno.EADDRINUSE
+                        or attempt >= API_SERVER_BIND_ATTEMPTS
+                    ):
+                        break
+                    owner = _describe_listener_owner(self._port)
+                    logger.warning(
+                        "[%s] Bind attempt %d/%d for %s:%d found the port in "
+                        "use (listener owner: %s); retrying in %.1fs",
+                        self.name,
+                        attempt,
+                        API_SERVER_BIND_ATTEMPTS,
+                        self._host,
+                        self._port,
+                        owner,
+                        API_SERVER_BIND_RETRY_DELAY_SECONDS,
+                    )
+                    await asyncio.sleep(API_SERVER_BIND_RETRY_DELAY_SECONDS)
+
+            if bind_error is not None:
                 await self._runner.cleanup()
                 self._runner = None
                 self._site = None
-                if getattr(exc, "errno", None) == errno.EADDRINUSE:
-                    # A port conflict is a configuration error, not a
-                    # transient blip — another process holds the port for
-                    # its lifetime. A bare ``return False`` makes the
-                    # reconnect watcher in gateway.run treat it as retryable
-                    # and loop forever at the backoff cap (observed: 1568+
-                    # retries over 5 days across multi-profile setups all
-                    # defaulting to the same port, #52132), filling
-                    # errors.log and leaking the adapter's ResponseStore
-                    # fds each retry. Non-retryable drops it from the
-                    # reconnect queue; the operator recovers with
-                    # ``/platform resume api_server`` after changing the port.
+                if getattr(bind_error, "errno", None) == errno.EADDRINUSE:
+                    owner = _describe_listener_owner(self._port)
+                    # A bounded retry absorbs the short old-listener/new-
+                    # listener overlap possible during a service restart.
+                    # Exhaustion is process-fatal at the GatewayRunner layer:
+                    # an explicitly enabled API endpoint must not disappear
+                    # while another adapter keeps a degraded process alive.
                     self._set_fatal_error(
                         "api_server_port_in_use",
-                        f"Port {self._port} already in use. Set "
-                        f"platforms.api_server.port in config.yaml to a "
-                        f"different value, then `/platform resume api_server`.",
+                        f"Port {self._port} remained in use after "
+                        f"{API_SERVER_BIND_ATTEMPTS} bind attempts "
+                        f"(listener owner: {owner}).",
                         retryable=False,
                     )
                 logger.error(
-                    "[%s] Could not bind %s:%d: %s. Set a different port in "
-                    "config.yaml: platforms.api_server.port",
-                    self.name, self._host, self._port, exc,
+                    "[%s] Could not bind %s:%d after %d attempt(s): %s",
+                    self.name,
+                    self._host,
+                    self._port,
+                    bind_attempts_used,
+                    bind_error,
                 )
                 return False
 

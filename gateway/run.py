@@ -7363,6 +7363,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         enabled_platform_count = 0
         startup_nonretryable_errors: list[str] = []
         startup_retryable_errors: list[str] = []
+        startup_process_fatal_errors: list[str] = []
         
         # Initialize and connect each configured platform
         _multiplex_on = bool(getattr(self.config, "multiplex_profiles", False))
@@ -7463,6 +7464,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         target.append(
                             f"{platform.value}: {adapter.fatal_error_message}"
                         )
+                        if adapter.fatal_error_code == "api_server_port_in_use":
+                            startup_process_fatal_errors.append(
+                                f"{platform.value}: {adapter.fatal_error_message}"
+                            )
                         # Queue for reconnection if the error is retryable
                         if adapter.fatal_error_retryable:
                             self._failed_platforms[platform] = {
@@ -7507,6 +7512,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 }
             if await self._abort_startup_if_shutdown_requested():
                 return True
+
+        if startup_process_fatal_errors:
+            reason = "; ".join(startup_process_fatal_errors)
+            logger.error(
+                "Gateway aborting startup after API listener bind exhaustion: %s",
+                reason,
+            )
+            for platform, adapter in list(self.adapters.items()):
+                try:
+                    await adapter.cancel_background_tasks()
+                except Exception as exc:
+                    logger.debug(
+                        "✗ %s background-task cancel error during startup abort: %s",
+                        platform.value,
+                        exc,
+                    )
+                await self._safe_adapter_disconnect(adapter, platform)
+            self.adapters.clear()
+            self.delivery_router.adapters = self.adapters
+            try:
+                from gateway.status import write_runtime_status
+
+                write_runtime_status(gateway_state="startup_failed", exit_reason=reason)
+            except Exception:
+                pass
+            self._exit_with_failure = True
+            self._exit_reason = reason
+            self._shutdown_event.set()
+            self._startup_restore_in_progress = False
+            return True
 
         # Multi-profile multiplexing: bring up adapters for every OTHER profile
         # this gateway serves. Each profile's adapters connect under that

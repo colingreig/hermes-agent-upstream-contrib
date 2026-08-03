@@ -4,12 +4,14 @@ Validates that is_network_accessible() correctly classifies addresses and
 that connect() refuses to start without API_SERVER_KEY.
 """
 
+import asyncio
 import socket
 from unittest.mock import patch
 
 import pytest
 
 from gateway.config import PlatformConfig
+from gateway.platforms import api_server as api_server_module
 from gateway.platforms.api_server import APIServerAdapter
 from gateway.platforms.base import is_network_accessible
 
@@ -164,6 +166,12 @@ class TestBindMechanics:
 
     _KEY = "sk-test-strong-key-0123456789"
 
+    @pytest.fixture(autouse=True)
+    def _fast_bind_retries(self, monkeypatch):
+        monkeypatch.setattr(
+            api_server_module, "API_SERVER_BIND_RETRY_DELAY_SECONDS", 0.0
+        )
+
     def _make_adapter(self, port: int) -> APIServerAdapter:
         return APIServerAdapter(
             PlatformConfig(
@@ -195,6 +203,48 @@ class TestBindMechanics:
         try:
             assert await second.connect() is True
         finally:
+            await second.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_transient_listener_collision_recovers(self, monkeypatch):
+        """A stopping old gateway can release the port between bind attempts."""
+        port = self._free_port()
+        first = self._make_adapter(port)
+        assert await first.connect() is True
+        second = self._make_adapter(port)
+        real_sleep = asyncio.sleep
+        released = False
+        retry_delay = 0.123
+        monkeypatch.setattr(
+            api_server_module, "API_SERVER_BIND_RETRY_DELAY_SECONDS", retry_delay
+        )
+
+        async def release_old_listener(delay):
+            nonlocal released
+            if delay == retry_delay and not released:
+                released = True
+                await first.disconnect()
+                await real_sleep(0)
+                return
+            await real_sleep(delay)
+
+        monkeypatch.setattr(api_server_module.asyncio, "sleep", release_old_listener)
+        monkeypatch.setattr(
+            api_server_module,
+            "_describe_listener_owner",
+            lambda _port: "pid=4242 name=old-gateway",
+        )
+
+        try:
+            with patch.object(api_server_module.logger, "warning") as warning:
+                assert await second.connect() is True
+            assert released is True
+            warning_args = warning.call_args.args
+            assert "Bind attempt %d/%d" in warning_args[0]
+            assert warning_args[2:4] == (1, 5)
+            assert warning_args[6] == "pid=4242 name=old-gateway"
+        finally:
+            await first.disconnect()
             await second.disconnect()
 
     @pytest.mark.asyncio
