@@ -37,6 +37,7 @@ from agent.tool_dispatch_helpers import _trajectory_normalize_msg, make_tool_res
 from agent.trajectory import convert_scratchpad_to_think
 from agent.credential_pool import STATUS_EXHAUSTED
 from agent.error_classifier import FailoverReason
+from agent.failure_taxonomy import FAILURE_KIND_AUTH_PERMANENT, FAILURE_KIND_USAGE_CAP
 from utils import base_url_host_matches, base_url_hostname, env_var_enabled, atomic_json_write
 
 logger = logging.getLogger(__name__)
@@ -888,6 +889,61 @@ def recover_with_credential_pool(
             return True, False
         return False, has_retried_429
 
+    if effective_reason == FailoverReason.usage_cap:
+        # A usage cap (weekly/monthly quota, or a rate/usage signal whose
+        # reset horizon is hours away) is quota-exhaustion-shaped, not
+        # session-throttle-shaped — rotate immediately like billing rather
+        # than waiting through the rate_limit retry-then-rotate dance. See
+        # agent/error_classifier.py's 429/402 horizon split.
+        rotate_status = status_code if status_code is not None else 429
+        _evidence = (error_context or {}).get("evidence") if error_context else None
+        next_entry = pool.mark_exhausted_and_rotate(
+            status_code=rotate_status,
+            error_context=error_context,
+            api_key_hint=getattr(agent, "api_key", None),
+            failure_kind=FAILURE_KIND_USAGE_CAP,
+            failure_evidence=_evidence,
+        )
+        if next_entry is not None:
+            _ra().logger.info(
+                "Credential %s (usage cap) — rotated to pool entry %s",
+                rotate_status,
+                getattr(next_entry, "id", "?"),
+            )
+            agent._swap_credential(next_entry)
+            return True, False
+        return False, has_retried_429
+
+    if effective_reason == FailoverReason.auth_permanent:
+        # Never attempt try_refresh_current() here — unlike the ``auth``
+        # branch below, this reason means the classifier already determined
+        # refresh cannot fix it (an unambiguous terminal OAuth reason, or a
+        # 403 that looks like a lapsed subscription). Re-minting a token
+        # against a permanently-invalid/unsubscribed account just reproduces
+        # the same failure and wastes a refresh cycle. Quarantine the
+        # credential directly — credential_pool._mark_exhausted decides
+        # DEAD-vs-EXHAUSTED(TTL quarantine) based on the specific signal
+        # (see its BINDING note: a single 403 must never directly kill a
+        # credential).
+        rotate_status = status_code if status_code is not None else 401
+        _evidence = (error_context or {}).get("evidence") if error_context else None
+        next_entry = pool.mark_exhausted_and_rotate(
+            status_code=rotate_status,
+            error_context=error_context,
+            api_key_hint=getattr(agent, "api_key", None),
+            failure_kind=FAILURE_KIND_AUTH_PERMANENT,
+            failure_evidence=_evidence,
+        )
+        if next_entry is not None:
+            _ra().logger.info(
+                "Credential %s (auth_permanent) — rotated to pool entry %s",
+                rotate_status,
+                getattr(next_entry, "id", "?"),
+            )
+            agent._swap_credential(next_entry)
+            return True, False
+        return False, has_retried_429
+
     if effective_reason == FailoverReason.rate_limit:
         # If current credential is already marked exhausted, skip retry and
         # rotate immediately. This prevents the "cancel-between-429s" trap
@@ -1035,6 +1091,15 @@ def recover_with_credential_pool(
             agent._swap_credential(next_entry)
             return True, False
 
+    # NOTE: FailoverReason.network_unreachable intentionally has NO branch
+    # above — it falls straight through to this default return. Pre-probe
+    # (PR 2 adds control-host arbitration) the pool must not mutate any
+    # entry's status on a network failure that might be entirely local to
+    # this process (this machine's DNS/route, not the credential itself).
+    # The classifier's should_rotate_credential=True hint on that reason is
+    # forward-looking, for when probe arbitration lands; until then the
+    # *fallback chain* (not the credential pool) is what actually recovers
+    # a single-host outage — see the classifier's BINDING note.
     return False, has_retried_429
 
 

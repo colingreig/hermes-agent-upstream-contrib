@@ -20,6 +20,10 @@ from agent.credential_persistence import (
     is_borrowed_credential_source,
     sanitize_borrowed_credential_payload,
 )
+from agent.failure_taxonomy import (
+    FAILURE_KIND_AUTH_PERMANENT,
+    EVIDENCE_SUSPECTED_AUTH_PERMANENT,
+)
 import hermes_cli.auth as auth_mod
 from hermes_cli.auth import (
     CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
@@ -121,6 +125,22 @@ EXHAUSTED_TTL_401_SECONDS = 5 * 60           # 5 minutes
 EXHAUSTED_TTL_429_SECONDS = 60 * 60          # 1 hour
 EXHAUSTED_TTL_DEFAULT_SECONDS = 60 * 60      # 1 hour
 
+# A 403/entitlement-shaped ``auth_permanent`` signal is quarantined rather
+# than killed outright — see the BINDING note on ``_mark_exhausted`` below.
+# 6 hours gives a corroborating probe (PR 2) or the user's own re-auth
+# plenty of time to clear it before the credential re-enters rotation on
+# its own, while still keeping a genuinely dead credential mostly out of
+# the hot path between confirmations.
+AUTH_PERMANENT_QUARANTINE_TTL_SECONDS = 6 * 60 * 60  # 6 hours
+
+# Consecutive same-kind auth_permanent confirmations (no intervening
+# recovery) required before a quarantined credential is promoted to DEAD
+# without an explicit probe verdict. A single 403 must never kill a
+# credential outright — GitHub secondary rate limits and region blocks are
+# also 403s — but a signal that keeps reproducing across this many
+# independent failures is no longer plausibly a one-off.
+AUTH_PERMANENT_DEAD_CONFIRMATION_THRESHOLD = 3
+
 # Throttle window for the "no available entries" INFO line. Credential
 # selection runs on a hot path (every model call, plus auxiliary tasks like
 # compression/moa/titles), so when a pool is empty or fully exhausted the
@@ -184,6 +204,26 @@ class PooledCredential:
     agent_key: Optional[str] = None
     agent_key_expires_at: Optional[str] = None
     request_count: int = 0
+    # ── Failure taxonomy (86e2mb8nv PR 1/4) ──────────────────────────────
+    # Deeper failure classification than last_status/last_error_code above.
+    # All default None/0 so entries loaded from an auth.json written before
+    # this field set existed round-trip cleanly — see from_dict()/to_dict().
+    last_failure_kind: Optional[str] = None       # e.g. "usage_cap", "auth_permanent"
+    last_failure_evidence: Optional[str] = None    # short marker, e.g. "suspected_network"
+    # Count of consecutive same-kind failure confirmations with no
+    # intervening recovery. Used to promote a quarantined auth_permanent
+    # entry to DEAD without an explicit probe verdict — see
+    # AUTH_PERMANENT_DEAD_CONFIRMATION_THRESHOLD.
+    failure_confirmations: int = 0
+    # Out-of-band probe corroboration (the probe itself ships in PR 2;
+    # this PR only persists the verdict via record_probe_verdict()).
+    last_probe_verdict: Optional[str] = None
+    last_probe_verdict_at: Optional[float] = None
+    # Best-known usage percentage snapshot (0-100), when a provider exposes
+    # one (e.g. a quota-headers probe). Nullable — most providers never
+    # populate this in PR 1.
+    usage_percent: Optional[float] = None
+    usage_percent_at: Optional[float] = None
     extra: Dict[str, Any] = None  # type: ignore[assignment]
 
     def __post_init__(self):
@@ -285,8 +325,17 @@ def _is_manual_source(source: str) -> bool:
     return normalized == SOURCE_MANUAL or normalized.startswith(f"{SOURCE_MANUAL}:")
 
 
-def _exhausted_ttl(error_code: Optional[int]) -> int:
-    """Return cooldown seconds based on the HTTP status that caused exhaustion."""
+def _exhausted_ttl(error_code: Optional[int], failure_kind: Optional[str] = None) -> int:
+    """Return cooldown seconds based on the HTTP status that caused exhaustion.
+
+    ``failure_kind`` takes priority when present: an ``auth_permanent``
+    quarantine (see ``_mark_exhausted``) needs a much longer TTL than a
+    normal 401 — 5 minutes is right for "token needs a refresh", not for
+    "this looks entitlement-lapsed and we're waiting for a corroborating
+    probe or repeated confirmation before declaring it DEAD".
+    """
+    if failure_kind == FAILURE_KIND_AUTH_PERMANENT:
+        return AUTH_PERMANENT_QUARANTINE_TTL_SECONDS
     if error_code == 401:
         return EXHAUSTED_TTL_401_SECONDS
     if error_code == 429:
@@ -408,7 +457,9 @@ def _exhausted_until(entry: PooledCredential) -> Optional[float]:
     if reset_at is not None:
         return reset_at
     if entry.last_status_at:
-        return entry.last_status_at + _exhausted_ttl(entry.last_error_code)
+        return entry.last_status_at + _exhausted_ttl(
+            entry.last_error_code, getattr(entry, "last_failure_kind", None),
+        )
     return None
 
 
@@ -682,6 +733,13 @@ class CredentialPool:
                 last_error_reason=None,
                 last_error_message=None,
                 last_error_reset_at=None,
+                # A probe-confirmed recovery clears the failure-taxonomy
+                # fields too — otherwise a stale ``last_failure_kind`` badge
+                # (and its confirmation counter) lingers on an entry that's
+                # actually healthy again, misleading the next probe/monitor.
+                last_failure_kind=None,
+                last_failure_evidence=None,
+                failure_confirmations=0,
             )
             self._entries[idx] = updated
             self._persist()
@@ -730,8 +788,20 @@ class CredentialPool:
         entry: PooledCredential,
         status_code: Optional[int],
         error_context: Optional[Dict[str, Any]] = None,
+        *,
+        failure_kind: Optional[str] = None,
+        failure_evidence: Optional[str] = None,
     ) -> PooledCredential:
         normalized_error = _normalize_error_context(error_context)
+
+        # Track consecutive same-kind failures with no intervening recovery
+        # — used below to promote a quarantined auth_permanent entry to DEAD
+        # without requiring an explicit probe verdict.
+        if failure_kind and entry.last_failure_kind == failure_kind:
+            confirmations = (entry.failure_confirmations or 0) + 1
+        else:
+            confirmations = 1 if failure_kind else 0
+
         # Permanent OAuth failures (token_invalidated, token_revoked, etc.)
         # transition to STATUS_DEAD instead of STATUS_EXHAUSTED.  Without this,
         # a revoked credential gets a 1-hour TTL cooldown and then re-enters
@@ -741,8 +811,36 @@ class CredentialPool:
         # sync (``_save_codex_tokens`` after a fresh device-code login).
         if self._is_terminal_auth_failure(status_code, normalized_error):
             terminal_status = STATUS_DEAD
+        elif (
+            failure_kind == FAILURE_KIND_AUTH_PERMANENT
+            and confirmations >= AUTH_PERMANENT_DEAD_CONFIRMATION_THRESHOLD
+        ):
+            # BINDING: a single 403/entitlement-shaped auth_permanent signal
+            # must NEVER directly kill a credential — GitHub secondary rate
+            # limits and region blocks are also 403s. But the same signal
+            # repeating across AUTH_PERMANENT_DEAD_CONFIRMATION_THRESHOLD
+            # independent failures (each one surviving its own TTL
+            # quarantine below) is no longer plausibly a false positive.
+            terminal_status = STATUS_DEAD
         else:
             terminal_status = STATUS_EXHAUSTED
+
+        reset_at = normalized_error.get("reset_at")
+        evidence = failure_evidence
+        if (
+            terminal_status == STATUS_EXHAUSTED
+            and failure_kind == FAILURE_KIND_AUTH_PERMANENT
+            and reset_at is None
+        ):
+            # BINDING: quarantine, not death. Hold the credential out of
+            # rotation for AUTH_PERMANENT_QUARANTINE_TTL_SECONDS and require
+            # either a corroborating probe verdict (record_probe_verdict(),
+            # probe itself ships in PR 2) or the repeated-confirmation
+            # promotion above before this can become DEAD. Only sets a
+            # default reset_at when the provider didn't already supply one.
+            reset_at = time.time() + AUTH_PERMANENT_QUARANTINE_TTL_SECONDS
+            evidence = evidence or EVIDENCE_SUSPECTED_AUTH_PERMANENT
+
         updated = replace(
             entry,
             last_status=terminal_status,
@@ -750,7 +848,10 @@ class CredentialPool:
             last_error_code=status_code,
             last_error_reason=normalized_error.get("reason"),
             last_error_message=normalized_error.get("message"),
-            last_error_reset_at=normalized_error.get("reset_at"),
+            last_error_reset_at=reset_at,
+            last_failure_kind=failure_kind if failure_kind is not None else entry.last_failure_kind,
+            last_failure_evidence=evidence if evidence is not None else entry.last_failure_evidence,
+            failure_confirmations=confirmations,
         )
         self._replace_entry(entry, updated)
         self._persist()
@@ -1724,6 +1825,17 @@ class CredentialPool:
                 if exhausted_until is not None and now < exhausted_until:
                     continue
                 if clear_expired:
+                    # Deliberately does NOT clear last_failure_kind /
+                    # failure_confirmations: a TTL elapsing is "try again",
+                    # not a confirmed recovery — the entry re-enters
+                    # rotation optimistically. If it fails again with the
+                    # same failure_kind, that's the repeated-confirmation
+                    # signal AUTH_PERMANENT_DEAD_CONFIRMATION_THRESHOLD
+                    # needs to eventually promote a quarantined
+                    # auth_permanent entry to DEAD. Only an explicit
+                    # out-of-band recovery (clear_stale_exhaustion(), a
+                    # probe-confirmed verdict) or a genuinely different
+                    # failure_kind resets the counter.
                     cleared = replace(
                         entry,
                         last_status=STATUS_OK,
@@ -1761,6 +1873,20 @@ class CredentialPool:
         if last is not None and (now - last) < NO_AVAILABLE_ENTRIES_LOG_THROTTLE_SECONDS:
             return
         self._last_no_entries_log_at = now
+        if not self._entries:
+            # A provider with ZERO configured pool entries is a *config*
+            # state (nobody ever authenticated), not exhaustion. Monitors
+            # that grep "no available entries (all exhausted or empty)" to
+            # alert on quota exhaustion previously false-alarmed on
+            # providers nobody ever configured (e.g. an xai-oauth pool with
+            # no auth at all) — see 86e2mb8nv. Emit a distinct,
+            # unambiguous line instead so alerting can tell "never set up"
+            # apart from "was working, now exhausted".
+            logger.info(
+                "credential pool: provider has no configured entries [provider=%s]",
+                self.provider,
+            )
+            return
         # Keep the provider-qualified line first: production alerting keys on
         # the exhausted-pool substring and extracts this suffix to name the
         # affected pool. The canonical generic line remains for exact-match
@@ -1823,6 +1949,8 @@ class CredentialPool:
         status_code: Optional[int],
         error_context: Optional[Dict[str, Any]] = None,
         api_key_hint: Optional[str] = None,
+        failure_kind: Optional[str] = None,
+        failure_evidence: Optional[str] = None,
     ) -> Optional[PooledCredential]:
         with self._lock:
             entry = None
@@ -1840,7 +1968,10 @@ class CredentialPool:
             if entry is None:
                 return None
             _label = entry.label or entry.id[:8]
-            self._mark_exhausted(entry, status_code, error_context)
+            self._mark_exhausted(
+                entry, status_code, error_context,
+                failure_kind=failure_kind, failure_evidence=failure_evidence,
+            )
             # Re-read the updated entry to log the correct terminal state.
             updated_entry = next(
                 (e for e in self._entries if e.id == entry.id), entry,
@@ -1959,6 +2090,11 @@ class CredentialPool:
                         last_error_reason=None,
                         last_error_message=None,
                         last_error_reset_at=None,
+                        # Explicit user-driven reset (unlike the passive
+                        # TTL-elapse path) — clear the taxonomy badge too.
+                        last_failure_kind=None,
+                        last_failure_evidence=None,
+                        failure_confirmations=0,
                     )
                 )
                 count += 1
@@ -2795,6 +2931,102 @@ def _seed_custom_pool(pool_key: str, entries: List[PooledCredential]) -> Tuple[b
         pass
 
     return changed, active_sources
+
+
+# ── Failure-taxonomy CLI/monitor APIs (86e2mb8nv PR 1/4) ────────────────
+# Module-level (not CredentialPool methods) and deliberately narrow: both
+# read/write auth.json directly under the same lock ``write_credential_pool``
+# uses, instead of going through ``load_pool()``'s full env/singleton
+# reseeding pass. That keeps them safe to call from a separate monitor or
+# probe process without side effects (record_probe_verdict) or expensive
+# secret-resolution work (failure_summary).
+
+def record_probe_verdict(
+    provider: str,
+    entry_id: str,
+    verdict: str,
+    evidence: Optional[str] = None,
+) -> bool:
+    """Persist an out-of-band probe's verdict against one pool entry.
+
+    PR 2 adds the actual control-host probe (confirms/denies a
+    ``suspected_*``-tagged classification — e.g. "is this credential really
+    auth_permanent, or was that 403 a GitHub secondary rate limit"). This PR
+    only lands the write API it will call: a narrow, single-entry state
+    update that doesn't require instantiating a full ``CredentialPool``
+    (which would trigger env reseeding / singleton sync as a side effect).
+
+    Returns True if the entry was found and updated, False on an unknown
+    provider/entry_id (a stale id must not crash a probe run).
+    """
+    provider = (provider or "").strip().lower()
+    if not provider or not entry_id:
+        return False
+    with _auth_store_lock():
+        auth_store = _load_auth_store()
+        pool = auth_store.get("credential_pool")
+        if not isinstance(pool, dict):
+            return False
+        raw_entries = pool.get(provider)
+        if not isinstance(raw_entries, list):
+            return False
+        found = False
+        now = time.time()
+        for payload in raw_entries:
+            if not isinstance(payload, dict) or payload.get("id") != entry_id:
+                continue
+            payload["last_probe_verdict"] = verdict
+            payload["last_probe_verdict_at"] = now
+            if evidence:
+                payload["last_failure_evidence"] = evidence
+            found = True
+            break
+        if not found:
+            return False
+        _save_auth_store(auth_store)
+        return True
+
+
+def failure_summary(provider: Optional[str] = None) -> Dict[str, List[Dict[str, Any]]]:
+    """Per-entry failure-kind/evidence/usage% snapshot for CLI/monitor use.
+
+    Read-only: does not seed, refresh, sync, or mutate the pool — safe to
+    call from a monitor/alerting process without side effects. Returns
+    ``{provider: [{"id", "label", "last_status", "last_failure_kind",
+    "last_failure_evidence", "last_probe_verdict", "last_probe_verdict_at",
+    "usage_percent", "usage_percent_at"}, ...]}``; providers with zero
+    entries are omitted entirely (see ``_log_no_available_entries`` for the
+    "not configured" distinction elsewhere).
+    """
+    if provider:
+        provider = provider.strip().lower()
+        raw: Dict[str, Any] = {provider: read_credential_pool(provider)}
+    else:
+        raw = read_credential_pool(None)
+
+    summary: Dict[str, List[Dict[str, Any]]] = {}
+    for prov, entries in raw.items():
+        if not isinstance(entries, list) or not entries:
+            continue
+        rows = []
+        for payload in entries:
+            if not isinstance(payload, dict):
+                continue
+            cred = PooledCredential.from_dict(prov, payload)
+            rows.append({
+                "id": cred.id,
+                "label": cred.label,
+                "last_status": cred.last_status,
+                "last_failure_kind": cred.last_failure_kind,
+                "last_failure_evidence": cred.last_failure_evidence,
+                "last_probe_verdict": cred.last_probe_verdict,
+                "last_probe_verdict_at": cred.last_probe_verdict_at,
+                "usage_percent": cred.usage_percent,
+                "usage_percent_at": cred.usage_percent_at,
+            })
+        if rows:
+            summary[prov] = rows
+    return summary
 
 
 def load_pool(provider: str) -> CredentialPool:
