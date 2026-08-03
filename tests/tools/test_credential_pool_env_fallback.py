@@ -347,6 +347,165 @@ class TestAuthCredentialPoolFallback:
         mock_lazy.assert_not_called()
 
 
+class TestLazyResolverPoolSeeding:
+    """`_seed_from_env` must reach the lazy 1Password resolver directly,
+    bypassing `agent.secret_scope.get_secret`, so multiplex mode (scope
+    installed with the key missing, or no scope installed at all) can never
+    starve pool seeding of 1Password material or abort the seed pass.
+
+    Regression coverage for the fix: pool seeding is process-global
+    bookkeeping and must not be subject to the per-profile-turn multiplex
+    fail-closed rule in `secret_scope.get_secret` (returns default with a
+    scope installed, raises `UnscopedSecretError` with none installed).
+    """
+
+    @pytest.fixture(autouse=True)
+    def _lazy_resolution_enabled(self, monkeypatch):
+        monkeypatch.setenv("HERMES_LAZY_SECRET_RESOLUTION", "1")
+
+    @pytest.fixture
+    def multiplex_active_no_scope(self):
+        """Simulate the production gateway shape that broke seeding: multiplex
+        active, no secret scope installed for this call. Under the old code
+        this made `get_secret` raise `UnscopedSecretError` and abort
+        `_seed_from_env` entirely.
+        """
+        from agent.secret_scope import set_multiplex_active
+        set_multiplex_active(True)
+        try:
+            yield
+        finally:
+            set_multiplex_active(False)
+
+    def test_lazy_resolver_seeds_entry_when_env_and_dotenv_are_absent(
+        self, isolated_hermes_home, multiplex_active_no_scope
+    ):
+        """(a) multiplex active, var absent from env/.env, lazy resolver
+        returns a value → the pool entry is seeded with that material.
+        """
+        assert "DEEPSEEK_API_KEY" not in os.environ
+
+        from agent.credential_pool import _seed_from_env
+        entries = []
+        with patch(
+            "agent.lazy_secret_resolver.get",
+            return_value="sk-lazy-resolved-deepseek",
+        ) as mock_lazy:
+            changed, active_sources = _seed_from_env("deepseek", entries)
+
+        assert changed is True
+        assert "env:DEEPSEEK_API_KEY" in active_sources
+        assert any(
+            e.access_token == "sk-lazy-resolved-deepseek"
+            and e.source == "env:DEEPSEEK_API_KEY"
+            for e in entries
+        ), f"Expected lazy-resolved entry, got: {[(e.source, e.access_token) for e in entries]}"
+        mock_lazy.assert_called_with("DEEPSEEK_API_KEY")
+
+    def test_lazy_resolver_raising_does_not_abort_seeding(
+        self, isolated_hermes_home, multiplex_active_no_scope
+    ):
+        """(b) the lazy resolver raising must not propagate out of
+        `_seed_from_env` — seeding continues and the entry is simply skipped.
+        """
+        assert "DEEPSEEK_API_KEY" not in os.environ
+
+        from agent.credential_pool import _seed_from_env
+        entries = []
+        with patch(
+            "agent.lazy_secret_resolver.get",
+            side_effect=RuntimeError("1Password SDK boom"),
+        ):
+            changed, active_sources = _seed_from_env("deepseek", entries)
+
+        assert changed is False
+        assert active_sources == set()
+        assert entries == []
+
+    def test_env_and_dotenv_still_take_precedence_over_lazy_resolver(
+        self, isolated_hermes_home, monkeypatch, multiplex_active_no_scope
+    ):
+        """(c) an explicit env var or .env value must win over the lazy
+        resolver — the resolver is only consulted when both are empty.
+        """
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-env-wins")
+
+        from agent.credential_pool import _seed_from_env
+        entries = []
+        with patch(
+            "agent.lazy_secret_resolver.get",
+            return_value="sk-lazy-should-not-be-used",
+        ) as mock_lazy:
+            changed, active_sources = _seed_from_env("deepseek", entries)
+
+        assert changed is True
+        seeded = [e for e in entries if e.source == "env:DEEPSEEK_API_KEY"]
+        assert len(seeded) == 1
+        assert seeded[0].access_token == "sk-env-wins"
+        # deepseek also has an (unset) base_url env var that legitimately
+        # falls through to the lazy resolver — only assert the API key
+        # itself never consulted it.
+        assert ("DEEPSEEK_API_KEY",) not in [c.args for c in mock_lazy.call_args_list]
+
+    def test_lazy_pool_secret_returns_empty_when_flag_disabled(
+        self, isolated_hermes_home, monkeypatch
+    ):
+        """The lazy fallback must be a strict no-op when the enablement flag
+        is off — byte-identical to pre-fix behaviour with the flag unset.
+        """
+        monkeypatch.delenv("HERMES_LAZY_SECRET_RESOLUTION", raising=False)
+
+        from agent.credential_pool import _lazy_pool_secret
+        with patch("agent.lazy_secret_resolver.get") as mock_lazy:
+            assert _lazy_pool_secret("DEEPSEEK_API_KEY") == ""
+        mock_lazy.assert_not_called()
+
+    def test_seed_from_env_survives_unscoped_secret_error(
+        self, isolated_hermes_home, multiplex_active_no_scope
+    ):
+        """Belt-and-suspenders: even if a resolution path still raised
+        `UnscopedSecretError` (e.g. a future call site regresses), the
+        `load_pool()` guard around `_seed_from_env` must not let it crash
+        pool loading. Exercised directly against `_seed_from_env` here since
+        that's the function `load_pool()` now wraps in try/except.
+        """
+        from agent.secret_scope import UnscopedSecretError
+        from agent.credential_pool import _seed_from_env
+
+        entries = []
+        with patch(
+            "agent.lazy_secret_resolver.get",
+            side_effect=UnscopedSecretError("no scope installed"),
+        ):
+            # Must not raise.
+            changed, active_sources = _seed_from_env("deepseek", entries)
+
+        assert changed is False
+        assert active_sources == set()
+
+    def test_load_pool_survives_seed_from_env_raising(self, tmp_path, monkeypatch):
+        """`load_pool()` itself must not crash if `_seed_from_env` raises for
+        any reason — this is the outer guard described in the fix (item 2):
+        a future resolution error can never again abort pool loading.
+
+        Uses a plain tmp_path HERMES_HOME (not `isolated_hermes_home`, which
+        also patches `Path.home()` — colliding with `_auth_file_path()`'s
+        real-home safety check, since `load_pool()` here needs to touch the
+        actual on-disk auth store code path rather than a mocked one).
+        """
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+
+        from agent.credential_pool import load_pool
+
+        with patch(
+            "agent.credential_pool._seed_from_env",
+            side_effect=RuntimeError("boom"),
+        ):
+            pool = load_pool("deepseek")  # must not raise
+
+        assert pool.provider == "deepseek"
+
+
 class TestAnthropicEnvAuthTypeClassification:
     """_seed_from_env must classify Anthropic env tokens by the sk-ant-oat prefix.
 
