@@ -2640,8 +2640,31 @@ class TestRunJobConfigEnvVarExpansion:
         "api_mode": "chat_completions",
     }
 
-    def test_governed_content_job_executes_sonnet_only_direct_skill_path(
-        self, tmp_path, monkeypatch
+    @pytest.mark.parametrize(
+        ("job_name", "expected_provider", "expected_model", "expected_prompt"),
+        [
+            (
+                "content-lane-executor",
+                "anthropic",
+                "claude-sonnet-5",
+                "/ignite-execute --lane content",
+            ),
+            (
+                "clickup-executor",
+                "openai-codex",
+                "gpt-5.6-sol",
+                "/ignite-execute --lane {lane}",
+            ),
+        ],
+    )
+    def test_governed_executor_job_propagates_no_fallback_to_dispatch(
+        self,
+        tmp_path,
+        monkeypatch,
+        job_name,
+        expected_provider,
+        expected_model,
+        expected_prompt,
     ):
         """Drive the checked-in fleet job through the real cron dispatch sink."""
         # Keep this focused test independent of optional provider SDKs: cron
@@ -2662,13 +2685,10 @@ class TestRunJobConfigEnvVarExpansion:
         )
         jobs = json.loads(jobs_path.read_text(encoding="utf-8"))["jobs"]
         job = dict(
-            next(
-                item
-                for item in jobs
-                if item["name"] == "content-lane-executor"
-            )
+            next(item for item in jobs if item["name"] == job_name)
         )
         job["workdir"] = str(tmp_path)
+        monkeypatch.setenv("CLICKUP_API_TOKEN", "test-clickup-token")
         (tmp_path / "config.yaml").write_text(
             "model:\n"
             "  provider: openai-codex\n"
@@ -2684,16 +2704,16 @@ class TestRunJobConfigEnvVarExpansion:
         loaded_skill = json.dumps(
             {
                 "success": True,
-                "content": "# Ignite execute\nGovern the content lane.",
+                "content": "# Ignite execute\nGovern the executor lane.",
                 "skill_dir": str(skill_dir),
             }
         )
         fake_db = MagicMock()
         runtime = {
-            "api_key": "test-anthropic-key",
-            "base_url": "https://api.anthropic.com",
-            "provider": "anthropic",
-            "api_mode": "anthropic_messages",
+            "api_key": "test-provider-key",
+            "base_url": "https://provider.invalid",
+            "provider": expected_provider,
+            "api_mode": "chat_completions",
         }
         resolve_runtime = MagicMock(return_value=runtime)
         runtime_module = types.ModuleType("hermes_cli.runtime_provider")
@@ -2733,15 +2753,15 @@ class TestRunJobConfigEnvVarExpansion:
         assert success is True
         assert error is None
         assert final_response == "ok"
-        assert resolve_runtime.call_args.kwargs["requested"] == "anthropic"
+        assert resolve_runtime.call_args.kwargs["requested"] == expected_provider
         kwargs = mock_agent_cls.call_args.kwargs
-        assert kwargs["provider"] == "anthropic"
-        assert kwargs["model"] == "claude-sonnet-5"
+        assert kwargs["provider"] == expected_provider
+        assert kwargs["model"] == expected_model
         assert kwargs["fallback_model"] is None
         assert kwargs["no_fallback"] is True
         effective_prompt = mock_agent.run_conversation.call_args.args[0]
-        assert "Govern the content lane." in effective_prompt
-        assert "/ignite-execute --lane content" in effective_prompt
+        assert "Govern the executor lane." in effective_prompt
+        assert expected_prompt in effective_prompt
 
     def test_governed_content_job_auth_error_never_attempts_global_fallback(
         self, tmp_path, monkeypatch

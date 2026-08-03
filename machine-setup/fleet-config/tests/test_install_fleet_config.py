@@ -931,3 +931,21 @@ def test_merge_jobs_json_preserves_runtime_for_real_fleet_bundle():
         assert merged_job["last_run_at"] == "2026-08-01T10:00:00+00:00"
         assert merged_job["runtime"] == {"probe": job["id"]}
         assert merged_job["repeat"]["completed"] == 7
+
+
+def test_merge_jobs_json_restores_governed_executor_no_fallback_pin():
+    bundled_path = Path(__file__).resolve().parents[1] / "jobs.json"
+    fleet_jobs = json.loads(bundled_path.read_text(encoding="utf-8"))["jobs"]
+    governed = dict(next(job for job in fleet_jobs if job["id"] == "62714b869845"))
+    assert governed["no_fallback"] is True
+    live = dict(governed)
+    live["no_fallback"] = False
+    live["last_status"] = "ok"
+
+    merged, counts = install_mod.merge_jobs_json(
+        {"jobs": [live]}, {"jobs": [governed]}
+    )
+
+    assert counts == {"preserved": 0, "changed": 1, "new": 0, "removed": 0}
+    assert merged["jobs"][0]["no_fallback"] is True
+    assert merged["jobs"][0]["last_status"] == "ok"
