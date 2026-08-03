@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.colingreig.hermes.codex-quota-probe</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/colingreig/.hermes/runtime-current/venv/bin/python</string>
+    <string>/Users/colingreig/.hermes/scripts/codex_quota_probe.py</string>
+    <string>--alert</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>CODEX_QUOTA_PROBE_ALERT_SLACK</key>
+    <string>slack:D0BA2PM9CFM</string>
+    <key>HERMES_HOME</key>
+    <string>/Users/colingreig/.hermes</string>
+    <key>HOME</key>
+    <string>/Users/colingreig</string>
+    <key>PATH</key>
+    <string>/Users/colingreig/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StartInterval</key>
+  <integer>900</integer>
+  <key>StandardOutPath</key>
+  <string>/Users/colingreig/.hermes/logs/codex-quota-probe.launchd.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/colingreig/.hermes/logs/codex-quota-probe.launchd.error.log</string>
+</dict>
+</plist>

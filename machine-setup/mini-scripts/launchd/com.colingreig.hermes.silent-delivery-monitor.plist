@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.colingreig.hermes.silent-delivery-monitor</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/colingreig/.hermes/scripts/silent_delivery_monitor.py</string>
+    <string>--alert</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>CRON_SILENT_ALERT_SLACK</key>
+    <string>slack:D0BA2PM9CFM</string>
+    <key>HERMES_HOME</key>
+    <string>/Users/colingreig/.hermes</string>
+    <key>HOME</key>
+    <string>/Users/colingreig</string>
+    <key>PATH</key>
+    <string>/Users/colingreig/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StartInterval</key>
+  <integer>300</integer>
+  <key>StandardOutPath</key>
+  <string>/Users/colingreig/.hermes/logs/silent-delivery-monitor.launchd.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/colingreig/.hermes/logs/silent-delivery-monitor.launchd.error.log</string>
+</dict>
+</plist>

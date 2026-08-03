@@ -387,6 +387,47 @@ proof packet:
   remain unavailable. Its SDK subprocess uses the immutable
   `~/.hermes/runtime-current/venv/bin/python` path, not the removed mutable
   `~/.hermes/hermes-agent/venv/bin/python` checkout.
+- `codex_quota_probe.py` — early-recovery probe for stale Codex quota marks
+  (86e2kxk50). A provider-supplied `reset_at` on an exhausted `openai-codex`
+  pool entry is a ceiling, not a guarantee — the account sometimes recovers
+  before it. Every 15 minutes (see the paired launchd plist) it re-checks
+  every entry still exhausted with an unexpired retry window using a single
+  cheap, zero-generation-token call (`GET .../codex/models`), and clears the
+  stale mark the moment the account proves usable again — independently per
+  entry, so clearing the primary account can never touch the backup
+  account's own exhaustion state. A still-exhausted entry is left untouched
+  and logged as a non-alerting reduced-redundancy line; a new early clear
+  sends one informational (non-paging) Slack note. Runs under the runtime
+  venv Python (needs `agent.credential_pool` / `hermes_cli.auth`), unlike
+  `degraded_secrets_monitor.py`'s deliberately stdlib-only design.
+  **Runbook:** a persistently-exhausted account with a distant `reset_at`
+  and no early-clear Slack note is normal — the drill only fires when the
+  account is *actually* usable again; check
+  `~/.hermes/logs/codex-quota-probe.launchd.log` for `still unavailable`
+  lines to confirm the probe is running and what HTTP status it is seeing.
+  A manual `hermes auth reset openai-codex` remains the immediate escape
+  hatch if the probe's classification looks wrong.
+- `silent_delivery_monitor.py` — alarms on an abnormal rate of `[SILENT]`
+  cron delivery-skips (86e2kxk4t). `cron/scheduler.py`'s
+  `_deliver_cron_outcome` now appends one durable JSONL record per silent
+  ending to `~/.hermes/state/cron-silent-deliveries.jsonl`; this monitor
+  reads a trailing 60-minute window and fires a real Slack alert (not just
+  the pre-existing INFO log line) when either one job accumulates >= 4
+  silents in the window (a stuck claim/routing path) or the fleet
+  accumulates >= 8 silents across all jobs (a simultaneous cross-job
+  silence spike — the "total outage" shape from 2026-08-02, 17/50 executor
+  runs). Signature-based dedupe/recovery, same convention as
+  `degraded_secrets_monitor.py`: alerts once per distinct breach, goes
+  quiet on repeat checks of the same signature, and re-arms the moment the
+  rolling window drops back under both thresholds — a satisfiable alarm,
+  not a permanently-red flag. Runs on the same stdlib-only, system-Python
+  design as `degraded_secrets_monitor.py` (no repo package imports needed).
+  **Runbook** is in the script's own module docstring: diagnose a
+  single-job breach via that job's recent output/jobs.json entry; diagnose
+  a fleet-wide breach via gateway/provider health first; the alarm clears
+  itself automatically once the window recovers, or can be force-cleared
+  by truncating the JSONL log or deleting
+  `~/.hermes/state/silent-delivery-monitor.json`.
 - `tests/test_op_sdk_resolve.py` — fully mocked resolver contract harness:
   transient-then-success, exhausted transient without stale, mixed auth +
   timeout precedence, complete stale fallback, and stdout quoting bytes.

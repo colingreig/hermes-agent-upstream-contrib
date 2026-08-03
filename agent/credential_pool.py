@@ -639,6 +639,56 @@ class CredentialPool:
             return None
         return next((entry for entry in self._entries if entry.id == self._current_id), None)
 
+    def frozen_exhausted_entries(self, *, now: Optional[float] = None) -> List[PooledCredential]:
+        """Entries marked exhausted whose stored retry window has NOT elapsed.
+
+        These are the entries a periodic quota probe (see
+        ``machine-setup/mini-scripts/codex_quota_probe.py``) should re-check
+        against the live upstream: a provider-supplied ``reset_at`` can be
+        many hours (or days) out, but the account sometimes recovers earlier
+        than that TTL — a stale ``reset_at`` should not starve the pool for
+        the full window when a cheap probe can prove the account is usable
+        again. Entries whose window has already elapsed are excluded here:
+        normal rotation already treats them as available on the next
+        selection, so probing them again would be redundant.
+        """
+        now = time.time() if now is None else now
+        result = []
+        for entry in self._entries:
+            if entry.last_status != STATUS_EXHAUSTED:
+                continue
+            until = _exhausted_until(entry)
+            if until is not None and until > now:
+                result.append(entry)
+        return result
+
+    def clear_stale_exhaustion(self, entry_id: str) -> bool:
+        """Clear one entry's exhaustion after an out-of-band probe proves it
+        usable again, independent of every other entry in the pool.
+
+        Returns True (and persists) only when the targeted entry was actually
+        exhausted; a no-op (already-cleared, unknown id, or non-exhausted
+        entry) returns False without writing anything.
+        """
+        for idx, entry in enumerate(self._entries):
+            if entry.id != entry_id:
+                continue
+            if entry.last_status != STATUS_EXHAUSTED:
+                return False
+            updated = replace(
+                entry,
+                last_status=None,
+                last_status_at=None,
+                last_error_code=None,
+                last_error_reason=None,
+                last_error_message=None,
+                last_error_reset_at=None,
+            )
+            self._entries[idx] = updated
+            self._persist()
+            return True
+        return False
+
     def _replace_entry(self, old: PooledCredential, new: PooledCredential) -> None:
         """Swap an entry in-place by id, preserving sort order."""
         for idx, entry in enumerate(self._entries):
