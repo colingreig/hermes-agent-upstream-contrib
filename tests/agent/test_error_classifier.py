@@ -1,5 +1,7 @@
 """Tests for agent.error_classifier — structured API error classification."""
 
+import time
+
 import pytest
 from agent.error_classifier import (
     ClassifiedError,
@@ -52,9 +54,9 @@ class TestFailoverReason:
 
     def test_enum_members_exist(self):
         expected = {
-            "auth", "auth_permanent", "billing", "rate_limit",
+            "auth", "auth_permanent", "billing", "rate_limit", "usage_cap",
             "upstream_rate_limit",
-            "overloaded", "server_error", "timeout",
+            "overloaded", "server_error", "timeout", "network_unreachable",
             "ssl_cert_verification",
             "context_overflow", "payload_too_large", "image_too_large",
             "model_not_found", "format_error",
@@ -1040,9 +1042,15 @@ class TestClassifyApiError:
         assert result.retryable is True
 
     def test_connect_error(self):
+        """A connection-refused message (even under httpx's generic
+        ConnectError type) is a network-unreachable signal now, not a
+        generic timeout — see the failure taxonomy (86e2mb8nv PR 1/4)."""
         e = ConnectError("Connection refused")
         result = classify_api_error(e)
-        assert result.reason == FailoverReason.timeout
+        assert result.reason == FailoverReason.network_unreachable
+        assert result.retryable is True
+        assert result.should_rotate_credential is True
+        assert result.should_fallback is True
 
     def test_connection_error_builtin(self):
         e = ConnectionError("Connection reset by peer")
@@ -1515,9 +1523,13 @@ class TestAdversarialEdgeCases:
         assert result.reason == FailoverReason.context_overflow
 
     def test_connection_refused_error(self):
+        """A bare ConnectionRefusedError (local provider down, e.g. Ollama
+        not running) is network_unreachable, not a generic timeout — see
+        the failure taxonomy (86e2mb8nv PR 1/4)."""
         e = ConnectionRefusedError("Connection refused: localhost:11434")
         result = classify_api_error(e, provider="ollama")
-        assert result.reason == FailoverReason.timeout
+        assert result.reason == FailoverReason.network_unreachable
+        assert result.retryable is True
 
     def test_body_message_enrichment(self):
         """Body message must be included in pattern matching even when
@@ -2193,3 +2205,269 @@ class Test408RequestTimeout:
         assert result.retryable is False
         assert result.should_fallback is True
         assert result.should_compress is False
+
+
+# ── Failure taxonomy: usage_cap (86e2mb8nv PR 1/4) ──────────────────────
+
+class TestUsageCapClassification:
+    """429/402 horizon split: an hours-away reset or an unambiguous cap
+    marker classifies as ``usage_cap`` (rotate/fall back now) instead of
+    the session-scoped ``rate_limit`` (wait-and-retry)."""
+
+    def test_429_weekly_marker_is_usage_cap(self):
+        e = MockAPIError(
+            "You have reached your weekly limit. Try again in 20 hours.",
+            status_code=429,
+        )
+        result = classify_api_error(e, provider="openai-codex")
+        assert result.reason == FailoverReason.usage_cap
+        assert result.retryable is False
+        assert result.should_rotate_credential is True
+        assert result.should_fallback is True
+
+    def test_429_numeric_horizon_over_6h_is_usage_cap(self):
+        e = MockAPIError("Rate limit exceeded. resets in 7 hours", status_code=429)
+        result = classify_api_error(e, provider="anthropic")
+        assert result.reason == FailoverReason.usage_cap
+
+    def test_429_numeric_horizon_exactly_6h_is_usage_cap(self):
+        """Boundary: the horizon threshold is inclusive (>=6h)."""
+        e = MockAPIError("Rate limited. resets in 6 hours", status_code=429)
+        result = classify_api_error(e, provider="anthropic")
+        assert result.reason == FailoverReason.usage_cap
+
+    def test_429_numeric_horizon_under_6h_stays_rate_limit(self):
+        e = MockAPIError("Rate limited. resets in 3 hours", status_code=429)
+        result = classify_api_error(e, provider="anthropic")
+        assert result.reason == FailoverReason.rate_limit
+        assert result.retryable is True
+
+    def test_429_no_horizon_no_marker_stays_rate_limit(self):
+        """No parseable horizon, no cap marker -> conservative default:
+        session-scoped rate_limit, not usage_cap."""
+        e = MockAPIError("Too many requests, please slow down", status_code=429)
+        result = classify_api_error(e, provider="openai")
+        assert result.reason == FailoverReason.rate_limit
+
+    def test_ambiguous_codex_5h_window_defaults_to_rate_limit_session(self):
+        """BINDING: codex's genuine 5-hour rolling window is phrased like a
+        usage limit but must default to the session-scoped rate_limit
+        reason. Only an unambiguous cap marker or a numeric horizon past
+        the 6h threshold may promote a codex 429 to usage_cap."""
+        e = MockAPIError(
+            "You've hit your usage limit for this session. "
+            "Try again in 4 hours 45 minutes.",
+            status_code=429,
+        )
+        result = classify_api_error(e, provider="openai-codex", model="gpt-5.5-codex")
+        assert result.reason == FailoverReason.rate_limit
+        assert result.retryable is True
+
+    def test_codex_weekly_cap_still_promotes_to_usage_cap(self):
+        """Guard the other side of the BINDING: a genuinely long-horizon
+        codex signal (weekly cap) must still classify as usage_cap — the
+        session-default only protects the ambiguous 5h-window case."""
+        e = MockAPIError(
+            "You have reached your weekly limit. resets in 40 hours.",
+            status_code=429,
+        )
+        result = classify_api_error(e, provider="openai-codex", model="gpt-5.5-codex")
+        assert result.reason == FailoverReason.usage_cap
+
+    def test_402_usage_limit_with_long_horizon_is_usage_cap(self):
+        e = MockAPIError(
+            "Usage limit reached. Limit will reset in 8 hours.",
+            status_code=402,
+        )
+        result = classify_api_error(e)
+        assert result.reason == FailoverReason.usage_cap
+        assert result.retryable is False
+
+    def test_402_usage_limit_with_short_horizon_stays_rate_limit(self):
+        e = MockAPIError(
+            "Usage limit reached, try again in 5 minutes",
+            status_code=402,
+        )
+        result = classify_api_error(e)
+        assert result.reason == FailoverReason.rate_limit
+        assert result.retryable is True
+
+    def test_usage_cap_structured_reset_at_epoch(self):
+        """A structured body reset_at far in the future (epoch seconds)
+        must parse via the body path, not just message text."""
+        reset_at = time.time() + 12 * 3600
+        e = MockAPIError(
+            "quota exceeded",
+            status_code=429,
+            body={"error": {"message": "quota exceeded", "reset_at": reset_at}},
+        )
+        result = classify_api_error(e, provider="gemini")
+        assert result.reason == FailoverReason.usage_cap
+
+    def test_overload_priority_preserved_over_usage_cap(self):
+        """The existing overload disambiguation must still run BEFORE the
+        new horizon split — an overloaded 429 must never get reclassified
+        as usage_cap just because its wording also mentions long waits."""
+        e = MockAPIError(
+            "The service is temporarily overloaded. resets in 7 hours",
+            status_code=429,
+        )
+        result = classify_api_error(e, provider="zai")
+        assert result.reason == FailoverReason.overloaded
+
+    def test_openrouter_upstream_priority_preserved_over_usage_cap(self):
+        """The OpenRouter upstream-aggregator disambiguation must still run
+        BEFORE the new horizon split."""
+        e = MockAPIError(
+            "Provider returned error",
+            status_code=429,
+            body={
+                "error": {
+                    "message": "Provider returned error",
+                    "metadata": {
+                        "provider_name": "DeepSeek",
+                        "raw": '{"error": {"message": "resets in 9 hours"}}',
+                    },
+                }
+            },
+        )
+        result = classify_api_error(e, provider="openrouter", model="x")
+        assert result.reason == FailoverReason.upstream_rate_limit
+
+
+# ── Failure taxonomy: auth_permanent (86e2mb8nv PR 1/4) ─────────────────
+
+class TestAuthPermanentClassification:
+    def test_401_token_invalidated_code_is_auth_permanent(self):
+        e = MockAPIError(
+            "Unauthorized",
+            status_code=401,
+            body={"error": {"code": "token_invalidated",
+                             "message": "Your authentication token has been invalidated."}},
+        )
+        result = classify_api_error(e, provider="openai-codex")
+        assert result.reason == FailoverReason.auth_permanent
+        assert result.is_auth is True
+        assert result.retryable is False
+        assert result.should_rotate_credential is True
+        assert result.should_fallback is True
+
+    def test_401_token_revoked_message_is_auth_permanent(self):
+        e = MockAPIError(
+            "Your OAuth token has been revoked by the account owner.",
+            status_code=401,
+        )
+        result = classify_api_error(e, provider="anthropic")
+        assert result.reason == FailoverReason.auth_permanent
+
+    def test_401_invalid_grant_code_is_auth_permanent(self):
+        e = MockAPIError(
+            "Bad Request",
+            status_code=401,
+            body={"error": {"code": "invalid_grant", "message": "refresh token rejected"}},
+        )
+        result = classify_api_error(e, provider="xai-oauth")
+        assert result.reason == FailoverReason.auth_permanent
+
+    def test_401_generic_stays_transient_auth(self):
+        """A plain 401 with no terminal reason must stay the refreshable
+        ``auth`` bucket — refresh is the correct first attempt there."""
+        e = MockAPIError("Unauthorized", status_code=401)
+        result = classify_api_error(e, provider="openrouter")
+        assert result.reason == FailoverReason.auth
+
+    def test_401_token_expired_stays_transient_auth(self):
+        """token_expired is refreshable — must NOT be swept into
+        auth_permanent alongside the terminal reasons."""
+        e = MockAPIError(
+            "Unauthorized",
+            status_code=401,
+            body={"error": {"code": "token_expired", "message": "Access token has expired"}},
+        )
+        result = classify_api_error(e, provider="anthropic")
+        assert result.reason == FailoverReason.auth
+
+    def test_403_subscription_expired_is_auth_permanent_with_evidence(self):
+        e = MockAPIError("Forbidden", status_code=403,
+                          body={"error": {"message": "Your subscription has expired."}})
+        result = classify_api_error(e, provider="anthropic")
+        assert result.reason == FailoverReason.auth_permanent
+        assert result.error_context.get("evidence") == "subscription_lapsed"
+        assert result.retryable is False
+        assert result.should_fallback is True
+
+    def test_403_requires_active_subscription_is_auth_permanent(self):
+        e = MockAPIError(
+            "Forbidden", status_code=403,
+            body={"error": {"message": "This endpoint requires an active subscription."}},
+        )
+        result = classify_api_error(e, provider="anthropic")
+        assert result.reason == FailoverReason.auth_permanent
+
+    def test_403_billing_pattern_priority_preserved_over_subscription_lapsed(self):
+        """Billing disambiguation must still run BEFORE the new
+        subscription-lapse check — a 403 that is unambiguously a credit/
+        balance problem stays ``billing``, not auth_permanent."""
+        e = MockAPIError(
+            "This plan does not include the requested model",
+            status_code=403,
+        )
+        result = classify_api_error(e)
+        assert result.reason == FailoverReason.billing
+
+    def test_403_generic_stays_transient_auth_not_auth_permanent(self):
+        """A single generic 403 (GitHub secondary rate limit / region block
+        shape — no subscription-lapse wording) must NOT be reclassified as
+        auth_permanent — only unambiguous subscription-lapse phrasing may."""
+        e = MockAPIError("Forbidden", status_code=403)
+        result = classify_api_error(e, provider="github")
+        assert result.reason == FailoverReason.auth
+        assert result.reason != FailoverReason.auth_permanent
+
+
+# ── Failure taxonomy: network_unreachable (86e2mb8nv PR 1/4) ────────────
+
+class TestNetworkUnreachableClassification:
+    def test_dns_failure_macos_wording_is_network_unreachable(self):
+        e = ConnectError(
+            "[Errno 8] nodename nor servname provided, or not known"
+        )
+        result = classify_api_error(e, provider="custom")
+        assert result.reason == FailoverReason.network_unreachable
+        assert result.retryable is True
+        assert result.should_rotate_credential is True
+        assert result.should_fallback is True
+        assert result.error_context.get("evidence") == "suspected_network"
+
+    def test_dns_failure_linux_wording_is_network_unreachable(self):
+        e = ConnectError("Name or service not known")
+        result = classify_api_error(e, provider="custom")
+        assert result.reason == FailoverReason.network_unreachable
+
+    def test_no_route_to_host_is_network_unreachable(self):
+        e = ConnectError("No route to host")
+        result = classify_api_error(e, provider="custom")
+        assert result.reason == FailoverReason.network_unreachable
+
+    def test_network_is_unreachable_is_network_unreachable(self):
+        e = ConnectError("Network is unreachable")
+        result = classify_api_error(e, provider="custom")
+        assert result.reason == FailoverReason.network_unreachable
+
+    def test_generic_connect_timeout_stays_timeout(self):
+        """A plain connect timeout (no DNS/refused/unreachable wording)
+        must stay the generic ``timeout`` bucket — not every transport
+        error is network_unreachable."""
+        e = ReadTimeout("Read timed out after 30s")
+        result = classify_api_error(e, provider="openai")
+        assert result.reason == FailoverReason.timeout
+
+    def test_server_disconnect_reset_by_peer_still_routes_via_disconnect_path(self):
+        """'Connection reset by peer' is claimed by the pre-existing
+        server-disconnect heuristic (context_overflow-vs-timeout
+        disambiguation) — it must NOT be reclassified as
+        network_unreachable, which would change its recovery path."""
+        e = ConnectionError("Connection reset by peer")
+        result = classify_api_error(e, provider="openai", approx_tokens=1000, context_length=200000)
+        assert result.reason == FailoverReason.timeout
+        assert result.reason != FailoverReason.network_unreachable

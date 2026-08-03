@@ -13,8 +13,16 @@ from __future__ import annotations
 
 import enum
 import logging
+import re
+import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
+
+from agent.failure_taxonomy import (
+    EVIDENCE_SUBSCRIPTION_LAPSED,
+    EVIDENCE_SUSPECTED_NETWORK,
+    classify_horizon,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -26,11 +34,23 @@ class FailoverReason(enum.Enum):
 
     # Authentication / authorization
     auth = "auth"                        # Transient auth (401/403) — refresh/rotate
-    auth_permanent = "auth_permanent"    # Auth failed after refresh — abort
+    # Auth failed in a way that refresh/rotate cannot fix: a 401 with an
+    # unambiguous terminal OAuth reason (token_invalidated/token_revoked/
+    # invalid_token/invalid_grant), or a 403 that looks like an expired/
+    # lapsed subscription rather than a transient credential problem. See
+    # the failure taxonomy (agent/failure_taxonomy.py, 86e2mb8nv PR 1/4).
+    auth_permanent = "auth_permanent"
 
     # Billing / quota
     billing = "billing"                  # 402 or confirmed credit exhaustion — rotate immediately
     rate_limit = "rate_limit"            # 429 or quota-based throttling — backoff then rotate
+    # A rate/usage signal whose reset horizon is hours away (≥6h) or that
+    # carries an unambiguous cap/quota-period marker (weekly/monthly/
+    # billing-period wording) — e.g. a ChatGPT weekly cap, not a session
+    # throttle. Waiting out a rate_limit-style backoff is pointless here;
+    # rotate/fall back immediately instead. See classify_horizon() in
+    # agent/failure_taxonomy.py.
+    usage_cap = "usage_cap"
     # Upstream model rate-limited (aggregator 429) — fallback to a different
     # model, NOT credential rotation. The user's key is healthy.
     upstream_rate_limit = "upstream_rate_limit"
@@ -41,6 +61,13 @@ class FailoverReason(enum.Enum):
 
     # Transport
     timeout = "timeout"                  # Connection/read timeout — rebuild client + retry
+    # DNS resolution failure, connection refused, or "no route to host" —
+    # the HOST is unreachable rather than merely slow/busy. Pre-probe (PR 2
+    # adds control-host arbitration) we cannot yet tell "this machine's
+    # network is down" from "this one credential's endpoint is down", so
+    # recovery hints stay conservative — see the BINDING note where this is
+    # assigned below.
+    network_unreachable = "network_unreachable"
     # TLS certificate verification failure — deterministic for the host
     # (TLS-inspecting proxy, missing/expired CA bundle, self-signed cert).
     # Retrying reproduces the identical handshake failure, so fail fast
@@ -428,6 +455,54 @@ _AUTH_PATTERNS = [
     "api key not valid",
 ]
 
+# Unambiguous terminal OAuth error codes/reasons on a 401 — the token is
+# permanently invalid server-side (revoked, invalidated, or a refresh_token
+# rejected during refresh) and retrying/refreshing reproduces the identical
+# rejection. Distinct from a generic 401 (could be a transient server-side
+# glitch, or a merely-expired token that a refresh call can fix) and from
+# ``token expired`` in _AUTH_PATTERNS above (refreshable). Matched against
+# both the structured error_code field and the message text, since providers
+# surface these inconsistently (a machine-readable code vs. a prose
+# sentence). Kept intentionally narrow to the 4 reasons the design calls
+# out — broader terminal-auth heuristics live in
+# agent.credential_pool._TERMINAL_AUTH_REASONS, which additionally promotes
+# the credential pool entry to DEAD.
+_AUTH_PERMANENT_CODES = frozenset({
+    "token_invalidated",
+    "token_revoked",
+    "invalid_token",
+    "invalid_grant",
+})
+_AUTH_PERMANENT_MESSAGE_PATTERNS = [
+    "token_invalidated",
+    "token_revoked",
+    "invalid_grant",
+    "token has been invalidated",
+    "token has been revoked",
+    "refresh token is invalid",
+    "refresh token has been revoked",
+]
+
+# 403 entitlement / subscription-lapse patterns — the account authenticated
+# fine but no longer has (or never had) the plan/entitlement required for
+# this request. Distinct from ``_BILLING_PATTERNS`` (credit/balance
+# exhaustion, which can recover the moment the user tops up) — a lapsed
+# subscription needs a NEW subscription, not a top-up, and refreshing the
+# OAuth token cannot fix it either. Classified as auth_permanent so the
+# recovery path skips try_refresh_current() (see agent_runtime_helpers.py)
+# instead of spinning re-issuing tokens against an unsubscribed account.
+_SUBSCRIPTION_LAPSED_PATTERNS = [
+    "subscription has expired",
+    "subscription expired",
+    "subscription is no longer active",
+    "subscription lapsed",
+    "no longer have an active subscription",
+    "does not have an active subscription",
+    "requires an active subscription",
+    "your plan has expired",
+    "plan has expired",
+]
+
 # Anthropic thinking block signature patterns
 _THINKING_SIG_PATTERNS = [
     "signature",  # Combined with "thinking" check
@@ -458,6 +533,34 @@ _TIMEOUT_MESSAGE_PATTERNS = [
     "deadline exceeded",
     "operation timed out",
     "upstream timed out",
+]
+
+# Network-layer unreachability — DNS resolution failure, connection
+# refused, or "no route to host". Distinct from the generic ``timeout``
+# bucket below: these mean the HOST is unreachable (or actively refusing),
+# not merely slow/busy, which is a materially different signal for
+# alerting and (eventually, PR 2) probe-based arbitration between "my
+# network is down" and "this one credential's endpoint is down". Checked
+# BEFORE the generic transport-type fallback so these get their own reason
+# instead of being folded into ``timeout``.
+#
+# Message patterns are the primary signal — most real traffic goes through
+# httpx/the OpenAI SDK, which wraps DNS/refused/unreachable failures under
+# the single type name ``ConnectError`` (already in _TRANSPORT_ERROR_TYPES
+# for the timeout fallback); the specific cause only shows up in the
+# message text. The type names below catch bare Python builtins raised by
+# custom/local providers that don't go through httpx.
+_NETWORK_UNREACHABLE_TYPES = frozenset({
+    "ConnectionRefusedError", "gaierror", "socket.gaierror",
+})
+_NETWORK_UNREACHABLE_PATTERNS = [
+    "nodename nor servname provided",       # macOS DNS resolution failure
+    "name or service not known",            # Linux DNS resolution failure
+    "temporary failure in name resolution",
+    "no address associated with hostname",
+    "network is unreachable",
+    "no route to host",
+    "connection refused",
 ]
 
 # Transport error type names
@@ -933,6 +1036,30 @@ def classify_api_error(
             should_fallback=True,
         )
 
+    # ── 7c. Network-layer unreachability → distinct from generic timeout ──
+    # DNS resolution failure, connection refused, or "no route to host" —
+    # checked before the generic transport fallback below so these get
+    # ``network_unreachable`` instead of being folded into ``timeout``.
+    if (
+        error_type in _NETWORK_UNREACHABLE_TYPES
+        or any(p in error_msg for p in _NETWORK_UNREACHABLE_PATTERNS)
+    ):
+        # BINDING (adversarial review, pre-probe default): a single-host DNS
+        # failure must fail over instead of starving the lane, so
+        # should_fallback=True. Rotation stays ON too (should_rotate_credential
+        # =True) — pre-probe we cannot yet tell "this whole machine's network
+        # is down" from "this one credential's endpoint is down" without the
+        # control-host arbitration PR 2 adds. Flipping rotation off is
+        # deferred to that PR; for now the evidence marker records that this
+        # classification is unconfirmed.
+        return _result(
+            FailoverReason.network_unreachable,
+            retryable=True,
+            should_rotate_credential=True,
+            should_fallback=True,
+            error_context={"evidence": EVIDENCE_SUSPECTED_NETWORK},
+        )
+
     # ── 8. Transport / timeout heuristics ───────────────────────────
 
     if error_type in _TRANSPORT_ERROR_TYPES or isinstance(error, (TimeoutError, ConnectionError, OSError)):
@@ -961,6 +1088,26 @@ def _classify_by_status(
     """Classify based on HTTP status code with message-aware refinement."""
 
     if status_code == 401:
+        # Unambiguous terminal OAuth states (token_invalidated/revoked,
+        # invalid_token, invalid_grant) will never recover via refresh — the
+        # server has permanently rejected this token. Classify as
+        # auth_permanent so the recovery path (agent_runtime_helpers.py)
+        # skips try_refresh_current() and quarantines the credential
+        # directly instead of re-minting tokens against a dead account.
+        # Any other 401 (including a merely-expired token, or a generic
+        # 401 with no specific reason) stays the transient ``auth`` bucket
+        # — refresh is the correct first attempt there.
+        error_code_lower = (error_code or "").lower()
+        if (
+            error_code_lower in _AUTH_PERMANENT_CODES
+            or any(p in error_msg for p in _AUTH_PERMANENT_MESSAGE_PATTERNS)
+        ):
+            return result_fn(
+                FailoverReason.auth_permanent,
+                retryable=False,
+                should_rotate_credential=True,
+                should_fallback=True,
+            )
         # Not retryable on its own — credential pool rotation and
         # provider-specific refresh (Codex, Anthropic, Nous) run before
         # the retryability check in run_agent.py.  If those succeed, the
@@ -991,6 +1138,22 @@ def _classify_by_status(
                 should_rotate_credential=True,
                 should_fallback=True,
             )
+        # Entitlement / subscription-lapse: the account authenticated fine
+        # but the subscription that would grant access has expired or
+        # never existed. NOT billing (a top-up won't fix a lapsed plan) and
+        # NOT a one-shot DEAD verdict here — a single 403 must never
+        # directly kill a credential (GitHub secondary rate limits and
+        # region blocks are also 403s). The credential pool
+        # (agent/credential_pool.py) applies a TTL quarantine instead of an
+        # immediate DEAD transition; see the BINDING note there.
+        if any(p in error_msg for p in _SUBSCRIPTION_LAPSED_PATTERNS):
+            return result_fn(
+                FailoverReason.auth_permanent,
+                retryable=False,
+                should_rotate_credential=True,
+                should_fallback=True,
+                error_context={"evidence": EVIDENCE_SUBSCRIPTION_LAPSED},
+            )
         return result_fn(
             FailoverReason.auth,
             retryable=False,
@@ -998,7 +1161,7 @@ def _classify_by_status(
         )
 
     if status_code == 402:
-        return _classify_402(error_msg, result_fn)
+        return _classify_402(error_msg, result_fn, body=body)
 
     if status_code == 404:
         # Nous API currently surfaces HA/NAS credit depletion as a paid model
@@ -1077,6 +1240,29 @@ def _classify_by_status(
                 should_rotate_credential=False,
                 should_fallback=True,
                 error_context=ctx,
+            )
+        # ── usage_cap vs rate_limit (session) horizon split ──────────
+        # A reset horizon ≥6h (or an unambiguous cap/quota-period marker)
+        # means the credential is capped for hours, not throttled for one
+        # session — a rate_limit-style backoff-and-retry is pointless and
+        # the credential should rotate/fall back immediately instead.
+        #
+        # BINDING (adversarial review): codex's genuine 5-hour rolling
+        # window is phrased like a usage limit but is NOT an hours-away
+        # cap. Its numeric horizon (~5h) already falls under
+        # USAGE_CAP_HORIZON_SECONDS (6h), and CAP_PATTERN_MARKERS
+        # deliberately excludes "5h"/"5-hour"/session phrasing — so an
+        # ambiguous codex 429 always defaults to the session-scoped
+        # ``rate_limit`` reason. Only an unambiguous cap marker (weekly/
+        # monthly/billing-period wording) or a future probe verdict (PR 2)
+        # may promote a codex 429 to ``usage_cap``.
+        _reset_horizon = _extract_reset_horizon_seconds(error_msg, body)
+        if classify_horizon(reset_in_seconds=_reset_horizon, message=error_msg):
+            return result_fn(
+                FailoverReason.usage_cap,
+                retryable=False,
+                should_rotate_credential=True,
+                should_fallback=True,
             )
         return result_fn(
             FailoverReason.rate_limit,
@@ -1180,18 +1366,30 @@ def _classify_by_status(
     return None
 
 
-def _classify_402(error_msg: str, result_fn) -> ClassifiedError:
-    """Disambiguate 402: billing exhaustion vs transient usage limit.
+def _classify_402(error_msg: str, result_fn, *, body: Optional[dict] = None) -> ClassifiedError:
+    """Disambiguate 402: billing exhaustion vs transient usage limit vs usage cap.
 
     The key insight from OpenClaw: some 402s are transient rate limits
     disguised as payment errors.  "Usage limit, try again in 5 minutes"
     is NOT a billing problem — it's a periodic quota that resets.
+
+    Within the transient-quota branch, apply the same horizon split as the
+    429 handler: a reset that's hours away (or an unambiguous cap marker)
+    means ``usage_cap``, not a session-scoped ``rate_limit``.
     """
     # Check for transient usage-limit signals first
     has_usage_limit = any(p in error_msg for p in _USAGE_LIMIT_PATTERNS)
     has_transient_signal = any(p in error_msg for p in _USAGE_LIMIT_TRANSIENT_SIGNALS)
 
     if has_usage_limit and has_transient_signal:
+        reset_horizon = _extract_reset_horizon_seconds(error_msg, body)
+        if classify_horizon(reset_in_seconds=reset_horizon, message=error_msg):
+            return result_fn(
+                FailoverReason.usage_cap,
+                retryable=False,
+                should_rotate_credential=True,
+                should_fallback=True,
+            )
         # Transient quota — treat as rate limit, not billing
         return result_fn(
             FailoverReason.rate_limit,
@@ -1581,6 +1779,69 @@ def _classify_by_message(
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────
+
+# "resets in 5h32m", "reset in 2 hours 15 minutes", "resets in 3 hours" —
+# mirrors (a narrowed copy of) the reset-time parsing in
+# agent_runtime_helpers.extract_api_error_context(). Duplicated rather than
+# imported: that module already imports FailoverReason from this one, so
+# importing it back here would create a cycle.
+_RESET_HORIZON_MESSAGE_PATTERN = re.compile(
+    r"resets?\s+in\s+"
+    r"(?:(\d+(?:\.\d+)?)\s*(?:h|hr|hrs|hour|hours)\b\s*)?"
+    r"(?:(\d+(?:\.\d+)?)\s*(?:m|min|mins|minute|minutes)\b\s*)?"
+    r"(?:(\d+(?:\.\d+)?)\s*(?:s|sec|secs|second|seconds)\b)?",
+    re.IGNORECASE,
+)
+
+# A reset/resets_at value larger than this is treated as an absolute epoch
+# timestamp rather than a relative offset in seconds (mirrors the same
+# disambiguation heuristic used by agent.credential_pool._parse_absolute_timestamp).
+_EPOCH_SECONDS_FLOOR = 10_000_000_000  # ~year 2286 in ms, ~year 5138 in s — any
+# real "seconds from now" horizon is nowhere near this; used only to catch
+# millisecond-epoch timestamps below in the elif branch.
+
+
+def _extract_reset_horizon_seconds(error_msg: str, body: Any) -> Optional[float]:
+    """Best-effort parse of how far away a provider's rate-limit reset is.
+
+    Checks the structured body first (``reset_at`` / ``resets_at`` /
+    ``retry_after`` on the error payload), then falls back to a "resets in
+    Xh Ym Zs" message-text pattern. Returns ``None`` when no horizon can be
+    parsed — callers must treat ``None`` as "unknown", not "zero", so an
+    unparseable message stays conservatively classified as session-scoped
+    rather than being treated as an immediate reset.
+    """
+    if isinstance(body, dict):
+        err = body.get("error")
+        payload = err if isinstance(err, dict) else body
+        if isinstance(payload, dict):
+            for key in ("reset_at", "resets_at"):
+                value = payload.get(key)
+                if isinstance(value, (int, float)) and value > 0:
+                    now = time.time()
+                    if value > now:
+                        # Absolute timestamp (epoch seconds, or epoch
+                        # milliseconds if implausibly large).
+                        if value > _EPOCH_SECONDS_FLOOR:
+                            value = value / 1000.0
+                        return max(0.0, value - now)
+                    # Small positive value with no plausible "now" relation
+                    # — treat as a relative seconds-from-now offset.
+                    return float(value)
+            retry_after = payload.get("retry_after")
+            if isinstance(retry_after, (int, float)) and retry_after > 0:
+                return float(retry_after)
+
+    match = _RESET_HORIZON_MESSAGE_PATTERN.search(error_msg or "")
+    if match and any(match.groups()):
+        hours = float(match.group(1) or 0)
+        minutes = float(match.group(2) or 0)
+        seconds = float(match.group(3) or 0)
+        total = hours * 3600 + minutes * 60 + seconds
+        if total > 0:
+            return total
+    return None
+
 
 def _extract_status_code(error: Exception) -> Optional[int]:
     """Walk the error and its cause chain to find an HTTP status code."""

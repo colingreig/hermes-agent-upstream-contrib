@@ -162,7 +162,8 @@ class TestPoolRotationCycle:
         # mark_exhausted_and_rotate returns next entry until exhausted
         self._rotation_index = 0
 
-        def rotate(status_code=None, error_context=None, api_key_hint=None):
+        def rotate(status_code=None, error_context=None, api_key_hint=None,
+                   failure_kind=None, failure_evidence=None):
             self._rotation_index += 1
             if self._rotation_index < pool_entries:
                 return entries[self._rotation_index]
@@ -239,3 +240,117 @@ class TestPoolRotationCycle:
         )
         assert recovered is False
         assert has_retried is False
+
+
+# ---------------------------------------------------------------------------
+# 6. Failure taxonomy branches (86e2mb8nv PR 1/4): usage_cap, auth_permanent,
+#    network_unreachable
+# ---------------------------------------------------------------------------
+
+class TestPoolRotationFailureTaxonomy:
+    def _make_agent_with_pool(self, pool_entries=3):
+        from run_agent import AIAgent
+
+        with patch.object(AIAgent, "__init__", lambda self, **kw: None):
+            agent = AIAgent()
+
+        entries = []
+        for i in range(pool_entries):
+            e = MagicMock(name=f"entry_{i}")
+            e.id = f"cred-{i}"
+            entries.append(e)
+
+        pool = MagicMock()
+        pool.has_credentials.return_value = True
+        pool.provider = ""
+
+        self._rotation_index = 0
+
+        def rotate(status_code=None, error_context=None, api_key_hint=None,
+                   failure_kind=None, failure_evidence=None):
+            self._rotation_index += 1
+            if self._rotation_index < pool_entries:
+                return entries[self._rotation_index]
+            pool.has_credentials.return_value = False
+            return None
+
+        pool.mark_exhausted_and_rotate = MagicMock(side_effect=rotate)
+        agent._credential_pool = pool
+        agent._swap_credential = MagicMock()
+        agent.log_prefix = ""
+
+        return agent, pool, entries
+
+    def test_usage_cap_immediate_rotation_with_failure_kind(self):
+        """usage_cap must rotate immediately (no retry-first, like billing)
+        and forward failure_kind/failure_evidence so the pool can persist
+        the taxonomy classification."""
+        from agent.error_classifier import FailoverReason
+        from agent.failure_taxonomy import FAILURE_KIND_USAGE_CAP
+
+        agent, pool, entries = self._make_agent_with_pool(3)
+        recovered, has_retried = agent._recover_with_credential_pool(
+            status_code=429,
+            has_retried_429=False,
+            classified_reason=FailoverReason.usage_cap,
+            error_context={"evidence": None},
+        )
+        assert recovered is True
+        assert has_retried is False
+        pool.mark_exhausted_and_rotate.assert_called_once_with(
+            status_code=429,
+            error_context={"evidence": None},
+            api_key_hint=None,
+            failure_kind=FAILURE_KIND_USAGE_CAP,
+            failure_evidence=None,
+        )
+        agent._swap_credential.assert_called_once_with(entries[1])
+
+    def test_auth_permanent_immediate_rotation_skips_refresh(self):
+        """auth_permanent must never call try_refresh_current() — it goes
+        straight to mark_exhausted_and_rotate, unlike the plain ``auth``
+        reason which attempts a refresh first."""
+        from agent.error_classifier import FailoverReason
+        from agent.failure_taxonomy import FAILURE_KIND_AUTH_PERMANENT
+
+        agent, pool, entries = self._make_agent_with_pool(3)
+        pool.try_refresh_current = MagicMock(
+            side_effect=AssertionError("must not be called for auth_permanent")
+        )
+
+        recovered, has_retried = agent._recover_with_credential_pool(
+            status_code=403,
+            has_retried_429=False,
+            classified_reason=FailoverReason.auth_permanent,
+            error_context={"evidence": "subscription_lapsed"},
+        )
+        assert recovered is True
+        assert has_retried is False
+        pool.try_refresh_current.assert_not_called()
+        pool.mark_exhausted_and_rotate.assert_called_once_with(
+            status_code=403,
+            error_context={"evidence": "subscription_lapsed"},
+            api_key_hint=None,
+            failure_kind=FAILURE_KIND_AUTH_PERMANENT,
+            failure_evidence="subscription_lapsed",
+        )
+        agent._swap_credential.assert_called_once_with(entries[1])
+
+    def test_network_unreachable_does_not_touch_pool_state(self):
+        """network_unreachable must fall through to the default no-op
+        return without calling ANY pool-mutating method — pre-probe we
+        can't tell 'this machine's network is down' from 'this one
+        credential's endpoint is down' (see the BINDING note)."""
+        from agent.error_classifier import FailoverReason
+
+        agent, pool, _ = self._make_agent_with_pool(3)
+        recovered, has_retried = agent._recover_with_credential_pool(
+            status_code=None,
+            has_retried_429=False,
+            classified_reason=FailoverReason.network_unreachable,
+            error_context={"evidence": "suspected_network"},
+        )
+        assert recovered is False
+        assert has_retried is False
+        pool.mark_exhausted_and_rotate.assert_not_called()
+        agent._swap_credential.assert_not_called()

@@ -3402,6 +3402,15 @@ def run_conversation(
                     FailoverReason.rate_limit,
                     FailoverReason.billing,
                     FailoverReason.upstream_rate_limit,
+                    # A usage cap (hours-away reset / weekly-or-longer
+                    # quota) is quota-exhaustion-shaped like billing, not
+                    # session-throttle-shaped — switch immediately instead
+                    # of waiting through the rate_limit retry-then-rotate
+                    # dance. classified.retryable=False for usage_cap also
+                    # routes it into the non-retryable client-error abort
+                    # path below when no fallback is available, so it never
+                    # reaches the bottom retry-wait sleep loop either way.
+                    FailoverReason.usage_cap,
                 }
                 _is_transport_failure = classified.reason in {
                     FailoverReason.timeout,
@@ -3451,6 +3460,10 @@ def run_conversation(
                         elif classified.reason == FailoverReason.billing:
                             agent._buffer_status(
                                 "⚠️ Billing or credits exhausted — switching to fallback provider..."
+                            )
+                        elif classified.reason == FailoverReason.usage_cap:
+                            agent._buffer_status(
+                                "⚠️ Usage cap reached — switching to fallback provider..."
                             )
                         elif _is_transport_failure:
                             agent._buffer_status(

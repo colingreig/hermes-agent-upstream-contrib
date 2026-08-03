@@ -3491,14 +3491,66 @@ def test_sync_anthropic_entry_clears_all_error_fields(tmp_path, monkeypatch):
     assert synced.last_error_reset_at is None
 
 
-def test_empty_pool_log_line_names_provider_and_keeps_alert_substring(tmp_path, monkeypatch, caplog):
-    """hermes-usage-alert (86e2a2p9q) matches the exhausted-pool page on the
-    literal substring "no available entries (all exhausted" and separately
-    parses out a "[provider=...]" suffix to name which pool paged. Both must
-    survive any future refactor of this log line.
+def test_zero_entry_pool_does_not_trip_the_exhausted_pool_alert(tmp_path, monkeypatch, caplog):
+    """Regression for 86e2mb8nv: a provider with ZERO configured pool
+    entries (nobody ever authenticated it) is a config state, not
+    exhaustion. hermes-usage-alert (86e2a2p9q) pages on the literal
+    substring "no available entries (all exhausted" — before this fix, a
+    never-configured provider (e.g. xai-oauth with no auth at all) tripped
+    that same alert as a false "quota exhausted" page. A zero-entry pool
+    must log a distinct, unambiguous line instead and must NOT contain the
+    exhausted-pool alert substring.
     """
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     _write_auth_store(tmp_path, {"version": 1, "credential_pool": {"zai": []}})
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("zai")
+
+    with caplog.at_level("INFO"):
+        entry = pool._select_unlocked()
+
+    assert entry is None
+    assert not any("no available entries" in r.message for r in caplog.records)
+    matching = [r.message for r in caplog.records if "no configured entries" in r.message]
+    assert matching, "expected a 'provider has no configured entries' log line"
+    assert "[provider=zai]" in matching[0]
+
+
+def test_genuinely_exhausted_pool_keeps_alert_substring_and_provider_suffix(
+    tmp_path, monkeypatch, caplog,
+):
+    """A provider that IS configured but every entry is currently exhausted
+    must keep the original alert-matched line — only the zero-entry
+    (never-configured) case gets the new distinct line. hermes-usage-alert
+    (86e2a2p9q) matches on the literal substring "no available entries (all
+    exhausted" and separately parses out a "[provider=...]" suffix; both
+    must survive.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "zai": [
+                    {
+                        "id": "cred-1",
+                        "label": "primary",
+                        "auth_type": "api_key",
+                        "priority": 0,
+                        "source": "manual",
+                        "access_token": "***",
+                        "last_status": "exhausted",
+                        "last_status_at": time.time(),
+                        "last_error_code": 402,
+                        "last_error_reset_at": time.time() + 3600,
+                    },
+                ]
+            },
+        },
+    )
 
     from agent.credential_pool import load_pool
 
@@ -3512,3 +3564,308 @@ def test_empty_pool_log_line_names_provider_and_keeps_alert_substring(tmp_path, 
     assert matching, "expected a 'no available entries' log line"
     assert "no available entries (all exhausted" in matching[0]
     assert "[provider=zai]" in matching[0]
+    assert not any("no configured entries" in r.message for r in caplog.records)
+
+
+# ── Failure taxonomy (86e2mb8nv PR 1/4) ──────────────────────────────────
+
+def _write_single_entry_pool(tmp_path, provider: str, *, entry_id: str = "cred-1") -> None:
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                provider: [
+                    {
+                        "id": entry_id,
+                        "label": "primary",
+                        "auth_type": "api_key",
+                        "priority": 0,
+                        "source": "manual",
+                        "access_token": f"tok-{entry_id}",
+                    },
+                ]
+            },
+        },
+    )
+
+
+def test_usage_cap_failure_kind_and_evidence_persist(tmp_path, monkeypatch):
+    """mark_exhausted_and_rotate(failure_kind=...) must persist
+    last_failure_kind/last_failure_evidence to auth.json so a monitor can
+    tell a usage cap apart from a session throttle after the fact."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_single_entry_pool(tmp_path, "openai-codex")
+
+    from agent.credential_pool import load_pool
+    from agent.failure_taxonomy import FAILURE_KIND_USAGE_CAP
+
+    pool = load_pool("openai-codex")
+    pool.mark_exhausted_and_rotate(
+        status_code=429,
+        error_context={"message": "weekly limit reached"},
+        failure_kind=FAILURE_KIND_USAGE_CAP,
+        failure_evidence=None,
+    )
+
+    auth_payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    persisted = auth_payload["credential_pool"]["openai-codex"][0]
+    assert persisted["last_status"] == "exhausted"
+    assert persisted["last_failure_kind"] == FAILURE_KIND_USAGE_CAP
+
+
+def test_auth_permanent_403_quarantines_not_dead(tmp_path, monkeypatch):
+    """BINDING: a single 403/entitlement-shaped auth_permanent signal must
+    NEVER directly kill a credential (GitHub secondary rate limits and
+    region blocks are also 403s). One failure must land as a long-TTL
+    EXHAUSTED quarantine, not DEAD."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_single_entry_pool(tmp_path, "anthropic")
+
+    from agent.credential_pool import (
+        load_pool,
+        STATUS_DEAD,
+        STATUS_EXHAUSTED,
+        AUTH_PERMANENT_QUARANTINE_TTL_SECONDS,
+    )
+    from agent.failure_taxonomy import (
+        FAILURE_KIND_AUTH_PERMANENT,
+        EVIDENCE_SUBSCRIPTION_LAPSED,
+    )
+
+    pool = load_pool("anthropic")
+    before = time.time()
+    pool.mark_exhausted_and_rotate(
+        status_code=403,
+        error_context={"message": "Your subscription has expired."},
+        failure_kind=FAILURE_KIND_AUTH_PERMANENT,
+        failure_evidence=EVIDENCE_SUBSCRIPTION_LAPSED,
+    )
+
+    auth_payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    persisted = auth_payload["credential_pool"]["anthropic"][0]
+    assert persisted["last_status"] == STATUS_EXHAUSTED
+    assert persisted["last_status"] != STATUS_DEAD
+    assert persisted["last_failure_kind"] == FAILURE_KIND_AUTH_PERMANENT
+    # The pool downgrades the evidence to its own "suspected" marker since
+    # this is a quarantine, not a corroborated verdict — even though the
+    # classifier passed a more specific evidence string.
+    assert persisted["last_failure_evidence"] in {
+        EVIDENCE_SUBSCRIPTION_LAPSED, "suspected_auth_permanent",
+    }
+    reset_at = persisted["last_error_reset_at"]
+    assert reset_at == pytest.approx(before + AUTH_PERMANENT_QUARANTINE_TTL_SECONDS, abs=5)
+    assert persisted["failure_confirmations"] == 1
+
+
+def test_auth_permanent_repeated_confirmations_promote_to_dead(tmp_path, monkeypatch):
+    """A 403/entitlement-shaped signal that keeps reproducing across
+    AUTH_PERMANENT_DEAD_CONFIRMATION_THRESHOLD independent failures (no
+    intervening recovery) is no longer plausibly a false positive and may
+    be promoted to DEAD without an explicit probe verdict."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_single_entry_pool(tmp_path, "anthropic")
+
+    from agent.credential_pool import (
+        load_pool,
+        STATUS_DEAD,
+        STATUS_EXHAUSTED,
+        AUTH_PERMANENT_DEAD_CONFIRMATION_THRESHOLD,
+    )
+    from agent.failure_taxonomy import FAILURE_KIND_AUTH_PERMANENT
+
+    pool = load_pool("anthropic")
+    entry = pool.current() or pool.select()
+    assert entry is not None
+
+    for i in range(1, AUTH_PERMANENT_DEAD_CONFIRMATION_THRESHOLD + 1):
+        entry = pool._mark_exhausted(
+            entry,
+            403,
+            {"message": "Your subscription has expired."},
+            failure_kind=FAILURE_KIND_AUTH_PERMANENT,
+            failure_evidence=None,
+        )
+        if i < AUTH_PERMANENT_DEAD_CONFIRMATION_THRESHOLD:
+            assert entry.last_status == STATUS_EXHAUSTED, f"confirmation {i}"
+        assert entry.failure_confirmations == i
+
+    assert entry.last_status == STATUS_DEAD
+
+
+def test_auth_permanent_401_terminal_stays_dead_on_first_failure(tmp_path, monkeypatch):
+    """The pre-existing unconditional-DEAD path (401 + an unambiguous
+    terminal OAuth reason) must be unaffected by the new quarantine logic
+    — it still goes DEAD on the FIRST failure, not after 3 confirmations."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_single_entry_pool(tmp_path, "openai-codex")
+
+    from agent.credential_pool import load_pool, STATUS_DEAD
+    from agent.failure_taxonomy import FAILURE_KIND_AUTH_PERMANENT
+
+    pool = load_pool("openai-codex")
+    next_entry = pool.mark_exhausted_and_rotate(
+        status_code=401,
+        error_context={
+            "reason": "token_invalidated",
+            "message": "Your authentication token has been invalidated.",
+        },
+        failure_kind=FAILURE_KIND_AUTH_PERMANENT,
+    )
+    # Single-entry pool — nothing to rotate to.
+    assert next_entry is None
+
+    auth_payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    persisted = auth_payload["credential_pool"]["openai-codex"][0]
+    assert persisted["last_status"] == STATUS_DEAD
+    assert persisted["failure_confirmations"] == 1
+
+
+def test_auth_permanent_quarantine_clears_via_probe_confirmed_recovery(tmp_path, monkeypatch):
+    """clear_stale_exhaustion (the probe-confirmed recovery path) must also
+    reset the failure-confirmation counter — otherwise a credential that
+    genuinely recovered would still be one bad response away from DEAD."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_single_entry_pool(tmp_path, "anthropic")
+
+    from agent.credential_pool import load_pool, STATUS_EXHAUSTED
+    from agent.failure_taxonomy import FAILURE_KIND_AUTH_PERMANENT
+
+    pool = load_pool("anthropic")
+    entry = pool.current() or pool.select()
+    entry = pool._mark_exhausted(
+        entry, 403, {"message": "subscription has expired"},
+        failure_kind=FAILURE_KIND_AUTH_PERMANENT,
+    )
+    assert entry.last_status == STATUS_EXHAUSTED
+    assert entry.failure_confirmations == 1
+
+    cleared = pool.clear_stale_exhaustion(entry.id)
+    assert cleared is True
+
+    reloaded_entry = pool.current()
+    assert reloaded_entry.last_status is None
+    assert reloaded_entry.last_failure_kind is None
+    assert reloaded_entry.failure_confirmations == 0
+
+
+def test_record_probe_verdict_updates_entry(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_single_entry_pool(tmp_path, "anthropic", entry_id="cred-probe")
+
+    from agent.credential_pool import record_probe_verdict
+
+    updated = record_probe_verdict("anthropic", "cred-probe", "confirmed_dead", evidence="probe_verified")
+    assert updated is True
+
+    auth_payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    persisted = auth_payload["credential_pool"]["anthropic"][0]
+    assert persisted["last_probe_verdict"] == "confirmed_dead"
+    assert persisted["last_probe_verdict_at"] is not None
+    assert persisted["last_failure_evidence"] == "probe_verified"
+
+
+def test_record_probe_verdict_unknown_entry_returns_false(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_single_entry_pool(tmp_path, "anthropic")
+
+    from agent.credential_pool import record_probe_verdict
+
+    assert record_probe_verdict("anthropic", "does-not-exist", "confirmed_dead") is False
+    assert record_probe_verdict("provider-never-configured", "cred-1", "confirmed_dead") is False
+
+
+def test_failure_summary_single_provider(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_single_entry_pool(tmp_path, "openai-codex", entry_id="cred-summary")
+
+    from agent.credential_pool import load_pool, failure_summary
+    from agent.failure_taxonomy import FAILURE_KIND_USAGE_CAP
+
+    pool = load_pool("openai-codex")
+    pool.mark_exhausted_and_rotate(status_code=429, failure_kind=FAILURE_KIND_USAGE_CAP)
+
+    summary = failure_summary("openai-codex")
+    assert "openai-codex" in summary
+    rows = summary["openai-codex"]
+    assert len(rows) == 1
+    assert rows[0]["id"] == "cred-summary"
+    assert rows[0]["last_failure_kind"] == FAILURE_KIND_USAGE_CAP
+
+
+def test_failure_summary_all_providers_omits_zero_entry_providers(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "anthropic": [
+                    {
+                        "id": "cred-a",
+                        "label": "a",
+                        "auth_type": "api_key",
+                        "priority": 0,
+                        "source": "manual",
+                        "access_token": "tok-a",
+                    },
+                ],
+                "xai-oauth": [],
+            },
+        },
+    )
+
+    from agent.credential_pool import failure_summary
+
+    summary = failure_summary()
+    assert "anthropic" in summary
+    assert "xai-oauth" not in summary
+
+
+def test_old_auth_json_without_new_taxonomy_fields_loads_with_defaults(tmp_path, monkeypatch):
+    """auth.json written before this field set existed must still load
+    cleanly — every new field defaults to None (or 0 for the confirmation
+    counter) rather than raising."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "anthropic": [
+                    {
+                        "id": "cred-legacy",
+                        "label": "legacy",
+                        "auth_type": "api_key",
+                        "priority": 0,
+                        "source": "manual",
+                        "access_token": "sk-ant-legacy",
+                        # Deliberately no last_failure_kind / last_failure_evidence /
+                        # failure_confirmations / last_probe_verdict / usage_percent /
+                        # etc. — this is what an old install's auth.json looks like.
+                    },
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("anthropic")
+    entry = pool.select()
+    assert entry is not None
+    assert entry.id == "cred-legacy"
+    assert entry.last_failure_kind is None
+    assert entry.last_failure_evidence is None
+    assert entry.failure_confirmations == 0
+    assert entry.last_probe_verdict is None
+    assert entry.last_probe_verdict_at is None
+    assert entry.usage_percent is None
+    assert entry.usage_percent_at is None
+
+    # And the round-trip through mark_exhausted_and_rotate still works fine
+    # on a legacy entry with no taxonomy fields pre-populated.
+    pool.mark_exhausted_and_rotate(status_code=429)
+    auth_payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    persisted = auth_payload["credential_pool"]["anthropic"][0]
+    assert persisted["last_status"] == "exhausted"
