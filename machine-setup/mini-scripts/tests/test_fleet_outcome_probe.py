@@ -1942,3 +1942,324 @@ def test_sqlite_health_reports_corruption_instead_of_crashing(tmp_path):
         now=NOW,
     )
     assert [item["code"] for item in findings] == ["database_unreadable"]
+
+
+def _run_main(
+    module,
+    monkeypatch,
+    *,
+    contracts_path,
+    jobs_path,
+    output_root,
+    launch_agents,
+    state_path,
+    receipt_path,
+    now,
+    sent_messages=None,
+):
+    """Drive main() against deterministic launchd and Slack surfaces."""
+
+    def stub_run(cmd, *args, **kwargs):
+        if cmd and str(cmd[0]) == str(module.HERMES_BIN):
+            if sent_messages is not None:
+                sent_messages.append(cmd[-1])
+            return _completed(0)
+        if cmd and cmd[0] == "launchctl":
+            return _stub_launchctl_print(cmd, loaded_label="com.colingreig.hermes.fixture")
+        raise AssertionError(f"unexpected subprocess call in test: {cmd}")
+
+    monkeypatch.setattr(module.subprocess, "run", stub_run)
+    monkeypatch.setattr(module, "_now", lambda: now)
+    return module.main(
+        [
+            "--contracts", str(contracts_path),
+            "--jobs", str(jobs_path),
+            "--output-root", str(output_root),
+            "--launch-agents-dir", str(launch_agents),
+            "--state", str(state_path),
+            "--receipt", str(receipt_path),
+        ]
+    )
+
+
+def test_every_probe_run_is_archived_even_though_the_receipt_is_overwritten(
+    tmp_path, monkeypatch
+):
+    """The overwritten-in-place receipt is why past storms were untriageable."""
+    import os
+
+    module = _load_module()
+    contracts, jobs_path, output_root, launch_agents, output = _fixture(tmp_path)
+    contracts_path = tmp_path / "contracts.json"
+    contracts_path.write_text(json.dumps(contracts), encoding="utf-8")
+    receipt_path = tmp_path / "receipt.json"
+    ledger_path = tmp_path / "receipt-history.jsonl"
+    snapshot_dir = tmp_path / "receipt-history"
+    kwargs = dict(
+        contracts_path=contracts_path,
+        jobs_path=jobs_path,
+        output_root=output_root,
+        launch_agents=launch_agents,
+        state_path=tmp_path / "state.json",
+        receipt_path=receipt_path,
+    )
+
+    output.write_text("# Cron Job\nsemantic-failure\n", encoding="utf-8")
+    os.utime(output, (NOW.timestamp(), NOW.timestamp()))
+    assert _run_main(module, monkeypatch, now=NOW, **kwargs) == 1
+
+    output.write_text("# Cron Job\nsemantic-success\n", encoding="utf-8")
+    later = NOW + timedelta(minutes=5)
+    os.utime(output, (later.timestamp(), later.timestamp()))
+    assert _run_main(module, monkeypatch, now=later, **kwargs) == 0
+
+    # The live receipt only ever describes the newest run ...
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["status"] == "clean"
+    assert receipt["history"]["ledger_path"] == str(ledger_path)
+
+    # ... but the archive still proves the earlier alarm happened.
+    archived = module._history_tail(ledger_path, 10)
+    assert [item["status"] for item in archived] == ["alert", "clean"]
+    assert archived[0]["finding_count"] >= 1
+    assert archived[0]["alarm_reason"]
+    assert any(item["code"] == "failure_marker" for item in archived[0]["findings"])
+
+    # Both transitions kept a full receipt snapshot for deep triage.
+    snapshots = sorted(snapshot_dir.glob("*.json"))
+    assert len(snapshots) == 2
+    first = json.loads(snapshots[0].read_text(encoding="utf-8"))
+    assert first["status"] == "alert"
+    assert first["evidence"]
+
+
+def test_history_snapshot_captures_signature_churn_inside_one_deduped_incident(tmp_path):
+    module = _load_module()
+    receipt_path = tmp_path / "receipt.json"
+
+    def archive(code, action, now):
+        finding = module._finding("cron", "job", code, "detail")
+        receipt = {
+            "checked_at": now.isoformat(),
+            "mode": "production",
+            "status": "alert",
+            "finding_count": 1,
+            "findings": [finding],
+            "evidence": [],
+            "alarm": {
+                "action": action,
+                "incident_id": "abc123",
+                "signature": module._signature([finding]),
+                "reason": "reason",
+            },
+        }
+        return module.archive_probe_run(receipt, receipt_path=receipt_path, now=now)
+
+    first = archive("scheduler_not_ok", "sent", NOW)
+    churned = archive("evidence_stale", "deduped", NOW + timedelta(minutes=5))
+    repeat = archive("evidence_stale", "deduped", NOW + timedelta(minutes=10))
+
+    assert first["transition"] is True
+    # Code churn inside one incident is deduped for Slack but must not be
+    # erased -- it is exactly the evidence a post-hoc triage pass needs.
+    assert churned["transition"] is True
+    assert churned["snapshot"]
+    # A genuinely unchanged repeat does not burn a snapshot.
+    assert repeat["transition"] is False
+    assert repeat["snapshot"] is None
+    assert len(list((tmp_path / "receipt-history").glob("*.json"))) == 2
+    assert len(module._history_tail(tmp_path / "receipt-history.jsonl", 10)) == 3
+
+
+def test_history_ledger_rotates_one_generation_and_stays_bounded(tmp_path, monkeypatch):
+    module = _load_module()
+    monkeypatch.setattr(module, "HISTORY_MAX_BYTES", 2048)
+    ledger = tmp_path / "history.jsonl"
+    for index in range(200):
+        module._append_history(ledger, {"checked_at": index, "detail": "x" * 100})
+
+    assert ledger.stat().st_size <= 2048 + 512
+    assert (tmp_path / "history.jsonl.1").is_file()
+    assert not list(tmp_path.glob("history.jsonl.2"))
+    assert [item["checked_at"] for item in module._history_tail(ledger, 3)] == [
+        197,
+        198,
+        199,
+    ]
+
+
+def test_history_snapshots_are_pruned_to_a_bounded_count(tmp_path, monkeypatch):
+    module = _load_module()
+    monkeypatch.setattr(module, "HISTORY_SNAPSHOT_LIMIT", 5)
+    receipt_path = tmp_path / "receipt.json"
+    for index in range(12):
+        module.archive_probe_run(
+            {
+                "checked_at": index,
+                "status": "alert",
+                "finding_count": index,
+                "findings": [],
+                "alarm": {"action": "sent", "incident_id": f"i{index}"},
+            },
+            receipt_path=receipt_path,
+            now=NOW + timedelta(seconds=index),
+        )
+    snapshots = sorted((tmp_path / "receipt-history").glob("*.json"))
+    assert len(snapshots) == 5
+    assert json.loads(snapshots[-1].read_text(encoding="utf-8"))["checked_at"] == 11
+
+
+def test_archive_failure_is_recorded_in_the_receipt_not_swallowed(tmp_path, monkeypatch):
+    module = _load_module()
+    contracts, jobs_path, output_root, launch_agents, _output = _fixture(tmp_path)
+    contracts_path = tmp_path / "contracts.json"
+    contracts_path.write_text(json.dumps(contracts), encoding="utf-8")
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory", encoding="utf-8")
+    receipt_path = tmp_path / "receipt.json"
+
+    def stub_run(cmd, *args, **kwargs):
+        if cmd and cmd[0] == "launchctl":
+            return _stub_launchctl_print(cmd, loaded_label="com.colingreig.hermes.fixture")
+        raise AssertionError(f"unexpected subprocess call in test: {cmd}")
+
+    monkeypatch.setattr(module.subprocess, "run", stub_run)
+    monkeypatch.setattr(module, "_now", lambda: NOW)
+    exit_code = module.main(
+        [
+            "--contracts", str(contracts_path),
+            "--jobs", str(jobs_path),
+            "--output-root", str(output_root),
+            "--launch-agents-dir", str(launch_agents),
+            "--state", str(tmp_path / "state.json"),
+            "--receipt", str(receipt_path),
+            "--history-dir", str(blocker / "nested"),
+        ]
+    )
+
+    assert exit_code == 0
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["status"] == "clean"
+    # A persisted failure reason, not a silent boolean.
+    assert receipt["history"]["error"]
+    assert receipt["history"]["snapshot"] is None
+
+
+def test_alarm_outcomes_persist_a_human_reason_for_every_routing_decision(tmp_path):
+    module = _load_module()
+    state_path = tmp_path / "state.json"
+    findings = [module._finding("cron", "job", "scheduler_not_ok", "last_status=error")]
+    messages = []
+
+    def sender(message):
+        messages.append(message)
+        return _completed()
+
+    sent = module.route_alarm(
+        findings, state_path=state_path, now=NOW,
+        drill=False, real_alert=True, sender=sender,
+    )
+    deduped = module.route_alarm(
+        findings, state_path=state_path, now=NOW + timedelta(minutes=5),
+        drill=False, real_alert=True, sender=sender,
+    )
+    recovery_pending = module.route_alarm(
+        [], state_path=state_path, now=NOW + timedelta(minutes=6),
+        drill=False, real_alert=True, sender=sender,
+    )
+    recovered = module.route_alarm(
+        [], state_path=state_path, now=NOW + timedelta(minutes=15),
+        drill=False, real_alert=True, sender=sender,
+    )
+
+    assert sent["action"] == "sent"
+    assert "New incident" in sent["reason"]
+    assert deduped["action"] == "deduped"
+    assert "re-alert interval has not elapsed" in deduped["reason"]
+    assert deduped["next_alert_at"] == NOW.timestamp() + module.REALERT_SECONDS
+    assert recovery_pending["action"] == "recovery-pending"
+    assert recovery_pending["reason"]
+    assert recovered["action"] == "recovery-sent"
+    assert recovered["alert_count"] == 1
+    assert len(messages) == 2
+
+
+def test_alert_message_explains_the_incident_and_points_at_the_archive(tmp_path):
+    module = _load_module()
+    state_path = tmp_path / "state.json"
+    findings = [module._finding("cron", "job", "scheduler_not_ok", "last_status=error")]
+    messages = []
+
+    def sender(message):
+        messages.append(message)
+        return _completed()
+
+    module.route_alarm(
+        findings, state_path=state_path, now=NOW,
+        drill=False, real_alert=True, sender=sender,
+    )
+    alert = messages[0]
+    incident_id = json.loads(state_path.read_text())["incident_id"]
+    assert f"Incident {incident_id[:12]}" in alert
+    assert "Why this alert fired now:" in alert
+    assert str(module.DEFAULT_HISTORY_LEDGER) in alert
+    assert "hermes fleet incident-report" in alert
+
+    module.route_alarm(
+        [], state_path=state_path, now=NOW + timedelta(minutes=1),
+        drill=False, real_alert=True, sender=sender,
+    )
+    module.route_alarm(
+        [], state_path=state_path, now=NOW + timedelta(minutes=30),
+        drill=False, real_alert=True, sender=sender,
+    )
+    recovery = messages[-1]
+    assert "recovered" in recovery
+    assert "1 alert(s) delivered" in recovery
+    assert str(module.DEFAULT_HISTORY_LEDGER) in recovery
+
+
+def test_long_open_unchanged_incident_is_flagged_as_probable_contract_drift(tmp_path):
+    """The poller expected:retired class: a stale contract, not a live outage."""
+    module = _load_module()
+    state_path = tmp_path / "state.json"
+    findings = [module._finding("launchd", "poller", "agent_not_loaded", "absent")]
+    messages = []
+
+    def sender(message):
+        messages.append(message)
+        return _completed()
+
+    module.route_alarm(
+        findings, state_path=state_path, now=NOW,
+        drill=False, real_alert=True, sender=sender,
+    )
+    stale = module.route_alarm(
+        findings, state_path=state_path, now=NOW + timedelta(hours=30),
+        drill=False, real_alert=True, sender=sender,
+    )
+
+    assert stale["action"] == "sent"
+    assert "re-alert" in stale["reason"]
+    assert "contract drift" in messages[-1]
+    assert "contract drift" not in messages[0]
+
+
+def test_cutover_suppression_publishes_its_bounded_expiry(tmp_path):
+    module = _load_module()
+    state_path = tmp_path / "state.json"
+    findings = [module._finding("launchd", "gateway", "endpoint_failed", "offline")]
+
+    suppressed = module.route_alarm(
+        findings, state_path=state_path, now=NOW + timedelta(minutes=1),
+        cutover_at=NOW, drill=False, real_alert=True,
+        sender=lambda _message: _completed(),
+    )
+
+    assert suppressed["action"] == "cutover-suppressed"
+    assert (
+        suppressed["suppressed_until"]
+        == NOW.timestamp() + module.CUTOVER_GRACE_SECONDS
+    )
+    assert suppressed["pending_identities"] == ["launchd:gateway"]
+    assert "grace window" in suppressed["reason"]

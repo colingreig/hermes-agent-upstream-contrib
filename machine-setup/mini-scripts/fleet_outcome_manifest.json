@@ -23,7 +23,7 @@
       "destination_root": "scripts",
       "destination": "fleet_outcome_probe.py",
       "mode": "0755",
-      "sha256": "1dbbee4c752c7b5ed44dbba0013dfb4125bb1d7cba008572dcf1946eed61a7d5"
+      "sha256": "658c30ff40583dc5e1b39ee29094eb5911a1de78be3a47d56f7daccb864e2401"
     },
     {
       "source": "fleet_incident_report.py",

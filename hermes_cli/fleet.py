@@ -26,6 +26,85 @@ def _read_json(path: Path) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
+FLEET_OUTCOME_HISTORY_LIMIT = 24
+
+
+def _jsonl_tail(path: Path, limit: int) -> list[dict[str, Any]]:
+    """Return up to ``limit`` newest records from a rotated JSONL ledger."""
+    if limit <= 0:
+        return []
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            window = min(size, max(65536, limit * 8192))
+            handle.seek(size - window)
+            data = handle.read(window)
+    except OSError:
+        return []
+    lines = data.decode("utf-8", errors="replace").splitlines()
+    if window < size and lines:
+        lines = lines[1:]
+    records: list[dict[str, Any]] = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            value = json.loads(stripped)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            records.append(value)
+    return records[-limit:]
+
+
+def _fleet_outcome_evidence(home: Path) -> dict[str, Any]:
+    """Join the latest fleet-outcome probe receipt with its run history.
+
+    The probe receipt is overwritten in place every run, so the archived
+    ledger and per-transition snapshots are what make a past alarm storm
+    triageable.  Both are surfaced here so one command answers "what did the
+    alarm plane actually see, and when".
+    """
+    state_dir = home / "state"
+    receipt_path = state_dir / "fleet-outcome-probe.json"
+    ledger_path = state_dir / "fleet-outcome-probe-history.jsonl"
+    snapshot_dir = state_dir / "fleet-outcome-probe-history"
+    receipt = _read_json(receipt_path)
+    alarm = dict((receipt or {}).get("alarm") or {})
+    history = _jsonl_tail(ledger_path, FLEET_OUTCOME_HISTORY_LIMIT)
+    try:
+        snapshots = sorted(
+            path.name for path in snapshot_dir.glob("*.json") if path.is_file()
+        )
+    except OSError:
+        snapshots = []
+    alert_state = _read_json(state_dir / "fleet-outcome-alert-state.json") or {}
+    return {
+        "receipt_path": str(receipt_path),
+        "history_path": str(ledger_path),
+        "snapshot_dir": str(snapshot_dir),
+        "history_available": bool(history),
+        "latest": {
+            "checked_at": (receipt or {}).get("checked_at"),
+            "status": (receipt or {}).get("status"),
+            "finding_count": (receipt or {}).get("finding_count"),
+            "alarm_action": alarm.get("action"),
+            "alarm_reason": alarm.get("reason"),
+            "incident_id": alarm.get("incident_id"),
+        }
+        if receipt
+        else None,
+        "incident_open": bool(alert_state.get("active")),
+        "incident_id": alert_state.get("incident_id"),
+        "incident_opened_at": alert_state.get("incident_opened_at"),
+        "alert_count": alert_state.get("alert_count"),
+        "history": history,
+        "recent_snapshots": snapshots[-FLEET_OUTCOME_HISTORY_LIMIT:],
+    }
+
+
 def _sqlite_evidence(path: Path) -> dict[str, Any]:
     evidence: dict[str, Any] = {"path": str(path), "size_bytes": None, "quick_check": None, "error": None}
     try:
@@ -209,6 +288,7 @@ def collect_incident_report(*, home: Path | None = None, root: Path | None = Non
         "resource_admission": admission.get("generic_leases", []),
         "production_write_leases": production_write,
         "databases": databases,
+        "fleet_outcome": _fleet_outcome_evidence(home),
         "findings": governed_findings + database_findings + admission_findings,
     }
     report["safe_to_cutover"] = bool(
@@ -228,6 +308,20 @@ def _print_human(report: dict[str, Any]) -> None:
     print(f"Safe to cut over: {report['safe_to_cutover']}")
     print(f"Gateway reachable: {report['gateway']['reachable']}")
     print(f"Active admission leases: {len(report['resource_admission'])}")
+    outcome = report.get("fleet_outcome") or {}
+    latest = outcome.get("latest") or {}
+    print(
+        "Fleet outcome probe: "
+        f"{latest.get('status') or 'no receipt'} "
+        f"({latest.get('finding_count') if latest else '?'} finding(s)) "
+        f"alarm={latest.get('alarm_action') or 'unknown'}"
+    )
+    if latest.get("alarm_reason"):
+        print(f"  Reason: {latest['alarm_reason']}")
+    print(
+        f"  Archived runs available: {len(outcome.get('history') or [])} "
+        f"({outcome.get('history_path')})"
+    )
     print(f"Findings: {len(report['findings'])}")
     for finding in report["findings"]:
         print(f"- {finding['code']}: {finding.get('path') or finding.get('ledger_execution_id') or finding.get('detail', '')}")
