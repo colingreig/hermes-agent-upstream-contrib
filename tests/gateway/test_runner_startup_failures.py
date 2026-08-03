@@ -64,6 +64,28 @@ class _SuccessfulAdapter(BasePlatformAdapter):
         return {"id": chat_id}
 
 
+class _PersistentAPIBindFailureAdapter(BasePlatformAdapter):
+    def __init__(self):
+        super().__init__(PlatformConfig(enabled=True), Platform.API_SERVER)
+
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
+        self._set_fatal_error(
+            "api_server_port_in_use",
+            "Port 8642 remained in use after 5 bind attempts.",
+            retryable=False,
+        )
+        return False
+
+    async def disconnect(self) -> None:
+        self._mark_disconnected()
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None):
+        raise NotImplementedError
+
+    async def get_chat_info(self, chat_id):
+        return {"id": chat_id}
+
+
 @pytest.mark.asyncio
 async def test_runner_stays_alive_for_retryable_startup_errors(monkeypatch, tmp_path):
     """Retryable startup errors should leave the gateway running in
@@ -140,6 +162,41 @@ async def test_runner_records_connected_platform_state_on_success(monkeypatch, t
     assert state["platforms"]["discord"]["state"] == "connected"
     assert state["platforms"]["discord"]["error_code"] is None
     assert state["platforms"]["discord"]["error_message"] is None
+
+
+@pytest.mark.asyncio
+async def test_api_bind_exhaustion_aborts_instead_of_degraded_success(
+    monkeypatch, tmp_path
+):
+    """A healthy chat adapter cannot mask an exhausted configured API bind."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    config = GatewayConfig(
+        platforms={
+            Platform.DISCORD: PlatformConfig(enabled=True, token="***"),
+            Platform.API_SERVER: PlatformConfig(enabled=True),
+        },
+        sessions_dir=tmp_path / "sessions",
+    )
+    runner = GatewayRunner(config)
+    successful = _SuccessfulAdapter()
+    failed_api = _PersistentAPIBindFailureAdapter()
+
+    def create_adapter(platform, _platform_config):
+        return successful if platform is Platform.DISCORD else failed_api
+
+    monkeypatch.setattr(runner, "_create_adapter", create_adapter)
+
+    ok = await runner.start()
+
+    assert ok is True
+    assert runner.should_exit_cleanly is False
+    assert runner.should_exit_with_failure is True
+    assert runner._running is False
+    assert runner.adapters == {}
+    assert "Port 8642 remained in use" in (runner.exit_reason or "")
+    state = read_runtime_status()
+    assert state["gateway_state"] == "startup_failed"
+    assert state["platforms"]["api_server"]["state"] == "fatal"
 
 
 @pytest.mark.asyncio
