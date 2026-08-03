@@ -4,6 +4,8 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -303,6 +305,73 @@ def _triggers(workflow: dict) -> dict:
 def _step(workflow: dict, name: str) -> dict:
     steps = workflow["jobs"]["promote"]["steps"]
     return next(step for step in steps if step.get("name") == name)
+
+
+def _run_certificate_step(tmp_path, workflow, *, path_prefix: Path | None = None):
+    evidence_path = tmp_path / "evidence.json"
+    evidence_path.write_text(json.dumps(_evidence()), encoding="utf-8")
+    certificate_path = tmp_path / "certificate.json"
+    output_path = tmp_path / "github-output"
+    script = _step(
+        workflow, "Certify exact SHA, aggregate job, and freeze state"
+    )["run"].replace("${{ steps.evidence.outputs.path }}", "$EVIDENCE_PATH")
+    env = {
+        **os.environ,
+        "CERTIFICATE_PATH": str(certificate_path),
+        "EVIDENCE_PATH": str(evidence_path),
+        "GITHUB_OUTPUT": str(output_path),
+    }
+    if path_prefix is not None:
+        env["PATH"] = f"{path_prefix}{os.pathsep}{env['PATH']}"
+    result = subprocess.run(
+        ["bash"],
+        input=script,
+        text=True,
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        check=False,
+    )
+    outputs = {}
+    if output_path.exists():
+        outputs = dict(
+            line.split("=", 1)
+            for line in output_path.read_text(encoding="utf-8").splitlines()
+        )
+    return result, certificate_path, outputs
+
+
+def test_certificate_step_issues_certificate_and_exports_id(tmp_path, workflow):
+    result, certificate_path, outputs = _run_certificate_step(tmp_path, workflow)
+
+    assert result.returncode == 0, result.stderr
+    expected_id = hashlib.sha256(certificate_path.read_bytes()).hexdigest()
+    assert outputs == {"path": str(certificate_path), "id": expected_id}
+
+
+def test_certificate_id_extraction_failure_fails_the_step(tmp_path, workflow):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    python_wrapper = bin_dir / "python3"
+    python_wrapper.write_text(
+        f"""#!/bin/bash
+if [ "$1" = "scripts/certify_prod_live_patches.py" ] && [ "${{2:-}}" = "certify" ]; then
+  "{sys.executable}" "$@" >/dev/null || exit $?
+  printf '%s\\n' '{{}}'
+else
+  exec "{sys.executable}" "$@"
+fi
+""",
+        encoding="utf-8",
+    )
+    python_wrapper.chmod(0o755)
+
+    result, _, _ = _run_certificate_step(
+        tmp_path, workflow, path_prefix=bin_dir
+    )
+
+    assert result.returncode != 0
+    assert "certificate_id" in result.stderr
 
 
 def test_workflow_waits_for_completed_ci_and_has_no_push_bypass(workflow):

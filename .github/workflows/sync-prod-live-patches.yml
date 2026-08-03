@@ -127,9 +127,12 @@ jobs:
           RESULT=$(python3 scripts/certify_prod_live_patches.py certify \
             --evidence "${{ steps.evidence.outputs.path }}" \
             --output "$CERTIFICATE_PATH")
-          echo "path=$CERTIFICATE_PATH" >> "$GITHUB_OUTPUT"
-          echo "id=$(python3 -c 'import json,sys; print(json.load(sys.stdin)[\"certificate_id\"])' <<<"$RESULT")" \
-            >> "$GITHUB_OUTPUT"
+          CERTIFICATE_ID=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["certificate_id"])' \
+            <<<"$RESULT")
+          {
+            echo "path=$CERTIFICATE_PATH"
+            echo "id=$CERTIFICATE_ID"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Prepare strict descendant promotion
         id: prepare
