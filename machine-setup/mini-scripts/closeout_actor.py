@@ -50,6 +50,14 @@ SAFETY
 - `--dry-run` lists what WOULD flip and why; touches nothing. Ambiguity => skip.
 - sweep() never raises.
 
+ALSO DRIVEN FROM HERE
+---------------------
+`main()` additionally drives two sibling backstops on this same cron cadence:
+`db_closeout_actor` (DB-backed publish tasks, no PR) and
+`manual_platform_handoff` (OPEN CI-green PRs on repos ignite-ship classifies
+PLATFORM=manual, where the executor can never deploy and a CI-green PR IS the
+complete deliverable). All three sweeps are disjoint on their PR-state predicate.
+
 CLI:
   closeout_actor.py --dry-run         # report, touch nothing (recommended first)
   closeout_actor.py                    # live: advance every qualifying task
@@ -429,6 +437,26 @@ def main():
         print(json.dumps({"db_flipped": dflip, "db_would_flip": dwould, "db_total": len(dres)}))
     except Exception as e:
         print(f"[db-closeout] ERROR sweep failed to run: {e!r}")
+
+    # Manual-platform handoff backstop (2026-08-03): this actor only advances
+    # MERGED+validated work. On a repo ignite-ship classifies PLATFORM=manual
+    # there is no pipeline the executor can drive, so a finished task can sit at
+    # an OPEN CI-green PR forever ("ignite- BLOCKED HANDOFF", tasks 86e2kmud4 /
+    # 86e2kxh59). The policy is that a CI-green PR IS the complete deliverable on
+    # those repos, so drive that sweep on the SAME cadence. The two sweeps are
+    # disjoint by construction: this one requires MERGED, that one requires OPEN.
+    try:
+        import manual_platform_handoff as mph
+        mres = mph.sweep(dry_run=a.dry_run, only_repo=a.repo, only_task=a.task)
+        mph.print_results(mres, dry_run=a.dry_run)
+        mhanded = sum(1 for r in mres
+                      if r.get("action") == "handoff" and r.get("handoff_ok"))
+        mwould = sum(1 for r in mres if r.get("action") == "handoff" and a.dry_run)
+        print(json.dumps({"manual_handoff": mhanded,
+                          "manual_would_hand_off": mwould,
+                          "manual_total": len(mres)}))
+    except Exception as e:
+        print(f"[manual-handoff] ERROR sweep failed to run: {e!r}")
     return 0
 
 
