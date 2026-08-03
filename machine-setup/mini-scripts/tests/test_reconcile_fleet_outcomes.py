@@ -6,6 +6,7 @@ import importlib.util
 import json
 import tempfile
 import unittest
+import warnings
 from pathlib import Path
 from unittest import mock
 
@@ -142,6 +143,41 @@ class FleetOutcomeReconcilerTests(unittest.TestCase):
         with self.assertRaisesRegex(module.ReconcileError, "source hash drift"):
             reconciler.install()
         self.assertEqual((self.hermes / "scripts" / "probe.py").read_bytes(), before)
+
+    def test_malformed_source_plist_is_skipped_with_warning_not_crash(self) -> None:
+        malformed = self.source / "launchd" / "probe.plist"
+        malformed.write_bytes(
+            b'<?xml version="1.0"?><plist><dict><!-- broken -- ></dict></plist>'
+        )
+        reconciler = self.reconciler()
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            labels = reconciler._labels()
+
+        self.assertEqual(labels, [])
+        warning = next(
+            item for item in caught if "skipped unreadable plist" in str(item.message)
+        )
+        self.assertIn(malformed.name, str(warning.message))
+        self.assertIn("not well-formed", str(warning.message))
+
+    def test_malformed_live_plist_is_skipped_with_warning_not_crash(self) -> None:
+        malformed = self.launch_agents / "probe.plist"
+        malformed.write_bytes(
+            b'<?xml version="1.0"?><plist><dict><!-- broken -- ></dict></plist>'
+        )
+        reconciler = self.reconciler()
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            reconciler._set_loaded({})
+
+        warning = next(
+            item for item in caught if "skipped unreadable plist" in str(item.message)
+        )
+        self.assertIn(malformed.name, str(warning.message))
+        self.assertIn("not well-formed", str(warning.message))
 
     def test_verify_failure_restores_files_and_full_jobs_document(self) -> None:
         reconciler = self.reconciler()

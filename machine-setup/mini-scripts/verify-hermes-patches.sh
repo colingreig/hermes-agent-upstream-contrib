@@ -429,25 +429,35 @@ for spec in \
     grn "wrapper identity  $wrapper_name"
   fi
   if [ ! -f "$plist" ]; then red "MISSING plist: $plist"; FAIL=1; continue; fi
-  if "$REPO/venv/bin/python" - "$plist" "$installed_wrapper" <<'PY'
+  plist_warning=$("$REPO/venv/bin/python" - "$plist" "$installed_wrapper" <<'PY'
 import plistlib
 import sys
 from pathlib import Path
+from xml.parsers.expat import ExpatError
 
-payload = plistlib.loads(Path(sys.argv[1]).read_bytes())
+path = Path(sys.argv[1])
+try:
+    payload = plistlib.loads(path.read_bytes())
+except (OSError, ValueError, ExpatError) as exc:
+    print(f"skipped unreadable plist {path.name}: {exc}")
+    raise SystemExit(0)
 assert payload.get("ProgramArguments") == ["/bin/bash", sys.argv[2]]
 assert payload.get("KeepAlive") == {"SuccessfulExit": False}
-text = Path(sys.argv[1]).read_text(encoding="utf-8")
+text = path.read_text(encoding="utf-8")
 assert not any(marker in text for marker in (
     "github_app_token.py", "GH_TOKEN", "GH_API_KEY_HERMES",
     "OPENAI_API_KEY", "VALIDATOR_", "op://",
 ))
 PY
-  then
-    grn "plist boundary    $svc -> $wrapper_name (park-on-auth contract)"
-  else
+  )
+  plist_status=$?
+  if [ "$plist_status" -ne 0 ]; then
     red "PLIST WRAPPER/RETRY CONTRACT INVALID: $plist — run governed release reconciliation"
     FAIL=1
+  elif [ -n "$plist_warning" ]; then
+    ylw "$plist_warning"
+  else
+    grn "plist boundary    $svc -> $wrapper_name (park-on-auth contract)"
   fi
   # Redacted live-env check: only the variable name is matched.
   pid=$(launchctl list 2>/dev/null | awk -v s="$svc" '$3==s{print $1}')

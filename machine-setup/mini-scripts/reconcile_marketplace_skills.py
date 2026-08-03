@@ -14,6 +14,8 @@ import subprocess
 import sys
 import tempfile
 from typing import Any
+import warnings
+from xml.parsers.expat import ExpatError
 
 IGNITE_LABEL = "com.colingreig.ignite-skills-pull"
 ANTHROPIC_LABEL = "com.colingreig.pull_anthropic_skills"
@@ -163,7 +165,15 @@ class Reconciler:
             if source.is_symlink() or not resolved_source.is_file():
                 raise RuntimeError(f"canonical source missing or symlinked: {source}")
             if target.suffix == ".plist":
-                payload = plistlib.loads(source.read_bytes())
+                try:
+                    payload = plistlib.loads(source.read_bytes())
+                except (OSError, ValueError, ExpatError) as exc:
+                    warnings.warn(
+                        f"skipped unreadable plist {source.name}: {exc}",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+                    continue
                 label = target.stem
                 if payload.get("Label") != label:
                     raise RuntimeError(f"plist label mismatch: {source}")

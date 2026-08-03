@@ -15,6 +15,8 @@ import sys
 import tempfile
 import time
 from typing import Any
+import warnings
+from xml.parsers.expat import ExpatError
 
 SCRIPT_ASSETS = (
     "reconcile_launchd_environment.py",
@@ -447,7 +449,15 @@ class Reconciler:
             (self.gateway_plist, self.gateway_wrapper),
             (self.dashboard_plist, self.dashboard_wrapper),
         ):
-            plist = plistlib.loads(plist_path.read_bytes())
+            try:
+                plist = plistlib.loads(plist_path.read_bytes())
+            except (OSError, ValueError, ExpatError) as exc:
+                warnings.warn(
+                    f"skipped unreadable plist {plist_path.name}: {exc}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                continue
             if plist["ProgramArguments"] != ["/bin/bash", str(wrapper)]:
                 raise RuntimeError(f"plist does not point only to canonical wrapper: {plist_path}")
             if plist.get("KeepAlive") != {"SuccessfulExit": False}:

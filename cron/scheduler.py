@@ -239,6 +239,15 @@ def _apply_weighted_lane_to_job(job: dict) -> tuple[dict, Optional[str]]:
     rendered = dict(job)
     rendered["prompt"] = prompt
     rendered["selected_lane"] = lane
+    # Content QA is a quality-sensitive, fail-closed gate. A weighted executor
+    # normally inherits the parent job's fallback chain, but that let an auth
+    # failure downgrade a content run to GLM-4.7. The weak fallback repeatedly
+    # drifted the gate argv (missing required values / inventing unsupported
+    # forms) and retried the same usage failure. Pin content dispatches to the
+    # job's primary tier before run_job() resolves authentication or assembles
+    # AIAgent.fallback_model. Code dispatches retain the configured policy.
+    if lane == "content":
+        rendered["no_fallback"] = True
     return rendered, lane
 
 

@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+import warnings
 from unittest import mock
 
 
@@ -177,6 +178,30 @@ class LaunchdEnvironmentTests(unittest.TestCase):
             self.assertEqual(record["source_sha256"], digest)
             self.assertEqual(record["deployed_sha256"], digest)
             self.assertEqual(record["source_sha256"], record["deployed_sha256"])
+
+    def test_malformed_plist_is_skipped_with_warning_not_crash(self):
+        self.reconciler.install()
+        self.reconciler.gateway_plist.write_bytes(
+            b'<?xml version="1.0"?><plist><dict><!-- broken -- ></dict></plist>'
+        )
+        desired = self.reconciler.desired()
+        _expected, mode = desired[self.reconciler.gateway_plist]
+        desired[self.reconciler.gateway_plist] = (
+            self.reconciler.gateway_plist.read_bytes(),
+            mode,
+        )
+
+        with mock.patch.object(self.reconciler, "desired", return_value=desired), warnings.catch_warnings(
+            record=True
+        ) as caught:
+            warnings.simplefilter("always")
+            self.reconciler.verify()
+
+        warning = next(
+            item for item in caught if "skipped unreadable plist" in str(item.message)
+        )
+        self.assertIn(self.reconciler.gateway_plist.name, str(warning.message))
+        self.assertIn("not well-formed", str(warning.message))
 
     def test_gateway_plist_matches_current_core_contract_for_active_release(self):
         release = self.hermes / "releases" / "v-test-active"

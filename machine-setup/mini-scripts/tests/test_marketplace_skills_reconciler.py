@@ -10,6 +10,7 @@ import plistlib
 import sys
 import tempfile
 import unittest
+import warnings
 
 import yaml
 
@@ -147,6 +148,24 @@ class MarketplaceSkillsReconcilerTests(unittest.TestCase):
 
             with self.assertRaisesRegex(RuntimeError, "identity mismatch"):
                 reconciler.verify()
+
+    def test_malformed_plist_is_skipped_with_warning_not_crash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            reconciler, _, _, _ = self._fixture(Path(tmp))
+            malformed = reconciler.source_root / "launchd" / f"{IGNITE_LABEL}.plist"
+            malformed.write_bytes(
+                b'<?xml version="1.0"?><plist><dict><!-- broken -- ></dict></plist>'
+            )
+
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                reconciler.validate_sources()
+
+            warning = next(
+                item for item in caught if "skipped unreadable plist" in str(item.message)
+            )
+            self.assertIn(malformed.name, str(warning.message))
+            self.assertIn("not well-formed", str(warning.message))
 
     def test_deployed_script_uses_runtime_source_root(self):
         with tempfile.TemporaryDirectory() as tmp:

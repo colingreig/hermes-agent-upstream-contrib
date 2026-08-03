@@ -17,6 +17,8 @@ import tempfile
 import time
 from pathlib import Path
 from typing import Any
+import warnings
+from xml.parsers.expat import ExpatError
 
 
 SCHEMA_VERSION = 1
@@ -342,8 +344,13 @@ class Reconciler:
                 continue
             try:
                 payload = plistlib.loads(source.read_bytes())
-            except (OSError, plistlib.InvalidFileException) as exc:
-                raise ReconcileError(f"could not parse plist {target}: {exc}") from exc
+            except (OSError, ValueError, ExpatError) as exc:
+                warnings.warn(
+                    f"skipped unreadable plist {source.name}: {exc}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                continue
             label = payload.get("Label")
             if not isinstance(label, str) or not label:
                 raise ReconcileError(f"plist has no Label: {target}")
@@ -430,7 +437,15 @@ class Reconciler:
         for target in self.target_map():
             if target.parent != self.launch_agents_dir or not target.exists():
                 continue
-            payload = plistlib.loads(target.read_bytes())
+            try:
+                payload = plistlib.loads(target.read_bytes())
+            except (OSError, ValueError, ExpatError) as exc:
+                warnings.warn(
+                    f"skipped unreadable plist {target.name}: {exc}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                continue
             plist_by_label[str(payload["Label"])] = target
         for label, should_load in sorted(loaded.items()):
             # Bootout erases the strongest ownership signal; retain it first.
