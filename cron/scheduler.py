@@ -225,6 +225,22 @@ class CronLaneConfigurationError(Exception):
     """Raised when a weighted-lane cron job cannot render a lane safely."""
 
 
+# Standing content policy (content-sonnet-only-no-rampdown): content-lane work
+# executes on anthropic/claude-sonnet-5 with no model substitution, ever. This
+# mirrors machine-setup/fleet-config/profiles/content/config.yaml, which is
+# the governed source of truth for the dedicated content profile. A weighted
+# job's *own* `model`/`provider` fields describe its primary (usually code)
+# tier — e.g. the unified `clickup-executor` job's primary tier is a coder
+# model — so a content-lane draw must NOT inherit them. Before the dedicated
+# `content-lane-executor` job was operator-retired, that assumption held by
+# construction (its only tier *was* Sonnet); once a single weighted job covers
+# both lanes, the content draw has to pin its own model/provider explicitly or
+# it silently executes on whatever the job's primary tier happens to be
+# (86e2kj1tr).
+CONTENT_LANE_PROVIDER = "anthropic"
+CONTENT_LANE_MODEL = "claude-sonnet-5"
+
+
 def _apply_weighted_lane_to_job(job: dict) -> tuple[dict, Optional[str]]:
     """Return a per-run job copy with its prompt rendered for the selected lane."""
     if not job.get("lane_weights"):
@@ -244,9 +260,14 @@ def _apply_weighted_lane_to_job(job: dict) -> tuple[dict, Optional[str]]:
     # failure downgrade a content run to GLM-4.7. The weak fallback repeatedly
     # drifted the gate argv (missing required values / inventing unsupported
     # forms) and retried the same usage failure. Pin content dispatches to the
-    # job's primary tier before run_job() resolves authentication or assembles
-    # AIAgent.fallback_model. Code dispatches retain the configured policy.
+    # governed content model/provider (never the job's own primary tier)
+    # before run_job() resolves authentication or assembles
+    # AIAgent.fallback_model, and force no_fallback so an auth failure fails
+    # closed instead of silently substituting a different model. Code
+    # dispatches retain the configured policy.
     if lane == "content":
+        rendered["provider"] = CONTENT_LANE_PROVIDER
+        rendered["model"] = CONTENT_LANE_MODEL
         rendered["no_fallback"] = True
     return rendered, lane
 
