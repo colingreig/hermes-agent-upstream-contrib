@@ -51,6 +51,126 @@ def test_is_recovery_pr_false_when_no_signals_present():
 
 
 # ---------------------------------------------------------------------------
+# Regression: bare "recovery" as domain vocabulary must NOT classify a PR as
+# a recovery/stranded-worktree PR. PR #318 and #321 were both false-blocked
+# on 2026-08-03 by the old bare-word match and needed a body reword +
+# close/reopen to merge -- bodies below are the verbatim false-positive
+# fragments (recovered via the GitHub content-edit history) that triggered
+# the old detector.
+# ---------------------------------------------------------------------------
+
+def test_is_recovery_pr_false_for_alarm_recovery_domain_vocabulary():
+    """PR #318: 'recovery' describes an alarm routing-decision variant
+    (recovery-sent / auto-resolved), not a git-worktree recovery."""
+    assert not psg.is_recovery_pr(
+        branch_name="ignite-86e2ku0a7-fleet-alarm-forensics",
+        pr_title="ignite- 86e2ku0a7: make fleet-outcome alarm storms triageable and self-explaining",
+        pr_description=(
+            "`route_alarm` now persists a human `reason` for **every** "
+            "routing decision (sent, deduped, cutover-suppressed, "
+            "new-finding-pending, recovery-*, delivery-failed), not just a "
+            "bare action. Slack alerts carry the incident id, when it "
+            "opened, how long it has been open, which alert number this "
+            "is, why it fired now, and the triage paths. Recovery reports "
+            "incident duration and alert count."
+        ),
+    )
+
+
+def test_is_recovery_pr_false_for_lease_recovery_domain_vocabulary():
+    """PR #321: 'recovery' describes the production write-lease's
+    recovered-state/fence-loss-recovery mechanism, not a stranded worktree."""
+    assert not psg.is_recovery_pr(
+        branch_name="ignite-86e2kmq8u-single-writer-lifecycle-gate",
+        pr_title=(
+            "ignite- 86e2kmq8u: single-writer mutation control — close the "
+            "state-db lifecycle registry gate"
+        ),
+        pr_description=(
+            "Governed destructive writers acquire the fenced production "
+            "write lease (monotone fencing tokens, CAS heartbeats, "
+            "`mutation_guard` held across each durable filesystem/DB "
+            "commit, immutable fence-loss and recovery receipts). "
+            "**Lifecycle states** are the lease ledger's: `active → "
+            "released | recovered | expired`, with evidence-backed "
+            "recovery only (expiry alone never permits takeover) and "
+            "immutable receipts for fence loss and recovery."
+        ),
+    )
+
+
+def test_check_recovery_pr_not_flagged_for_alarm_recovery_domain_vocabulary():
+    """End-to-end (a): the PR #318 false positive must not block merge --
+    not classified as a recovery PR at all, so no diff cross-check runs."""
+    result = psg.check_recovery_pr(
+        branch_name="ignite-86e2ku0a7-fleet-alarm-forensics",
+        pr_title="ignite- 86e2ku0a7: make fleet-outcome alarm storms triageable and self-explaining",
+        pr_description=(
+            "`route_alarm` now persists a human `reason` for **every** "
+            "routing decision (sent, deduped, cutover-suppressed, "
+            "new-finding-pending, recovery-*, delivery-failed), not just a "
+            "bare action."
+        ),
+        diff_stat_text=(
+            "hermes_cli/fleet.py | 20 ++++\n"
+            "machine-setup/mini-scripts/fleet_outcome_probe.py | 80 +++++\n"
+            "2 files changed, 100 insertions(+)"
+        ),
+    )
+    assert result.is_recovery_pr is False
+    assert result.mismatch is None
+    assert result.blocked is False
+
+
+def test_check_recovery_pr_not_flagged_for_lease_recovery_domain_vocabulary():
+    """End-to-end (b): the PR #321 false positive must not block merge."""
+    result = psg.check_recovery_pr(
+        branch_name="ignite-86e2kmq8u-single-writer-lifecycle-gate",
+        pr_title=(
+            "ignite- 86e2kmq8u: single-writer mutation control — close the "
+            "state-db lifecycle registry gate"
+        ),
+        pr_description=(
+            "Governed destructive writers acquire the fenced production "
+            "write lease, with evidence-backed recovery only (expiry "
+            "alone never permits takeover) and immutable receipts for "
+            "fence loss and recovery."
+        ),
+        diff_stat_text=(
+            "state_db_lifecycle.py | 60 +++++\n"
+            "tests/test_state_db_lifecycle.py | 40 +++\n"
+            "2 files changed, 100 insertions(+)"
+        ),
+    )
+    assert result.is_recovery_pr is False
+    assert result.mismatch is None
+    assert result.blocked is False
+
+
+def test_check_recovery_pr_genuine_recovery_still_blocked_despite_domain_wording():
+    """A GENUINE recovery PR (structural branch marker) whose description
+    also happens to use 'recovery' loosely must still be classified and
+    cross-checked -- the branch pattern is the primary, unweakened signal.
+    Regression guard: tightening the description-text match must not
+    weaken detection when a real structural marker is present.
+    """
+    result = psg.check_recovery_pr(
+        branch_name="recover/lost-work",
+        pr_title="Recover lost work from stranded worktree",
+        pr_description=(
+            "Recovery PR for a stranded worktree. Restores `src/a.py`."
+        ),
+        diff_stat_text=(
+            "src/unrelated.py | 5 +++--\n"
+            "1 file changed, 3 insertions(+), 2 deletions(-)"
+        ),
+    )
+    assert result.is_recovery_pr is True
+    assert result.mismatch is not None
+    assert result.blocked is True
+
+
+# ---------------------------------------------------------------------------
 # check_recovery_pr — the three required scenarios
 # ---------------------------------------------------------------------------
 

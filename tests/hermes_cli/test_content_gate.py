@@ -204,6 +204,23 @@ def test_flag_recovery_pr_mismatch_flags_scope_understatement():
     assert warning is not None
 
 
+def test_flag_recovery_pr_mismatch_not_applicable_for_domain_recovery_vocabulary():
+    """Bare 'recovery' used as domain vocabulary (not a recovery-PR phrase)
+    must not trigger the check at all -- regression for PR #318 (alarm
+    recovery-sent codes) and PR #321 (lease recovery lifecycle), both
+    false-blocked on 2026-08-03 by the old bare-word ``_RECOVERY_SIGNAL_RE``.
+    """
+    description = (
+        "route_alarm now persists a reason for every routing decision "
+        "(sent, deduped, cutover-suppressed, recovery-sent, "
+        "delivery-failed). Recovery reports incident duration."
+    )
+    diff_stat = (
+        "hermes_cli/fleet.py | 20 ++++\n1 file changed, 20 insertions(+)"
+    )
+    assert cg.flag_recovery_pr_mismatch(description, diff_stat) is None
+
+
 def test_flag_recovery_pr_mismatch_none_when_everything_lines_up():
     description = (
         "Recovery PR for stranded worktree — restores `src/a.py` and `src/b.py`."
