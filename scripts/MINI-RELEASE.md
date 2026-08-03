@@ -448,12 +448,17 @@ non-symlink fixed-prefix bootstrap root, and only after proving no cutter
 process or active production-write lease still references the operation. If
 those checks cannot be proved, it preserves the directory and exits nonzero.
 
-## Optional local polling contingency
+## Release-poll LaunchAgent — installer and governed controls
 
-This generic contingency is not installed or enabled for the rebuilt Hermes
-fleet. Its source remains available for a different deployment only after an
-explicit decision to adopt polling. The poller is local-only, exposes no
-webhook, and delegates all decisions to the locked cutter:
+`com.colingreig.hermes.release-poll` (see "Rebuilt fleet production policy"
+above — it is installed, enabled, and the fleet's standing automatic release
+path, not an opt-in contingency) is managed with the same installer script.
+This section previously described the LaunchAgent as "not installed or
+enabled for the rebuilt Hermes fleet," which stopped being accurate once the
+poller was reinstated on 2026-08-03 (#310) — that PR corrected the "retired"
+language earlier in this file but missed this second, contradicting
+occurrence. The poller is local-only, exposes no webhook, and delegates all
+decisions to the locked cutter:
 
 ```bash
 ~/.hermes/runtime-current/scripts/install-mini-release-poller.sh --install \
