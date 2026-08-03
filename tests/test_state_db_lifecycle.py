@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,22 @@ import pytest
 from hermes_state import SessionDB
 import state_db_lifecycle as lifecycle
 from state_db_lifecycle import LifecycleSafetyError, run_lifecycle
+
+
+@contextmanager
+def _noop_guard(phase: str):
+    """Stand-in for the fenced production write lease in unit tests."""
+    assert isinstance(phase, str) and phase
+    yield
+
+
+def _recording_guard(record: list[str]):
+    @contextmanager
+    def guard(phase: str):
+        record.append(phase)
+        yield
+
+    return guard
 
 
 def _config(*, wal_max_bytes: int = 1024 * 1024, stale_hours: float | None = 48) -> dict:
@@ -102,7 +119,7 @@ def test_lifecycle_apply_bounds_backup_artifacts(tmp_path: Path) -> None:
     config = _config()
     config["backup"]["max_count"] = 1
 
-    report = run_lifecycle(path, config=config, apply=True, backup_dir=backups)
+    report = run_lifecycle(path, config=config, apply=True, mutation_guard_factory=_noop_guard, backup_dir=backups)
 
     assert str(stale_backup) in report["backup_retention_removed"]
     assert len(list(backups.glob("state.lifecycle-*.sqlite"))) == 1
@@ -134,7 +151,7 @@ def test_production_policy_allows_apply_for_2_5_gib_db_and_bounds_backups(
         return actual_path_size(candidate)
 
     monkeypatch.setattr(lifecycle, "_path_size", production_realistic_path_size)
-    report = run_lifecycle(path, config=policy, apply=True, backup_dir=tmp_path / "backups")
+    report = run_lifecycle(path, config=policy, apply=True, mutation_guard_factory=_noop_guard, backup_dir=tmp_path / "backups")
 
     backup_path = Path(report["backup_path"])
     assert backup_path.is_file()
@@ -155,7 +172,7 @@ def test_lifecycle_preserves_existing_backup_when_replacement_fails(tmp_path: Pa
 
     monkeypatch.setattr(lifecycle, "create_online_backup", fail_backup)
     with pytest.raises(LifecycleSafetyError, match="simulated backup failure"):
-        run_lifecycle(path, config=_config(), apply=True, backup_dir=backups)
+        run_lifecycle(path, config=_config(), apply=True, mutation_guard_factory=_noop_guard, backup_dir=backups)
 
     assert existing.is_file()
     db.close()
@@ -171,7 +188,7 @@ def test_lifecycle_preserves_existing_backup_when_replacement_exceeds_cap(tmp_pa
     config["backup"]["max_bytes"] = 1
 
     with pytest.raises(LifecycleSafetyError, match="preserving existing backups"):
-        run_lifecycle(path, config=config, apply=True, backup_dir=backups)
+        run_lifecycle(path, config=config, apply=True, mutation_guard_factory=_noop_guard, backup_dir=backups)
 
     assert existing.is_file()
     db.close()
@@ -182,12 +199,12 @@ def test_lifecycle_archives_then_prunes_ended_session_and_keeps_fts_consistent(t
     db.create_session("archive", "cli")
     db.append_message("archive", "user", "lifecycle fts needle")
     _set_ended_at(path, "archive", time.time() - 10 * 86400)
-    first = run_lifecycle(path, config=_config(), apply=True, backup_dir=tmp_path / "backups")
+    first = run_lifecycle(path, config=_config(), apply=True, mutation_guard_factory=_noop_guard, backup_dir=tmp_path / "backups")
     assert first["applied"]["archived"] == 1
     assert db.get_session("archive")["archived"] == 1
 
     _set_ended_at(path, "archive", time.time() - 40 * 86400, archived=1)
-    second = run_lifecycle(path, config=_config(), apply=True, backup_dir=tmp_path / "backups")
+    second = run_lifecycle(path, config=_config(), apply=True, mutation_guard_factory=_noop_guard, backup_dir=tmp_path / "backups")
     assert second["applied"]["pruned"] == 1
     assert db.get_session("archive") is None
     with sqlite3.connect(path) as conn:
@@ -200,7 +217,7 @@ def test_lifecycle_reports_and_bounds_wal_checkpoint_to_passive_mode(tmp_path: P
     db.create_session("old", "cli")
     _set_ended_at(path, "old", time.time() - 40 * 86400)
 
-    report = run_lifecycle(path, config=_config(wal_max_bytes=0), apply=True, backup_dir=tmp_path / "backups")
+    report = run_lifecycle(path, config=_config(wal_max_bytes=0), apply=True, mutation_guard_factory=_noop_guard, backup_dir=tmp_path / "backups")
 
     assert report["checkpoint"]["mode"] == "PASSIVE"
     assert "busy" in report["checkpoint"]
@@ -217,7 +234,7 @@ def test_lifecycle_never_archives_or_prunes_active_sessions(tmp_path: Path) -> N
     _set_ended_at(path, "ended-parent", time.time() - 40 * 86400, archived=1)
     db.create_session("active-child", "cli", parent_session_id="ended-parent")
 
-    report = run_lifecycle(path, config=_config(), apply=True, backup_dir=tmp_path / "backups")
+    report = run_lifecycle(path, config=_config(), apply=True, mutation_guard_factory=_noop_guard, backup_dir=tmp_path / "backups")
 
     assert report["active_session_count"] == 2
     assert report["active_session_exclusion_verified"] is True
@@ -241,7 +258,7 @@ def test_lifecycle_rechecks_new_active_child_inside_prune_transaction(tmp_path: 
         return original_backup(*args, **kwargs)
 
     monkeypatch.setattr(lifecycle, "create_online_backup", create_backup_after_new_child)
-    report = run_lifecycle(path, config=_config(), apply=True, backup_dir=tmp_path / "backups")
+    report = run_lifecycle(path, config=_config(), apply=True, mutation_guard_factory=_noop_guard, backup_dir=tmp_path / "backups")
 
     assert report["prune_ids"] == ["parent"]
     assert report["applied"]["pruned"] == 0
@@ -271,7 +288,7 @@ def test_lifecycle_excludes_sessions_referenced_by_inflight_delegations(tmp_path
             ("parent-delegation", "other", "parent-protected", now, now),
         )
 
-    report = run_lifecycle(path, config=_config(), apply=True, backup_dir=tmp_path / "backups")
+    report = run_lifecycle(path, config=_config(), apply=True, mutation_guard_factory=_noop_guard, backup_dir=tmp_path / "backups")
 
     assert report["prune_ids"] == []
     assert db.get_session("origin-protected") is not None
@@ -349,7 +366,7 @@ def test_schema_v1_policy_still_loads_with_new_controls_disabled(tmp_path: Path)
     db.create_session("abandoned", "cli")
     _set_started_at(path, "abandoned", time.time() - 30 * 86400)
 
-    report = run_lifecycle(path, config=legacy, apply=True, backup_dir=tmp_path / "backups")
+    report = run_lifecycle(path, config=legacy, apply=True, mutation_guard_factory=_noop_guard, backup_dir=tmp_path / "backups")
 
     assert report["stale_ids"] == []
     assert report["applied"]["stale_reaped"] == 0
@@ -365,7 +382,7 @@ def test_abandoned_session_is_closed_so_retention_can_reach_it(tmp_path: Path) -
     _set_started_at(path, "abandoned", stale_at)
     _set_message_timestamps(path, "abandoned", stale_at)
 
-    report = run_lifecycle(path, config=_config(), apply=True, backup_dir=tmp_path / "backups")
+    report = run_lifecycle(path, config=_config(), apply=True, mutation_guard_factory=_noop_guard, backup_dir=tmp_path / "backups")
 
     assert report["stale_ids"] == ["abandoned"]
     assert report["applied"]["stale_reaped"] == 1
@@ -382,7 +399,7 @@ def test_recently_active_open_session_is_never_reaped(tmp_path: Path) -> None:
     _set_started_at(path, "busy", time.time() - 30 * 86400)
     db.append_message("busy", "user", "still talking right now")
 
-    report = run_lifecycle(path, config=_config(), apply=True, backup_dir=tmp_path / "backups")
+    report = run_lifecycle(path, config=_config(), apply=True, mutation_guard_factory=_noop_guard, backup_dir=tmp_path / "backups")
 
     assert report["stale_ids"] == []
     assert db.get_session("busy")["ended_at"] is None
@@ -400,7 +417,7 @@ def test_open_session_holding_a_compression_lock_is_never_reaped(tmp_path: Path)
             ("compressing", time.time(), time.time() + 3600),
         )
 
-    report = run_lifecycle(path, config=_config(), apply=True, backup_dir=tmp_path / "backups")
+    report = run_lifecycle(path, config=_config(), apply=True, mutation_guard_factory=_noop_guard, backup_dir=tmp_path / "backups")
 
     assert report["stale_ids"] == []
     assert db.get_session("compressing")["ended_at"] is None
@@ -420,7 +437,7 @@ def test_reaper_rechecks_a_session_that_wakes_up_before_the_write_lock(
         return original_backup(*args, **kwargs)
 
     monkeypatch.setattr(lifecycle, "create_online_backup", speak_before_backup)
-    report = run_lifecycle(path, config=_config(), apply=True, backup_dir=tmp_path / "backups")
+    report = run_lifecycle(path, config=_config(), apply=True, mutation_guard_factory=_noop_guard, backup_dir=tmp_path / "backups")
 
     assert report["stale_ids"] == ["waking"]
     assert report["applied"]["stale_reaped"] == 0
@@ -458,7 +475,7 @@ def test_prune_verifies_fts_integrity_and_clears_orphaned_rows(tmp_path: Path) -
             (time.time() - 40 * 86400, time.time() - 40 * 86400),
         )
 
-    report = run_lifecycle(path, config=_config(), apply=True, backup_dir=tmp_path / "backups")
+    report = run_lifecycle(path, config=_config(), apply=True, mutation_guard_factory=_noop_guard, backup_dir=tmp_path / "backups")
 
     assert report["applied"]["pruned"] == 1
     assert report["fts_consistency"] == {"messages_fts": "ok", "messages_fts_trigram": "ok"}
@@ -478,7 +495,7 @@ def test_prune_refuses_to_finish_when_fts_integrity_fails(tmp_path: Path, monkey
     )
 
     with pytest.raises(LifecycleSafetyError, match="FTS integrity check failed"):
-        run_lifecycle(path, config=_config(), apply=True, backup_dir=tmp_path / "backups")
+        run_lifecycle(path, config=_config(), apply=True, mutation_guard_factory=_noop_guard, backup_dir=tmp_path / "backups")
     db.close()
 
 
@@ -541,3 +558,202 @@ def test_cli_dry_run_flag_is_explicit_and_mutually_exclusive_with_apply(
 
     with pytest.raises(SystemExit):
         lifecycle.main(["--db", str(path), "--config", str(policy), "--dry-run", "--apply"])
+
+
+def test_apply_is_refused_without_a_mutation_guard(tmp_path: Path) -> None:
+    path, db = _db_with_sessions(tmp_path)
+    db.close()
+
+    with pytest.raises(LifecycleSafetyError, match="production write lease"):
+        run_lifecycle(path, config=_config(), apply=True, backup_dir=tmp_path / "backups")
+
+    # Fail-closed means refused before any mutation: no backup artifact appears.
+    assert not (tmp_path / "backups").exists()
+
+
+def test_dry_run_requires_no_mutation_guard(tmp_path: Path) -> None:
+    path, db = _db_with_sessions(tmp_path)
+    db.close()
+
+    report = run_lifecycle(path, config=_config())
+
+    assert report["dry_run"] is True
+
+
+def test_every_durable_apply_phase_is_fenced(tmp_path: Path) -> None:
+    path, db = _db_with_sessions(tmp_path)
+    db.create_session("doomed", "cli")
+    db.append_message("doomed", "user", "needle")
+    _set_ended_at(path, "doomed", time.time() - 40 * 86400, archived=1)
+    phases: list[str] = []
+
+    run_lifecycle(
+        path,
+        config=_config(wal_max_bytes=0),
+        apply=True,
+        backup_dir=tmp_path / "backups",
+        mutation_guard_factory=_recording_guard(phases),
+    )
+
+    assert phases == ["backup", "retention-write", "checkpoint", "metrics"]
+    db.close()
+
+
+def test_fence_loss_fails_closed_before_further_mutation(tmp_path: Path) -> None:
+    path, db = _db_with_sessions(tmp_path)
+    db.create_session("doomed", "cli")
+    db.append_message("doomed", "user", "needle")
+    _set_ended_at(path, "doomed", time.time() - 40 * 86400, archived=1)
+
+    @contextmanager
+    def lose_fence_after_backup(phase: str):
+        if phase == "retention-write":
+            raise LifecycleSafetyError("production write fence lost during retention-write")
+        yield
+
+    with pytest.raises(LifecycleSafetyError, match="fence lost during retention-write"):
+        run_lifecycle(
+            path,
+            config=_config(),
+            apply=True,
+            backup_dir=tmp_path / "backups",
+            mutation_guard_factory=lose_fence_after_backup,
+        )
+
+    # The backup phase completed, but no session row was mutated afterwards.
+    assert list((tmp_path / "backups").glob("*.sqlite"))
+    row = db.get_session("doomed")
+    assert row is not None and row["archived"] == 1
+    db.close()
+
+
+def test_apply_end_to_end_with_real_production_write_lease(tmp_path: Path) -> None:
+    from cron import production_write_lease as pwl
+
+    path, db = _db_with_sessions(tmp_path)
+    db.create_session("old", "cli")
+    _set_ended_at(path, "old", time.time() - 40 * 86400, archived=1)
+    lease_db = tmp_path / "production-write-lease.db"
+
+    with lifecycle.production_write_guards(
+        hermes_root=tmp_path,
+        commit_sha="a" * 40,
+        reason="lifecycle lease integration test",
+        lease_database_path=lease_db,
+    ) as (guard, lease):
+        assert lease.actor == lifecycle.PRODUCTION_WRITE_ACTOR
+        assert set(lease.resources) == set(lifecycle.PRODUCTION_WRITE_RESOURCES)
+        # Exactly one incompatible writer may hold the resource at a time.
+        with pytest.raises(pwl.ProductionWriteLeaseError, match="conflict"):
+            pwl.acquire(
+                ["session-db"],
+                "state-db-lifecycle",
+                "competing-session",
+                str(tmp_path),
+                "hermes-agent",
+                "b" * 40,
+                "competing lifecycle operator",
+                database_path=lease_db,
+            )
+        report = run_lifecycle(
+            path,
+            config=_config(),
+            apply=True,
+            backup_dir=tmp_path / "backups",
+            mutation_guard_factory=guard,
+        )
+
+    assert report["applied"]["pruned"] == 1
+    status = pwl.status(database_path=lease_db)
+    assert status["active_leases"] == []
+    assert status["fence_loss_receipts"] == []
+    db.close()
+
+
+def test_lost_real_fence_aborts_apply_and_records_a_receipt(tmp_path: Path) -> None:
+    from cron import production_write_lease as pwl
+
+    path, db = _db_with_sessions(tmp_path)
+    db.create_session("old", "cli")
+    _set_ended_at(path, "old", time.time() - 40 * 86400, archived=1)
+    lease_db = tmp_path / "production-write-lease.db"
+
+    with lifecycle.production_write_guards(
+        hermes_root=tmp_path,
+        commit_sha="a" * 40,
+        reason="lifecycle fence loss test",
+        lease_database_path=lease_db,
+    ) as (guard, lease):
+        # The owner loses its lease before the first durable phase.
+        pwl.release(
+            lease_id=lease.lease_id,
+            actor=lease.actor,
+            session_id=lease.session_id,
+            fencing_token=lease.fencing_token,
+            database_path=lease_db,
+        )
+        with pytest.raises(LifecycleSafetyError, match="fence lost during backup"):
+            run_lifecycle(
+                path,
+                config=_config(),
+                apply=True,
+                backup_dir=tmp_path / "backups",
+                mutation_guard_factory=guard,
+            )
+
+    status = pwl.status(database_path=lease_db)
+    assert status["active_leases"] == []
+    assert len(status["fence_loss_receipts"]) == 1
+    receipt = status["fence_loss_receipts"][0]
+    assert receipt["evidence"] == {"operation": "state-db-lifecycle-apply", "phase": "backup"}
+    # No session mutation happened and no backup artifact was committed.
+    assert db.get_session("old")["archived"] == 1
+    assert not list((tmp_path / "backups").glob("*.sqlite")) if (tmp_path / "backups").exists() else True
+    db.close()
+
+
+def test_cli_apply_acquires_and_releases_the_production_write_lease(
+    tmp_path: Path, capsys
+) -> None:
+    from cron import production_write_lease as pwl
+
+    path, db = _db_with_sessions(tmp_path)
+    db.create_session("old", "cli")
+    _set_ended_at(path, "old", time.time() - 40 * 86400, archived=1)
+    db.close()
+    policy = tmp_path / "policy.json"
+    policy.write_text(json.dumps(_config()), encoding="utf-8")
+    lease_db = tmp_path / "production-write-lease.db"
+
+    rc = lifecycle.main(
+        [
+            "--db", str(path),
+            "--config", str(policy),
+            "--apply",
+            "--commit-sha", "a" * 40,
+            "--lease-db", str(lease_db),
+        ]
+    )
+
+    assert rc == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["production_write_lease"]["actor"] == "state-db-lifecycle"
+    assert report["production_write_lease"]["resources"] == ["session-db"]
+    assert report["production_write_lease"]["commit_sha"] == "a" * 40
+    assert report["applied"]["pruned"] == 1
+    status = pwl.status(database_path=lease_db)
+    assert status["active_leases"] == []
+
+
+def test_cli_apply_refuses_an_invalid_commit_sha(tmp_path: Path, capsys) -> None:
+    path, db = _db_with_sessions(tmp_path)
+    db.close()
+    policy = tmp_path / "policy.json"
+    policy.write_text(json.dumps(_config()), encoding="utf-8")
+
+    rc = lifecycle.main(
+        ["--db", str(path), "--config", str(policy), "--apply", "--commit-sha", "not-a-sha"]
+    )
+
+    assert rc == 2
+    assert "40-character commit SHA" in capsys.readouterr().err
