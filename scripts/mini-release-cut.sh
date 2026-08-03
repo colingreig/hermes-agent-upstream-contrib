@@ -726,7 +726,16 @@ install_governed_fleet_config() {
     || { warn "fleet-config manifest missing or symlinked: $manifest"; return 1; }
   [ -f "$skills_policy" ] && [ ! -L "$skills_policy" ] \
     || { warn "fleet-config skills-policy missing or symlinked: $skills_policy"; return 1; }
-  if ! guarded_or_direct "$release_dir/venv/bin/python" "$installer" \
+  # NOTE: invoke the installer DIRECTLY, not via guarded_or_direct/
+  # guarded_production_write. install_fleet_config.py is itself a
+  # production-write-lease actor: it acquires its own fenced lease over
+  # ["fleet-config", "cron-jobs", "skills-policy"] and holds a
+  # mutation_guard around its own writes. Wrapping it in the cut script's
+  # guard would nest a second acquire attempt on the SAME single-writer
+  # production-write-lease.db while the outer guard already holds a BEGIN
+  # IMMEDIATE transaction across the child process — guaranteed self
+  # -deadlock ("production write lease database remained busy").
+  if ! "$release_dir/venv/bin/python" "$installer" \
     --manifest "$manifest" --bundle-root "$bundle_root" \
     --skills-policy "$skills_policy" --home "$HOME"; then
     return 1
@@ -1460,6 +1469,13 @@ production_write_mutation_allowed() {
 # the lease transaction open through the child command, so a successor cannot
 # commit takeover in the heartbeat-to-mv/rm/ln gap.  Do not use this for
 # ephemeral /tmp bootstrap files.
+#
+# Never wrap a child that itself acquires a production write lease: the
+# lease DB (production-write-lease.db) is a single-writer SQLite store, and
+# a child trying to acquire its own lease while this function already holds
+# an open BEGIN IMMEDIATE transaction across it will self-deadlock (see
+# install_governed_fleet_config, which invokes install_fleet_config.py
+# directly for this reason).
 guarded_production_write() {
   [ -n "$PRODUCTION_WRITE_LEASE_JSON" ] || {
     warn "refusing protected mutation without a production write lease: $*"
