@@ -1,10 +1,11 @@
 {
   "version": 1,
-  "policy_id": "hermes-mini-skill-surface-2026-08-01",
+  "policy_id": "hermes-mini-skill-surface-2026-08-03",
   "source_tasks": [
     "86e2kkj69",
     "86e2kkhv1",
-    "86e2kkhv4"
+    "86e2kkhv4",
+    "86e2kxk52"
   ],
   "bundled_skills_root": "../../skills",
   "bundled": {
@@ -118,6 +119,15 @@
   "required_local_keep": {
     "clickup-queue-poller": "clickup-queue-poller",
     "hermes-self-report": "hermes-self-report"
+  },
+  "ungoverned_active": {
+    "mode": "quarantine",
+    "dispositions": {
+      "promise-validation": {
+        "decision": "discard",
+        "reason": "Written by the background self-improvement review on 2026-08-02 into ~/.hermes/skills/software-development/promise-validation. It pushed the default profile to 25 active manifests against an expected 24 and hard-blocked install_fleet_config.py on 2026-08-03 (task 86e2kxk52). Discarded rather than promoted: its guidance (validate the running artefact, not the diff) is already the governed contract carried by ignite-validate under IGNITE_SKILLS_ROOT plus the bundled test-driven-development and systematic-debugging keeps, and it was never reviewed by an operator. The quarantined copy stays recoverable under ~/.hermes/archives/fleet-skill-policy/ and ~/.hermes/skills-quarantine/."
+      }
+    }
   },
   "profiles": {
     "default": {
