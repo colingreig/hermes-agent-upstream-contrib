@@ -68,7 +68,7 @@ import os
 import subprocess
 import sys
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 DEFAULT_LOG_PATH = os.path.expanduser("~/.hermes/state/cron-silent-deliveries.jsonl")

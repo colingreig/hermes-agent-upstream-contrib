@@ -26,7 +26,8 @@ SPEC.loader.exec_module(monitor)
 
 
 def _write_log(path: Path, records) -> None:
-    path.write_text("\n".join(json.dumps(r) for r in records) + ("\n" if records else ""))
+    content = "\n".join(json.dumps(r) for r in records) + ("\n" if records else "")
+    path.write_text(content, encoding="utf-8")
 
 
 def _inject_records(job_id: str, count: int, *, at: float):
