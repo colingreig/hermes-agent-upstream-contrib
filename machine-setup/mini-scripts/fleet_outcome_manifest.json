@@ -37,14 +37,56 @@
       "destination_root": "scripts",
       "destination": "verify_governed_paths.py",
       "mode": "0755",
-      "sha256": "b8882d8b8d7f5c224b1ae852fe8d500539a9dec530e113532d9ebd3c974e9e01"
+      "sha256": "ecce5c417b83e33bdfeb781ae0fbcaa8644e2137885542e5a66193943284a7e5"
+    },
+    {
+      "source": "verify_governed_paths_launcher.py",
+      "destination_root": "scripts",
+      "destination": "verify_governed_paths_launcher.py",
+      "mode": "0755",
+      "sha256": "a2610072e23d3740d1e4072da80603a02001c02adb2bb5ba53aab2546d6af8be"
+    },
+    {
+      "source": "verify_governed_paths.sh",
+      "destination_root": "scripts",
+      "destination": "verify_governed_paths.sh",
+      "mode": "0755",
+      "sha256": "9a43748e80ff9fda691e85a718e2cd8183886d7f098611ab842b473796f4a203"
+    },
+    {
+      "source": "runtime_current_guard.py",
+      "destination_root": "scripts",
+      "destination": "runtime_current_guard.py",
+      "mode": "0755",
+      "sha256": "1706f421d4068f9fcb2ef62ced4bc1281bd3087b981d9d4549aee7e8992aa843"
+    },
+    {
+      "source": "digest_trusted_scripts.json",
+      "destination_root": "scripts",
+      "destination": "digest_trusted_scripts.json",
+      "mode": "0644",
+      "sha256": "ed5cba4e78101ee1cfdce9daa0d089d6bed863cb7b079953d48f6a84edc21a86"
+    },
+    {
+      "source": "hermes_self_report_delivery_probe.py",
+      "destination_root": "scripts",
+      "destination": "hermes_self_report_delivery_probe.py",
+      "mode": "0755",
+      "sha256": "caa52b11adf2939f302b512bf095ed7916c81bcf7e9c8541fc208e32fc76437a"
+    },
+    {
+      "source": "postmark_send_report.py",
+      "destination_root": "scripts",
+      "destination": "postmark_send_report.py",
+      "mode": "0755",
+      "sha256": "f98c5e2bcaa43dd9a44231c96a32f4eb54aca6bc53c4430804c690bd216a0d61"
     },
     {
       "source": "fleet_outcome_contracts.json",
       "destination_root": "scripts",
       "destination": "fleet_outcome_contracts.json",
       "mode": "0644",
-      "sha256": "de224ae5e8a7f674b3f5e62c186181c212370cc67170608f086418661cf18b19"
+      "sha256": "048feb93addbbc6e37061b28f4eac6067ab36f0527e1f7fb648d5369cb56f568"
     },
     {
       "source": "mini_local_registry.json",
@@ -58,7 +100,7 @@
       "destination_root": "scripts",
       "destination": "hermes_usage_alert.py",
       "mode": "0755",
-      "sha256": "f4adbeb2ba0263dbeec52e6a2e146a6e00a5edf8fdd5fad3f3bb84f1de8ccf42"
+      "sha256": "396972cd6890db6ebaae1be47c2227f80dc7b617798bc1c2676d0ff073192b9f"
     },
     {
       "source": "degraded_secrets_monitor.py",
@@ -122,9 +164,58 @@
       "destination": "com.colingreig.hermes.silent-delivery-monitor.plist",
       "mode": "0644",
       "sha256": "53c1a63ae75e0052fc681808b81fbdb683dbc1aff57c4ea7914caa5f8ef40c3a"
+    },
+    {
+      "source": "governed_interpreter.py",
+      "destination_root": "scripts",
+      "destination": "governed_interpreter.py",
+      "mode": "0755",
+      "sha256": "bef839574b7f660508d69b517ec812cd3a6f31ac8d003b2f1e03eda2bc2a82bc"
+    },
+    {
+      "source": "fleet_health_digest.py",
+      "destination_root": "scripts",
+      "destination": "fleet_health_digest.py",
+      "mode": "0755",
+      "sha256": "80912c29051493ab606c686a5125e26a5190a958422e88a6903a5a698f5b2b67"
+    },
+    {
+      "source": "hermes_report_build.py",
+      "destination_root": "scripts",
+      "destination": "hermes_report_build.py",
+      "mode": "0755",
+      "sha256": "eafc391c40d5806a10df897ad396dc73da5efe0767d3c614b43626312645b70b"
+    },
+    {
+      "source": "hermes_validate_size_monitor.py",
+      "destination_root": "scripts",
+      "destination": "hermes_validate_size_monitor.py",
+      "mode": "0755",
+      "sha256": "7946d3ca5e6087e5b8409806080f2c9a0e7a80e9d2c06d17d4fdb27d949a233d"
+    },
+    {
+      "source": "ignite_model_deprecation_check.py",
+      "destination_root": "scripts",
+      "destination": "ignite_model_deprecation_check.py",
+      "mode": "0755",
+      "sha256": "222b920e14f42611a52ee53f809fcad3dfeef9df46043f1c41d8cc51e71ec19f"
+    },
+    {
+      "source": "supabase_rls_guard.py",
+      "destination_root": "scripts",
+      "destination": "supabase_rls_guard.py",
+      "mode": "0755",
+      "sha256": "fee1c085fc0ba16795f4f65421d26f4d54bc0199afeebf628f7cbaaba1782ae2"
     }
   ],
   "cron_updates": [
+    {
+      "id": "a6e2d5b00123",
+      "name": "verify-governed-paths",
+      "fields": {
+        "script": "verify_governed_paths.sh"
+      }
+    },
     {
       "id": "e835c614cfb2",
       "name": "ci-health-watch",

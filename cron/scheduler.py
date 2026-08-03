@@ -13,6 +13,7 @@ import atexit
 import concurrent.futures
 import contextvars
 import inspect
+import hashlib
 import json
 import logging
 import os
@@ -2867,6 +2868,9 @@ def _windows_cron_python_invocation(python_exe: str) -> tuple[str, dict[str, str
 def _run_job_script(
     script_path: str,
     required_environment_variables: Any = None,
+    trusted_interpreter: str | None = None,
+    trusted_interpreter_sha256: str | None = None,
+    governed_interpreter_selector: str | None = None,
 ) -> tuple[bool, str]:
     """Execute a cron job's data-collection script and capture its output.
 
@@ -2963,7 +2967,64 @@ def _run_job_script(
         argv = [_bash, str(path)]
         env_overlay: dict[str, str] = {}
     else:
-        python_exe, env_overlay = _windows_cron_python_invocation(sys.executable)
+        if governed_interpreter_selector is not None:
+            if governed_interpreter_selector != "release-python-pyyaml-onepassword-v1":
+                return False, "Blocked: unknown governed cron interpreter selector"
+            try:
+                import importlib.util
+                selector_path = (
+                    Path(__file__).resolve().parents[1]
+                    / "machine-setup" / "mini-scripts" / "governed_interpreter.py"
+                )
+                spec = importlib.util.spec_from_file_location(
+                    "_cron_governed_interpreter", selector_path
+                )
+                if spec is None or spec.loader is None:
+                    raise ImportError(f"cannot load {selector_path}")
+                selector_module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(selector_module)
+                candidate = selector_module.select_governed_interpreter(
+                    _get_hermes_home() / "releases"
+                )
+            except Exception as exc:
+                return False, f"Blocked: governed cron interpreter unavailable: {exc}"
+            python_exe, env_overlay = str(candidate), {}
+        elif trusted_interpreter is not None:
+            candidate = Path(trusted_interpreter)
+            expected_parts = ("venv", "bin", "python")
+            try:
+                releases_lexical = (_get_hermes_home() / "releases").absolute()
+                if not candidate.is_absolute():
+                    raise ValueError("interpreter must be absolute")
+                relative = candidate.relative_to(releases_lexical)
+                lexical_chain = [
+                    releases_lexical,
+                    releases_lexical / relative.parts[0],
+                    releases_lexical / relative.parts[0] / "venv",
+                    releases_lexical / relative.parts[0] / "venv" / "bin",
+                    candidate,
+                ]
+                if any(part.is_symlink() for part in lexical_chain):
+                    raise ValueError("symlinked provenance component")
+                releases = releases_lexical.resolve(strict=True)
+                resolved_candidate = candidate.resolve(strict=True)
+                resolved_candidate.relative_to(releases)
+                if resolved_candidate != candidate:
+                    raise ValueError("interpreter resolution changed path")
+                digest = hashlib.sha256(resolved_candidate.read_bytes()).hexdigest()
+            except (OSError, ValueError):
+                return False, "Blocked: trusted cron interpreter is unavailable or outside governed releases"
+            if (
+                len(relative.parts) != 4
+                or tuple(relative.parts[1:]) != expected_parts
+                or re.fullmatch(r"v[0-9][0-9A-Za-z.!+_-]*-[0-9a-f]{12,64}", relative.parts[0]) is None
+                or not trusted_interpreter_sha256
+                or digest != trusted_interpreter_sha256
+            ):
+                return False, "Blocked: trusted cron interpreter provenance/hash mismatch"
+            python_exe, env_overlay = str(resolved_candidate), {}
+        else:
+            python_exe, env_overlay = _windows_cron_python_invocation(sys.executable)
         argv = [python_exe, str(path)]
 
     try:
@@ -3071,13 +3132,22 @@ def _run_job_script_with_claim_heartbeat(
         # Preserve the historical one-positional-argument call shape when the
         # job has no env passthrough. This keeps custom/test script runners
         # compatible while still forwarding declared production secrets.
-        if not _normalize_environment_variable_declarations(
-            required_environment_variables
-        ):
+        trusted_kwargs = {}
+        if job.get("governed_interpreter_selector") is not None:
+            trusted_kwargs = {
+                "governed_interpreter_selector": job.get("governed_interpreter_selector")
+            }
+        elif job.get("trusted_interpreter") is not None:
+            trusted_kwargs = {
+                "trusted_interpreter": job.get("trusted_interpreter"),
+                "trusted_interpreter_sha256": job.get("trusted_interpreter_sha256"),
+            }
+        if not _normalize_environment_variable_declarations(required_environment_variables) and not trusted_kwargs:
             return _run_job_script(script_path)
         return _run_job_script(
             script_path,
             required_environment_variables=required_environment_variables,
+            **trusted_kwargs,
         )
 
     schedule = job.get("schedule")

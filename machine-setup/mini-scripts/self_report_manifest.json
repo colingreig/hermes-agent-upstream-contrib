@@ -7,7 +7,7 @@
     "repo": "brain",
     "path": "hermes/skills/hermes-self-report/scripts/hermes_report_build.py",
     "runtime_mirror": "machine-setup/mini-scripts/hermes_report_build.py",
-    "sha256": "44ebfa6ce2b88faffa8adb8c93b1189153521513fe168392cb1218a624c0ce57"
+    "sha256": "eafc391c40d5806a10df897ad396dc73da5efe0767d3c614b43626312645b70b"
   },
   "coexist_required": [
     {
@@ -24,8 +24,16 @@
       "src_rel": "hermes_report_build.py",
       "src_base": "mirror",
       "dest_abs": "~/.hermes/scripts/hermes_report_build.py",
-      "sha256": "44ebfa6ce2b88faffa8adb8c93b1189153521513fe168392cb1218a624c0ce57",
-      "role": "exact-byte runtime mirror of Brain canonical report builder; owns HTML+text+subject+JSON, team-wide review queue, separated spend labels, and nominal-slot-bound System-signal-only Activity continuity consumption",
+      "sha256": "eafc391c40d5806a10df897ad396dc73da5efe0767d3c614b43626312645b70b",
+      "role": "runtime report builder with an in-memory compose API plus legacy file-output CLI; owns HTML+text+subject+JSON, team-wide review queue, separated spend labels, and nominal-slot-bound System-signal-only Activity continuity consumption",
+      "deploy_mode": "script"
+    },
+    {
+      "src_rel": "fleet_health_digest.py",
+      "src_base": "mirror",
+      "dest_abs": "~/.hermes/scripts/fleet_health_digest.py",
+      "sha256": "80912c29051493ab606c686a5125e26a5190a958422e88a6903a5a698f5b2b67",
+      "role": "no-agent in-memory digest composer and fixed-recipient Postmark/fixed-channel fallback delivery entry point; accepts no recipient or body-file input and writes no receipt/artifact",
       "deploy_mode": "script"
     },
     {
@@ -57,7 +65,7 @@
       "src_base": "mirror",
       "dest_abs": "~/.hermes/scripts/postmark_send_report.py",
       "sha256": "f98c5e2bcaa43dd9a44231c96a32f4eb54aca6bc53c4430804c690bd216a0d61",
-      "role": "RC4 delivery contract plus 86e2gczqw alert subject flagging: venv re-exec, lazy token resolve, Postmark POST with in-code hermes-send fallback, receipt, nonzero-exit-on-total-failure. Canon = deploy mirror bytes (live behavior + encoding=utf-8)",
+      "role": "legacy generic sender and shared delivery helper imported by fleet_health_digest.py; direct CLI use can write a receipt, but the current no-agent digest calls only its in-memory send helpers and writes no receipt",
       "deploy_mode": "script"
     },
     {
@@ -65,7 +73,7 @@
       "src_base": "mirror",
       "dest_abs": "~/.hermes/scripts/hermes_self_report_delivery_probe.py",
       "sha256": "caa52b11adf2939f302b512bf095ed7916c81bcf7e9c8541fc208e32fc76437a",
-      "role": "receipt-reader probe for its own no_agent cron (offset from 0 */6 * * *): 0 fresh+sent, 1 both channels failed, 2 missing/stale/unreadable. Canon = deploy mirror bytes (live behavior + encoding=utf-8)",
+      "role": "compatibility receipt-reader for legacy generic-sender receipts; not scheduled for the current no-agent digest, whose delivery truth is its cron output",
       "deploy_mode": "script"
     },
     {

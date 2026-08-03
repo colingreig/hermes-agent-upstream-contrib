@@ -165,6 +165,7 @@ class ShellHookSpec:
     command: str
     matcher: Optional[str] = None
     timeout: int = DEFAULT_TIMEOUT_SECONDS
+    mandatory: bool = False
     compiled_matcher: Optional[re.Pattern] = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
@@ -419,6 +420,7 @@ def _parse_single_entry(
         command=command.strip(),
         matcher=matcher,
         timeout=timeout,
+        mandatory=raw.get("mandatory") is True,
     )
 
 
@@ -505,12 +507,22 @@ def _make_callback(spec: ShellHookSpec) -> Callable[..., Optional[Dict[str, Any]
                 "shell hook failed (event=%s command=%s): %s",
                 spec.event, spec.command, r["error"],
             )
+            if spec.mandatory and spec.event == "pre_tool_call":
+                return {
+                    "action": "block",
+                    "message": "Mandatory security hook failed closed: " + str(r["error"]),
+                }
             return None
         if r["timed_out"]:
             logger.warning(
                 "shell hook timed out after %.2fs (event=%s command=%s)",
                 r["elapsed_seconds"], spec.event, spec.command,
             )
+            if spec.mandatory and spec.event == "pre_tool_call":
+                return {
+                    "action": "block",
+                    "message": "Mandatory security hook timed out and failed closed.",
+                }
             return None
 
         stderr = r["stderr"].strip()
@@ -526,6 +538,11 @@ def _make_callback(spec: ShellHookSpec) -> Callable[..., Optional[Dict[str, Any]
                 "shell hook exited %d (event=%s command=%s); stderr=%s",
                 r["returncode"], spec.event, spec.command, stderr[:400],
             )
+            if spec.mandatory and spec.event == "pre_tool_call":
+                return {
+                    "action": "block",
+                    "message": "Mandatory security hook exited non-zero and failed closed.",
+                }
         return _parse_response(spec.event, r["stdout"])
 
     _callback.__name__ = f"shell_hook[{spec.event}:{spec.command}]"
@@ -546,6 +563,7 @@ def _serialize_payload(event: str, kwargs: Dict[str, Any]) -> str:
         "tool_name": kwargs.get("tool_name"),
         "tool_input": kwargs.get("args") if isinstance(kwargs.get("args"), dict) else None,
         "session_id": kwargs.get("session_id") or kwargs.get("parent_session_id") or "",
+        "parent_session_id": kwargs.get("parent_session_id") or "",
         "cwd": cwd,
         "extra": extras,
     }

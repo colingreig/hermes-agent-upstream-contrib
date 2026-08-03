@@ -366,13 +366,19 @@ def test_repository_manifest_is_content_addressed() -> None:
         )
         reconciler.validate_sources()
         assert reconciler.manifest["files"]
-        assert reconciler.manifest["cron_updates"] == [
-            {
-                "id": "e835c614cfb2",
-                "name": "ci-health-watch",
-                "fields": {"script": "ci-health-watch-cron.py"},
-            }
-        ]
+        cron_updates = {
+            update["name"]: update for update in reconciler.manifest["cron_updates"]
+        }
+        assert cron_updates["verify-governed-paths"] == {
+            "id": "a6e2d5b00123",
+            "name": "verify-governed-paths",
+            "fields": {"script": "verify_governed_paths.sh"},
+        }
+        assert cron_updates["ci-health-watch"] == {
+            "id": "e835c614cfb2",
+            "name": "ci-health-watch",
+            "fields": {"script": "ci-health-watch-cron.py"},
+        }
 
 
 if __name__ == "__main__":

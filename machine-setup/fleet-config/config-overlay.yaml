@@ -10,7 +10,9 @@
 #   - dict value, EMPTY ({}) -> replace the whole destination key with {}
 #     (this is how `delegation: {}` below means "clear it", not "merge
 #     nothing" — an empty dict overlay is a deliberate reset, never a no-op)
-#   - list / scalar value    -> replace the destination key wholesale
+#   - list / scalar value    -> replace the destination key wholesale, except
+#     hooks.pre_tool_call, whose separately governed entries are preserved and
+#     this bundle's exact hook is appended once
 #     (fallback_providers below REPLACES the live chain; it does not append)
 #
 # NEVER set delegation.base_url together with a named delegation.provider —
@@ -65,3 +67,13 @@ browser:
 kanban:
   dispatch_in_gateway: true
   dispatch_interval_seconds: 60
+
+# Additive at this one path: the installer preserves independently governed
+# merge/identity hooks while ensuring the runtime-release deny gate is present.
+hooks:
+  pre_tool_call:
+    - name: runtime-current-production-write-guard
+      command: /usr/bin/python3 /Users/colingreig/.hermes/scripts/runtime_current_guard.py
+      matcher: ^terminal$
+      timeout: 3
+      mandatory: true

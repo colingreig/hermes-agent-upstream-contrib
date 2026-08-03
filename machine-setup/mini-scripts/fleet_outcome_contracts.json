@@ -357,19 +357,16 @@
       "enabled": true,
       "max_age_seconds": 27000,
       "outcome": {
-        "kind": "json_artifact",
-        "path": "~/.hermes/logs/hermes-self-report-last-send.json",
+        "kind": "cron_output",
         "max_age_seconds": 27000,
-        "timestamp_key": "ts",
-        "required_values": {
-          "status": "sent"
-        },
+        "response_only": true,
         "success_patterns": [
           "\"status\"\\s*:\\s*\"sent\"",
-          "\"channel\""
+          "\"channel\"\\s*:\\s*\"(?:postmark|hermes-send:slack:D0BA2PM9CFM)\""
         ],
         "failure_patterns": [
-          "\"status\"\\s*:\\s*\"(?:failed|error)\""
+          "\"status\"\\s*:\\s*\"error\"",
+          "Cron watchdog.*script failed"
         ]
       }
     },
@@ -424,6 +421,29 @@
           "Traceback",
           "ERROR",
           "Status: .*failed"
+        ]
+      }
+    },
+    {
+      "id": "a6e2d5b00123",
+      "name": "verify-governed-paths",
+      "enabled": true,
+      "max_age_seconds": 900,
+      "outcome": {
+        "kind": "json_artifact",
+        "path": "~/.hermes/state/governed-paths-verification.json",
+        "max_age_seconds": 900,
+        "timestamp_key": "checked_at",
+        "required_values": {
+          "schema_version": 1,
+          "status": "ok"
+        },
+        "success_patterns": [
+          "\"status\"\\s*:\\s*\"ok\""
+        ],
+        "failure_patterns": [
+          "\"status\"\\s*:\\s*\"failed\"",
+          "\"failure_reason\"\\s*:\\s*\"[^\"]+\""
         ]
       }
     }

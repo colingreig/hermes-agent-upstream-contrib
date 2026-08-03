@@ -156,6 +156,11 @@ def test_real_install_writes_all_three_destinations(bundle):
         assert (profile_dir / "SOUL.md").is_file()
     jobs = json.loads((bundle["home"] / ".hermes" / "cron" / "jobs.json").read_text())
     assert jobs["jobs"][0]["name"] == "synthetic-job"
+    approvals_path = bundle["home"] / ".hermes" / "shell-hooks-allowlist.json"
+    approvals = json.loads(approvals_path.read_text())["approvals"]
+    assert [(row["event"], row["command"]) for row in approvals] == [
+        ("pre_tool_call", install_mod.GOVERNED_RUNTIME_GUARD_COMMAND)
+    ]
     # profile bootstrap dirs got created too
     for sub in install_mod.PROFILE_BOOTSTRAP_DIRS:
         assert (bundle["home"] / ".hermes" / "profiles" / "ops" / sub).is_dir()

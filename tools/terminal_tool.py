@@ -2451,6 +2451,16 @@ def terminal_tool(
         # stable, thread-safe anchor.
         from tools.approval import get_current_session_key
 
+        if env_type == "local":
+            from tools.governed_paths import wrap_terminal_command
+
+            command, governed_error = wrap_terminal_command(command, session_id or "")
+            if governed_error:
+                return json.dumps({
+                    "output": "", "exit_code": -1, "error": governed_error,
+                    "status": "blocked",
+                }, ensure_ascii=False)
+
         session_key = get_current_session_key(default="") or (task_id or "")
 
         if background:

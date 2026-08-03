@@ -93,21 +93,20 @@ def test_every_governed_installer_and_deploy_entry_point_is_registered():
     assert sync_actor["entry_points"] == ["machine-setup/mini-scripts/ignite-skills-pull.sh"]
 
 
-def test_all_six_llm_cron_jobs_are_covered_and_executors_share_one_lease_identity():
+def test_all_five_llm_cron_jobs_are_covered_and_executors_share_one_lease_identity():
     registry = _registry()
     llm_jobs = {
         job["id"]: job["name"]
         for job in json.loads(JOBS_PATH.read_text(encoding="utf-8"))["jobs"]
         if job["no_agent"] is False
     }
-    assert len(llm_jobs) == 6
+    assert len(llm_jobs) == 5
     assert set(llm_jobs) <= _all_cron_job_ids(registry)
     assert set(llm_jobs.values()) == {
         "clickup-executor",
         "content-lane-executor",
         "hermes-pr-validate",
         "clickup-lifecycle",
-        "fleet-health-digest",
         "repo-maintenance",
     }
 
@@ -132,7 +131,7 @@ def test_all_six_llm_cron_jobs_are_covered_and_executors_share_one_lease_identit
 def test_every_current_fleet_job_is_registered_including_no_agent_writers():
     registry = _registry()
     jobs = json.loads(JOBS_PATH.read_text(encoding="utf-8"))["jobs"]
-    assert len(jobs) == 17  # Filesystem-authoritative count: six LLM plus eleven no-agent jobs.
+    assert len(jobs) == 18  # Filesystem-authoritative count: five LLM plus thirteen no-agent jobs.
     assert {job["id"] for job in jobs} == _all_cron_job_ids(registry)
 
     no_agent_ids = {job["id"] for job in jobs if job["no_agent"] is True}
@@ -145,7 +144,6 @@ def test_every_current_fleet_job_is_registered_including_no_agent_writers():
             "production-clickup-executor",
             "hermes-pr-validator",
             "clickup-lifecycle-cron",
-            "fleet-health-digest-cron",
             "repo-maintenance-cron",
         }
     }

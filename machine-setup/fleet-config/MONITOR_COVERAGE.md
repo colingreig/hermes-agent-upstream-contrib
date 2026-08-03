@@ -28,7 +28,7 @@ state. It does not change live cron or launchd state. The five-minute
 while the probe verifies CI health's semantic `"health": "OK"` result. These
 two scheduling planes therefore cross-watch rather than self-monitor.
 
-## Cron fleet: 16/16 declared
+## Cron fleet: 18/18 declared
 
 | ID | Job | Expected | Outcome proof (not exit-only) | Alarm condition |
 |---|---|---:|---|---|
@@ -36,6 +36,7 @@ two scheduling planes therefore cross-watch rather than self-monitor.
 | `dcab830aa41c` | content-lane-executor | retired/rejected | no live admission or dispatch | any enabled/runtime appearance is drift |
 | `9dca144ff19b` | clickup-poll-gate | enabled | fresh `wakeAgent`/semantic-silent gate document | credential, scan, stale, or failed gate |
 | `8d3b1d53470d` | review-poll-gate | enabled | fresh `wakeAgent`/semantic-silent gate document | credential, scan, stale, or failed gate |
+| `4b8e1d97c3a2` | validator-live-trigger | enabled | fresh validator-trigger/validated or semantic-silent cron output | missing finalize token, trigger error, stale, or failed output |
 | `ad0ae6b717e2` | clickup-review-sla | enabled | fresh SLA/review scan document | scan, stale, or failed result |
 | `5a76e290811d` | hermes-pr-validate | enabled (2026-07-31, task `86e2k3qe1`) | fresh `ignite-validate` PASS/FAIL result document | error, missing, stale result, or safety-guard ABORT |
 | `b0c4c5cc70c1` | spend-meter | enabled | fresh under-cap or spend evaluation document | unreadable spend data, stale, or failure |
@@ -45,9 +46,10 @@ two scheduling planes therefore cross-watch rather than self-monitor.
 | `542fca8d839f` | ignite-board-sync | enabled | fresh sync/complete result document | failed/missing/stale sync |
 | `2ff001bea4b5` | clickup-closeout-actor | enabled | fresh PR and DB closeout count documents | error, failed flip, missing/stale counts |
 | `777876d3eb16` | clickup-lifecycle | enabled | fresh non-empty lifecycle response | empty/failed/stale lifecycle pass |
-| `f23a03e9d1b2` | fleet-health-digest | enabled | fresh parsed delivery receipt with `status=sent` | missing/stale/failed delivery |
+| `f23a03e9d1b2` | fleet-health-digest | enabled | fresh no-agent cron output with `status=sent` and the fixed Postmark or Slack channel | missing/stale/error cron output or failed delivery |
 | `59bdd8ebc468` | repo-maintenance | enabled | fresh non-empty maintenance response | empty/failed/stale maintenance pass |
 | `6e25865a22a4` | Purelymail notify-me poller | enabled | fresh `purelymail-poller.log` production finish (`dry_run=False` start + finished); rejects SSL/mailbox connect failures | missing/stale log, SSL/CERTIFICATE_VERIFY_FAILED, Mailbox poll failed, or Traceback |
+| `a6e2d5b00123` | verify-governed-paths | enabled | fresh parsed verification artifact with `schema_version=1` and `status=ok` | missing/stale/failed artifact or explicit failure reason |
 
 ## LaunchAgent fleet: 24 active + 0 retired
 

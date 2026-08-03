@@ -114,6 +114,112 @@ class TestRunJobScript:
         assert success is True
         assert output == "hello from script"
 
+    def test_shell_wrapper_launch_survives_broken_runtime_python(self, cron_env, monkeypatch):
+        from cron import scheduler as sched_mod
+        wrapper = cron_env / "scripts" / "verify_governed_paths.sh"
+        wrapper.write_text("#!/bin/bash\n/usr/bin/python3 -c 'print(\"wrapper-ok\")'\n")
+        monkeypatch.setattr(sched_mod.sys, "executable", "/missing/runtime-current/bin/python")
+        success, output = sched_mod._run_job_script(wrapper.name)
+        assert success is True
+        assert output == "wrapper-ok"
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX executable and symlink contract")
+    def test_jobs_release_python_selector_survives_rollover_pruning_and_symlink_attack(
+        self, cron_env, tmp_path
+    ):
+        from cron import scheduler as sched_mod
+
+        jobs_path = Path(__file__).resolve().parents[2] / "machine-setup" / "fleet-config" / "jobs.json"
+        jobs = json.loads(jobs_path.read_text(encoding="utf-8"))["jobs"]
+        digest_job = next(job for job in jobs if job["name"] == "fleet-health-digest")
+        selector = digest_job["governed_interpreter_selector"]
+        script = cron_env / "scripts" / digest_job["script"]
+        script.write_text(
+            "import sys\n"
+            "from pathlib import Path\n"
+            "print((Path(sys.prefix).parent / 'release-marker').read_text().strip())\n",
+            encoding="utf-8",
+        )
+        releases = cron_env / "releases"
+
+        def install_release(name: str, marker: str) -> Path:
+            """Create a physical venv layout backed by the real test Python."""
+            import importlib.metadata
+            import site
+            import shutil
+            from packaging.requirements import Requirement
+
+            release = releases / name
+            venv = release / "venv"
+            bindir = venv / "bin"
+            bindir.mkdir(parents=True, exist_ok=True)
+
+            base_python = Path(getattr(sys, "_base_executable", sys.executable)).resolve(strict=True)
+            (venv / "pyvenv.cfg").write_text(
+                f"home = {base_python.parent}\n"
+                "include-system-site-packages = false\n"
+                f"version = {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}\n"
+                f"executable = {base_python}\n",
+                encoding="utf-8",
+            )
+            candidate = bindir / "python"
+            candidate.symlink_to(base_python)
+
+            # The selector's real isolated capability probe requires these
+            # packages to originate inside the selected venv. Hard-link the
+            # installed distributions (and dependencies) rather than faking
+            # probe output or replacing Python with a shell script.
+            source_site = Path(site.getsitepackages()[0])
+            target_site = venv / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages"
+            installed: set[str] = set()
+
+            def install_distribution(distribution_name: str) -> None:
+                normalized = distribution_name.lower().replace("_", "-")
+                if normalized in installed:
+                    return
+                installed.add(normalized)
+                distribution = importlib.metadata.distribution(distribution_name)
+                for relative in distribution.files or ():
+                    relative_path = Path(str(relative))
+                    if relative_path.is_absolute() or ".." in relative_path.parts:
+                        continue
+                    source = source_site / relative_path
+                    if not source.is_file():
+                        continue
+                    destination = target_site / relative_path
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    try:
+                        os.link(source, destination)
+                    except OSError:
+                        shutil.copy2(source, destination)
+                for requirement_text in distribution.requires or ():
+                    requirement = Requirement(requirement_text)
+                    if requirement.marker is None or requirement.marker.evaluate({"extra": ""}):
+                        install_distribution(requirement.name)
+
+            install_distribution("PyYAML")
+            install_distribution("onepassword-sdk")
+            (release / "release-marker").write_text(marker, encoding="utf-8")
+            return candidate
+
+        old_release = releases / ("v0.18.2-" + "a" * 12)
+        install_release(old_release.name, "old-release")
+        assert sched_mod._run_job_script(
+            digest_job["script"], governed_interpreter_selector=selector
+        ) == (True, "old-release")
+
+        new_release = releases / ("v0.18.3-" + "b" * 12)
+        install_release(new_release.name, "new-release")
+        import shutil
+        shutil.rmtree(old_release)
+        attacker = tmp_path / "attacker-release"
+        install_release("v0.18.4-" + "c" * 12, "temporary").parent.parent.parent.rename(attacker)
+        (releases / ("v9.9.9-" + "f" * 12)).symlink_to(attacker, target_is_directory=True)
+
+        assert sched_mod._run_job_script(
+            digest_job["script"], governed_interpreter_selector=selector
+        ) == (True, "new-release")
+
     def test_script_relative_path(self, cron_env):
         from cron.scheduler import _run_job_script
 
@@ -286,6 +392,7 @@ class TestRunJobScript:
         assert success is True
         assert output == ""
 
+    @pytest.mark.live_system_guard_bypass
     def test_script_timeout(self, cron_env, monkeypatch):
         from cron import scheduler as sched_mod
         from cron.scheduler import _run_job_script
