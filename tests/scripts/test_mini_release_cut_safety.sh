@@ -51,6 +51,11 @@ for bad_verify in 0 901 01 -1; do
     fail "invalid verify timeout was accepted: $bad_verify"
   fi
 done
+for bad_drain in 0 901 01 -1; do
+  if MINI_RELEASE_DRAIN_TIMEOUT="$bad_drain" "$SCRIPT" --dry-run >/dev/null 2>&1; then
+    fail "invalid release drain timeout was accepted: $bad_drain"
+  fi
+done
 for bad_keep in 21 01 -1; do
   if MINI_RELEASE_KEEP_EXTRA="$bad_keep" "$SCRIPT" --dry-run --prune >/dev/null 2>&1; then
     fail "invalid keep-extra value was accepted: $bad_keep"
@@ -279,6 +284,76 @@ ln -s "$WAIT_RELEASE" "$CURRENT_LINK"
   [ "$heartbeat_count" -ge 5 ] \
     || fail "dashboard verifier did not renew through a wait beyond the lease TTL"
 ) >/dev/null 2>&1
+rm "$CURRENT_LINK"
+
+# A release cut uses the reversible external marker, waits for the gateway's
+# fresh aggregate status to reach draining/zero, and renews its production
+# write lease throughout the wait. The marker remains armed until the newly
+# registered gateway is ready to have admission restored.
+DRAIN_RELEASE="$RELEASES_DIR/v-release-drain"
+mkdir -p "$DRAIN_RELEASE/venv/bin"
+ln -s "$(command -v python3)" "$DRAIN_RELEASE/venv/bin/python"
+ln -s "$DRAIN_RELEASE" "$CURRENT_LINK"
+DRAIN_REQUEST_FILE="$HERMES_HOME/.drain_request.json"
+GATEWAY_STATE_FILE="$HERMES_HOME/gateway_state.json"
+(
+  DRY_RUN=0
+  DRAIN_TIMEOUT=8
+  LEASE_HEARTBEAT_INTERVAL=2
+  RELEASE_DRAIN_ARMED=0
+  SECONDS=0
+  heartbeat_count=0
+  guarded_production_write() {
+    case "${3:-}" in
+      *write_drain_request*) printf '{"action":"drain"}\n' > "$DRAIN_REQUEST_FILE" ;;
+      *clear_drain_request*) rm -f "$DRAIN_REQUEST_FILE" ;;
+      *) return 91 ;;
+    esac
+  }
+  heartbeat_production_write_lease() { heartbeat_count=$((heartbeat_count + 1)); }
+  sleep() {
+    SECONDS=$((SECONDS + $1))
+    case "$SECONDS" in
+      1) printf '{"gateway_state":"running","active_agents":0}\n' > "$GATEWAY_STATE_FILE" ;;
+      2) printf '{"gateway_state":"draining","active_agents":2}\n' > "$GATEWAY_STATE_FILE" ;;
+      3) printf '{"gateway_state":"draining","active_agents":0}\n' > "$GATEWAY_STATE_FILE" ;;
+    esac
+  }
+  begin_release_drain || fail "release drain did not accept fresh draining/zero aggregate status"
+  [ "$RELEASE_DRAIN_ARMED" -eq 1 ] || fail "successful wait did not retain drain through registration"
+  [ "$heartbeat_count" -ge 2 ] || fail "release drain wait did not renew the production write lease"
+  clear_release_drain || fail "release drain marker cleanup failed"
+  [ ! -e "$DRAIN_REQUEST_FILE" ] || fail "release drain marker survived successful cleanup"
+) >/dev/null
+
+# A gateway that never acknowledges draining/zero times out without an
+# unbounded wait; the caller can then remove the marker before any switch.
+(
+  DRY_RUN=0
+  DRAIN_TIMEOUT=3
+  LEASE_HEARTBEAT_INTERVAL=1
+  RELEASE_DRAIN_ARMED=0
+  SECONDS=0
+  guarded_production_write() {
+    case "${3:-}" in
+      *write_drain_request*) printf '{"action":"drain"}\n' > "$DRAIN_REQUEST_FILE" ;;
+      *clear_drain_request*) rm -f "$DRAIN_REQUEST_FILE" ;;
+      *) return 91 ;;
+    esac
+  }
+  heartbeat_production_write_lease() { :; }
+  sleep() {
+    SECONDS=$((SECONDS + $1))
+    printf '{"gateway_state":"draining","active_agents":1}\n' > "$GATEWAY_STATE_FILE"
+  }
+  if begin_release_drain; then
+    fail "release drain timeout fixture unexpectedly quiesced"
+  fi
+  [ "$SECONDS" -ge "$DRAIN_TIMEOUT" ] || fail "release drain returned before its bounded deadline"
+  clear_release_drain || fail "timed-out release drain could not be cancelled"
+  [ ! -e "$DRAIN_REQUEST_FILE" ] || fail "timed-out release drain left its marker armed"
+) >/dev/null 2>&1
+rm -f "$GATEWAY_STATE_FILE"
 rm "$CURRENT_LINK"
 
 # The managed ClickUp wrapper is installed atomically, is executable, and a
@@ -1343,12 +1418,24 @@ dry_marketplace_line="$(grep -nF 'reconcile_marketplace_skills.py install --sour
   | head -n1 | cut -d: -f1 || true)"
 dry_launchd_line="$(grep -nF 'reconcile_launchd_environment.py install --source-root' "$DRY_ROOT/output" \
   | head -n1 | cut -d: -f1 || true)"
+dry_drain_request_line="$(grep -nF 'request external gateway drain' "$DRY_ROOT/output" \
+  | head -n1 | cut -d: -f1 || true)"
+dry_runtime_swap_line="$(grep -nF "ln -sfn $DRY_PLANNED" "$DRY_ROOT/output" \
+  | head -n1 | cut -d: -f1 || true)"
+dry_drain_clear_line="$(grep -nF 'clear external gateway drain' "$DRY_ROOT/output" \
+  | head -n1 | cut -d: -f1 || true)"
 [ -n "$dry_marketplace_line" ] \
   || fail "dry cut did not plan marketplace skill reconciliation"
 [ -n "$dry_launchd_line" ] \
   || fail "dry cut did not plan launchd reconciliation and gateway start"
 [ "$dry_marketplace_line" -lt "$dry_launchd_line" ] \
   || fail "dry cut planned gateway start before marketplace skill reconciliation"
+[ -n "$dry_drain_request_line" ] && [ -n "$dry_runtime_swap_line" ] && [ -n "$dry_drain_clear_line" ] \
+  || fail "dry cut omitted release drain request, runtime switch, or drain cleanup"
+[ "$dry_drain_request_line" -lt "$dry_runtime_swap_line" ] \
+  || fail "dry cut planned runtime switch before external drain"
+[ "$dry_launchd_line" -lt "$dry_drain_clear_line" ] \
+  || fail "dry cut planned drain cleanup before new launchd registration"
 grep -Fq "ls-tree $DRY_TARGET_SHA -- $VENDORED_REFRESH_REL" "$DRY_GIT_LOG" \
   || fail "dry cut did not validate refresh metadata from the target tree"
 grep -Fq "ls-tree $DRY_TARGET_SHA -- $VENDORED_LAUNCHD_RECONCILER_REL" "$DRY_GIT_LOG" \
@@ -1489,6 +1576,30 @@ fi
   || fail "fetch failure created poll-control state before lease acquisition"
 
 cleanup_body="$(sed -n '/^cleanup_on_exit() {/,/^}$/p' "$SCRIPT")"
+# Any ordinary abort after the marker is armed removes it before slower
+# partial-release cleanup and before releasing the production-write lease.
+DRAIN_EXIT_ROOT="$TEST_ROOT/drain-exit"
+mkdir -p "$DRAIN_EXIT_ROOT"
+if (
+  eval "$cleanup_body"
+  DRY_RUN=0
+  NEW_DIR=""
+  LEASE_CUT_READY=1
+  RELEASE_DRAIN_ARMED=1
+  production_write_mutation_allowed() { return 0; }
+  clear_release_drain() { : > "$DRAIN_EXIT_ROOT/cleared"; RELEASE_DRAIN_ARMED=0; }
+  freeze_managed_poll_after_failure() { return 0; }
+  release_cut_lock() { return 0; }
+  release_production_write_lease() { return 0; }
+  cleanup_production_write_lease_bootstrap() { :; }
+  warn() { :; }
+  false
+  cleanup_on_exit
+); then
+  fail "release-drain abort cleanup unexpectedly returned success"
+fi
+[ -f "$DRAIN_EXIT_ROOT/cleared" ] || fail "abort cleanup did not clear release drain marker"
+
 # A nonzero cut after a verified automatic rollback must not let EXIT cleanup
 # delete the failed generation now recorded as .previous.
 ROLLBACK_EXIT_ROOT="$TEST_ROOT/rollback-generation-exit"

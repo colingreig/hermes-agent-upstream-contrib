@@ -61,6 +61,7 @@ GATEWAY_PORT=8642
 DASHBOARD_PORT=9119
 MIN_PLATFORMS=2
 VERIFY_TIMEOUT="${MINI_RELEASE_VERIFY_TIMEOUT:-240}"          # seconds — observed real cold-boot (Slack connect + channel directory build) taking 150-180s under load; 60s caused spurious rollbacks on healthy releases
+DRAIN_TIMEOUT="${MINI_RELEASE_DRAIN_TIMEOUT:-300}"            # seconds — release-cut-only external drain; does not change the gateway's global shutdown-drain default
 LEASE_HEARTBEAT_INTERVAL=30                                   # seconds — comfortably below the production-write lease's 120s TTL
 # KEEP_RELEASES_EXTRA (86e2k3ryc, disk lifecycle): number of ADDITIONAL release dirs to
 # retain BEYOND the active (runtime-current target) and previous (.previous) releases,
@@ -176,6 +177,7 @@ bounded_decimal() {
 # write. Command substitutions, signs, whitespace, leading-zero/octal forms,
 # and unbounded retention/verification windows all fail closed as plain data.
 VERIFY_TIMEOUT="$(bounded_decimal MINI_RELEASE_VERIFY_TIMEOUT "$VERIFY_TIMEOUT" 1 900)"
+DRAIN_TIMEOUT="$(bounded_decimal MINI_RELEASE_DRAIN_TIMEOUT "$DRAIN_TIMEOUT" 1 900)"
 KEEP_RELEASES_EXTRA="$(bounded_decimal MINI_RELEASE_KEEP_EXTRA "$KEEP_RELEASES_EXTRA" 0 20)"
 
 # run CMD... — echo it; execute unless dry-run.
@@ -1493,6 +1495,10 @@ release_production_write_lease() {
 
 guarded_rollback_to_previous() {
   local reason="${1:-production write rollback}"
+  # A failed cut must not leave the restored gateway refusing new work. Clear
+  # the release-owned reversible drain before the rollback restart.
+  clear_release_drain \
+    || die "cannot clear release drain before rollback — MANUAL INTERVENTION REQUIRED"
   # The rollback pointer swap is itself a protected write. Refresh the exact
   # owner/fence immediately before it; a stale owner must leave recovery to
   # the successor instead of changing runtime-current.
@@ -1624,6 +1630,117 @@ log_offset() {
   else
     echo 0
   fi
+}
+
+# A release cut uses the gateway's existing reversible external-drain contract
+# rather than changing the gateway-wide shutdown drain default.  The marker is
+# written through the active runtime so its epoch matches the running gateway;
+# the watcher then refuses new work while allowing every current gateway, cron,
+# and API agent included in active_agents to finish.
+DRAIN_REQUEST_FILE="$HERMES_HOME/.drain_request.json"
+GATEWAY_STATE_FILE="$HERMES_HOME/gateway_state.json"
+RELEASE_DRAIN_ARMED=0
+
+request_release_drain() {
+  local runtime_python="$CURRENT_LINK/venv/bin/python"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '\033[35m[DRY-RUN]\033[0m request external gateway drain via %s (timeout %ss)\n' \
+      "$DRAIN_REQUEST_FILE" "$DRAIN_TIMEOUT"
+    RELEASE_DRAIN_ARMED=1
+    return 0
+  fi
+  [ -x "$runtime_python" ] \
+    || { warn "release drain unavailable: active runtime python missing: $runtime_python"; return 1; }
+  guarded_production_write "$runtime_python" -c '
+import sys
+sys.path.insert(0, sys.argv[1])
+from gateway.drain_control import write_drain_request
+write_drain_request(principal="mini-release-cut")
+' "$CURRENT_LINK" || return 1
+  RELEASE_DRAIN_ARMED=1
+  log "release drain requested; waiting for gateway quiescence"
+}
+
+clear_release_drain() {
+  [ "$RELEASE_DRAIN_ARMED" -eq 1 ] || return 0
+  local runtime_python="$CURRENT_LINK/venv/bin/python"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '\033[35m[DRY-RUN]\033[0m clear external gateway drain via %s\n' "$DRAIN_REQUEST_FILE"
+    RELEASE_DRAIN_ARMED=0
+    return 0
+  fi
+  [ -x "$runtime_python" ] \
+    || { warn "release drain cleanup unavailable: runtime python missing: $runtime_python"; return 1; }
+  if guarded_production_write "$runtime_python" -c '
+import sys
+sys.path.insert(0, sys.argv[1])
+from gateway.drain_control import clear_drain_request, drain_request_path
+clear_drain_request()
+raise SystemExit(1 if drain_request_path().exists() else 0)
+' "$CURRENT_LINK"; then
+    RELEASE_DRAIN_ARMED=0
+    ok "release drain marker cleared"
+    return 0
+  fi
+  warn "release drain marker could not be cleared"
+  return 1
+}
+
+# Accept only a fresh status write made after this cutter's marker.  This
+# prevents a stale draining/zero status file from authorizing a service cut.
+release_drain_quiesced() {
+  python3 - "$DRAIN_REQUEST_FILE" "$GATEWAY_STATE_FILE" <<'PY'
+import json
+import os
+import stat
+import sys
+
+marker_path, status_path = sys.argv[1:]
+try:
+    marker_info = os.lstat(marker_path)
+    status_info = os.lstat(status_path)
+    if not stat.S_ISREG(marker_info.st_mode) or not stat.S_ISREG(status_info.st_mode):
+        raise ValueError("drain evidence must be regular files")
+    if status_info.st_mtime_ns < marker_info.st_mtime_ns:
+        raise ValueError("gateway status predates drain request")
+    with open(status_path, encoding="utf-8") as handle:
+        payload = json.load(handle)
+    active = payload.get("active_agents")
+    if payload.get("gateway_state") != "draining":
+        raise ValueError("gateway has not acknowledged drain")
+    if isinstance(active, bool) or not isinstance(active, int) or active != 0:
+        raise ValueError("gateway still has active work")
+except (OSError, ValueError, TypeError, json.JSONDecodeError):
+    raise SystemExit(1)
+PY
+}
+
+wait_for_release_drain() {
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '\033[35m[DRY-RUN]\033[0m wait for gateway_state=draining and active_agents=0 (bounded to %ss)\n' \
+      "$DRAIN_TIMEOUT"
+    return 0
+  fi
+  local deadline=$((SECONDS + DRAIN_TIMEOUT))
+  local next_lease_heartbeat=$SECONDS
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    if [ "$SECONDS" -ge "$next_lease_heartbeat" ]; then
+      heartbeat_production_write_lease
+      next_lease_heartbeat=$((SECONDS + LEASE_HEARTBEAT_INTERVAL))
+    fi
+    if release_drain_quiesced; then
+      ok "gateway drain complete (gateway_state=draining, active_agents=0)"
+      return 0
+    fi
+    sleep 1
+  done
+  warn "gateway did not drain within ${DRAIN_TIMEOUT}s; refusing runtime switch/reload"
+  return 1
+}
+
+begin_release_drain() {
+  request_release_drain || return 1
+  wait_for_release_drain
 }
 
 # Scan new gateway.log content (from $1 bytes onward) for
@@ -2162,6 +2279,17 @@ LEASE_CUT_READY=0
 # shellcheck disable=SC2329 # registered as an EXIT trap immediately below
 cleanup_on_exit() {
   local status=$?
+  # The marker is an admission gate, so unwind it before slower partial-build
+  # cleanup. A lost production fence deliberately fails closed: a stale cutter
+  # must not remove a successor's drain marker.
+  if [ "$RELEASE_DRAIN_ARMED" -eq 1 ]; then
+    if [ "$DRY_RUN" -eq 1 ]; then
+      RELEASE_DRAIN_ARMED=0
+    elif ! production_write_mutation_allowed || ! clear_release_drain; then
+      warn "FATAL: release drain cleanup could not be completed"
+      status=70
+    fi
+  fi
   if [ "$status" -ne 0 ] && [ "$DRY_RUN" -ne 1 ] && [ -n "$NEW_DIR" ] && [ -e "$NEW_DIR" ]; then
     local live="" previous=""
     [ -L "$CURRENT_LINK" ] && live="$(readlink "$CURRENT_LINK")"
@@ -2565,6 +2693,15 @@ PY
 fi
 heartbeat_production_write_lease
 
+# Quiesce the live gateway before the first pre-switch operational mutation.
+# Timeout clears the marker and aborts before .previous, runtime-current, or
+# any launchd registration is changed.
+if ! begin_release_drain; then
+  clear_release_drain || warn "release drain remained armed after timeout"
+  die "cut aborted before runtime switch: gateway did not quiesce"
+fi
+heartbeat_production_write_lease
+
 # Preserve the exact pre-cut deployed script for bootstrap rollback before
 # runtime-current or any protected operational file changes.
 stage_refresh_backup
@@ -2595,6 +2732,15 @@ heartbeat_production_write_lease
 if ! install_governed_launchd_environment "$NEW_DIR"; then
   warn "governed launchd environment install/reload failed — rolling back"
   guarded_rollback_to_previous "governed launchd environment install failed"
+  die "cut aborted and rolled back to previous release"
+fi
+heartbeat_production_write_lease
+# The new gateway registration now owns runtime-current. Release admission as
+# soon as bootout/bootstrap succeeds; later verification may roll back normally
+# without leaving either generation parked in external drain.
+if ! clear_release_drain; then
+  warn "new gateway registered but release drain cleanup failed — rolling back"
+  guarded_rollback_to_previous "release drain cleanup failed after launchd registration"
   die "cut aborted and rolled back to previous release"
 fi
 heartbeat_production_write_lease

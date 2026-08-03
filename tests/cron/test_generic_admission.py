@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import json
+import os
+import sqlite3
+
 import pytest
 
 
@@ -20,6 +24,16 @@ def _store(monkeypatch, tmp_path):
 
     monkeypatch.setattr(admission, "_database_path", lambda: tmp_path / "admission.db")
     return admission
+
+
+def _stores(monkeypatch, tmp_path):
+    admission = _store(monkeypatch, tmp_path)
+    import cron.executions as executions
+
+    monkeypatch.setattr(
+        executions, "EXECUTIONS_FILE", tmp_path / "cron" / "executions.db"
+    )
+    return admission, executions
 
 
 def test_disjoint_profiles_run_but_resource_and_same_task_conflicts_reject(monkeypatch, tmp_path):
@@ -124,3 +138,283 @@ def test_generic_recovery_requires_exact_dead_owner_proof(monkeypatch, tmp_path)
     assert admission.recover_generic_admission_lease_before_execution_reap({"execution_id": "ledger", "job_id": "validator"}) is False
     proof = {"execution_id": "ledger", "job_id": "validator", "disposition": "stale", "owner_liveness": "dead", "proposed_terminal_status": "interrupted", "proposed_terminal_reason": "owner_dead"}
     assert admission.recover_generic_admission_lease_before_execution_reap(proof) is True
+
+
+def test_quick_restart_waits_then_naturally_recovers_and_acquires(monkeypatch, tmp_path):
+    admission, executions = _stores(monkeypatch, tmp_path)
+    from datetime import timedelta
+
+    clock = [admission._now()]
+    monkeypatch.setattr(admission, "_now", lambda: clock[0])
+    monkeypatch.setattr(executions, "_hermes_now", lambda: clock[0])
+    record = executions.create_execution("validator", source="builtin", lease_seconds=1)
+    with sqlite3.connect(executions.EXECUTIONS_FILE) as conn:
+        conn.execute(
+            "UPDATE executions SET pid=?, process_started_at=? WHERE id=?",
+            (os.getpid(), -1, record["id"]),
+        )
+    first = admission.acquire_job_admission_lease(
+        job=_job("validator", "root/validator", ["validation/{task_id}"]),
+        task_id="first",
+        owner_run_id="first-owner",
+        ledger_execution_id=record["id"],
+        lease_seconds=1,
+    )
+    assert first is not None
+
+    assert admission.acquire_job_admission_lease(
+        job=_job("validator", "root/validator", ["validation/{task_id}"]),
+        task_id="second",
+        owner_run_id="second-owner",
+        ledger_execution_id="second-ledger",
+    ) is None
+
+    recovery_calls = []
+    recover = executions.recover_interrupted_executions
+
+    def recover_once():
+        recovery_calls.append(True)
+        return recover()
+
+    monkeypatch.setattr(executions, "recover_interrupted_executions", recover_once)
+    clock[0] += timedelta(seconds=2)
+    successor = admission.acquire_job_admission_lease(
+        job=_job("validator", "root/validator", ["validation/{task_id}"]),
+        task_id="second",
+        owner_run_id="second-owner",
+        ledger_execution_id="second-ledger",
+    )
+
+    assert successor is not None
+    assert successor.fencing_token > first.fencing_token
+    assert len(recovery_calls) == 1
+    assert executions.latest_execution("validator")["status"] == "interrupted"
+    with sqlite3.connect(admission._database_path()) as conn:
+        states = conn.execute(
+            "SELECT ledger_execution_id,state FROM admission_leases ORDER BY fencing_token"
+        ).fetchall()
+        receipt = conn.execute(
+            "SELECT ledger_execution_id,reviewed_by FROM admission_recovery_receipts"
+        ).fetchone()
+    assert states == [(record["id"], "recovered"), ("second-ledger", "active")]
+    assert receipt == (record["id"], "cron-startup-reaper")
+
+
+def test_recovery_retry_reresolves_a_newer_pending_wake(monkeypatch, tmp_path):
+    admission, executions = _stores(monkeypatch, tmp_path)
+    from datetime import timedelta
+
+    clock = [admission._now()]
+    monkeypatch.setattr(admission, "_now", lambda: clock[0])
+    monkeypatch.setattr(executions, "_hermes_now", lambda: clock[0])
+    record = executions.create_execution("validator", source="builtin", lease_seconds=1)
+    with sqlite3.connect(executions.EXECUTIONS_FILE) as conn:
+        conn.execute(
+            "UPDATE executions SET pid=?, process_started_at=? WHERE id=?",
+            (os.getpid(), -1, record["id"]),
+        )
+    first = admission.acquire_job_admission_lease(
+        job=_job("validator", "root/validator", ["validation/{task_id}"]),
+        task_id="first",
+        owner_run_id="first-owner",
+        ledger_execution_id=record["id"],
+        lease_seconds=1,
+    )
+    assert first is not None
+    with sqlite3.connect(admission._database_path()) as conn:
+        conn.execute(
+            "INSERT INTO pending_wakes(job_id,task_id,reason,requested_at) "
+            "VALUES (?,?,?,?)",
+            ("validator", "old-task", "old", admission._iso(clock[0])),
+        )
+
+    recover = executions.recover_interrupted_executions
+
+    def recover_then_refresh_wake():
+        changed = recover()
+        with sqlite3.connect(admission._database_path()) as conn:
+            conn.execute(
+                "UPDATE pending_wakes SET task_id=?,reason=?,requested_at=? "
+                "WHERE job_id=?",
+                ("new-task", "new", admission._iso(clock[0]), "validator"),
+            )
+        return changed
+
+    monkeypatch.setattr(
+        executions, "recover_interrupted_executions", recover_then_refresh_wake
+    )
+    clock[0] += timedelta(seconds=2)
+    successor = admission.acquire_job_admission_lease(
+        job=_job("validator", "root/validator", ["validation/{task_id}"]),
+        owner_run_id="second-owner",
+        ledger_execution_id="second-ledger",
+    )
+
+    assert successor is not None
+    assert successor.task_id == "new-task"
+    assert successor.mutable_resources == ("validation/new-task",)
+    with sqlite3.connect(admission._database_path()) as conn:
+        conn.row_factory = sqlite3.Row
+        active = conn.execute(
+            "SELECT task_id,mutable_resources_json FROM admission_leases "
+            "WHERE state='active'"
+        ).fetchone()
+        pending = conn.execute(
+            "SELECT task_id FROM pending_wakes WHERE job_id='validator'"
+        ).fetchone()
+    assert active["task_id"] == "new-task"
+    assert json.loads(active["mutable_resources_json"]) == ["validation/new-task"]
+    assert pending is None
+
+
+def test_recovery_retry_recomputes_successor_lease_times(monkeypatch, tmp_path):
+    admission, executions = _stores(monkeypatch, tmp_path)
+    from datetime import timedelta
+
+    clock = [admission._now()]
+    monkeypatch.setattr(admission, "_now", lambda: clock[0])
+    monkeypatch.setattr(executions, "_hermes_now", lambda: clock[0])
+    record = executions.create_execution("validator", source="builtin", lease_seconds=1)
+    with sqlite3.connect(executions.EXECUTIONS_FILE) as conn:
+        conn.execute(
+            "UPDATE executions SET pid=?, process_started_at=? WHERE id=?",
+            (os.getpid(), -1, record["id"]),
+        )
+    first = admission.acquire_job_admission_lease(
+        job=_job("validator", "root/validator", ["validation/{task_id}"]),
+        task_id="first",
+        owner_run_id="first-owner",
+        ledger_execution_id=record["id"],
+        lease_seconds=1,
+    )
+    assert first is not None
+    recover = executions.recover_interrupted_executions
+
+    def recover_with_elapsed_time():
+        changed = recover()
+        clock[0] += timedelta(seconds=30)
+        return changed
+
+    monkeypatch.setattr(
+        executions, "recover_interrupted_executions", recover_with_elapsed_time
+    )
+    clock[0] += timedelta(seconds=2)
+    successor = admission.acquire_job_admission_lease(
+        job=_job("validator", "root/validator", ["validation/{task_id}"]),
+        task_id="second",
+        owner_run_id="second-owner",
+        ledger_execution_id="second-ledger",
+        lease_seconds=5,
+    )
+
+    assert successor is not None
+    assert successor.acquired_at == admission._iso(clock[0])
+    assert successor.heartbeat_at == admission._iso(clock[0])
+    assert successor.expires_at == admission._iso(clock[0] + timedelta(seconds=5))
+
+
+@pytest.mark.parametrize("owner_liveness", ["live", "unknown"])
+def test_expired_live_or_unknown_owner_recovery_is_bounded_and_closed(
+    monkeypatch, tmp_path, owner_liveness
+):
+    admission, executions = _stores(monkeypatch, tmp_path)
+    from datetime import timedelta
+
+    clock = [admission._now()]
+    monkeypatch.setattr(admission, "_now", lambda: clock[0])
+    monkeypatch.setattr(executions, "_hermes_now", lambda: clock[0])
+    monkeypatch.setattr(
+        executions, "_owner_liveness", lambda *_args: owner_liveness
+    )
+    record = executions.create_execution("validator", source="builtin", lease_seconds=1)
+    lease = admission.acquire_job_admission_lease(
+        job=_job("validator", "root/validator", ["validation/{task_id}"]),
+        task_id="first",
+        owner_run_id="first-owner",
+        ledger_execution_id=record["id"],
+        lease_seconds=1,
+    )
+    assert lease is not None
+    recovery_calls = []
+    recover = executions.recover_interrupted_executions
+
+    def recover_once():
+        recovery_calls.append(True)
+        return recover()
+
+    monkeypatch.setattr(executions, "recover_interrupted_executions", recover_once)
+    clock[0] += timedelta(seconds=2)
+
+    with pytest.raises(admission.ExecutorAdmissionError, match="owner is uncertain"):
+        admission.acquire_job_admission_lease(
+            job=_job("validator", "root/validator", ["validation/{task_id}"]),
+            task_id="second",
+            owner_run_id="second-owner",
+            ledger_execution_id="second-ledger",
+        )
+
+    assert len(recovery_calls) == 1
+    assert executions.latest_execution("validator")["status"] == "claimed"
+    with sqlite3.connect(admission._database_path()) as conn:
+        row = conn.execute(
+            "SELECT state,ledger_execution_id FROM admission_leases"
+        ).fetchone()
+        receipt_count = conn.execute(
+            "SELECT COUNT(*) FROM admission_recovery_receipts"
+        ).fetchone()[0]
+    assert row == ("active", record["id"])
+    assert receipt_count == 0
+
+
+def test_expired_owner_with_mismatched_ledger_proof_remains_closed(monkeypatch, tmp_path):
+    admission, executions = _stores(monkeypatch, tmp_path)
+    from datetime import timedelta
+
+    clock = [admission._now()]
+    monkeypatch.setattr(admission, "_now", lambda: clock[0])
+    monkeypatch.setattr(executions, "_hermes_now", lambda: clock[0])
+    mismatched = executions.create_execution(
+        "validator", source="builtin", lease_seconds=1
+    )
+    with sqlite3.connect(executions.EXECUTIONS_FILE) as conn:
+        conn.execute(
+            "UPDATE executions SET pid=?, process_started_at=? WHERE id=?",
+            (os.getpid(), -1, mismatched["id"]),
+        )
+    lease = admission.acquire_job_admission_lease(
+        job=_job("validator", "root/validator", ["validation/{task_id}"]),
+        task_id="first",
+        owner_run_id="first-owner",
+        ledger_execution_id="different-ledger",
+        lease_seconds=1,
+    )
+    assert lease is not None
+    recovery_calls = []
+    recover = executions.recover_interrupted_executions
+
+    def recover_once():
+        recovery_calls.append(True)
+        return recover()
+
+    monkeypatch.setattr(executions, "recover_interrupted_executions", recover_once)
+    clock[0] += timedelta(seconds=2)
+
+    with pytest.raises(admission.ExecutorAdmissionError, match="owner is uncertain"):
+        admission.acquire_job_admission_lease(
+            job=_job("validator", "root/validator", ["validation/{task_id}"]),
+            task_id="second",
+            owner_run_id="second-owner",
+            ledger_execution_id="second-ledger",
+        )
+
+    assert len(recovery_calls) == 1
+    assert executions.latest_execution("validator")["status"] == "interrupted"
+    with sqlite3.connect(admission._database_path()) as conn:
+        row = conn.execute(
+            "SELECT state,ledger_execution_id FROM admission_leases"
+        ).fetchone()
+        receipt_count = conn.execute(
+            "SELECT COUNT(*) FROM admission_recovery_receipts"
+        ).fetchone()[0]
+    assert row == ("active", "different-ledger")
+    assert receipt_count == 0
