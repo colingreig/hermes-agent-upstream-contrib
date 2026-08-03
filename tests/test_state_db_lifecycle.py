@@ -94,6 +94,35 @@ def test_lifecycle_apply_bounds_backup_artifacts(tmp_path: Path) -> None:
     db.close()
 
 
+def test_production_policy_allows_apply_for_2_5_gib_db_and_bounds_backups(
+    tmp_path: Path, monkeypatch
+) -> None:
+    path, db = _db_with_sessions(tmp_path)
+    db.create_session("old", "cli")
+    _set_ended_at(path, "old", time.time() - 40 * 86400)
+    policy = lifecycle.load_retention_config()
+    gib = 1024**3
+
+    assert policy["backup"]["max_bytes"] == policy["root"]["max_bytes"] + gib
+    assert policy["backup"]["max_count"] == 3
+
+    actual_path_size = lifecycle._path_size
+
+    def production_realistic_path_size(candidate: Path) -> int:
+        if Path(candidate) == path:
+            return 5 * gib // 2
+        return actual_path_size(candidate)
+
+    monkeypatch.setattr(lifecycle, "_path_size", production_realistic_path_size)
+    report = run_lifecycle(path, config=policy, apply=True, backup_dir=tmp_path / "backups")
+
+    backup_path = Path(report["backup_path"])
+    assert backup_path.is_file()
+    assert report["rollback"]["backup_path"] == str(backup_path)
+    assert report["applied"]["archived"] == 1
+    db.close()
+
+
 def test_lifecycle_preserves_existing_backup_when_replacement_fails(tmp_path: Path, monkeypatch) -> None:
     path, db = _db_with_sessions(tmp_path)
     backups = tmp_path / "backups"

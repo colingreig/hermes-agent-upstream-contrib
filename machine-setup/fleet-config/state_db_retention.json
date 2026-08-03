@@ -15,8 +15,8 @@
     "max_busy_retries": 15
   },
   "backup": {
-    "max_count": 14,
-    "max_bytes": 536870912,
+    "max_count": 3,
+    "max_bytes": 3221225472,
     "max_age_days": 30
   }
 }
