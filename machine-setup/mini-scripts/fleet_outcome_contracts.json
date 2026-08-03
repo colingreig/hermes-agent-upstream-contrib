@@ -460,6 +460,11 @@
       "id": "governed-path-integrity",
       "kind": "governed_manifest",
       "path": "~/.hermes/scripts/fleet_outcome_manifest.json"
+    },
+    {
+      "id": "deployment-coverage",
+      "kind": "deployment_coverage",
+      "path": "~/.hermes/scripts/mini_local_registry.json"
     }
   ],
   "launch_agents": [
