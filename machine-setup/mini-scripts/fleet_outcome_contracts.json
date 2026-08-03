@@ -406,6 +406,40 @@
       }
     }
   ],
+  "operational_checks": [
+    {
+      "id": "executor-admission-contention-recovery",
+      "kind": "admission_health",
+      "path": "~/.hermes/state/executor-admission.db",
+      "max_size_bytes": 268435456,
+      "recovery_alarm_seconds": 3600
+    },
+    {
+      "id": "cron-execution-db-health",
+      "kind": "sqlite_health",
+      "path": "~/.hermes/cron/executions.db",
+      "max_size_bytes": 1073741824
+    },
+    {
+      "id": "session-db-health",
+      "kind": "sqlite_health",
+      "path": "~/.hermes/state.db",
+      "max_size_bytes": 1073741824
+    },
+    {
+      "id": "repeated-preflight-failures",
+      "kind": "repeated_preflight_failures",
+      "path": "~/.hermes/logs/gateway.log",
+      "pattern": "preflight.*(?:fail|error|refus)",
+      "threshold": 3,
+      "tail_bytes": 262144
+    },
+    {
+      "id": "governed-path-integrity",
+      "kind": "governed_manifest",
+      "path": "~/.hermes/scripts/fleet_outcome_manifest.json"
+    }
+  ],
   "launch_agents": [
     {
       "label": "ai.hermes.codex-proxy",

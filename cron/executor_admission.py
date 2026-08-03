@@ -343,6 +343,16 @@ def request_executor_wake(
                 f"retired executor job id is not admissible: {job_id}"
             )
         raise ExecutorAdmissionError(f"unrecognized executor job id: {job_id}")
+    # A wake persists pending state before making the cron job due. Treat it as
+    # an LLM dispatch start and reject it before either write while this profile
+    # is draining; the native schedule remains available after cancellation.
+    from cron.fleet_drain import cron_job_admission
+
+    decision = cron_job_admission({"id": job_id, "no_agent": False})
+    if not decision.allowed:
+        raise ExecutorAdmissionError(
+            f"executor wake rejected by fleet drain: {decision.reason}"
+        )
     normalized_task = str(task_id or "__unclaimed__")
     requested_at = _iso(_now())
     conn = _connect()
@@ -1025,40 +1035,104 @@ def recover_expired_executor_lease(
         conn.close()
 
 
-def executor_drain_status() -> dict[str, Any]:
-    """Return non-mutating cutover evidence; never reaps or kills an owner."""
+def executor_drain_status(*, database_path: Path | None = None) -> dict[str, Any]:
+    """Return truthful cutover evidence for legacy and generic leases.
+
+    The no-argument compatibility form uses the profile-local admission
+    connection, including its established path validation and schema bootstrap.
+    An explicitly supplied path is the incident-reporting form: it opens only
+    that profile's existing store read-only and never creates or migrates it.
+    Neither form reaps or recovers an owner.
+    """
+    empty = {
+        "safe_to_cutover": True,
+        "state": "idle",
+        "error": None,
+        "lease": None,                 # backward-compatible legacy key
+        "pending_wakes": [],           # backward-compatible key
+        "generic_leases": [],
+        "generic_recovery_receipts": [],
+        "mutated": False,
+    }
+    explicit_database = database_path is not None
+    database = database_path if explicit_database else _database_path()
+    if explicit_database and not database.exists() and not database.is_symlink():
+        return empty
     try:
-        conn = _connect()
+        if explicit_database:
+            conn = sqlite3.connect(
+                f"file:{database}?mode=ro", uri=True,
+                timeout=_SQLITE_BUSY_SLICE_SECONDS,
+            )
+        else:
+            conn = _connect()
+        conn.row_factory = sqlite3.Row
         try:
-            lease = conn.execute(
-                "SELECT * FROM executor_lease WHERE singleton=1"
-            ).fetchone()
-            pending = conn.execute(
-                "SELECT job_id,task_id,reason,requested_at "
-                "FROM pending_wakes ORDER BY requested_at"
-            ).fetchall()
+            tables = {
+                row[0] for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+            quick_check = conn.execute("PRAGMA quick_check").fetchone()
+            if quick_check is None or quick_check[0] != "ok":
+                raise sqlite3.DatabaseError(
+                    f"executor admission quick_check failed: {quick_check[0] if quick_check else 'no result'}"
+                )
+            lease = (
+                conn.execute("SELECT * FROM executor_lease WHERE singleton=1").fetchone()
+                if "executor_lease" in tables else None
+            )
+            pending = (
+                conn.execute(
+                    "SELECT job_id,task_id,reason,requested_at FROM pending_wakes ORDER BY requested_at"
+                ).fetchall() if "pending_wakes" in tables else []
+            )
+            generic = (
+                conn.execute(
+                    "SELECT * FROM admission_leases WHERE state='active' ORDER BY fencing_token"
+                ).fetchall() if "admission_leases" in tables else []
+            )
+            receipts = (
+                conn.execute(
+                    "SELECT * FROM admission_recovery_receipts ORDER BY recovered_at DESC LIMIT 20"
+                ).fetchall() if "admission_recovery_receipts" in tables else []
+            )
         finally:
             conn.close()
-    except ExecutorAdmissionError as exc:
+    except (ExecutorAdmissionError, sqlite3.Error) as exc:
         return {
+            **empty,
             "safe_to_cutover": False,
             "state": "unknown",
             "error": str(exc),
-            "lease": None,
-            "pending_wakes": [],
-            "mutated": False,
         }
     now_iso = _iso(_now())
     lease_dict = dict(lease) if lease is not None else None
     if lease_dict is not None:
         lease_dict["expired"] = lease_dict["expires_at"] < now_iso
+    generic_dicts = []
+    for row in generic:
+        item = dict(row)
+        item["expired"] = item["expires_at"] < now_iso
+        try:
+            item["mutable_resources"] = json.loads(item.pop("mutable_resources_json"))
+        except (json.JSONDecodeError, TypeError):
+            item["mutable_resources"] = None
+        generic_dicts.append(item)
+    occupied = lease is not None or bool(generic_dicts)
+    state = (
+        "active"
+        if generic_dicts
+        else ("idle" if lease is None else str(lease["state"]))
+    )
     return {
-        "safe_to_cutover": lease is None,
-        "state": "idle" if lease is None else str(lease["state"]),
-        "error": None,
+        **empty,
+        "safe_to_cutover": not occupied,
+        "state": state,
         "lease": lease_dict,
         "pending_wakes": [dict(row) for row in pending],
-        "mutated": False,
+        "generic_leases": generic_dicts,
+        "generic_recovery_receipts": [dict(row) for row in receipts],
     }
 
 

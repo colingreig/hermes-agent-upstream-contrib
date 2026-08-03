@@ -23,7 +23,14 @@
       "destination_root": "scripts",
       "destination": "fleet_outcome_probe.py",
       "mode": "0755",
-      "sha256": "97947a1c24f01eacd7585d9dd4d146d52372d799e7c463f1e83af1e4adf3b474"
+      "sha256": "1dbbee4c752c7b5ed44dbba0013dfb4125bb1d7cba008572dcf1946eed61a7d5"
+    },
+    {
+      "source": "fleet_incident_report.py",
+      "destination_root": "scripts",
+      "destination": "fleet_incident_report.py",
+      "mode": "0755",
+      "sha256": "9917f9164acb28a10c75b7cbd859cc4a4b63a7d049ee12b4c6bebd4f0fe94c7c"
     },
     {
       "source": "verify_governed_paths.py",
@@ -37,7 +44,7 @@
       "destination_root": "scripts",
       "destination": "fleet_outcome_contracts.json",
       "mode": "0644",
-      "sha256": "62a02dc2d077bd2c2b6a09e03712461b3392f28948dd474fc57e6cf8d53e9193"
+      "sha256": "ea0a52026e17167e93e1dbe5fc43f5bd25b336f2c8eed30c3a77c87c04d1a713"
     },
     {
       "source": "hermes_usage_alert.py",

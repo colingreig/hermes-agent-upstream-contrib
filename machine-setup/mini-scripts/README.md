@@ -596,6 +596,16 @@ proof packet:
   scheduling plane. The full inventory and outcome mapping is in
   `../fleet-config/MONITOR_COVERAGE.md`.
 
+### Fleet incident report and drain
+
+`fleet_incident_report.py incident-report --json` is the thin Mini entry point
+for the core `hermes fleet incident-report --json` collector. It performs only
+non-mutating filesystem/process/HTTP reads and read-only SQLite URI connections
+with bounded timeouts and `PRAGMA quick_check`. Operators can place the active
+profile into a reversible fleet drain with `hermes fleet drain begin`, inspect
+it with `status`, and remove it with `cancel`; blocked jobs remain due rather
+than having their schedules advanced.
+
   Deployment is governed by the content-addressed
   `fleet_outcome_manifest.json` and transactional
   `reconcile_fleet_outcomes.py`. The normal Mini release cut invokes it

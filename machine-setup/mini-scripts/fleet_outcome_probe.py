@@ -28,6 +28,7 @@ import os
 import plistlib
 import re
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -869,6 +870,100 @@ def _check_launch_contracts(
     return findings, evidence
 
 
+def _check_operational_contracts(
+    contracts: list[dict[str, Any]], *, home: Path, now: datetime
+) -> tuple[list[dict[str, str]], list[dict[str, Any]]]:
+    """Check contention/recovery/storage/drift signals without taking locks."""
+    findings: list[dict[str, str]] = []
+    evidence: list[dict[str, Any]] = []
+    for contract in contracts:
+        identifier = str(contract.get("id") or "unknown")
+        kind = contract.get("kind")
+        path = _expand_path(str(contract.get("path") or ""), home=home)
+        if kind in {"sqlite_health", "admission_health"}:
+            if not path.is_file():
+                findings.append(_finding("operational", identifier, "database_missing", f"missing {path}"))
+                continue
+            try:
+                size = path.stat().st_size
+                conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=0.05)
+                conn.row_factory = sqlite3.Row
+                try:
+                    check = conn.execute("PRAGMA quick_check").fetchone()
+                    if check is None or check[0] != "ok":
+                        findings.append(_finding("operational", identifier, "database_quick_check_failed", str(check[0] if check else "no result")))
+                    if kind == "admission_health":
+                        tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                        active_lease_queries = []
+                        if "admission_leases" in tables:
+                            active_lease_queries.append(
+                                "SELECT ledger_execution_id,heartbeat_at,expires_at FROM admission_leases WHERE state='active'"
+                            )
+                        if "executor_lease" in tables:
+                            active_lease_queries.append(
+                                "SELECT ledger_execution_id,heartbeat_at,expires_at FROM executor_lease WHERE state='active'"
+                            )
+                        for query in active_lease_queries:
+                            for row in conn.execute(query):
+                                expires = _parse_time(row["expires_at"])
+                                if expires is None or expires < now:
+                                    findings.append(_finding("operational", identifier, "stale_heartbeat", f"expired admission {row['ledger_execution_id']}"))
+                        recovery_times = []
+                        if "admission_recovery_receipts" in tables:
+                            recent = conn.execute("SELECT recovered_at FROM admission_recovery_receipts ORDER BY recovered_at DESC LIMIT 1").fetchone()
+                            if recent:
+                                recovery_times.append(recent[0])
+                        if "recovery_receipts" in tables:
+                            recent = conn.execute("SELECT recovered_at FROM recovery_receipts ORDER BY recovered_at DESC LIMIT 1").fetchone()
+                            if recent:
+                                recovery_times.append(recent[0])
+                        recent_recoveries = [
+                            (parsed, value)
+                            for value in recovery_times
+                            if (parsed := _parse_time(value)) is not None
+                        ]
+                        if recent_recoveries:
+                            recovered, value = max(recent_recoveries, key=lambda item: item[0])
+                            if (now - recovered).total_seconds() < int(contract.get("recovery_alarm_seconds", 3600)):
+                                findings.append(_finding("operational", identifier, "owner_dead_recovery", f"owner recovery at {value}"))
+                finally:
+                    conn.close()
+            except sqlite3.Error as exc:
+                message = str(exc).lower()
+                code = "database_busy" if "locked" in message or "busy" in message else "database_unreadable"
+                findings.append(_finding("operational", identifier, code, f"{path}: {exc}"))
+                continue
+            max_size = int(contract.get("max_size_bytes", 0))
+            if max_size and size > max_size:
+                findings.append(_finding("operational", identifier, "database_size", f"{path} is {size} bytes (limit {max_size})"))
+            evidence.append({"surface": "operational", "id": identifier, "path": str(path), "size_bytes": size})
+        elif kind == "repeated_preflight_failures":
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            pattern = str(contract.get("pattern") or "preflight.*(?:fail|error)")
+            count = len(re.findall(pattern, text[-int(contract.get("tail_bytes", 262144)):], re.IGNORECASE))
+            if count >= int(contract.get("threshold", 3)):
+                findings.append(_finding("operational", identifier, "repeated_preflight_failures", f"{count} recent matching records in {path}"))
+            evidence.append({"surface": "operational", "id": identifier, "matches": count})
+        elif kind == "governed_manifest":
+            manifest = _load_optional_json(path)
+            for item in manifest.get("files", []):
+                source = path.parent / str(item.get("source") or "")
+                try:
+                    actual = hashlib.sha256(source.read_bytes()).hexdigest()
+                except OSError as exc:
+                    findings.append(_finding("operational", identifier, "governed_path_unreadable", f"{source}: {exc}"))
+                    continue
+                if actual != item.get("sha256"):
+                    findings.append(_finding("operational", identifier, "governed_path_drift", f"hash drift: {source}"))
+            evidence.append({"surface": "operational", "id": identifier, "path": str(path)})
+        else:
+            raise ProbeError(f"operational check {identifier} has unsupported kind {kind!r}")
+    return findings, evidence
+
+
 def evaluate(
     contracts: dict[str, Any],
     *,
@@ -884,8 +979,11 @@ def evaluate(
         raise ProbeError("unsupported or missing contract schema_version")
     cron_contracts = contracts.get("cron_jobs")
     launch_contracts = contracts.get("launch_agents")
+    operational_contracts = contracts.get("operational_checks", [])
     if not isinstance(cron_contracts, list) or not isinstance(launch_contracts, list):
         raise ProbeError("contracts require cron_jobs and launch_agents arrays")
+    if not isinstance(operational_contracts, list):
+        raise ProbeError("operational_checks must be an array")
 
     cron_findings, cron_evidence = _check_cron_contracts(
         cron_contracts,
@@ -902,7 +1000,13 @@ def evaluate(
         launchctl=launchctl,
         loaded_inventory=launch_inventory(),
     )
-    return cron_findings + launch_findings, cron_evidence + launch_evidence
+    operational_findings, operational_evidence = _check_operational_contracts(
+        operational_contracts, home=home, now=now
+    )
+    return (
+        cron_findings + launch_findings + operational_findings,
+        cron_evidence + launch_evidence + operational_evidence,
+    )
 
 
 def _signature(findings: list[dict[str, str]]) -> str:

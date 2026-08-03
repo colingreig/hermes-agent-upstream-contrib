@@ -80,6 +80,26 @@ The legacy `com.ignite.skills-sync` label remains retired. If its plist
 reappears, the probe's unknown-Hermes/Ignite fail-closed inventory check alarms
 even though the label is not part of the active contract.
 
+## Fleet admission and incident coverage
+
+The independent probe also evaluates operational contracts for generic
+admission contention and stale heartbeats, exact owner-dead recovery receipts,
+read-only SQLite busy/`quick_check`/size health, repeated scheduler preflight
+failures, and content-addressed governed-path drift. These checks open SQLite
+with `mode=ro` and a bounded timeout and never reap an owner or acquire a write
+lock. `hermes fleet incident-report [--json]` collects the same incident class
+alongside the deployment receipt, runtime symlink, worktrees, processes,
+gateway, profile drain, execution/resource admission, production-write leases,
+and database evidence.
+
+For a release cut, `hermes fleet drain begin --reason <reason>` atomically
+creates a profile-local marker. The scheduler holds every LLM job and every
+mutating or unregistered no-agent job before schedule advancement or execution
+creation; only no-agent cron IDs uniquely declared `read-only` in
+`production_mutation_registry.json` continue. `cancel` is reversible and
+`status` reports both legacy and generic leases. Gateway shutdown drain remains
+a blanket dispatch stop and is not weakened by this policy.
+
 ## Alarm proof
 
 Repository tests prove semantic failures are distinguishable from scheduler

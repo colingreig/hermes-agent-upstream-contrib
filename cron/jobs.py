@@ -2112,6 +2112,15 @@ def claim_job_for_fire(job_id: str, *, claim_ttl_seconds: int = 300) -> bool:
                 continue
             if not job.get("enabled", True) or job.get("state") == "paused":
                 return False
+            # The claim is itself a scheduler mutation: recurring claims advance
+            # next_run_at and every claim writes fire_claim. Enforce the
+            # profile-local drain while the jobs lock is held, before either
+            # mutation, so direct/manual and external-provider callers cannot
+            # bypass the ticker's admission gate.
+            from cron.fleet_drain import cron_job_admission
+
+            if not cron_job_admission(job).allowed:
+                return False
             now = _hermes_now()
             existing = job.get("fire_claim")
             if existing:
@@ -2290,6 +2299,16 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
         # state still reaches save_jobs() below.
         try:
             if not job.get("enabled", True):
+                continue
+
+            # A due scan is not read-only: it can fast-forward recurring
+            # schedules and stamp one-shot run claims below. Gate before any
+            # per-job repair/advance/claim so drained jobs remain due and
+            # untouched for the first post-drain tick. This also covers callers
+            # of get_due_jobs() outside cron.scheduler.tick().
+            from cron.fleet_drain import cron_job_admission
+
+            if not cron_job_admission(job).allowed:
                 continue
 
             # Cross-process running-claim guard (#59229): if another scheduler

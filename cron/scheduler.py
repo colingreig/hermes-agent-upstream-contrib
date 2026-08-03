@@ -5047,6 +5047,18 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
     Returns the normalized execution success.  Delivery failures remain
     separately recorded and do not turn an otherwise-completed execution red.
     """
+    # Defense in depth for direct/manual callers.  This check intentionally
+    # precedes execution creation and every scheduler/output mutation.
+    from cron.fleet_drain import cron_job_admission
+    drain_decision = cron_job_admission(job)
+    if not drain_decision.allowed:
+        logger.info(
+            "Job '%s' denied by fleet drain: %s",
+            job.get("name", job.get("id")),
+            drain_decision.reason,
+        )
+        return False
+
     execution_id = job.get("execution_id")
     owner_token = job.get("execution_owner_token")
     if not execution_id:
@@ -5523,6 +5535,24 @@ def tick(
 
         due_jobs = get_due_jobs()
 
+        # Fleet drain admission happens before schedule advancement and before
+        # execution creation.  Blocked jobs remain due for the first healthy
+        # post-drain tick.  Gateway shutdown's blanket can_dispatch gate above
+        # remains broader and unchanged.
+        from cron.fleet_drain import cron_job_admission
+        admitted_jobs = []
+        for job in due_jobs:
+            decision = cron_job_admission(job)
+            if decision.allowed:
+                admitted_jobs.append(job)
+            else:
+                logger.info(
+                    "Job '%s' held due during fleet drain: %s",
+                    job.get("name", job.get("id")),
+                    decision.reason,
+                )
+        due_jobs = admitted_jobs
+
         if verbose and not due_jobs:
             logger.info("%s - No jobs due", _hermes_now().strftime('%H:%M:%S'))
             return 0
@@ -5620,6 +5650,19 @@ def tick(
             membership is released in the worker's finally block.
             """
             job_id = job["id"]
+            # A drain may begin after the due scan/schedule bump but before a
+            # queued worker is submitted. Recheck before in-flight membership
+            # and, critically, before creating the durable execution ledger row.
+            from cron.fleet_drain import cron_job_admission
+
+            decision = cron_job_admission(job)
+            if not decision.allowed:
+                logger.info(
+                    "Job '%s' denied before dispatch by fleet drain: %s",
+                    job.get("name", job_id),
+                    decision.reason,
+                )
+                return None
             # A tick can race gateway teardown: once the interpreter is
             # finalizing, ``pool.submit`` raises "cannot schedule new futures
             # after interpreter shutdown" and crashes the tick. Skip cleanly —
