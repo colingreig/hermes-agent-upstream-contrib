@@ -281,6 +281,98 @@ class DegradedSecretsMonitorCredentialPoolTests(unittest.TestCase):
         )
         self.assertNotIn("secret", repr(result))
 
+    def test_env_sourced_api_key_with_fingerprint_is_not_missing_credential(self):
+        """Borrowed env:-sourced entries never persist access_token to disk
+
+        (see agent/credential_persistence.py sanitize_borrowed_credential_payload)
+        — only a secret_fingerprint survives the disk-boundary sanitizer as
+        proof a real secret was seeded. The monitor must not false-alarm
+        missing_credential for these live-verified shapes.
+        """
+        result = monitor.classify_credential_pool(
+            {
+                "credential_pool": {
+                    "anthropic": [
+                        {
+                            "id": "7de3fd",
+                            "source": "env:ANTHROPIC_API_KEY",
+                            "auth_type": "api_key",
+                            "last_status": None,
+                            "secret_fingerprint": "sha256:fdef7abc12340000",
+                        }
+                    ],
+                    "zai": [
+                        {
+                            "id": "bf0337",
+                            "source": "env:ZAI_API_KEY",
+                            "auth_type": "api_key",
+                            "last_status": None,
+                            "secret_fingerprint": "sha256:bdff7abc12340000",
+                        }
+                    ],
+                }
+            },
+            datetime.fromisoformat(self.NOW),
+        )
+
+        self.assertFalse(result["triggered"])
+        self.assertEqual(result["hits"], [])
+
+    def test_env_sourced_entry_without_fingerprint_is_still_missing_credential(self):
+        """An env:-sourced entry that never seeded (no fingerprint, no token)
+
+        is genuinely unusable and must still alarm.
+        """
+        result = monitor.classify_credential_pool(
+            {
+                "credential_pool": {
+                    "anthropic": [
+                        {
+                            "id": "unseeded",
+                            "source": "env:ANTHROPIC_API_KEY",
+                            "auth_type": "api_key",
+                            "last_status": None,
+                        }
+                    ]
+                }
+            },
+            datetime.fromisoformat(self.NOW),
+        )
+
+        self.assertTrue(result["triggered"])
+        self.assertEqual(
+            result["hits"],
+            [{"provider": "anthropic", "id": "unseeded", "status": "missing_credential"}],
+        )
+
+    def test_non_env_sourced_entry_with_fingerprint_only_is_still_missing_credential(self):
+        """secret_fingerprint alone only substitutes for a live token on
+
+        env:-sourced (borrowed) entries. A non-env source with no
+        access_token must still be treated as missing_credential — the
+        fingerprint-trust carve-out is scoped, not blanket.
+        """
+        result = monitor.classify_credential_pool(
+            {
+                "credential_pool": {
+                    "openrouter": [
+                        {
+                            "id": "manual-no-token",
+                            "source": "manual:1",
+                            "secret_fingerprint": "sha256:aaaaaaaaaaaaaaaa",
+                        }
+                    ]
+                }
+            },
+            datetime.fromisoformat(self.NOW),
+        )
+
+        self.assertTrue(result["triggered"])
+        self.assertEqual(
+            result["hits"],
+            [{"provider": "openrouter", "id": "manual-no-token", "status": "missing_credential"}],
+        )
+
     def test_nous_agent_key_requires_runtime_usable_inference_jwt(self):
         now = datetime.fromisoformat(self.NOW)
         valid_jwt = _jwt({"scope": "inference:invoke", "exp": now.timestamp() + 3600})

@@ -1979,6 +1979,57 @@ def test_release_poll_drift_pages_on_persistent_drift_not_transient(tmp_path):
     assert findings[0]["id"] == "release-poll-drift"
 
 
+def test_release_poll_drift_recency_window_ignores_resolved_historical_incident(tmp_path):
+    """86e2m2c1g finding 4: repeated_release_drift must not alarm forever on
+
+    a resolved incident just because the matching lines are still inside the
+    tail_bytes byte window (a low-volume poller log can hold days of history
+    in 256KB). Old drift ticks from well outside window_minutes must not
+    count, but a fresh sustained run must still alarm distinguishably."""
+    module = _load_module()
+    contract = dict(_canonical_operational_contract("release-poll-drift"))
+    assert contract["window_minutes"] == 90
+    assert contract["timestamp_pattern"]
+    log = tmp_path / "mini-release-poll.log"
+    contract["path"] = str(log)
+
+    drift_line = "mini-release-poll: remote prod SHA does not match governed control\n"
+
+    def heartbeat(ts):
+        return f"mini-release-poll: heartbeat ts={ts} pid=1\n"
+
+    # This morning's incident: 5 drift ticks, all well outside the 90-minute
+    # recency window (and already resolved) -- must NOT alarm even though
+    # they are still within the tail_bytes byte window.
+    historical = "".join(
+        heartbeat(f"2026-07-30T0{h}:00:00Z") + drift_line for h in range(3, 8)
+    )
+    # Recovery: subsequent healthy ticks with no drift line.
+    recovered = "".join(
+        heartbeat(f"2026-07-30T1{h}:00:00Z") for h in range(0, 5)
+    )
+    log.write_text(historical + recovered, encoding="utf-8")
+    findings, evidence = module._check_operational_contracts(
+        [contract], home=tmp_path, now=NOW
+    )
+    assert findings == []
+    assert evidence[0]["matches"] == 0
+
+    # Fresh sustained drift near "now" (NOW = 2026-07-30T16:00Z) must still
+    # alarm distinguishably -- the recency window doesn't silence real
+    # incidents, only stale ones.
+    fresh = "".join(
+        heartbeat(f"2026-07-30T15:{m:02d}:00Z") + drift_line for m in (30, 40, 50)
+    )
+    log.write_text(historical + recovered + fresh, encoding="utf-8")
+    findings, evidence = module._check_operational_contracts(
+        [contract], home=tmp_path, now=NOW
+    )
+    assert [item["code"] for item in findings] == ["repeated_release_drift"]
+    assert findings[0]["id"] == "release-poll-drift"
+    assert evidence[0]["matches"] == 3
+
+
 def test_governed_manifest_resolves_launch_agents_from_live_plist_dir(tmp_path):
     """86e2m61xw (2a): governed-path-integrity resolved *every* manifest entry
     as path.parent/source, but LaunchAgents entries deploy from a staging

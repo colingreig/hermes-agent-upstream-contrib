@@ -755,6 +755,8 @@
   "dot_state_suffixes": [
    ".json",
    ".sqlite3",
+   ".sqlite3-shm",
+   ".sqlite3-wal",
    ".lock"
   ],
   "files": [

@@ -23,7 +23,7 @@
       "destination_root": "scripts",
       "destination": "fleet_outcome_probe.py",
       "mode": "0755",
-      "sha256": "ecb6c58de47fa8cf1ba22a56c934bfda517eec76775f6221fcf4a2161c7de754"
+      "sha256": "93c44bad22c911a3aa464945954b1de01754311de54b93c36152819122266f7b"
     },
     {
       "source": "fleet_incident_report.py",
@@ -44,14 +44,14 @@
       "destination_root": "scripts",
       "destination": "fleet_outcome_contracts.json",
       "mode": "0644",
-      "sha256": "388ee3b4a6bf3759e3d0157b86c09c1bfde2205d91599d95582089214c998a7c"
+      "sha256": "de224ae5e8a7f674b3f5e62c186181c212370cc67170608f086418661cf18b19"
     },
     {
       "source": "mini_local_registry.json",
       "destination_root": "scripts",
       "destination": "mini_local_registry.json",
       "mode": "0644",
-      "sha256": "b4b96a92d7b7c2bedefd439c2a9e0b4ae03556bc66e5bdd9a00caf8a46697b0b"
+      "sha256": "da9b739aa8cb806e2eabfb0b4ab652a26e1b4cefbdddf2a90edf4596eee54e6c"
     },
     {
       "source": "hermes_usage_alert.py",
@@ -65,7 +65,7 @@
       "destination_root": "scripts",
       "destination": "degraded_secrets_monitor.py",
       "mode": "0755",
-      "sha256": "ba192c3a3dbf56f2a85ae2612598e66bf204f9cea1f35436b4688376f2697286"
+      "sha256": "38b001098b9bb8aa532a28ab0815a170e0773b54df1bcc08e41a67715f8e8954"
     },
     {
       "source": "mcp_serve_reaper.py",

@@ -259,6 +259,26 @@ def _nous_jwt_is_usable(token, *, scope, expires_at, now):
     return expiry.astimezone(timezone.utc) > threshold
 
 
+def _has_borrowed_env_secret(entry):
+    """True when a borrowed env:-sourced entry seeded successfully.
+
+    ``agent/credential_persistence.py`` deliberately never persists raw
+    secret material for borrowed sources (e.g. ``env:ANTHROPIC_API_KEY``,
+    ``env:ZAI_API_KEY``) to auth.json — only a ``secret_fingerprint``
+    (``sha256:<prefix>``) survives the disk-boundary sanitizer as proof a
+    real secret was seeded. The runtime process re-hydrates the actual
+    token from the environment on every load, so on-disk absence of
+    ``access_token`` for these entries is expected, not degraded. Only
+    trust the fingerprint for ``env:``-sourced entries; other borrowed
+    sources have no such guarantee.
+    """
+    source = str(entry.get("source") or "")
+    if not source.startswith("env:"):
+        return False
+    fingerprint = entry.get("secret_fingerprint")
+    return isinstance(fingerprint, str) and bool(fingerprint.strip())
+
+
 def _has_runtime_credential(provider, entry, now):
     if provider == "nous":
         return any(
@@ -274,7 +294,9 @@ def _has_runtime_credential(provider, entry, now):
             )
         )
     access_token = entry.get("access_token")
-    return isinstance(access_token, str) and bool(access_token.strip())
+    if isinstance(access_token, str) and access_token.strip():
+        return True
+    return _has_borrowed_env_secret(entry)
 
 
 def classify_credential_pool(auth_payload, now):

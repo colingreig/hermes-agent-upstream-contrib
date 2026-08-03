@@ -277,6 +277,41 @@ def test_state_and_backup_debris_never_alarm(tmp_path):
     assert findings == []
 
 
+def test_sqlite_wal_and_shm_sidecars_never_alarm(tmp_path):
+    """A SQLite WAL-mode connection creates transient -shm/-wal sidecar files
+
+    next to a governed .sqlite3 db (e.g. .validator_trust.sqlite3-shm /
+    .validator_trust.sqlite3-wal). These are runtime state, not undeclared
+    deploy artifacts, and must never alarm.
+    """
+    module = _load_module()
+    contract, registry, registry_path, scripts, _a, _m = _fixture(tmp_path)
+    registry["state"]["dot_state_suffixes"] = [".json", ".sqlite3", ".sqlite3-shm", ".sqlite3-wal", ".lock"]
+    registry_path.write_text(json.dumps(registry), encoding="utf-8")
+    (scripts / ".validator_trust.sqlite3-shm").write_bytes(b"\x00")
+    (scripts / ".validator_trust.sqlite3-wal").write_bytes(b"\x00")
+    findings, _ = module._check_deployment_coverage(contract, home=tmp_path)
+    assert findings == []
+
+
+def test_sqlite_wal_shm_alarm_without_the_suffix_rule(tmp_path):
+    """Guard against the suffix rule silently no-oping: with the pre-fix
+
+    registry (no -shm/-wal suffixes declared), the same sidecar files must
+    still alarm as undeclared_file — proving the fixture actually exercises
+    the fix rather than passing for an unrelated reason.
+    """
+    module = _load_module()
+    contract, _registry, _registry_path, scripts, _a, _m = _fixture(tmp_path)
+    (scripts / ".validator_trust.sqlite3-shm").write_bytes(b"\x00")
+    (scripts / ".validator_trust.sqlite3-wal").write_bytes(b"\x00")
+    findings, _ = module._check_deployment_coverage(contract, home=tmp_path)
+    assert _codes(findings) == ["undeclared_file"]
+    detail = findings[0]["detail"]
+    assert "scripts/.validator_trust.sqlite3-shm" in detail
+    assert "scripts/.validator_trust.sqlite3-wal" in detail
+
+
 def test_operational_dispatch_routes_deployment_coverage_kind(tmp_path):
     module = _load_module()
     contract, _r, registry_path, _s, _a, _m = _fixture(tmp_path)
