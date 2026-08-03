@@ -48,6 +48,9 @@ VENDORED_SKILLS_RECONCILER_REL="machine-setup/mini-scripts/reconcile_marketplace
 VENDORED_PR_PIPELINE_RECONCILER_REL="machine-setup/mini-scripts/reconcile_pr_pipeline.py"
 VENDORED_FLEET_OUTCOMES_RECONCILER_REL="machine-setup/mini-scripts/reconcile_fleet_outcomes.py"
 VENDORED_FLEET_OUTCOMES_MANIFEST_REL="machine-setup/mini-scripts/fleet_outcome_manifest.json"
+VENDORED_FLEET_CONFIG_INSTALLER_REL="machine-setup/fleet-config/install_fleet_config.py"
+VENDORED_FLEET_CONFIG_MANIFEST_REL="machine-setup/fleet-config/fleet_config_manifest.json"
+VENDORED_FLEET_CONFIG_SKILLS_POLICY_REL="machine-setup/fleet-config/skills-policy.json"
 PROMOTION_CERTIFIER_REL="scripts/certify_prod_live_patches.py"
 
 UID_NUM="$(id -u)"
@@ -694,6 +697,40 @@ install_governed_fleet_outcomes() {
     return 1
   fi
   FLEET_OUTCOMES_CHANGED=1
+}
+
+# Install the source-controlled fleet-config bundle (config-overlay, named
+# profiles, curated cron jobs.json, and skills-policy) as one manifest-verified
+# transaction. The installer performs its own hash verification, snapshots
+# every destination it will mutate, and best-effort rolls back its own
+# partial writes on failure.
+install_governed_fleet_config() {
+  local release_dir="${1:-}"
+  local installer="$release_dir/$VENDORED_FLEET_CONFIG_INSTALLER_REL"
+  local manifest="$release_dir/$VENDORED_FLEET_CONFIG_MANIFEST_REL"
+  local skills_policy="$release_dir/$VENDORED_FLEET_CONFIG_SKILLS_POLICY_REL"
+  local bundle_root
+  bundle_root="$(dirname "$manifest")"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    dry_run_target_regular_file_metadata "$VENDORED_FLEET_CONFIG_INSTALLER_REL" || return 1
+    dry_run_target_regular_file_metadata "$VENDORED_FLEET_CONFIG_MANIFEST_REL" || return 1
+    dry_run_target_regular_file_metadata "$VENDORED_FLEET_CONFIG_SKILLS_POLICY_REL" || return 1
+    printf '\033[35m[DRY-RUN]\033[0m %s %s --manifest %s --bundle-root %s --skills-policy %s --home %s\n' \
+      "$release_dir/venv/bin/python" "$installer" "$manifest" "$bundle_root" \
+      "$skills_policy" "$HOME"
+    return 0
+  fi
+  [ -f "$installer" ] && [ ! -L "$installer" ] \
+    || { warn "fleet-config installer missing or symlinked: $installer"; return 1; }
+  [ -f "$manifest" ] && [ ! -L "$manifest" ] \
+    || { warn "fleet-config manifest missing or symlinked: $manifest"; return 1; }
+  [ -f "$skills_policy" ] && [ ! -L "$skills_policy" ] \
+    || { warn "fleet-config skills-policy missing or symlinked: $skills_policy"; return 1; }
+  if ! guarded_or_direct "$release_dir/venv/bin/python" "$installer" \
+    --manifest "$manifest" --bundle-root "$bundle_root" \
+    --skills-policy "$skills_policy" --home "$HOME"; then
+    return 1
+  fi
 }
 
 rollback_governed_fleet_outcomes() {
@@ -2004,6 +2041,9 @@ rollback_to_previous() {
   rollback_governed_fleet_outcomes "$reason" \
     || die "rollback could not restore governed fleet outcomes — MANUAL INTERVENTION REQUIRED"
   heartbeat_production_write_lease
+  install_governed_fleet_config "$prev" \
+    || die "rollback could not restore governed fleet config — MANUAL INTERVENTION REQUIRED"
+  heartbeat_production_write_lease
   restore_governed_pr_pipeline_for_release "$prev" \
     || die "rollback could not restore governed PR pipeline — MANUAL INTERVENTION REQUIRED"
   heartbeat_production_write_lease
@@ -2753,6 +2793,12 @@ heartbeat_production_write_lease
 if ! install_governed_fleet_outcomes "$NEW_DIR"; then
   warn "governed fleet-outcome reconciliation failed — rolling back"
   guarded_rollback_to_previous "governed fleet-outcome reconciliation failed"
+  die "cut aborted and rolled back to previous release"
+fi
+heartbeat_production_write_lease
+if ! install_governed_fleet_config "$NEW_DIR"; then
+  warn "governed fleet-config install failed — rolling back"
+  guarded_rollback_to_previous "governed fleet-config install failed"
   die "cut aborted and rolled back to previous release"
 fi
 heartbeat_production_write_lease

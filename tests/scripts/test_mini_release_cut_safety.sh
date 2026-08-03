@@ -918,6 +918,27 @@ grep -Fq "install --source-root $(dirname "$LAUNCHD_RECONCILER")" \
 cmp -s "$LAUNCHD_RECONCILER" \
   "$HERMES_HOME/scripts/reconcile_launchd_environment.py" \
   || fail "launchd install did not deploy its rollback reconciler"
+# Stage a minimal working fleet-config bundle (installer + manifest +
+# skills-policy, plus a fake venv/bin/python that exits 0) so
+# install_governed_fleet_config succeeds for real against a release fixture
+# that isn't specifically exercising its missing/symlink guards. Mirrors the
+# placeholder-reconciler + fake-venv-python convention used for the launchd
+# and marketplace reconcilers above.
+stage_fleet_config_bundle() {
+  local release_dir="${1:?release dir required}"
+  mkdir -p "$release_dir/$(dirname "$VENDORED_FLEET_CONFIG_INSTALLER_REL")" \
+    "$release_dir/venv/bin"
+  printf '# placeholder fleet-config installer\n' \
+    > "$release_dir/$VENDORED_FLEET_CONFIG_INSTALLER_REL"
+  printf '{}\n' > "$release_dir/$VENDORED_FLEET_CONFIG_MANIFEST_REL"
+  printf '{}\n' > "$release_dir/$VENDORED_FLEET_CONFIG_SKILLS_POLICY_REL"
+  cat > "$release_dir/venv/bin/python" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+  chmod 0755 "$release_dir/venv/bin/python"
+}
+
 MISSING_RECONCILER_RELEASE="$RELEASES_DIR/v1.1.1-missing-reconciler"
 mkdir "$MISSING_RECONCILER_RELEASE"
 if install_governed_launchd_environment "$MISSING_RECONCILER_RELEASE"; then
@@ -937,6 +958,26 @@ if install_governed_launchd_environment "$SYMLINK_RECONCILER_RELEASE"; then
 fi
 if install_governed_marketplace_skills "$SYMLINK_RECONCILER_RELEASE"; then
   fail "real cut accepted symlinked marketplace reconciler"
+fi
+
+# The fleet-config bundle (installer + manifest + skills-policy) gets the same
+# missing/symlink fail-closed treatment as the other governed reconcilers.
+if install_governed_fleet_config "$MISSING_RECONCILER_RELEASE"; then
+  fail "real cut accepted missing fleet-config installer"
+fi
+FLEET_CONFIG_MISSING_MANIFEST_RELEASE="$RELEASES_DIR/v1.1.3-missing-fleet-config-manifest"
+mkdir -p "$FLEET_CONFIG_MISSING_MANIFEST_RELEASE/$(dirname "$VENDORED_FLEET_CONFIG_INSTALLER_REL")"
+printf '# placeholder fleet-config installer\n' \
+  > "$FLEET_CONFIG_MISSING_MANIFEST_RELEASE/$VENDORED_FLEET_CONFIG_INSTALLER_REL"
+if install_governed_fleet_config "$FLEET_CONFIG_MISSING_MANIFEST_RELEASE"; then
+  fail "real cut accepted fleet-config bundle missing its manifest/skills-policy"
+fi
+SYMLINK_FLEET_CONFIG_RELEASE="$RELEASES_DIR/v1.1.4-symlink-fleet-config"
+stage_fleet_config_bundle "$SYMLINK_FLEET_CONFIG_RELEASE"
+ln -sf "$LAUNCHD_RECONCILER" \
+  "$SYMLINK_FLEET_CONFIG_RELEASE/$VENDORED_FLEET_CONFIG_INSTALLER_REL"
+if install_governed_fleet_config "$SYMLINK_FLEET_CONFIG_RELEASE"; then
+  fail "real cut accepted symlinked fleet-config installer"
 fi
 
 # A later cut starts with an unarmed in-process marker. If reconciliation fails
@@ -1058,6 +1099,7 @@ mkdir -p "$PREVIOUS_RELEASE/scripts" "$PREVIOUS_RELEASE/$(dirname "$VENDORED_REF
 printf '#!/usr/bin/env bash\nprintf previous\n' > "$PREVIOUS_RELEASE/scripts/cu-clickup"
 chmod 0755 "$PREVIOUS_RELEASE/scripts/cu-clickup"
 printf '#!/usr/bin/env python3\nprint("previous")\n' > "$PREVIOUS_RELEASE/$VENDORED_REFRESH_REL"
+stage_fleet_config_bundle "$PREVIOUS_RELEASE"
 printf '%s\n' "$PREVIOUS_RELEASE" > "$PREV_FILE"
 ln -s "$FAILED_ROLLBACK_SOURCE" "$CURRENT_LINK"
 ROLLBACK_KICKSTART_LOG="$TEST_ROOT/rollback-kickstarts.log"
@@ -1369,10 +1411,13 @@ case "${1:-}" in
       machine-setup/mini-scripts/reconcile_launchd_environment.py|\
       machine-setup/mini-scripts/reconcile_marketplace_skills.py|\
       machine-setup/mini-scripts/reconcile_pr_pipeline.py|\
-      machine-setup/mini-scripts/reconcile_fleet_outcomes.py)
+      machine-setup/mini-scripts/reconcile_fleet_outcomes.py|\
+      machine-setup/fleet-config/install_fleet_config.py)
         printf '100755 blob %s\t%s\n' "$DRY_TARGET_BLOB" "$target_path"
         ;;
-      machine-setup/mini-scripts/fleet_outcome_manifest.json)
+      machine-setup/mini-scripts/fleet_outcome_manifest.json|\
+      machine-setup/fleet-config/fleet_config_manifest.json|\
+      machine-setup/fleet-config/skills-policy.json)
         printf '100644 blob %s\t%s\n' "$DRY_TARGET_BLOB" "$target_path"
         ;;
       *) exit 3 ;;
@@ -1448,6 +1493,12 @@ grep -Fq "ls-tree $DRY_TARGET_SHA -- $VENDORED_FLEET_OUTCOMES_RECONCILER_REL" "$
   || fail "dry cut did not validate fleet-outcome reconciler metadata from the target tree"
 grep -Fq "ls-tree $DRY_TARGET_SHA -- $VENDORED_FLEET_OUTCOMES_MANIFEST_REL" "$DRY_GIT_LOG" \
   || fail "dry cut did not validate fleet-outcome manifest metadata from the target tree"
+grep -Fq "ls-tree $DRY_TARGET_SHA -- $VENDORED_FLEET_CONFIG_INSTALLER_REL" "$DRY_GIT_LOG" \
+  || fail "dry cut did not validate fleet-config installer metadata from the target tree"
+grep -Fq "ls-tree $DRY_TARGET_SHA -- $VENDORED_FLEET_CONFIG_MANIFEST_REL" "$DRY_GIT_LOG" \
+  || fail "dry cut did not validate fleet-config manifest metadata from the target tree"
+grep -Fq "ls-tree $DRY_TARGET_SHA -- $VENDORED_FLEET_CONFIG_SKILLS_POLICY_REL" "$DRY_GIT_LOG" \
+  || fail "dry cut did not validate fleet-config skills-policy metadata from the target tree"
 if grep -Eq ' (show|cat-file) ' "$DRY_GIT_LOG"; then
   fail "dry cut materialized a target blob"
 fi

@@ -36,7 +36,7 @@
       "required_environment_variables": [
         "CLICKUP_API_TOKEN"
       ],
-      "no_fallback": true,
+      "no_fallback": false,
       "context_from": null,
       "enabled_toolsets": null,
       "repeat": {
