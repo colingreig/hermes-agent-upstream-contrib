@@ -24,6 +24,7 @@ from agent.codex_responses_adapter import _normalize_codex_response
 import run_agent
 from run_agent import AIAgent
 from agent.error_classifier import FailoverReason
+from agent.failure_taxonomy import FAILURE_KIND_RATE_LIMIT_SESSION
 from agent.memory_manager import MemoryManager
 from agent.prompt_builder import DEFAULT_AGENT_IDENTITY
 
@@ -6280,9 +6281,12 @@ class TestCredentialPoolRecovery:
             def current(self):
                 return SimpleNamespace(label="primary")
 
-            def mark_exhausted_and_rotate(self, *, status_code, error_context=None):
+            def mark_exhausted_and_rotate(
+                self, *, status_code, error_context=None, failure_kind=None
+            ):
                 assert status_code == 429
                 assert error_context is None
+                assert failure_kind == FAILURE_KIND_RATE_LIMIT_SESSION
                 return next_entry
 
         agent._credential_pool = _Pool()
@@ -6486,9 +6490,12 @@ class TestCredentialPoolRecovery:
             def current(self):
                 return SimpleNamespace(label="primary")
 
-            def mark_exhausted_and_rotate(self, *, status_code, error_context=None):
+            def mark_exhausted_and_rotate(
+                self, *, status_code, error_context=None, failure_kind=None
+            ):
                 captured["status_code"] = status_code
                 captured["error_context"] = error_context
+                captured["failure_kind"] = failure_kind
                 return next_entry
 
         agent._credential_pool = _Pool()
@@ -6504,6 +6511,7 @@ class TestCredentialPoolRecovery:
         assert retry_same is False
         assert captured["status_code"] == 429
         assert captured["error_context"]["reason"] == "device_code_exhausted"
+        assert captured["failure_kind"] == FAILURE_KIND_RATE_LIMIT_SESSION
 
 
 class TestMaxTokensParam:

@@ -37,7 +37,11 @@ from agent.tool_dispatch_helpers import _trajectory_normalize_msg, make_tool_res
 from agent.trajectory import convert_scratchpad_to_think
 from agent.credential_pool import STATUS_EXHAUSTED
 from agent.error_classifier import FailoverReason
-from agent.failure_taxonomy import FAILURE_KIND_AUTH_PERMANENT, FAILURE_KIND_USAGE_CAP
+from agent.failure_taxonomy import (
+    FAILURE_KIND_AUTH_PERMANENT,
+    FAILURE_KIND_RATE_LIMIT_SESSION,
+    FAILURE_KIND_USAGE_CAP,
+)
 from utils import base_url_host_matches, base_url_hostname, env_var_enabled, atomic_json_write
 
 logger = logging.getLogger(__name__)
@@ -49,6 +53,16 @@ logger = logging.getLogger(__name__)
 # even when the upstream keeps rejecting it, so without this cap the retry loop
 # spins forever and never reaches ``_try_activate_fallback``. See #26080.
 _MAX_AUTH_REFRESH_ATTEMPTS = 2
+
+
+def _alert_provider_failure_best_effort(agent, failure_kind: str) -> None:
+    """Alert after pool persistence without affecting recovery semantics."""
+    try:
+        from agent.ops_alerts import alert_provider_failure
+
+        alert_provider_failure(failure_kind, provider=getattr(agent, "provider", "unknown"))
+    except Exception:
+        logger.debug("Provider failure alert failed", exc_info=True)
 
 
 def _ra():
@@ -904,6 +918,7 @@ def recover_with_credential_pool(
             failure_kind=FAILURE_KIND_USAGE_CAP,
             failure_evidence=_evidence,
         )
+        _alert_provider_failure_best_effort(agent, FAILURE_KIND_USAGE_CAP)
         if next_entry is not None:
             _ra().logger.info(
                 "Credential %s (usage cap) — rotated to pool entry %s",
@@ -934,6 +949,7 @@ def recover_with_credential_pool(
             failure_kind=FAILURE_KIND_AUTH_PERMANENT,
             failure_evidence=_evidence,
         )
+        _alert_provider_failure_best_effort(agent, FAILURE_KIND_AUTH_PERMANENT)
         if next_entry is not None:
             _ra().logger.info(
                 "Credential %s (auth_permanent) — rotated to pool entry %s",
@@ -957,7 +973,12 @@ def recover_with_credential_pool(
                 current_last_status,
             )
             rotate_status = status_code if status_code is not None else 429
-            next_entry = pool.mark_exhausted_and_rotate(status_code=rotate_status, error_context=error_context)
+            next_entry = pool.mark_exhausted_and_rotate(
+                status_code=rotate_status,
+                error_context=error_context,
+                failure_kind=FAILURE_KIND_RATE_LIMIT_SESSION,
+            )
+            _alert_provider_failure_best_effort(agent, FAILURE_KIND_RATE_LIMIT_SESSION)
             if next_entry is not None:
                 _ra().logger.info(
                     "Credential %s (rate limit, pre-exhausted) — rotated to pool entry %s",
@@ -981,7 +1002,12 @@ def recover_with_credential_pool(
         if not has_retried_429 and not usage_limit_reached:
             return False, True
         rotate_status = status_code if status_code is not None else 429
-        next_entry = pool.mark_exhausted_and_rotate(status_code=rotate_status, error_context=error_context)
+        next_entry = pool.mark_exhausted_and_rotate(
+            status_code=rotate_status,
+            error_context=error_context,
+            failure_kind=FAILURE_KIND_RATE_LIMIT_SESSION,
+        )
+        _alert_provider_failure_best_effort(agent, FAILURE_KIND_RATE_LIMIT_SESSION)
         if next_entry is not None:
             _ra().logger.info(
                 "Credential %s (rate limit) — rotated to pool entry %s",
