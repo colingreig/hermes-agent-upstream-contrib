@@ -4,6 +4,7 @@
   "source_commit_required": true,
   "source_root_entrypoints": [
     "review_poll_gate.py",
+    "validate_pr_live_trigger.py",
     "verify-hermes-patches.sh"
   ],
   "expected_local_patches": {

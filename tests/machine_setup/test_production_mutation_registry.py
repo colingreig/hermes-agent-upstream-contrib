@@ -132,7 +132,7 @@ def test_all_six_llm_cron_jobs_are_covered_and_executors_share_one_lease_identit
 def test_every_current_fleet_job_is_registered_including_no_agent_writers():
     registry = _registry()
     jobs = json.loads(JOBS_PATH.read_text(encoding="utf-8"))["jobs"]
-    assert len(jobs) == 16  # Filesystem-authoritative count: six LLM plus ten no-agent jobs.
+    assert len(jobs) == 17  # Filesystem-authoritative count: six LLM plus eleven no-agent jobs.
     assert {job["id"] for job in jobs} == _all_cron_job_ids(registry)
 
     no_agent_ids = {job["id"] for job in jobs if job["no_agent"] is True}

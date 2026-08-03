@@ -204,6 +204,52 @@
       "paused_reason": null
     },
     {
+      "id": "4b8e1d97c3a2",
+      "name": "validator-live-trigger",
+      "schedule": {
+        "display": "7,37 * * * *",
+        "expr": "7,37 * * * *",
+        "kind": "cron"
+      },
+      "schedule_display": "7,37 * * * *",
+      "enabled": true,
+      "state": "scheduled",
+      "no_agent": true,
+      "deliver": "local",
+      "workdir": null,
+      "model": null,
+      "provider": null,
+      "model_snapshot": null,
+      "provider_snapshot": null,
+      "skill": null,
+      "skills": [],
+      "skill_scope": null,
+      "max_turns": null,
+      "required_environment_variables": [
+        "HERMES_VALIDATOR_FINALIZE_TOKEN"
+      ],
+      "context_from": null,
+      "enabled_toolsets": null,
+      "repeat": {
+        "completed": 0,
+        "times": null
+      },
+      "origin": null,
+      "key_env": null,
+      "fire_claim": null,
+      "base_url": null,
+      "script": "validate_pr_live_trigger.py",
+      "prompt": "",
+      "created_at": "2026-08-03T00:00:00-07:00",
+      "last_run_at": null,
+      "next_run_at": null,
+      "last_status": null,
+      "last_error": null,
+      "last_delivery_error": null,
+      "paused_at": null,
+      "paused_reason": null
+    },
+    {
       "id": "ad0ae6b717e2",
       "name": "clickup-review-sla",
       "schedule": {
