@@ -51,11 +51,17 @@ promotion receipt ID that authorizes that same SHA:
   --promotion-receipt-id <promotion-receipt-sha256>
 ```
 
-The automatic LaunchAgent `com.colingreig.hermes.release-poll` is retired for
-this fleet and is not installed, loaded, or enabled. Do not bootstrap it during
-fleet setup or normal release operations. The generic poller tooling remains
-source-controlled and tested only as an opt-in contingency for another
-deployment that explicitly adopts polling.
+The automatic LaunchAgent `com.colingreig.hermes.release-poll` is the fleet's
+standing automatic release path, bootstrapped via
+`install-mini-release-poller.sh --install-and-enable` (see below). It was
+found silently unloaded on 2026-08-03 — nothing had alerted that it was
+structurally absent rather than merely idle, which contributed to a
+multi-day promotion logjam (ClickUp 86e2ky37p). It was reinstated the same
+day, and `machine-setup/mini-scripts/fleet_outcome_contracts.json` now
+declares it `expected: loaded` with a freshness contract against its own
+heartbeat log (`~/.hermes/logs/mini-release-poll.log`, max age 2x
+`StartInterval`), so an unloaded or non-executing poller pages independently
+of whether a promotion happens to be waiting to cut.
 
 ## Layout on the mini
 

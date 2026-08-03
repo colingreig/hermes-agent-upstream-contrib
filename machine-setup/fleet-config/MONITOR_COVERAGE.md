@@ -49,7 +49,7 @@ two scheduling planes therefore cross-watch rather than self-monitor.
 | `59bdd8ebc468` | repo-maintenance | enabled | fresh non-empty maintenance response | empty/failed/stale maintenance pass |
 | `6e25865a22a4` | Purelymail notify-me poller | enabled | fresh `purelymail-poller.log` production finish (`dry_run=False` start + finished); rejects SSL/mailbox connect failures | missing/stale log, SSL/CERTIFICATE_VERIFY_FAILED, Mailbox poll failed, or Traceback |
 
-## LaunchAgent fleet: 21 active + 1 retired
+## LaunchAgent fleet: 22 active + 0 retired
 
 | Label | Expected | Outcome proof (not exit-only) | Alarm condition |
 |---|---:|---|---|
@@ -74,7 +74,7 @@ two scheduling planes therefore cross-watch rather than self-monitor.
 | `com.colingreig.hermes.fleet-outcome-probe` | loaded | current process execution plus CI-wrapper heartbeat cross-watch | unloaded agent or stale probe receipt |
 | `com.colingreig.hermes.disk-space-alert` | loaded | fresh durable receipt with `status=ok` | low disk, check error, failed delivery, or stale/missing receipt |
 | `com.colingreig.hermes.kanban-workspace-sweep` | loaded | fresh complete `sweep-finish` summary with `errors=0` | missing/unusable board DB, unlistable workspace root, non-zero errors, traceback, or stale/incomplete summary |
-| `com.colingreig.hermes.release-poll` | retired | plist absent and `launchctl print` fails | any plist/load resurrection |
+| `com.colingreig.hermes.release-poll` | loaded | fresh `mini-release-poll: heartbeat` marker in its own log, within 2x `StartInterval` (1800s) | unloaded agent, or no heartbeat within 1800s — distinguishable from a healthy no-op poll that finds nothing new to cut |
 
 The legacy `com.ignite.skills-sync` label remains retired. If its plist
 reappears, the probe's unknown-Hermes/Ignite fail-closed inventory check alarms

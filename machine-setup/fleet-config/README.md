@@ -55,12 +55,13 @@ promotion receipt ID:
   --promotion-receipt-id <promotion-receipt-sha256>
 ```
 
-The automatic LaunchAgent `com.colingreig.hermes.release-poll` is retired for
-this fleet and is not installed, loaded, or enabled by the fleet bundle. Do not
-bootstrap it as part of fleet setup or normal release operations. The generic
-poller scripts and tests remain in the repository as an opt-in contingency for
-a deployment that explicitly adopts that operating model; they are not a
-second Hermes fleet production path.
+The automatic LaunchAgent `com.colingreig.hermes.release-poll` is the fleet's
+standing automatic release path (bootstrap via
+`install-mini-release-poller.sh --install-and-enable`). It was found silently
+unloaded on 2026-08-03, contributing to a multi-day promotion logjam (ClickUp
+86e2ky37p); see `scripts/MINI-RELEASE.md` for the reinstatement and its
+liveness contract in `machine-setup/mini-scripts/fleet_outcome_contracts.json`
+(`expected: loaded`, freshness against its own heartbeat log).
 
 ## Why an overlay, not a full config.yaml replacement
 

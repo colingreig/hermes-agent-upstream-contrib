@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -208,6 +209,43 @@ def test_poll_wrapper_never_calls_cutter_when_frozen_or_unknown(tmp_path: Path) 
     )
     assert frozen.returncode != 0
     assert not called.exists()
+
+
+def test_poll_wrapper_heartbeat_prints_even_when_frozen_or_unauthorized(
+    tmp_path: Path,
+) -> None:
+    """ClickUp 86e2ky37p: the liveness contract distinguishes an unloaded or
+    non-executing poller from a healthy no-op by checking freshness of this
+    heartbeat line -- it must print on every invocation, including ones that
+    refuse to reach the cutter (unknown/frozen control state)."""
+    module = _load_control()
+    hermes, called = _poll_fixture(tmp_path)
+    releases = hermes / "releases"
+    env = {**os.environ, "HERMES_HOME": str(hermes)}
+    heartbeat_pattern = re.compile(r"^mini-release-poll: heartbeat ts=\S+ pid=\d+$", re.MULTILINE)
+
+    unknown = subprocess.run(
+        [str(hermes / "runtime-current" / "scripts" / WRAPPER.name)],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert unknown.returncode != 0
+    assert not called.exists()
+    assert heartbeat_pattern.search(unknown.stdout)
+
+    module.change_state(releases, state="frozen", actor="operator", reason="hold")
+    frozen = subprocess.run(
+        [str(hermes / "runtime-current" / "scripts" / WRAPPER.name)],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert frozen.returncode != 0
+    assert not called.exists()
+    assert heartbeat_pattern.search(frozen.stdout)
 
 
 def test_poll_wrapper_binds_cutter_to_authorized_exact_sha(tmp_path: Path) -> None:
