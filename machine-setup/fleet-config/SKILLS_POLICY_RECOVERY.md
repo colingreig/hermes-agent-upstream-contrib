@@ -16,7 +16,7 @@ Every removed directory is also moved intact, never deleted, below:
 
 ```text
 ~/.hermes/archives/fleet-skill-policy/
-  hermes-mini-skill-surface-2026-08-01/<stamp>/<profile>/<kind>/
+  hermes-mini-skill-surface-2026-08-03/<stamp>/<profile>/<kind>/
 ```
 
 Before the standalone
@@ -55,6 +55,60 @@ and run `hermes skills sync` for that profile. Restoring the local
 skill should remain the only resolver winner. Restoring the old
 `sentry-monitor` wrapper is likewise unnecessary while Ignite Sentinel remains
 operational through its governed repository and launchd paths.
+
+## Self-authored and other ungoverned skills
+
+Hermes writes skills for itself from the background self-improvement review
+fork. Anything that lands in an installed `skills/` tree without being
+classified by `skills-policy.json` — self-authored skills, hand-copied skills,
+a hub install nobody pinned — is **ungoverned**.
+
+`ungoverned_active.mode` decides what the installer does with them:
+
+- `quarantine` (shipped): each ungoverned skill root is archived exactly like
+  a policy removal — pre-change tarball, whole-directory move under
+  `<stamp>/<profile>/ungoverned/<rel>`, move-back rollback, and a receipt line
+  carrying its recorded disposition. The install then continues.
+- `fail`: refuse the whole install (the pre-2026-08-03 behaviour). An omitted
+  `ungoverned_active` section also means `fail`, so an older policy file can
+  never be silently relaxed by a newer installer.
+
+A `SKILL.md` found *inside* a governed skill directory is that skill's own
+vendored reference content and collapses onto its owning skill; it is neither
+counted as a separate active skill nor quarantined.
+
+`ungoverned_active.dispositions` is the audit trail of what an operator decided
+about a specific skill (`discard` or `promotion-pending`, each with a written
+reason). It is advisory: an unlisted skill is still quarantined, and simply
+reports as `unreviewed` in the plan and the receipt.
+
+### Promoting a self-authored skill into the fleet
+
+1. Recover its directory from the quarantine archive back to its original
+   relative path under the profile's `skills/` directory.
+2. Add it to `required_local_keep` in `skills-policy.json` and drop or update
+   its `dispositions` entry.
+3. Bump `profiles.default.expected_active_manifests` to match — the loader
+   derives the expected count from `bundled.keep` plus `required_local_keep`
+   and refuses a policy whose declared number disagrees.
+4. Regenerate the `skills-policy.json` sha256 in `fleet_config_manifest.json`.
+   Skipping this silently aborts and rolls back every cutover.
+
+Do step 1 before shipping steps 2-3: `required_local_keep` fails closed when
+the skill is missing from the live tree.
+
+### Standing disposition: `promise-validation` — discard
+
+Created by the self-improvement review on 2026-08-02 at
+`software-development/promise-validation`, it made the default profile 25
+active manifests against an expected 24 and hard-blocked `install_fleet_config.py`
+on 2026-08-03 (task 86e2kxk52). It is **discarded, not promoted**: its guidance
+(validate the running artefact, not the diff) is already the governed contract
+carried by `ignite-validate` under `IGNITE_SKILLS_ROOT`, plus the bundled
+`test-driven-development` and `systematic-debugging` keeps. The bytes remain
+recoverable under the quarantine archive and the manual
+`~/.hermes/skills-quarantine/` stopgap; that stopgap directory is inert (it is
+outside every `skills/` tree) and can be swept whenever convenient.
 
 Never recover this policy by adding `.no-bundled-skills`, copying the Ignite
 tree into a profile, or deleting the governed archives.

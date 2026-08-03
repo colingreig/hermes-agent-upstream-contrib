@@ -2,8 +2,8 @@
   "bundle": "fleet-config",
   "source_task": "86e2kkj69",
   "fleet_contract": "direct-clickup-v1",
-  "generated_at": "2026-08-01T16:35:00Z",
-  "description": "Governed Hermes Mini fleet bundle for the 86e2kkj69 skill-surface hardening rollout. install_fleet_config.py is the sole writer of four surfaces: the deep-merged ~/.hermes/config.yaml overlay, five direct-execution profiles under ~/.hermes/profiles/, the curated 15-job ~/.hermes/cron/jobs.json, and the manifest-pinned skill policy across the default plus five profile homes. ClickUp executor jobs use direct skill paths while upstream Hermes kanban remains available independently. Every source, including the installer and shared jobs materializer, is SHA-256 verified before mutation; config, root legacy config-backup modes, jobs, skill provenance, archive-copy bytes, and hub identity fail closed, with snapshots, recoverable archives, rollback, and receipts.",
+  "generated_at": "2026-08-03T00:00:00Z",
+  "description": "Governed Hermes Mini fleet bundle for the 86e2kkj69 skill-surface hardening rollout, extended by 86e2kxk52 self-authored-skill governance. install_fleet_config.py is the sole writer of four surfaces: the deep-merged ~/.hermes/config.yaml overlay, five direct-execution profiles under ~/.hermes/profiles/, the curated 15-job ~/.hermes/cron/jobs.json, and the manifest-pinned skill policy across the default plus five profile homes. ClickUp executor jobs use direct skill paths while upstream Hermes kanban remains available independently. Every source, including the installer and shared jobs materializer, is SHA-256 verified before mutation; config, root legacy config-backup modes, jobs, skill provenance, archive-copy bytes, and hub identity fail closed, with snapshots, recoverable archives, rollback, and receipts. Skills the policy does not classify \u2014 most importantly ones Hermes's self-improvement loop writes for itself \u2014 are recoverably quarantined and reported instead of blocking the install.",
   "files": [
     {
       "src_rel": "config-overlay.yaml",
@@ -91,8 +91,8 @@
     },
     {
       "src_rel": "skills-policy.json",
-      "sha256": "e13ca4376be7ea58c0584f3a2552578897260ffb887c02874dbda81bf90813d2",
-      "role": "governed Mini-specific bundled/local/hub skill allowlist, historical-reference consolidation, obsolete sentry wrapper archival, exact hub provenance, per-profile suppression, and recoverable cull policy",
+      "sha256": "154661f9d4969726c242e04d755112f32feb27e2de9f293c2787feb423caa07a",
+      "role": "governed Mini-specific bundled/local/hub skill allowlist, historical-reference consolidation, obsolete sentry wrapper archival, exact hub provenance, per-profile suppression, recoverable cull policy, and the ungoverned/self-authored skill quarantine stance",
       "deploy_mode": "skill_policy"
     },
     {
@@ -103,7 +103,7 @@
     },
     {
       "src_rel": "install_fleet_config.py",
-      "sha256": "376d83eaec46fa3353537566e0024f2ca5aba3b0f304eaebbcfd307acb2434f5",
+      "sha256": "b4d69d2d2528d47f76a0b82bf19c02d2af7ab58c2132625b734e1a4ab6b52eaa",
       "role": "source-only pin for the governed fleet installer, including private legacy root config-backup remediation and exact-mode rollback",
       "deploy_mode": "installer_source"
     }

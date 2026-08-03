@@ -1,7 +1,7 @@
 # fleet-config
 
 Declarative fleet-config bundle for the Hermes mini, authored for the
-2026-07-29 rebuild cutover and governed by the 2026-08-01 skill-surface
+2026-07-29 rebuild cutover and governed by the 2026-08-03 skill-surface
 hardening rollout. This is the sole writer of four governed surfaces on the
 mini:
 
@@ -10,13 +10,33 @@ mini:
 | `config-overlay.yaml` | `~/.hermes/config.yaml` | Governed **overlay** (not a replacement) — deep-merges `model`, `fallback_providers`, `delegation`, `kanban` in. Every other section (platforms, secrets wiring, security, approvals, credential_pool_strategies, ...) is left untouched. |
 | `profiles/<name>/{config.yaml,SOUL.md}` | `~/.hermes/profiles/<name>/` | Five direct-execution profiles: `coder`, `content`, `design`, `research`, `ops`. Each gets its model config, its SOUL.md persona, and the full `_PROFILE_DIRS` bootstrap tree from `hermes_cli/profiles.py` (`memories`, `sessions`, `skills`, `skins`, `logs`, `plans`, `workspace`, `cron`, `home`). The `home/` entry is a subprocess workspace, not the profile's Hermes root. |
 | `jobs.json` | `~/.hermes/cron/jobs.json` | Curated 16-job cron set (12 carried forward from the pre-freeze live config, 3 new consolidated hygiene/digest jobs, plus Purelymail poller). **Definition merge**: bundled job definitions replace the live fleet, but scheduler-owned runtime fields (`last_status`, `last_run_at`, `next_run_at`, `state`, `runtime`, `repeat.completed`, claims, …) are preserved for unchanged job ids. |
-| `skills-policy.json` | Default plus five profile-local `skills/` trees | SHA-pinned allowlist/cull policy. Preserves allowed bundled skills, archives and suppresses removals, consolidates two historical ClickUp poller references, removes the obsolete local `sentry-monitor` wrapper without touching the operational Ignite Sentinel checkout, and removes the local hub shadow of `vehicle-image-qc` only with exact hub provenance. |
+| `skills-policy.json` | Default plus five profile-local `skills/` trees | SHA-pinned allowlist/cull policy. Preserves allowed bundled skills, archives and suppresses removals, consolidates two historical ClickUp poller references, removes the obsolete local `sentry-monitor` wrapper without touching the operational Ignite Sentinel checkout, removes the local hub shadow of `vehicle-image-qc` only with exact hub provenance, and quarantines any **ungoverned** skill it does not classify (see below). |
 | `install_fleet_config.py` | Operator entry point (source-only manifest pin) | Verifies the whole bundle, performs the governed mutations, and records rollback receipts. The installer itself is SHA-256 pinned by the same manifest before any mutation. |
 
 `fleet_config_manifest.json` sha256-pins every source file above.
 `install_fleet_config.py` verifies those hashes before writing anything,
 snapshots each existing destination, writes atomically, and re-verifies the
 deployed bytes.
+
+## Ungoverned (self-authored) skills
+
+Hermes's background self-improvement review writes skills for itself. Until
+2026-08-03 any such skill silently joined the fleet's active surface and, on
+the next cutover, blew the policy's fail-closed manifest count — one
+self-authored `promise-validation` skill made the default profile 25 active
+manifests against an expected 24 and hard-blocked every fleet install
+(task 86e2kxk52).
+
+The installer is now the promotion gate. `skills-policy.json` carries an
+`ungoverned_active` section; in `quarantine` mode (shipped) any active skill the
+policy does not classify is recoverably archived under
+`<stamp>/<profile>/ungoverned/` and reported in the dry-run plan and the
+install receipt, and the install proceeds. Activating a self-authored skill is
+an explicit policy edit, never a side effect. `mode: "fail"` — and an omitted
+section — keep the old hard stop.
+
+Full mechanics, the promotion procedure, and the standing `promise-validation`
+disposition are in `SKILLS_POLICY_RECOVERY.md`.
 
 ## Production-write lease
 
