@@ -1489,7 +1489,74 @@ def _check_operational_contracts(
         identifier = str(contract.get("id") or "unknown")
         kind = contract.get("kind")
         path = _expand_path(str(contract.get("path") or ""), home=home)
-        if kind in {"sqlite_health", "admission_health"}:
+        if kind == "session_db_health":
+            if not path.is_file():
+                findings.append(_finding("operational", identifier, "database_missing", f"missing {path}"))
+                continue
+            named_root = path.parent / "profiles"
+            databases = [path, *sorted(named_root.glob(f"*/{path.name}"))]
+            profile_limit = int(contract.get("profile_max_size_bytes", contract.get("max_size_bytes", 0)))
+            root_limit = int(contract.get("root_max_size_bytes", profile_limit))
+            profiles: list[dict[str, Any]] = []
+            for database in databases:
+                profile_bytes = sum(
+                    candidate.stat().st_size if candidate.is_file() else 0
+                    for candidate in (
+                        database,
+                        database.with_name(database.name + "-wal"),
+                        database.with_name(database.name + "-shm"),
+                    )
+                )
+                try:
+                    conn = sqlite3.connect(f"file:{database}?mode=ro", uri=True, timeout=0.05)
+                    try:
+                        check = conn.execute("PRAGMA quick_check").fetchone()
+                        if check is None or check[0] != "ok":
+                            findings.append(
+                                _finding(
+                                    "operational",
+                                    identifier,
+                                    "database_quick_check_failed",
+                                    f"{database}: {check[0] if check else 'no result'}",
+                                )
+                            )
+                    finally:
+                        conn.close()
+                except sqlite3.Error as exc:
+                    message = str(exc).lower()
+                    code = "database_busy" if "locked" in message or "busy" in message else "database_unreadable"
+                    findings.append(_finding("operational", identifier, code, f"{database}: {exc}"))
+                if profile_limit and profile_bytes > profile_limit:
+                    findings.append(
+                        _finding(
+                            "operational",
+                            identifier,
+                            "profile_database_size",
+                            f"{database} plus WAL/SHM is {profile_bytes} bytes (profile limit {profile_limit})",
+                        )
+                    )
+                profiles.append({"path": str(database), "profile_bytes": profile_bytes})
+            root_bytes = sum(item["profile_bytes"] for item in profiles)
+            if root_limit and root_bytes > root_limit:
+                findings.append(
+                    _finding(
+                        "operational",
+                        identifier,
+                        "root_database_size",
+                        f"aggregate session databases plus WAL/SHM are {root_bytes} bytes (root limit {root_limit})",
+                    )
+                )
+            evidence.append(
+                {
+                    "surface": "operational",
+                    "id": identifier,
+                    "path": str(path),
+                    "profile_bytes": profiles[0]["profile_bytes"],
+                    "root_bytes": root_bytes,
+                    "profiles": profiles,
+                }
+            )
+        elif kind in {"sqlite_health", "admission_health"}:
             if not path.is_file():
                 findings.append(_finding("operational", identifier, "database_missing", f"missing {path}"))
                 continue

@@ -2003,6 +2003,68 @@ def test_sqlite_health_reports_corruption_instead_of_crashing(tmp_path):
     assert [item["code"] for item in findings] == ["database_unreadable"]
 
 
+def test_session_db_health_profile_budget_counts_wal_and_shm(tmp_path):
+    module = _load_module()
+    database = tmp_path / "state.db"
+    with sqlite3.connect(database) as conn:
+        conn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY)")
+    database_bytes = database.stat().st_size
+    Path(f"{database}-wal").write_bytes(b"w" * 101)
+    Path(f"{database}-shm").write_bytes(b"s" * 37)
+    profile_bytes = database_bytes + 138
+
+    findings, evidence = module._check_operational_contracts(
+        [{
+            "id": "session-db",
+            "kind": "session_db_health",
+            "path": str(database),
+            "profile_max_size_bytes": profile_bytes - 1,
+            "root_max_size_bytes": profile_bytes + 1000,
+        }],
+        home=tmp_path,
+        now=NOW,
+    )
+
+    assert [item["code"] for item in findings] == ["profile_database_size"]
+    assert str(profile_bytes) in findings[0]["detail"]
+    assert evidence[0]["profile_bytes"] == profile_bytes
+    assert evidence[0]["root_bytes"] == profile_bytes
+
+
+def test_session_db_health_root_budget_aggregates_named_profiles(tmp_path):
+    module = _load_module()
+    database = tmp_path / "state.db"
+    named = tmp_path / "profiles" / "coder" / "state.db"
+    named.parent.mkdir(parents=True)
+    for path in (database, named):
+        with sqlite3.connect(path) as conn:
+            conn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY)")
+    Path(f"{named}-shm").write_bytes(b"s" * 41)
+    default_bytes = database.stat().st_size
+    named_bytes = named.stat().st_size + 41
+    root_bytes = default_bytes + named_bytes
+
+    findings, evidence = module._check_operational_contracts(
+        [{
+            "id": "session-db",
+            "kind": "session_db_health",
+            "path": str(database),
+            "profile_max_size_bytes": max(default_bytes, named_bytes) + 1,
+            "root_max_size_bytes": root_bytes - 1,
+        }],
+        home=tmp_path,
+        now=NOW,
+    )
+
+    assert [item["code"] for item in findings] == ["root_database_size"]
+    assert str(root_bytes) in findings[0]["detail"]
+    assert evidence[0]["root_bytes"] == root_bytes
+    assert {item["path"] for item in evidence[0]["profiles"]} == {
+        str(database),
+        str(named),
+    }
+
+
 def _canonical_operational_contract(op_id):
     contracts = json.loads(CONTRACTS_PATH.read_text(encoding="utf-8"))
     return next(item for item in contracts["operational_checks"] if item["id"] == op_id)

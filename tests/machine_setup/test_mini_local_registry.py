@@ -21,6 +21,7 @@ MINI_SCRIPTS = REPO_ROOT / "machine-setup" / "mini-scripts"
 REGISTRY_PATH = MINI_SCRIPTS / "mini_local_registry.json"
 MANIFEST_PATH = MINI_SCRIPTS / "fleet_outcome_manifest.json"
 CONTRACTS_PATH = MINI_SCRIPTS / "fleet_outcome_contracts.json"
+RETENTION_POLICY_PATH = REPO_ROOT / "machine-setup" / "fleet-config" / "state_db_retention.json"
 
 VALID_DEST_PREFIXES = ("scripts/", "launch_agents/")
 VALID_SCHEMAS = {"dest_map", "fleet_outcome", "pr_pipeline"}
@@ -173,6 +174,20 @@ def test_contracts_wire_the_deployment_coverage_check():
     checks = [c for c in contracts["operational_checks"] if c.get("kind") == "deployment_coverage"]
     assert len(checks) == 1, "exactly one deployment_coverage operational check must be wired"
     assert checks[0]["path"] == "~/.hermes/scripts/mini_local_registry.json"
+
+
+def test_session_db_fleet_alarm_matches_the_retention_profile_budget():
+    """The outcome plane must not alarm on bytes retention cannot prune yet."""
+    contracts = json.loads(CONTRACTS_PATH.read_text(encoding="utf-8"))
+    retention = json.loads(RETENTION_POLICY_PATH.read_text(encoding="utf-8"))
+    checks = [c for c in contracts["operational_checks"] if c.get("id") == "session-db-health"]
+
+    assert len(checks) == 1
+    assert checks[0]["path"] == "~/.hermes/state.db"
+    assert checks[0]["kind"] == "session_db_health"
+    assert checks[0]["max_size_bytes"] == retention["profile"]["max_bytes"]
+    assert checks[0]["profile_max_size_bytes"] == retention["profile"]["max_bytes"]
+    assert checks[0]["root_max_size_bytes"] == retention["root"]["max_bytes"]
 
 
 def test_live_mini_inventory_is_complete_when_available():

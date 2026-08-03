@@ -23,8 +23,8 @@
       "destination_root": "scripts",
       "destination": "fleet_outcome_probe.py",
       "mode": "0755",
-      "sha256": "e01875a93b7acf1c28b92d80cefdc9587375e476fb6f5c5793a55045eb38c754"    },
-    {
+      "sha256": "91c7d5df81e2a58a7d48f76e269dd1715f5978de2cab203ce2a679355559e4eb"
+    },    {
       "source": "fleet_incident_report.py",
       "destination_root": "scripts",
       "destination": "fleet_incident_report.py",
@@ -85,8 +85,7 @@
       "destination_root": "scripts",
       "destination": "fleet_outcome_contracts.json",
       "mode": "0644",
-      "sha256": "dda756dacaec3b48038143faba23aa16e863c85d0b61b1dad2e549ef1ef1ecc5"
-    },
+      "sha256": "511250efb7f3328821c5f421421175b0fd38b370d5ffe9f75765944b49f5f9a7"    },
     {
       "source": "mini_local_registry.json",
       "destination_root": "scripts",
