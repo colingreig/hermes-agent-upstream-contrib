@@ -1944,6 +1944,142 @@ def test_sqlite_health_reports_corruption_instead_of_crashing(tmp_path):
     assert [item["code"] for item in findings] == ["database_unreadable"]
 
 
+def _canonical_operational_contract(op_id):
+    contracts = json.loads(CONTRACTS_PATH.read_text(encoding="utf-8"))
+    return next(item for item in contracts["operational_checks"] if item["id"] == op_id)
+
+
+def test_release_poll_drift_pages_on_persistent_drift_not_transient(tmp_path):
+    """86e2m61xw: a single 'remote prod SHA does not match governed control'
+    line is a benign race (poller ticked mid-cutover); three across ~45 min
+    of 15-min poller ticks is a genuinely stuck governed control that must
+    not sit silent for hours."""
+    module = _load_module()
+    contract = dict(_canonical_operational_contract("release-poll-drift"))
+    assert contract["threshold"] == 3
+    log = tmp_path / "mini-release-poll.log"
+    contract["path"] = str(log)
+
+    drift_line = "mini-release-poll: remote prod SHA does not match governed control\n"
+    heartbeat_line = "mini-release-poll: heartbeat ts=2026-08-03T12:00:00Z pid=1\n"
+
+    # Two drift ticks: below threshold, stay quiet.
+    log.write_text((heartbeat_line + drift_line) * 2, encoding="utf-8")
+    findings, _evidence = module._check_operational_contracts(
+        [contract], home=tmp_path, now=NOW
+    )
+    assert findings == []
+
+    # Three drift ticks (~45 min of 15-min polls): alarm distinguishably.
+    log.write_text((heartbeat_line + drift_line) * 3, encoding="utf-8")
+    findings, _evidence = module._check_operational_contracts(
+        [contract], home=tmp_path, now=NOW
+    )
+    assert [item["code"] for item in findings] == ["repeated_release_drift"]
+    assert findings[0]["id"] == "release-poll-drift"
+
+
+def test_governed_manifest_resolves_launch_agents_from_live_plist_dir(tmp_path):
+    """86e2m61xw (2a): governed-path-integrity resolved *every* manifest entry
+    as path.parent/source, but LaunchAgents entries deploy from a staging
+    source (launchd/foo.plist) to a live path under ~/Library/LaunchAgents
+    named by "destination" -- those two are never siblings on disk. Scripts
+    entries have no such split and must keep the staging-source check."""
+    module = _load_module()
+    scripts_dir = tmp_path / "scripts"
+    scripts_dir.mkdir()
+    launch_agents_dir = tmp_path / "LaunchAgents"
+    launch_agents_dir.mkdir()
+
+    script_source = scripts_dir / "reconcile_fleet_outcomes.py"
+    script_source.write_bytes(b"print('governed script')\n")
+    script_sha = module.hashlib.sha256(script_source.read_bytes()).hexdigest()
+
+    live_plist = launch_agents_dir / "com.colingreig.hermes.fleet-outcome-probe.plist"
+    live_plist.write_bytes(b"<plist>live</plist>")
+    plist_sha = module.hashlib.sha256(live_plist.read_bytes()).hexdigest()
+    # The staging source (launchd/*.plist) legitimately differs from the
+    # live deployed plist's bytes/path -- it must never be consulted for a
+    # launch_agents entry.
+    staging_plist_dir = scripts_dir / "launchd"
+    staging_plist_dir.mkdir()
+    (staging_plist_dir / "com.colingreig.hermes.fleet-outcome-probe.plist").write_bytes(
+        b"<plist>staged, not live</plist>"
+    )
+
+    manifest_path = scripts_dir / "fleet_outcome_manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "files": [
+                    {
+                        "source": "reconcile_fleet_outcomes.py",
+                        "destination_root": "scripts",
+                        "destination": "reconcile_fleet_outcomes.py",
+                        "sha256": script_sha,
+                    },
+                    {
+                        "source": "launchd/com.colingreig.hermes.fleet-outcome-probe.plist",
+                        "destination_root": "launch_agents",
+                        "destination": "com.colingreig.hermes.fleet-outcome-probe.plist",
+                        "sha256": plist_sha,
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    contract = {
+        "id": "governed-path-integrity",
+        "kind": "governed_manifest",
+        "path": str(manifest_path),
+        "launch_agents_dir": str(launch_agents_dir),
+    }
+    findings, _evidence = module._check_operational_contracts(
+        [contract], home=tmp_path, now=NOW
+    )
+    assert findings == []
+
+    # Corrupt the live plist only: must alarm against the live LaunchAgents
+    # copy, not the (unrelated) staging source.
+    live_plist.write_bytes(b"<plist>tampered</plist>")
+    findings, _evidence = module._check_operational_contracts(
+        [contract], home=tmp_path, now=NOW
+    )
+    assert [item["code"] for item in findings] == ["governed_path_drift"]
+    assert str(live_plist) in findings[0]["detail"]
+
+
+def test_degraded_secrets_monitor_success_marker_survives_trailing_diagnostics(tmp_path):
+    """86e2m61xw (2c): the probe keeps only the LAST tail line matching
+    latest_record_pattern, and degraded_secrets_monitor.py prints its
+    reduced-redundancy diagnostic line(s) AFTER the terminal status line on
+    a healthy run. A loose latest_record_pattern let the diagnostic line win
+    "last match", losing the real status line and false-paging
+    success_marker_missing on an actually-healthy tick."""
+    module = _load_module()
+    label = "com.colingreig.hermes.degraded-secrets-monitor"
+    outcome = _canonical_contract(launch_label=label)["outcome"]
+
+    real_shaped_tail = (
+        "[degraded-secrets-monitor] healthy\n"
+        "[degraded-secrets-monitor] credential pool reduced redundancy: "
+        "provider=anthropic usable=2/3 unavailable=backup:invalid\n"
+    )
+    artifact = _fresh_artifact(tmp_path, real_shaped_tail)
+    checked_outcome = {**outcome, "path": str(artifact)}
+
+    findings = module._check_artifact(
+        surface="launchd",
+        identifier=label,
+        outcome=checked_outcome,
+        home=tmp_path,
+        now=NOW,
+    )
+    assert findings == []
+
+
 def _run_main(
     module,
     monkeypatch,
