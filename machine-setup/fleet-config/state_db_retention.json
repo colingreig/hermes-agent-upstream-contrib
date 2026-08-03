@@ -1,13 +1,18 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
+  "_comment": "Calibrated 2026-08-03 against the live mini store: 2.05 GiB of session data accumulated in 15 days (~140 MiB/day), of which ~76% is FTS5 shadow index. root.max_bytes counts session databases only (default state.db plus profiles/*/state.db and their WAL/SHM sidecars), not the whole Hermes home. prune_after_days x growth.expected_bytes_per_day must stay <= root.max_bytes or the operator refuses to load this policy.",
   "root": {
-    "max_bytes": 2147483648,
+    "max_bytes": 8589934592,
     "max_retained_age_days": 730
   },
   "profile": {
-    "max_bytes": 536870912,
-    "archive_after_days": 30,
-    "prune_after_days": 365
+    "max_bytes": 1073741824,
+    "archive_after_days": 14,
+    "prune_after_days": 45,
+    "stale_session_after_hours": 48
+  },
+  "growth": {
+    "expected_bytes_per_day": 157286400
   },
   "wal_checkpoint": {
     "max_bytes": 134217728,
@@ -15,8 +20,8 @@
     "max_busy_retries": 15
   },
   "backup": {
-    "max_count": 3,
-    "max_bytes": 3221225472,
-    "max_age_days": 30
+    "max_count": 2,
+    "max_bytes": 9663676416,
+    "max_age_days": 14
   }
 }
