@@ -23,6 +23,16 @@ PROFILES = ("coder", "content", "design", "research", "ops")
 RETIRED_POLLER_JOB_ID = "6139465f559f"
 PURELYMAIL_POLLER_JOB_ID = "6e25865a22a4"
 INSTALLER_PATH = FLEET_CONFIG_ROOT / "install_fleet_config.py"
+JOBS_HELPER_PATH = FLEET_CONFIG_ROOT / "fleet_job_payload.py"
+
+
+def _jobs_helper_item() -> dict:
+    helper_bytes = JOBS_HELPER_PATH.read_bytes()
+    return {
+        "src": JOBS_HELPER_PATH,
+        "sha256": hashlib.sha256(helper_bytes).hexdigest(),
+        "verified_bytes": helper_bytes,
+    }
 
 
 def _load_manifest() -> dict:
@@ -161,7 +171,9 @@ def test_enabled_lifecycle_jobs_materialize_report_activity_postconditions():
     installer = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = installer
     spec.loader.exec_module(installer)
-    payload = installer._load_jobs_payload({"src": JOBS_PATH})
+    payload = installer._load_jobs_payload(
+        {"src": JOBS_PATH}, helper_item=_jobs_helper_item()
+    )
     jobs = {job["id"]: job for job in payload["jobs"]}
 
     executor_prompt = jobs["62714b869845"]["prompt"]
@@ -193,7 +205,9 @@ def test_enabled_lifecycle_job_without_verified_emitter_is_rejected():
     installer = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = installer
     spec.loader.exec_module(installer)
-    payload = installer._load_jobs_payload({"src": JOBS_PATH})
+    payload = installer._load_jobs_payload(
+        {"src": JOBS_PATH}, helper_item=_jobs_helper_item()
+    )
     lifecycle = next(job for job in payload["jobs"] if job["id"] == "777876d3eb16")
     lifecycle["prompt"] = lifecycle["prompt"].replace(
         "report_activity_journal.py confirm-transition", "missing-emitter"

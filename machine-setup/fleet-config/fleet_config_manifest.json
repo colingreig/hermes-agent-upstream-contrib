@@ -3,7 +3,7 @@
   "source_task": "86e2kkj69",
   "fleet_contract": "direct-clickup-v1",
   "generated_at": "2026-08-01T16:35:00Z",
-  "description": "Governed Hermes Mini fleet bundle for the 86e2kkj69 skill-surface hardening rollout. install_fleet_config.py is the sole writer of four surfaces: the deep-merged ~/.hermes/config.yaml overlay, five direct-execution profiles under ~/.hermes/profiles/, the curated 15-job ~/.hermes/cron/jobs.json, and the manifest-pinned skill policy across the default plus five profile homes. ClickUp executor jobs use direct skill paths while upstream Hermes kanban remains available independently. Every source, including the installer itself, is SHA-256 verified before mutation; config, root legacy config-backup modes, jobs, skill provenance, archive-copy bytes, and hub identity fail closed, with snapshots, recoverable archives, rollback, and receipts.",
+  "description": "Governed Hermes Mini fleet bundle for the 86e2kkj69 skill-surface hardening rollout. install_fleet_config.py is the sole writer of four surfaces: the deep-merged ~/.hermes/config.yaml overlay, five direct-execution profiles under ~/.hermes/profiles/, the curated 15-job ~/.hermes/cron/jobs.json, and the manifest-pinned skill policy across the default plus five profile homes. ClickUp executor jobs use direct skill paths while upstream Hermes kanban remains available independently. Every source, including the installer and shared jobs materializer, is SHA-256 verified before mutation; config, root legacy config-backup modes, jobs, skill provenance, archive-copy bytes, and hub identity fail closed, with snapshots, recoverable archives, rollback, and receipts.",
   "files": [
     {
       "src_rel": "config-overlay.yaml",
@@ -96,8 +96,14 @@
       "deploy_mode": "skill_policy"
     },
     {
+      "src_rel": "fleet_job_payload.py",
+      "sha256": "386559ebee76f80a4aa322fc93fe5b28ab35ba85cc837f6c447c9af7b6e23571",
+      "role": "source-only pin for the pure governed jobs postcondition materialization contract shared by installer and verifier",
+      "deploy_mode": "jobs_payload_helper"
+    },
+    {
       "src_rel": "install_fleet_config.py",
-      "sha256": "1ede387f6e55409e3c2e5e777b50672b2f998103070ff0ca32cb39e3e263538e",
+      "sha256": "5fd6905399386535858f6dfbb1d5ac61a761b661a39f23f61f28dcdda0bfe716",
       "role": "source-only pin for the governed fleet installer, including private legacy root config-backup remediation and exact-mode rollback",
       "deploy_mode": "installer_source"
     }

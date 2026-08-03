@@ -18,6 +18,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = REPO_ROOT / "machine-setup" / "mini-scripts" / "verify_governed_paths.py"
 MINI_SCRIPTS = SCRIPT.parent
 FLEET_ROOT = REPO_ROOT / "machine-setup" / "fleet-config"
+JOBS_HELPER = FLEET_ROOT / "fleet_job_payload.py"
 
 
 def _load_module():
@@ -30,6 +31,17 @@ def _load_module():
 
 
 module = _load_module()
+
+
+def _load_jobs_helper():
+    spec = importlib.util.spec_from_file_location("fleet_job_payload_under_test", JOBS_HELPER)
+    assert spec and spec.loader
+    helper = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(helper)
+    return helper
+
+
+jobs_helper = _load_jobs_helper()
 
 
 def _sha256(data: bytes) -> str:
@@ -71,7 +83,7 @@ def _install_fixture(home: Path) -> Path:
         shutil.copy2(source, destination)
         destination.chmod(int(entry["mode"], 8))
 
-    source_jobs = json.loads((FLEET_ROOT / "jobs.json").read_text())
+    source_jobs = jobs_helper.materialize_jobs_payload((FLEET_ROOT / "jobs.json").read_bytes())
     source_jobs["jobs"][0]["last_run_at"] = "runtime-owned"
     cron = hermes / "cron"
     cron.mkdir()
@@ -95,6 +107,16 @@ def _copied_outcome_source(tmp_path: Path) -> Path:
     source = tmp_path / "outcome-source"
     shutil.copytree(MINI_SCRIPTS, source)
     return source
+
+
+def _copied_fleet_root(tmp_path: Path) -> Path:
+    fleet_root = tmp_path / "fleet-config"
+    shutil.copytree(
+        FLEET_ROOT,
+        fleet_root,
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+    )
+    return fleet_root
 
 
 def _replace_deployed_manifest(home: Path, source_root: Path) -> None:
@@ -151,6 +173,95 @@ def test_verifier_accepts_scheduler_lane_state_and_equivalent_lane_weight_ratio(
     jobs_path.write_text(json.dumps(jobs), encoding="utf-8")
 
     module.GovernedPathsVerifier(home=tmp_path, fixture_safe=True).verify()
+
+
+@pytest.mark.parametrize("mutation", ["missing", "altered"])
+def test_verifier_rejects_materialized_prompt_postcondition_drift(tmp_path, mutation):
+    _install_fixture(tmp_path)
+    source = json.loads((FLEET_ROOT / "jobs.json").read_text())
+    job_id, postcondition = next(iter(source["job_prompt_postconditions"].items()))
+    jobs_path = tmp_path / ".hermes" / "cron" / "jobs.json"
+    jobs = json.loads(jobs_path.read_text())
+    job = next(item for item in jobs["jobs"] if item["id"] == job_id)
+    expected_suffix = postcondition.strip()
+    assert job["prompt"].endswith(expected_suffix)
+    if mutation == "missing":
+        job["prompt"] = job["prompt"][: -len(expected_suffix)].rstrip()
+    else:
+        job["prompt"] += " altered"
+    jobs_path.write_text(json.dumps(jobs), encoding="utf-8")
+
+    with pytest.raises(module.VerificationError, match="managed cron job drifted"):
+        module.GovernedPathsVerifier(home=tmp_path, fixture_safe=True).verify()
+
+
+def test_verifier_rejects_jobs_helper_hash_drift_without_executing_it(tmp_path):
+    _install_fixture(tmp_path)
+    fleet_root = _copied_fleet_root(tmp_path)
+    (fleet_root / "fleet_job_payload.py").write_text(
+        "raise RuntimeError('unverified helper executed')\n", encoding="utf-8"
+    )
+
+    with pytest.raises(module.VerificationError, match="fleet config source hash drift"):
+        module.GovernedPathsVerifier(
+            home=tmp_path, fleet_root=fleet_root, fixture_safe=True
+        ).verify()
+
+    assert not (fleet_root / "__pycache__").exists()
+
+
+def test_verifier_maps_verified_jobs_helper_load_failure_without_pycache(tmp_path):
+    _install_fixture(tmp_path)
+    fleet_root = _copied_fleet_root(tmp_path)
+    helper_path = fleet_root / "fleet_job_payload.py"
+    helper_bytes = b"raise RuntimeError('verified helper failed closed')\n"
+    helper_path.write_bytes(helper_bytes)
+    manifest_path = fleet_root / "fleet_config_manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    helper_entry = next(
+        entry
+        for entry in manifest["files"]
+        if entry["deploy_mode"] == "jobs_payload_helper"
+    )
+    helper_entry["sha256"] = _sha256(helper_bytes)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(
+        module.VerificationError, match="fleet jobs payload helper cannot be loaded"
+    ):
+        module.GovernedPathsVerifier(
+            home=tmp_path, fleet_root=fleet_root, fixture_safe=True
+        ).verify()
+
+    assert not (fleet_root / "__pycache__").exists()
+
+
+def test_verifier_rejects_jobs_helper_with_non_exception_error_type(tmp_path):
+    _install_fixture(tmp_path)
+    fleet_root = _copied_fleet_root(tmp_path)
+    helper_path = fleet_root / "fleet_job_payload.py"
+    helper_bytes = b'''class FleetJobPayloadError:
+    pass
+def materialize_jobs_payload(payload_bytes):
+    return {"jobs": []}
+'''
+    helper_path.write_bytes(helper_bytes)
+    manifest_path = fleet_root / "fleet_config_manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    helper_entry = next(
+        entry
+        for entry in manifest["files"]
+        if entry["deploy_mode"] == "jobs_payload_helper"
+    )
+    helper_entry["sha256"] = _sha256(helper_bytes)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(module.VerificationError, match="required contract"):
+        module.GovernedPathsVerifier(
+            home=tmp_path, fleet_root=fleet_root, fixture_safe=True
+        ).verify()
+
+    assert not (fleet_root / "__pycache__").exists()
 
 
 def test_verifier_rejects_real_lane_weight_ratio_drift(tmp_path):

@@ -30,7 +30,7 @@
       "destination_root": "scripts",
       "destination": "verify_governed_paths.py",
       "mode": "0755",
-      "sha256": "6e2568a74955b6dcf59df5bf9da079e787c1edb1bfe8ab9911963923087dbbd5"
+      "sha256": "35201d8cc92f61634703be252bea271b0982296d5267ea05b5ee9360cac635b1"
     },
     {
       "source": "fleet_outcome_contracts.json",

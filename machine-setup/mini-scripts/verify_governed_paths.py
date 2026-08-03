@@ -73,6 +73,42 @@ def _load_json(path: Path, label: str) -> dict[str, Any]:
     return value
 
 
+def _materialize_fleet_jobs(
+    path: Path, helper_path: Path, helper_sha256: object
+) -> dict[str, Any]:
+    """Load source jobs through the same pure expansion contract as the installer."""
+    _plain_file(path, "fleet jobs")
+    _plain_file(helper_path, "fleet jobs payload helper")
+    try:
+        helper_bytes = helper_path.read_bytes()
+    except OSError as exc:
+        raise VerificationError(f"cannot read fleet jobs payload helper: {helper_path}: {exc}") from exc
+    if hashlib.sha256(helper_bytes).hexdigest() != helper_sha256:
+        raise VerificationError(f"fleet config source hash drift: {helper_path}")
+    namespace: dict[str, Any] = {
+        "__file__": str(helper_path),
+        "__name__": "_verified_fleet_job_payload",
+    }
+    try:
+        exec(compile(helper_bytes, str(helper_path), "exec"), namespace)
+        error_type = namespace["FleetJobPayloadError"]
+        materialize = namespace["materialize_jobs_payload"]
+    except Exception as exc:
+        raise VerificationError(f"fleet jobs payload helper cannot be loaded: {exc}") from exc
+    if (
+        not isinstance(error_type, type)
+        or not issubclass(error_type, Exception)
+        or not callable(materialize)
+    ):
+        raise VerificationError("fleet jobs payload helper does not expose its required contract")
+    try:
+        return materialize(path.read_bytes())
+    except error_type as exc:
+        raise VerificationError(f"fleet jobs cannot be materialized: {exc}") from exc
+    except Exception as exc:
+        raise VerificationError(f"fleet jobs payload helper failed: {exc}") from exc
+
+
 def _load_yaml(path: Path, label: str) -> dict[str, Any]:
     if not path.is_file() or path.is_symlink():
         raise VerificationError(f"{label} missing or symlinked: {path}")
@@ -390,9 +426,23 @@ class GovernedPathsVerifier:
         jobs_entry = entries.get("jobs_json")
         if jobs_entry is None:
             raise VerificationError("fleet config manifest has no jobs JSON")
-        source_jobs = _load_json(
-            _safe_join(self.fleet_root, _plain_relative(jobs_entry["src_rel"], "fleet jobs src_rel"), "fleet jobs"),
-            "fleet jobs",
+        jobs_helper_entry = entries.get("jobs_payload_helper")
+        if jobs_helper_entry is None:
+            raise VerificationError("fleet config manifest has no jobs payload helper")
+        source_jobs = _materialize_fleet_jobs(
+            _safe_join(
+                self.fleet_root,
+                _plain_relative(jobs_entry["src_rel"], "fleet jobs src_rel"),
+                "fleet jobs",
+            ),
+            _safe_join(
+                self.fleet_root,
+                _plain_relative(
+                    jobs_helper_entry["src_rel"], "fleet jobs payload helper src_rel"
+                ),
+                "fleet jobs payload helper",
+            ),
+            jobs_helper_entry.get("sha256"),
         )
         live_jobs = _load_json(
             _safe_join(self.hermes, Path("cron/jobs.json"), "live cron jobs"), "live cron jobs"
