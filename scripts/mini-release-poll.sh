@@ -3,6 +3,17 @@
 # advancement validation, locking, receipts, cutover, and rollback.
 set -euo pipefail
 
+# Liveness heartbeat (ClickUp 86e2ky37p). Printed unconditionally, before any
+# check below that can exit early (frozen state, missing dependency, stale
+# authority, etc.), so this script's StandardOutPath log advances on every
+# launchd-scheduled invocation regardless of outcome. That lets an
+# independent liveness contract (fleet_outcome_contracts.json's
+# com.colingreig.hermes.release-poll entry) alarm on a genuinely unloaded or
+# non-executing poller while staying silent on the common, healthy case of
+# "ran, found nothing new to cut."
+printf 'mini-release-poll: heartbeat ts=%s pid=%s\n' \
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$$"
+
 HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
 CUT="$HERMES_HOME/runtime-current/scripts/mini-release-cut.sh"
 PYTHON="$HERMES_HOME/runtime-current/venv/bin/python"

@@ -838,9 +838,13 @@
     },
     {
       "label": "com.colingreig.hermes.release-poll",
-      "expected": "retired",
+      "expected": "loaded",
       "outcome": {
-        "kind": "self"
+        "kind": "text_artifact",
+        "path": "~/.hermes/logs/mini-release-poll.log",
+        "max_age_seconds": 1800,
+        "success_patterns": ["^mini-release-poll: heartbeat "],
+        "required_patterns": ["^mini-release-poll: heartbeat "]
       }
     }
   ]

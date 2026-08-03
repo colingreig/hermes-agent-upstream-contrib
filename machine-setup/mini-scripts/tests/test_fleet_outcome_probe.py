@@ -867,13 +867,13 @@ def test_canonical_contract_inventory_covers_exact_jobs_and_semantic_outcomes():
         "com.colingreig.hermes.fleet-outcome-probe": "loaded",
         "com.colingreig.hermes.disk-space-alert": "loaded",
         "com.colingreig.hermes.kanban-workspace-sweep": "loaded",
-        "com.colingreig.hermes.release-poll": "retired",
+        "com.colingreig.hermes.release-poll": "loaded",
     }
     declared_states = {
         item["label"]: item["expected"] for item in contracts["launch_agents"]
     }
     assert {label: declared_states[label] for label in required_states} == required_states
-    assert retired_labels == {"com.colingreig.hermes.release-poll"}
+    assert retired_labels == set()
 
     for item in contracts["cron_jobs"]:
         if not item["enabled"]:
@@ -1015,6 +1015,97 @@ def test_disk_space_contract_requires_fresh_ok_receipt(tmp_path):
     )
     assert {(item["id"], item["code"]) for item in findings} == {
         (label, "evidence_stale")
+    }
+
+
+def test_release_poll_contract_requires_fresh_heartbeat(tmp_path):
+    """ClickUp 86e2ky37p: the release-poll liveness contract must alarm on a
+    genuinely unloaded or non-executing poller, but stay silent on the
+    common, healthy no-op case of "ran, found nothing new to cut" (which
+    produces no distinguishing text beyond the unconditional heartbeat
+    line)."""
+    module = _load_module()
+    label = "com.colingreig.hermes.release-poll"
+    contract = _canonical_contract(launch_label=label)
+    assert contract["expected"] == "loaded"
+    outcome = contract["outcome"]
+
+    import os
+
+    heartbeat = _fresh_artifact(
+        tmp_path, "mini-release-poll: heartbeat ts=2026-08-03T12:00:00Z pid=123\n"
+    )
+    checked_outcome = {**outcome, "path": str(heartbeat)}
+
+    # Loaded, and heartbeat present and fresh: healthy, no findings.
+    assert (
+        module._check_artifact(
+            surface="launchd",
+            identifier=label,
+            outcome=checked_outcome,
+            home=tmp_path,
+            now=NOW,
+        )
+        == []
+    )
+
+    # A no-op poll (nothing to cut) writes nothing beyond the heartbeat.
+    # Still healthy -- the contract never requires a cut to have happened.
+    assert (
+        module._check_artifact(
+            surface="launchd",
+            identifier=label,
+            outcome=checked_outcome,
+            home=tmp_path,
+            now=NOW,
+        )
+        == []
+    )
+
+    # Log exists but has gone stale (poller loaded yet not actually executing,
+    # or a heartbeat older than 2x StartInterval): alarm distinguishably.
+    stale_timestamp = NOW.timestamp() - outcome["max_age_seconds"] - 1
+    os.utime(heartbeat, (stale_timestamp, stale_timestamp))
+    findings = module._check_artifact(
+        surface="launchd",
+        identifier=label,
+        outcome=checked_outcome,
+        home=tmp_path,
+        now=NOW,
+    )
+    assert {(item["id"], item["code"]) for item in findings} == {
+        (label, "evidence_stale")
+    }
+
+    # Log is fresh but missing the heartbeat marker entirely (unexpected
+    # content): alarm rather than silently pass.
+    os.utime(heartbeat, (NOW.timestamp(), NOW.timestamp()))
+    heartbeat.write_text("some unrelated line\n", encoding="utf-8")
+    os.utime(heartbeat, (NOW.timestamp(), NOW.timestamp()))
+    findings = module._check_artifact(
+        surface="launchd",
+        identifier=label,
+        outcome=checked_outcome,
+        home=tmp_path,
+        now=NOW,
+    )
+    assert {item["code"] for item in findings} == {
+        "success_marker_missing",
+        "required_marker_missing",
+    }
+
+    # Structurally absent (unloaded): the launchd-registration check itself
+    # must alarm, independent of any log content.
+    launch_findings, _ = module._check_launch_contracts(
+        [contract],
+        launch_agents_dir=tmp_path / "LaunchAgents",
+        home=tmp_path,
+        now=NOW,
+        launchctl=lambda _domain, _label: _completed(returncode=113, stderr="not found"),
+        loaded_inventory=set(),
+    )
+    assert {(item["id"], item["code"]) for item in launch_findings} == {
+        (label, "agent_not_loaded")
     }
 
 
