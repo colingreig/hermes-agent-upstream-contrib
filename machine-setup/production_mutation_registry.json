@@ -5,7 +5,7 @@
   "unknown_path_policy": {
     "default": "fail-closed",
     "rule": "A production mutation is unsupported unless its actor, target resource, lock or transaction boundary, and rollback surface are present in this registry. Callers must reject an unknown path before it writes.",
-    "enforcement_status": "This inventory is authoritative now; runtime admission enforcement is intentionally deferred to the bounded follow-on tasks below.",
+    "enforcement_status": "This inventory is authoritative. Runtime lease enforcement is live at the fleet-config installer, the mini release cut, and the state DB lifecycle operator's apply mode (cron/production_write_lease.py rejects any actor or resource set absent from this registry); fleet drain admission (cron/fleet_drain.py) uses the mutability declarations to decide which no-agent crons may run during a drain. Remaining cron actors declare their lock boundaries here but do not yet acquire the shared lease, and mutability declarations are contract rather than enforcement for actors that bypass the lease entirely: on 2026-08-02 the fleet-health-digest cron agent, registered read-only, repointed runtime-current with no lease, no fence-loss receipt, and no detection. Closing that class needs the per-resource deny/verify layer (86e2m5drb for runtime-current) and deploy-path drift enforcement (86e2m2c1g) on top of this lease layer.",
     "follow_on_hook_points": [
       {
         "task": "86e2kmucr",
@@ -16,6 +16,16 @@
         "task": "86e2kmuct",
         "hook": "shared executor-dispatch lease admission",
         "purpose": "Enforce the one logical executor dispatch surface named by this registry."
+      },
+      {
+        "task": "86e2m2c1g",
+        "hook": "unified deployment path enforcement",
+        "purpose": "Make the release cut's report-only ungoverned-change detection blocking and give verify_governed_paths.py a scheduled cadence, so direct writes to governed production paths are rejected or surfaced as drift rather than merely logged."
+      },
+      {
+        "task": "86e2m5drb",
+        "hook": "runtime-current mutation deny hook and release-pinned drift verifier",
+        "purpose": "Detect and reject unleased mutation of the runtime-release pointer by actors registered read-only (proven violated 2026-08-02 by the fleet-health-digest agent), with a distinguishable alarm and a verifier interpreter that does not itself depend on runtime-current."
       }
     ]
   },
@@ -52,15 +62,15 @@
     },
     {
       "id": "executor-admission",
-      "path": "~/.hermes/state/executor-admission.sqlite3",
+      "path": "~/.hermes/state/executor-admission.db",
       "description": "Fenced lease and pending-wake state shared by both executor cron jobs.",
       "concurrency_model": "SQLite BEGIN IMMEDIATE transaction with fencing token"
     },
     {
       "id": "session-db",
-      "path": "~/.hermes/state.db (including WAL sidecars)",
+      "path": "~/.hermes/state.db, profiles/*/state.db (including WAL sidecars), and their lifecycle backups/ directories",
       "description": "Hermes sessions and dashboard-visible conversation state.",
-      "concurrency_model": "SQLite WAL multi-writer tolerant; lifecycle contract follows task 86e2kmud2"
+      "concurrency_model": "SQLite WAL multi-writer tolerant for ordinary row writes; destructive lifecycle operations (backup rotation, stale-session reap, archive, prune, checkpoint, vacuum) additionally require the fenced production write lease held by the state-db-lifecycle actor"
     },
     {
       "id": "kanban-dispatcher",
@@ -240,7 +250,7 @@
       "resources_touched": ["executor-admission", "clickup-remote-state", "repo-worktrees", "cron-jobs"],
       "current_lock_or_transaction_boundary": {
         "kind": "fenced SQLite lease",
-        "path_or_identity": "~/.hermes/state/executor-admission.sqlite3 / production-clickup-executor",
+        "path_or_identity": "~/.hermes/state/executor-admission.db / production-clickup-executor",
         "behavior": "Both executor cron IDs enter one lease identity; BEGIN IMMEDIATE and monotonically increasing fencing tokens reject overlap."
       },
       "rollback_surface": {
@@ -497,7 +507,7 @@
         "surface": "Digest email and sender receipt",
         "procedure": "No Hermes-owned production resource is changed by the digest; delivery correction is a subsequent digest or sender retry."
       },
-      "notes": "Email delivery is an external side effect, but this actor is read-only for Hermes production resources."
+      "notes": "Email delivery is an external side effect, but this actor is read-only for Hermes production resources. That declaration is contract, not enforcement: on 2026-08-02 this agent repointed runtime-current (a resource it does not touch here) with no lease and no detection. Runtime-current deny/verify enforcement is tracked by 86e2m5drb."
     },
     {
       "id": "repo-maintenance-cron",
@@ -553,6 +563,39 @@
         "surface": "SQLite backup and session lifecycle records",
         "procedure": "Recover using the session DB lifecycle procedure; never treat a WAL-capable session store as a fleet-wide single-writer resource."
       }
+    },
+    {
+      "id": "state-db-lifecycle",
+      "name": "State DB lifecycle operator",
+      "actor_class": "conductor-ssh",
+      "owning_repository": "hermes-agent",
+      "mutability": "mutating",
+      "entry_points": ["state_db_lifecycle.py"],
+      "resources_touched": ["session-db"],
+      "current_lock_or_transaction_boundary": {
+        "kind": "fenced production write lease plus short BEGIN IMMEDIATE transactions",
+        "path_or_identity": "~/.hermes/state/production-write-lease.db / state-db-lifecycle",
+        "behavior": "Apply mode is refused without the registry-backed lease; every durable phase (backup rotation, retention write, checkpoint, vacuum, metrics persist) runs inside mutation_guard so an expired owner cannot commit after a successor acquires the resource. Dry runs take no lease and mutate nothing. Ordinary session-row writers stay WAL-concurrent and are deliberately not gated."
+      },
+      "rollback_surface": {
+        "surface": "profile backups/ directory holding the verified SQLite online-backup artifact named in the run report",
+        "procedure": "Stop Hermes writers, preserve the current state.db for forensics, then restore the report's backup artifact; never copy WAL/SHM sidecars. Fence loss aborts the run with an immutable fence_loss_receipts row and leaves the pre-run backup in place."
+      },
+      "operational_pointers": {
+        "activation": {
+          "entry_point": "state_db_lifecycle.py",
+          "command": "python3 state_db_lifecycle.py --apply [--commit-sha <full-sha>]"
+        },
+        "rollback": {
+          "entry_point": "state_db_lifecycle.py",
+          "command": "restore the backup_path named in the apply report per its rollback.procedure"
+        },
+        "verification": {
+          "entry_point": "state_db_lifecycle.py",
+          "command": "python3 state_db_lifecycle.py --dry-run"
+        }
+      },
+      "notes": "Operator-run today (no cron invokes apply). Wiring a scheduled cadence rides the unified deployment path (86e2m2c1g); the read-only --dry-run --metrics-out cadence needs no lease."
     },
     {
       "id": "purelymail-poller-cron",

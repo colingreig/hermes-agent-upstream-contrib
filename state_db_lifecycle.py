@@ -21,6 +21,16 @@ silent row) are reaped into the normal archive/prune pipeline rather than being
 treated as live conversations; otherwise every crashed worker leaves a row that
 retention can never reach and that permanently blocks VACUUM.
 
+Apply mode is a governed production mutation.  It requires the fenced
+production write lease over the ``session-db`` registry resource (actor
+``state-db-lifecycle`` in ``machine-setup/production_mutation_registry.json``),
+and every durable phase -- backup rotation, retention write, checkpoint,
+vacuum, metrics persist -- runs inside ``mutation_guard`` so an expired owner
+cannot commit after a successor acquires the resource.  Ordinary session-row
+writers stay WAL-concurrent and are deliberately not lease-gated; the lease
+serializes *destructive lifecycle operators* against each other and against
+any future lease-taking mutator of the session store.
+
 This module is an operational edge rather than a SessionDB hot-path feature.
 Keeping it here means normal prompts, toolsets, and active-session behavior
 remain unchanged.
@@ -31,13 +41,17 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import random
+import secrets
 import sqlite3
+import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping, Optional
+from typing import Any, Callable, ContextManager, Iterator, Mapping, Optional
 
 from hermes_constants import get_hermes_home
 
@@ -52,9 +66,121 @@ METRICS_META_KEY = "state_db_lifecycle_metrics_v1"
 _RETRY_MIN_SECONDS = 0.020
 _RETRY_MAX_SECONDS = 0.150
 
+# Registry identity for the one governed destructive writer of the session
+# store.  Ordinary session-row writers stay WAL-concurrent and unleased; only
+# retention/backup/vacuum -- operations whose rollback procedure assumes no
+# competing lifecycle operator -- must hold the fenced production write lease.
+PRODUCTION_WRITE_ACTOR = "state-db-lifecycle"
+PRODUCTION_WRITE_RESOURCES = ("session-db",)
+PRODUCTION_WRITE_REPO = "hermes-agent"
+
+MutationGuardFactory = Callable[[str], ContextManager[Any]]
+
 
 class LifecycleSafetyError(RuntimeError):
     """Raised when a requested lifecycle operation would violate its guardrails."""
+
+
+def _source_commit_sha(explicit: Optional[str] = None) -> str:
+    """Full source SHA pinned into the production write lease."""
+    if explicit is not None:
+        value = explicit.strip().lower()
+    else:
+        try:
+            value = subprocess.check_output(
+                ["git", "-C", str(Path(__file__).resolve().parent), "rev-parse", "HEAD"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            ).strip()
+        except (OSError, subprocess.CalledProcessError) as exc:
+            raise LifecycleSafetyError(
+                "cannot resolve the source commit for the production write lease; "
+                "pass --commit-sha with the deployed release's full 40-character SHA"
+            ) from exc
+    if len(value) != 40 or any(ch not in "0123456789abcdef" for ch in value):
+        raise LifecycleSafetyError(
+            "production write lease requires a full lowercase 40-character commit SHA"
+        )
+    return value
+
+
+@contextmanager
+def production_write_guards(
+    *,
+    hermes_root: Path,
+    commit_sha: str,
+    reason: str,
+    lease_database_path: Optional[Path] = None,
+) -> Iterator[tuple[MutationGuardFactory, Any]]:
+    """Hold the fenced production write lease for one apply run.
+
+    Yields ``(guard_factory, lease)``.  ``guard_factory(phase)`` fences one
+    durable mutation inside :func:`cron.production_write_lease.mutation_guard`,
+    so an owner that loses its fence cannot commit after a successor acquires
+    the ``session-db`` resource.  Fence loss records an immutable receipt and
+    fails the run closed; the lease is released on exit either way.
+    """
+    from cron import production_write_lease as pwl
+
+    database_path = lease_database_path or (hermes_root / "state" / "production-write-lease.db")
+    session_id = f"state-db-lifecycle-{os.getpid()}-{secrets.token_hex(8)}"
+    try:
+        lease = pwl.acquire(
+            list(PRODUCTION_WRITE_RESOURCES),
+            PRODUCTION_WRITE_ACTOR,
+            session_id,
+            str(hermes_root),
+            PRODUCTION_WRITE_REPO,
+            commit_sha,
+            reason,
+            database_path=database_path,
+        )
+    except pwl.ProductionWriteLeaseError as exc:
+        raise LifecycleSafetyError(
+            f"production write lease refused state DB lifecycle apply: {exc}"
+        ) from exc
+
+    @contextmanager
+    def guard(phase: str) -> Iterator[None]:
+        try:
+            with pwl.mutation_guard(
+                lease_id=lease.lease_id,
+                actor=lease.actor,
+                session_id=lease.session_id,
+                fencing_token=lease.fencing_token,
+                database_path=database_path,
+            ):
+                yield
+        except pwl.ProductionWriteLeaseError as exc:
+            try:
+                pwl.record_fence_loss(
+                    lease_id=lease.lease_id,
+                    actor=lease.actor,
+                    session_id=lease.session_id,
+                    fencing_token=lease.fencing_token,
+                    reason=f"state DB lifecycle lost the production write fence during {phase}",
+                    evidence={"operation": "state-db-lifecycle-apply", "phase": phase},
+                    database_path=database_path,
+                )
+            except pwl.ProductionWriteLeaseError:
+                pass
+            raise LifecycleSafetyError(
+                f"production write fence lost during {phase}; stopping before further mutation: {exc}"
+            ) from exc
+
+    try:
+        yield guard, lease
+    finally:
+        try:
+            pwl.release(
+                lease_id=lease.lease_id,
+                actor=lease.actor,
+                session_id=lease.session_id,
+                fencing_token=lease.fencing_token,
+                database_path=database_path,
+            )
+        except pwl.ProductionWriteLeaseError as exc:
+            print(f"WARNING: production write lease release failed: {exc}", file=sys.stderr)
 
 
 def load_retention_config(path: Path = DEFAULT_CONFIG_PATH) -> dict[str, Any]:
@@ -668,6 +794,7 @@ def run_lifecycle(
     reap_stale: bool = True,
     metrics_out: Optional[Path] = None,
     now: Optional[float] = None,
+    mutation_guard_factory: Optional[MutationGuardFactory] = None,
 ) -> dict[str, Any]:
     """Plan or apply state DB retention safely.
 
@@ -680,9 +807,20 @@ def run_lifecycle(
     Vacuum is intentionally exceptional: it requires apply mode, a prior
     dry-run report for the same DB fingerprint, a newly-created online backup,
     and zero active sessions.
+
+    Apply mode is a governed production mutation: it is refused unless the
+    caller supplies ``mutation_guard_factory`` (normally the fenced
+    ``session-db`` production write lease from :func:`production_write_guards`),
+    which is entered around every durable phase.  Dry runs need no lease.
     """
     db_path = Path(db_path).expanduser().resolve()
     policy = _validate_retention_config(config) if config is not None else load_retention_config()
+    if apply and mutation_guard_factory is None:
+        raise LifecycleSafetyError(
+            "apply mode mutates production session state and requires the fenced "
+            "production write lease (registry actor 'state-db-lifecycle'); run the "
+            "CLI with --apply, pass mutation_guard_factory, or use a dry run"
+        )
     runtime_now = time.time() if now is None else now
     profile = policy["profile"]
     root = policy["root"]
@@ -776,20 +914,21 @@ def run_lifecycle(
             # A known-over-cap source fails before touching the backup folder.
             if _path_size(db_path) > int(backup_policy["max_bytes"]):
                 raise LifecycleSafetyError("state DB backup exceeds backup.max_bytes; preserving existing backups")
-            backup_path = create_online_backup(db_path, backup_dir=backup_dir, now=runtime_now)
-            try:
-                _verify_online_backup(backup_path)
-                if _path_size(backup_path) > int(backup_policy["max_bytes"]):
-                    raise LifecycleSafetyError("verified state DB backup exceeds backup.max_bytes")
-            except BaseException:
+            with mutation_guard_factory("backup"):
+                backup_path = create_online_backup(db_path, backup_dir=backup_dir, now=runtime_now)
                 try:
-                    backup_path.unlink(missing_ok=True)
-                except OSError:
-                    pass
-                raise
-            removed_backups = _prune_backup_artifacts(
-                backup_dir, db_path, backup_policy, now=runtime_now, retain_path=backup_path
-            )
+                    _verify_online_backup(backup_path)
+                    if _path_size(backup_path) > int(backup_policy["max_bytes"]):
+                        raise LifecycleSafetyError("verified state DB backup exceeds backup.max_bytes")
+                except BaseException:
+                    try:
+                        backup_path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                    raise
+                removed_backups = _prune_backup_artifacts(
+                    backup_dir, db_path, backup_policy, now=runtime_now, retain_path=backup_path
+                )
             plan["backup_path"] = str(backup_path)
             plan["backup_retention_removed"] = removed_backups
             plan["rollback"] = {
@@ -893,9 +1032,10 @@ def run_lifecycle(
                     "stale_skipped_after_recheck": len(stale_ids) - len(safe_stale_ids),
                 }
 
-            counts, retry_count, latency = _run_write(
-                conn, operation, max_retries=int(checkpoint["max_busy_retries"])
-            )
+            with mutation_guard_factory("retention-write"):
+                counts, retry_count, latency = _run_write(
+                    conn, operation, max_retries=int(checkpoint["max_busy_retries"])
+                )
             busy_retries += retry_count
             write_latencies.append(latency)
             plan["applied"] = counts
@@ -915,7 +1055,8 @@ def run_lifecycle(
             # A PASSIVE checkpoint never blocks writers or readers.  It is a
             # bounded maintenance attempt, not a destructive WAL truncate.
             if wal_bytes_before > checkpoint["max_bytes"]:
-                checkpoint_row = conn.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
+                with mutation_guard_factory("checkpoint"):
+                    checkpoint_row = conn.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
                 plan["checkpoint"] = {
                     "mode": "PASSIVE",
                     "busy": int(checkpoint_row[0]),
@@ -934,7 +1075,8 @@ def run_lifecycle(
                 if active_before_vacuum != 0:
                     raise LifecycleSafetyError("vacuum is forbidden while an active session exists")
                 started = time.monotonic()
-                conn.execute("VACUUM")
+                with mutation_guard_factory("vacuum"):
+                    conn.execute("VACUUM")
                 write_latencies.append((time.monotonic() - started) * 1000)
                 plan["vacuum"] = "completed"
 
@@ -953,9 +1095,10 @@ def run_lifecycle(
                 stale_session_count=len(stale_rows) - counts.get("stale_reaped", 0),
                 previous=previous_metrics,
             )
-            metrics_retries, metrics_latency = _persist_metrics(
-                conn, metrics, max_retries=int(checkpoint["max_busy_retries"])
-            )
+            with mutation_guard_factory("metrics"):
+                metrics_retries, metrics_latency = _persist_metrics(
+                    conn, metrics, max_retries=int(checkpoint["max_busy_retries"])
+                )
             metrics["busy_retries"] += metrics_retries
             metrics["write_latency_samples_ms"].append(round(metrics_latency, 3))
             plan["metrics"] = metrics
@@ -1016,14 +1159,25 @@ def main(argv: Optional[list[str]] = None) -> int:
         type=Path,
         help="append one JSONL observability row (also supplies growth history for dry runs)",
     )
+    parser.add_argument(
+        "--commit-sha",
+        help=(
+            "full 40-character source SHA recorded on the production write lease "
+            "(defaults to git rev-parse of this module's checkout; required with "
+            "--apply when no git metadata is available, e.g. in a release tree)"
+        ),
+    )
+    parser.add_argument(
+        "--lease-db",
+        type=Path,
+        help="override the production write lease database path (defaults to <hermes-root>/state/production-write-lease.db)",
+    )
     args = parser.parse_args(argv)
     if args.vacuum and not args.apply:
         parser.error("--vacuum requires --apply")
     try:
-        report = run_lifecycle(
-            args.db,
+        common = dict(
             config=load_retention_config(args.config),
-            apply=args.apply,
             backup_dir=args.backup_dir,
             vacuum=args.vacuum,
             dry_run_plan=_load_plan(args.plan) if args.plan else None,
@@ -1032,6 +1186,27 @@ def main(argv: Optional[list[str]] = None) -> int:
             reap_stale=not args.no_reap_stale,
             metrics_out=args.metrics_out,
         )
+        if args.apply:
+            db_path = Path(args.db).expanduser().resolve()
+            hermes_root, _, _ = _retention_scope(db_path)
+            with production_write_guards(
+                hermes_root=hermes_root,
+                commit_sha=_source_commit_sha(args.commit_sha),
+                reason="state DB retention apply run",
+                lease_database_path=args.lease_db,
+            ) as (guard, lease):
+                report = run_lifecycle(
+                    db_path, apply=True, mutation_guard_factory=guard, **common
+                )
+                report["production_write_lease"] = {
+                    "actor": lease.actor,
+                    "lease_id": lease.lease_id,
+                    "resources": list(lease.resources),
+                    "fencing_token": lease.fencing_token,
+                    "commit_sha": lease.commit_sha,
+                }
+        else:
+            report = run_lifecycle(args.db, apply=False, **common)
     except LifecycleSafetyError as exc:
         print(f"state-db lifecycle refused: {exc}", file=sys.stderr)
         return 2

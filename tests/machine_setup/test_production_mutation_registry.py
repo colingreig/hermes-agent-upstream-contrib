@@ -193,6 +193,13 @@ def test_unknown_path_guard_and_generated_human_index_are_current():
     assert {hook["task"] for hook in policy["follow_on_hook_points"]} == {
         "86e2kmucr",
         "86e2kmuct",
+        # 86e2kmq8u: deploy-path enforcement (blocking ungoverned-change
+        # detection, scheduled drift verification) rides the unified
+        # deployment path task rather than the lease layer.
+        "86e2m2c1g",
+        # 2026-08-02 runtime-current violation by a read-only actor: the
+        # per-resource deny/verify layer is 86e2m5drb's remediation.
+        "86e2m5drb",
     }
 
     result = subprocess.run(
@@ -208,3 +215,52 @@ def test_unknown_path_guard_and_generated_human_index_are_current():
     assert "DO NOT EDIT" in generated
     assert "production_mutation_registry.json" in generated
     assert "Operational pointers" in generated
+
+
+def test_state_db_lifecycle_actor_matches_the_operator_contract():
+    registry = _registry()
+    actor = _actors_by_id(registry)["state-db-lifecycle"]
+
+    assert actor["mutability"] == "mutating"
+    assert actor["resources_touched"] == ["session-db"]
+    assert actor["entry_points"] == ["state_db_lifecycle.py"]
+    assert (REPO_ROOT / "state_db_lifecycle.py").is_file()
+
+    # The registry mapping and the operator's own lease identity must agree,
+    # because production_write_lease rejects any acquire whose resource set is
+    # not an exact match for the actor's registry mapping.
+    source = (REPO_ROOT / "state_db_lifecycle.py").read_text(encoding="utf-8")
+    assert 'PRODUCTION_WRITE_ACTOR = "state-db-lifecycle"' in source
+    assert 'PRODUCTION_WRITE_RESOURCES = ("session-db",)' in source
+
+    boundary = actor["current_lock_or_transaction_boundary"]
+    assert "production-write-lease.db" in boundary["path_or_identity"]
+
+
+def test_registry_resource_paths_match_the_code_they_describe():
+    registry = _registry()
+    resources = {resource["id"]: resource for resource in registry["resources"]}
+
+    # 86e2kmq8u: the registry declared executor-admission.sqlite3 while the
+    # code has always used executor-admission.db.  A resource path that names
+    # a file no writer touches is a violation-detection blind spot.
+    admission_source = (REPO_ROOT / "cron" / "executor_admission.py").read_text(encoding="utf-8")
+    assert 'executor-admission.db' in admission_source
+    assert resources["executor-admission"]["path"].endswith("executor-admission.db")
+    assert "executor-admission.sqlite3" not in json.dumps(registry)
+
+    lease_source = (REPO_ROOT / "cron" / "production_write_lease.py").read_text(encoding="utf-8")
+    assert 'production-write-lease.db' in lease_source
+
+
+def test_session_db_resource_documents_the_lifecycle_lease_contract():
+    registry = _registry()
+    resources = {resource["id"]: resource for resource in registry["resources"]}
+    model = resources["session-db"]["concurrency_model"]
+
+    # Ordinary row writers stay WAL-concurrent; destructive lifecycle
+    # operations are single-writer via the fenced lease.  Both halves of the
+    # contract must stay stated, or a future editor may "simplify" one away.
+    assert "WAL multi-writer tolerant" in model
+    assert "production write lease" in model
+    assert "state-db-lifecycle" in model
