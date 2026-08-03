@@ -2757,8 +2757,13 @@ class TestRunJobConfigEnvVarExpansion:
         kwargs = mock_agent_cls.call_args.kwargs
         assert kwargs["provider"] == expected_provider
         assert kwargs["model"] == expected_model
-        assert kwargs["fallback_model"] is None
-        assert kwargs["no_fallback"] is True
+        # clickup-executor allows fallback (no_fallback=false); content-lane-executor is fail-closed (no_fallback=true)
+        if job_name == "clickup-executor":
+            assert kwargs["fallback_model"] == [{"model": "fallback-must-not-run", "provider": "openrouter"}]
+            assert kwargs["no_fallback"] is False
+        else:  # content-lane-executor
+            assert kwargs["fallback_model"] is None
+            assert kwargs["no_fallback"] is True
         effective_prompt = mock_agent.run_conversation.call_args.args[0]
         assert "Govern the executor lane." in effective_prompt
         assert expected_prompt in effective_prompt
