@@ -16,7 +16,6 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from hermes_constants import OPENROUTER_BASE_URL
 from hermes_cli.config import load_env
-from agent.secret_scope import get_secret as _get_secret
 from agent.credential_persistence import (
     is_borrowed_credential_source,
     sanitize_borrowed_credential_payload,
@@ -2167,6 +2166,32 @@ def _normalize_pool_priorities(provider: str, entries: List[PooledCredential]) -
     return changed
 
 
+def _lazy_pool_secret(key: str) -> str:
+    """Best-effort lazy 1Password lookup for pool seeding.
+
+    Pool seeding is process-global bookkeeping — it runs once per
+    ``load_pool()`` call, not per profile turn — so it must not be subject to
+    the multiplex fail-closed rule in ``agent.secret_scope.get_secret``: with
+    a scope installed and the key missing, that returns "" without trying the
+    lazy resolver; with no scope installed, it raises ``UnscopedSecretError``
+    and aborts the whole seed pass. Call the lazy resolver directly instead,
+    gated on the same enablement flag ``get_secret`` itself uses, so seeding
+    still reaches 1Password material under multiplexing. Fails open (returns
+    "") on any error, including the flag being off — seeding must never crash
+    the pool loader.
+    """
+    try:
+        from agent.secret_scope import _lazy_secret_resolution_enabled
+
+        if not _lazy_secret_resolution_enabled():
+            return ""
+        from agent.lazy_secret_resolver import get as _lazy_get
+
+        return _lazy_get(key) or ""
+    except Exception:
+        return ""
+
+
 def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tuple[bool, Set[str]]:
     changed = False
     active_sources: Set[str] = set()
@@ -2211,7 +2236,12 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
         _env_file = load_env()
 
         def _env_val(key: str) -> str:
-            return (_env_file.get(key) or _get_secret(key, "") or "").strip()
+            return (
+                _env_file.get(key)
+                or os.environ.get(key, "")
+                or _lazy_pool_secret(key)
+                or ""
+            ).strip()
 
         anthropic_api_key = _env_val("ANTHROPIC_API_KEY")
         anthropic_oauth_env = (
@@ -2553,7 +2583,7 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
         # .env-takes-precedence behaviour is preserved unchanged.
         if raw.startswith("op://") and env_val:
             return env_val
-        return raw or _get_secret(key, "") or env_val
+        return raw or env_val or _lazy_pool_secret(key)
 
     # Honour user suppression — `hermes auth remove <provider> <N>` for an
     # env-seeded credential marks the env:<VAR> source as suppressed so it
@@ -2805,7 +2835,20 @@ def load_pool(provider: str) -> CredentialPool:
         changed |= _prune_stale_seeded_entries(entries, custom_sources)
     else:
         singleton_changed, singleton_sources = _seed_from_singletons(provider, entries)
-        env_changed, env_sources = _seed_from_env(provider, entries)
+        try:
+            env_changed, env_sources = _seed_from_env(provider, entries)
+        except Exception:
+            # Secret resolution (lazy 1Password lookups, suppression-store
+            # reads, etc.) must never be able to abort the whole pool load —
+            # a transient resolver error here used to raise UnscopedSecretError
+            # and take the entire seed pass down with it. Skip env seeding for
+            # this call and keep whatever was already persisted on disk.
+            logger.warning(
+                "credential_pool: _seed_from_env(%s) raised, skipping env seeding this pass",
+                provider,
+                exc_info=True,
+            )
+            env_changed, env_sources = False, set()
         changed = (
             raw_needs_sanitization
             or raw_needs_auth_normalization
