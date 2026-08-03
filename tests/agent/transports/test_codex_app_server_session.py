@@ -175,6 +175,36 @@ class TestLifecycle:
         _, params = next(r for r in client.requests if r[0] == "thread/start")
         assert "model" not in params
 
+    def test_thread_start_response_model_is_propagated_to_turn_result(self):
+        """The stable thread/start response is app-server's authoritative
+        resolved-model signal; turn/start/completed carry no model field."""
+        def request(method, params):
+            if method == "thread/start":
+                return {
+                    "thread": {"id": "thread-fake-001"},
+                    "model": "gpt-provider-resolved",
+                    "modelProvider": "openai",
+                }
+            if method == "turn/start":
+                return {"turn": {"id": "turn-fake-001"}}
+            return {}
+
+        client = FakeClient()
+        client._request_handler = request
+        client.queue_notification(
+            "turn/completed",
+            threadId="thread-fake-001",
+            turn={"id": "turn-fake-001", "status": "completed", "error": None},
+        )
+
+        result = make_session(client, model="requested-alias").run_turn(
+            "hi", turn_timeout=2.0
+        )
+
+        assert result.resolved_model == "gpt-provider-resolved"
+        assert result.model_provenance == "thread_start_response"
+        assert result.resolved_provider == "openai"
+
     def test_close_idempotent(self):
         client = FakeClient()
         s = make_session(client)
@@ -217,6 +247,13 @@ class TestRunTurn:
             "gpt-initial",
             "gpt-switched",
         ]
+        # Only thread/start reports a resolved model. Once a retained thread is
+        # switched, preserve the accepted explicit request without falsely
+        # labeling it provider-reported.
+        assert first.model_provenance == "turn_start_request"
+        assert first.resolved_model == "gpt-initial"
+        assert second.model_provenance == "turn_start_request"
+        assert second.resolved_model == "gpt-switched"
 
     def test_simple_text_turn_returns_final_message(self):
         client = FakeClient()
