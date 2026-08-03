@@ -102,13 +102,25 @@ class CronScheduler(ABC):
         """
         from cron.jobs import claim_job_for_fire, get_job
         from cron.executions import create_execution
+        from cron.fleet_drain import cron_job_admission
         from cron.scheduler import run_one_job
 
+        # Admission precedes the store claim: a drain must not advance the
+        # external one-shot or create an execution that never ran.
+        job = get_job(job_id)
+        if job is None:
+            return False
+        decision = cron_job_admission(job)
+        if not decision.allowed:
+            return False
         if not claim_job_for_fire(job_id):
             return False  # another machine already claimed this fire
         job = get_job(job_id)
         if job is None:
             return False  # job removed (e.g. repeat-N exhausted) between arm and fire
+        # Defend against a drain beginning or metadata changing during claim.
+        if not cron_job_admission(job).allowed:
+            return False
         execution = create_execution(job_id, source=self.name)
         job["execution_id"] = execution["id"]
         job["execution_owner_token"] = execution["owner_token"]

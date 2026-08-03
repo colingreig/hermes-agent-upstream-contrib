@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import plistlib
+import sqlite3
 import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -1800,3 +1801,53 @@ def test_kanban_sweep_stderr_shares_canonical_semantic_evidence_log():
         pattern.startswith("^Traceback")
         for pattern in contract["outcome"]["failure_patterns"]
     )
+
+
+def test_admission_health_covers_legacy_stale_owner_and_recovery(tmp_path):
+    module = _load_module()
+    database = tmp_path / "executor-admission.db"
+    expired = (NOW - timedelta(minutes=1)).isoformat()
+    recovered = (NOW - timedelta(minutes=5)).isoformat()
+    with sqlite3.connect(database) as conn:
+        conn.execute(
+            "CREATE TABLE executor_lease (singleton INTEGER, ledger_execution_id TEXT, heartbeat_at TEXT, expires_at TEXT, state TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO executor_lease VALUES (1, 'legacy-ledger', ?, ?, 'active')",
+            (expired, expired),
+        )
+        conn.execute(
+            "CREATE TABLE recovery_receipts (receipt_id TEXT, recovered_at TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO recovery_receipts VALUES ('legacy-recovery', ?)",
+            (recovered,),
+        )
+
+    findings, _evidence = module._check_operational_contracts(
+        [{
+            "id": "admission",
+            "kind": "admission_health",
+            "path": str(database),
+            "recovery_alarm_seconds": 3600,
+        }],
+        home=tmp_path,
+        now=NOW,
+    )
+    assert {item["code"] for item in findings} == {
+        "stale_heartbeat",
+        "owner_dead_recovery",
+    }
+
+
+def test_sqlite_health_reports_corruption_instead_of_crashing(tmp_path):
+    module = _load_module()
+    database = tmp_path / "corrupt.db"
+    database.write_bytes(b"not a sqlite database")
+
+    findings, _evidence = module._check_operational_contracts(
+        [{"id": "db", "kind": "sqlite_health", "path": str(database)}],
+        home=tmp_path,
+        now=NOW,
+    )
+    assert [item["code"] for item in findings] == ["database_unreadable"]

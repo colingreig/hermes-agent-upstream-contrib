@@ -12705,7 +12705,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "acp", "auth", "backup", "bundles", "checkpoints", "claw", "completion",
         "computer-use",
         "config", "console", "cron", "curator", "dashboard", "serve", "debug", "doctor",
-        "dump", "fallback", "gateway", "hooks", "import", "insights",
+        "dump", "fallback", "fleet", "gateway", "hooks", "import", "insights",
         "gui", "desktop", "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate", "moa",
         "journey", "memory-graph", "learning",
         "model", "pairing", "pets", "plugins", "portal", "postinstall", "profile",
@@ -13488,6 +13488,12 @@ def main():
     # =========================================================================
     from hermes_cli.portal_cli import add_parser as _add_portal_parser
     _add_portal_parser(subparsers)
+
+    # =========================================================================
+    # fleet command — drain control and read-only incident evidence
+    # =========================================================================
+    from hermes_cli.fleet import build_parser as _build_fleet_parser
+    _build_fleet_parser(subparsers)
 
     # =========================================================================
     # kanban command — multi-profile collaboration board
