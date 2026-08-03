@@ -12,6 +12,7 @@ or rewrite request/response bodies. It's a credential-attaching forwarder.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import signal
 from typing import Optional
@@ -229,6 +230,49 @@ def create_app(adapter: UpstreamAdapter) -> "web.Application":
                 if upstream_resp is None:
                     return session_or_response
                 session = session_or_response
+
+        # Codex reports exhausted subscription windows as HTTP 429 with a
+        # structured ``usage_limit_reached`` body. OpenCode treats every 429 as
+        # transient and retries it with exponential backoff while emitting no
+        # response tokens, so its parent sees a live-but-silent child. Translate
+        # only this terminal quota shape to non-retryable 402; ordinary Codex
+        # 429s still flow through unchanged and retain their retry semantics.
+        if adapter.name == "openai-codex" and upstream_resp.status == 429:
+            upstream_body = await upstream_resp.read()
+            error_type = ""
+            try:
+                payload = json.loads(upstream_body)
+                error = payload.get("error") if isinstance(payload, dict) else None
+                if isinstance(error, dict):
+                    error_type = str(error.get("type") or error.get("code") or "")
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                pass
+
+            if error_type == "usage_limit_reached":
+                quota_log = (
+                    "proxy: codex upstream quota exhausted: "
+                    f"{error_type} (HTTP 429 -> 402)"
+                )
+                logger.warning(quota_log)
+                # The launchd service captures stdout in codex-proxy.log. Keep
+                # this message metadata-only so no credential or response-body
+                # content can reach that operational log.
+                print(quota_log, flush=True)
+                headers = _filter_response_headers(upstream_resp.headers)
+                upstream_resp.release()
+                await session.close()
+                return web.Response(  # type: ignore[union-attr]
+                    status=402, headers=headers, body=upstream_body
+                )
+
+            # The body was consumed for classification; return it buffered with
+            # the original status so non-quota 429 behavior remains unchanged.
+            headers = _filter_response_headers(upstream_resp.headers)
+            upstream_resp.release()
+            await session.close()
+            return web.Response(  # type: ignore[union-attr]
+                status=429, headers=headers, body=upstream_body
+            )
 
         # Stream response back. Headers first, then chunked body.
         resp = web.StreamResponse(
