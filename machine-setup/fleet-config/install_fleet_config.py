@@ -107,6 +107,25 @@ PROFILE_BOOTSTRAP_DIRS = [
 
 SKILL_POLICY_PROFILES = ("default", "coder", "content", "ops", "design", "research")
 SKILL_POLICY_CONFIG_MODE = 0o600
+
+# Governance for skills that appear in an installed skills tree without being
+# classified by skills-policy.json — most importantly the ones Hermes writes
+# for itself from the background self-improvement review fork.  Before this
+# existed, one self-authored skill pushed the default profile to 25 active
+# manifests against a policy expecting 24 and hard-blocked every fleet-config
+# install (task 86e2kxk52).
+#
+#   "quarantine" — recoverably archive the ungoverned skill alongside the
+#                  policy's other removals, then continue.  Promotion into the
+#                  active fleet is an explicit skills-policy.json edit.
+#   "fail"       — refuse the install (the pre-86e2kxk52 behaviour; kept so a
+#                  policy can still opt into a hard stop).
+UNGOVERNED_SKILL_MODES = frozenset({"quarantine", "fail"})
+UNGOVERNED_SKILL_KIND = "ungoverned"
+# Documented fate of a specific ungoverned skill. Advisory only: an unlisted
+# ungoverned skill is still quarantined, it just reports as "unreviewed".
+UNGOVERNED_SKILL_DECISIONS = frozenset({"discard", "promotion-pending"})
+UNGOVERNED_SKILL_UNREVIEWED = "unreviewed"
 FLEET_JOBS_CONTRACT = "direct-clickup-v1"
 INSTALL_LOCK_NAME = ".fleet-config-install.lock"
 TEMP_WRITE_ATTEMPTS = 64
@@ -1138,6 +1157,51 @@ def _validate_reference_consolidations(
     return result
 
 
+def _validate_ungoverned_skills(value: object) -> dict[str, Any]:
+    """Validate the policy's stance on skills it does not classify.
+
+    An absent section keeps the historical fail-closed behaviour so an older
+    policy file can never be silently relaxed by a newer installer.
+    """
+    if value is None:
+        return {"mode": "fail", "dispositions": {}}
+    if not isinstance(value, dict):
+        raise InstallError("skill policy 'ungoverned_active' must be an object")
+    section: dict[Any, Any] = dict(value)
+    unknown = sorted(str(key) for key in set(section) - {"mode", "dispositions"})
+    if unknown:
+        raise InstallError(f"skill policy 'ungoverned_active' has unknown keys: {unknown}")
+    mode = section.get("mode")
+    if mode not in UNGOVERNED_SKILL_MODES:
+        raise InstallError(
+            "skill policy 'ungoverned_active.mode' must be one of "
+            f"{sorted(UNGOVERNED_SKILL_MODES)}; got {mode!r}"
+        )
+    raw = section.get("dispositions", {})
+    if not isinstance(raw, dict):
+        raise InstallError("skill policy 'ungoverned_active.dispositions' must be an object")
+    dispositions: dict[str, dict[str, str]] = {}
+    for name, spec in dict(raw).items():
+        if not isinstance(name, str) or not name or not isinstance(spec, dict):
+            raise InstallError("skill policy 'ungoverned_active.dispositions' has an invalid entry")
+        entry: dict[Any, Any] = dict(spec)
+        if set(entry) != {"decision", "reason"}:
+            raise InstallError(
+                f"ungoverned disposition {name!r} must contain exactly decision and reason"
+            )
+        decision = entry["decision"]
+        reason = entry["reason"]
+        if decision not in UNGOVERNED_SKILL_DECISIONS:
+            raise InstallError(
+                f"ungoverned disposition {name!r} has invalid decision {decision!r}; "
+                f"expected one of {sorted(UNGOVERNED_SKILL_DECISIONS)}"
+            )
+        if not isinstance(reason, str) or not reason.strip():
+            raise InstallError(f"ungoverned disposition {name!r} must record a non-empty reason")
+        dispositions[name] = {"decision": decision, "reason": reason}
+    return {"mode": mode, "dispositions": dispositions}
+
+
 def load_skill_policy(policy_path: Path, *, bundle_root: Path) -> dict[str, Any]:
     """Load and fail-closed validate the Mini skill policy against this checkout."""
     try:
@@ -1198,6 +1262,14 @@ def load_skill_policy(policy_path: Path, *, bundle_root: Path) -> dict[str, Any]
     if len(all_names) != len(classified) + len(local_remove) + len(hub_remove) + len(local_keep):
         raise InstallError("skill policy has overlapping bundled/local/hub names")
 
+    ungoverned = _validate_ungoverned_skills(policy.get("ungoverned_active"))
+    governed_by_disposition = sorted(set(ungoverned["dispositions"]) & all_names)
+    if governed_by_disposition:
+        raise InstallError(
+            "skill policy records ungoverned dispositions for names it already governs: "
+            f"{governed_by_disposition}"
+        )
+
     profiles = policy.get("profiles")
     if not isinstance(profiles, dict) or set(profiles) != set(SKILL_POLICY_PROFILES):
         raise InstallError(f"skill policy profiles must be exactly {list(SKILL_POLICY_PROFILES)}")
@@ -1221,6 +1293,7 @@ def load_skill_policy(policy_path: Path, *, bundle_root: Path) -> dict[str, Any]
     policy["local_reference_consolidations"] = consolidations
     policy["hub_shadow_remove"] = hub_remove
     policy["required_local_keep"] = local_keep
+    policy["ungoverned_active"] = ungoverned
     policy["_source_root"] = source_root
     policy["_path"] = policy_path
     return policy
@@ -1237,6 +1310,59 @@ def _active_skill_manifests(skills_dir: Path) -> list[Path]:
         path for path in skills_dir.rglob("SKILL.md")
         if not any(part.startswith(".") for part in path.relative_to(skills_dir).parts)
     ]
+
+
+def _governed_skill_dirs(policy: dict[str, Any], skills_dir: Path, profile: str) -> set[Path]:
+    """Every skill directory this policy classifies for ``profile``.
+
+    Bundled skills are governed in every profile (a profile in ``empty`` mode
+    removes the keeps too).  The local/hub/required-keep surfaces only exist in
+    the default home, so they are only governed there.
+    """
+    rels: set[str] = set(policy["bundled"]["remove"].values())
+    rels.update(policy["bundled"]["keep"].values())
+    if profile == "default":
+        rels.update(policy["local_remove"].values())
+        rels.update(policy["required_local_keep"].values())
+        rels.update(spec["install_path"] for spec in policy["hub_shadow_remove"].values())
+    return {skills_dir / rel for rel in rels}
+
+
+def _classify_active_skill_roots(
+    skills_dir: Path, governed_dirs: set[Path]
+) -> tuple[list[Path], list[Path]]:
+    """Split the active skill tree into governed and ungoverned skill roots.
+
+    A ``SKILL.md`` found *inside* a governed skill directory is that skill's own
+    vendored content (a progressive-disclosure reference package), not a second
+    active skill — it collapses onto its owning root instead of inflating the
+    count.  Everything else is an ungoverned root: a skill nothing in
+    ``skills-policy.json`` accounts for, which is exactly what the background
+    self-improvement review produces when it writes a skill for Hermes itself.
+    """
+    governed_roots: set[Path] = set()
+    ungoverned: set[Path] = set()
+    for manifest in _active_skill_manifests(skills_dir):
+        skill_dir = manifest.parent
+        root: Path | None = skill_dir if skill_dir in governed_dirs else None
+        if root is None:
+            for parent in skill_dir.parents:
+                if parent == skills_dir:
+                    break
+                if parent in governed_dirs:
+                    root = parent
+                    break
+        if root is not None:
+            governed_roots.add(root)
+        else:
+            ungoverned.add(skill_dir)
+    # A nested ungoverned skill travels with its outermost ungoverned parent,
+    # so only the outermost directory is an archive target.
+    outermost = {
+        path for path in ungoverned
+        if not any(parent in ungoverned for parent in path.parents)
+    }
+    return sorted(governed_roots), sorted(outermost)
 
 
 def _read_suppressed(path: Path) -> set[str]:
@@ -1348,6 +1474,47 @@ def _load_hub_lock(lock_path: Path) -> dict[str, Any]:
     if not isinstance(data, dict) or not isinstance(data.get("installed"), dict):
         raise InstallError(f"hub lock has invalid shape: {lock_path}")
     return data
+
+
+def _build_ungoverned_rows(
+    policy: dict[str, Any],
+    *,
+    profile: str,
+    skills_dir: Path,
+    roots: list[Path],
+) -> list[dict[str, Any]]:
+    """Turn ungoverned active skill roots into recoverable archive targets.
+
+    The self-improvement loop is allowed to keep writing skills; it just cannot
+    silently join the governed fleet surface.  Under ``quarantine`` each
+    ungoverned root becomes an ordinary archive target (pre-change tarball,
+    move-to-archive, move-back rollback, receipt line), so a repeat
+    self-authoring event costs a receipt entry instead of a blocked install.
+    """
+    ungoverned = policy["ungoverned_active"]
+    rows: list[dict[str, Any]] = []
+    for root in roots:
+        rel = root.relative_to(skills_dir).as_posix()
+        name = _frontmatter_name(root / "SKILL.md") or root.name
+        if ungoverned["mode"] == "fail":
+            raise InstallError(
+                f"ungoverned active skill {rel!r} in {profile} is not classified by skill "
+                f"policy {policy['policy_id']} — promote it into the policy or quarantine it"
+            )
+        if root.is_symlink():
+            raise InstallError(f"refusing to quarantine symlinked skill path: {root}")
+        disposition = ungoverned["dispositions"].get(name)
+        rows.append({
+            "name": name,
+            "rel": rel,
+            "path": root,
+            "kind": UNGOVERNED_SKILL_KIND,
+            "disposition": (
+                disposition["decision"] if disposition else UNGOVERNED_SKILL_UNREVIEWED
+            ),
+            "disposition_reason": disposition["reason"] if disposition else None,
+        })
+    return rows
 
 
 def build_skill_policy_plan(policy: dict[str, Any], *, home: Path) -> list[dict[str, Any]]:
@@ -1488,8 +1655,16 @@ def build_skill_policy_plan(policy: dict[str, Any], *, home: Path) -> list[dict[
             consolidation_rows = []
             hub_lock_removals = []
 
-        current = len(_active_skill_manifests(skills_dir))
-        predicted = current - len({row["path"] for row in target_rows})
+        governed_dirs = _governed_skill_dirs(policy, skills_dir, profile)
+        governed_roots, ungoverned_roots = _classify_active_skill_roots(skills_dir, governed_dirs)
+        ungoverned_rows = _build_ungoverned_rows(
+            policy, profile=profile, skills_dir=skills_dir, roots=ungoverned_roots
+        )
+        target_rows.extend(ungoverned_rows)
+
+        removed = {row["path"] for row in target_rows}
+        current = len(governed_roots) + len(ungoverned_roots)
+        predicted = len([root for root in governed_roots + ungoverned_roots if root not in removed])
         expected = spec["expected_active_manifests"]
         if predicted != expected:
             raise InstallError(
@@ -1499,6 +1674,8 @@ def build_skill_policy_plan(policy: dict[str, Any], *, home: Path) -> list[dict[
             "profile": profile,
             "home": profile_home,
             "skills_dir": skills_dir,
+            "governed_dirs": governed_dirs,
+            "ungoverned": ungoverned_rows,
             "targets": target_rows,
             "consolidations": consolidation_rows,
             "hub_lock_removals": hub_lock_removals,
@@ -1521,6 +1698,11 @@ def _print_skill_policy_plan(policy: dict[str, Any], actions: list[dict[str, Any
             f"consolidate {len(action['consolidations'])}, "
             f"suppress +{len(additions)}, active {action['current_count']} -> {action['predicted_count']}"
         )
+        for row in action["ungoverned"]:
+            print(
+                f"    quarantine ungoverned skill {row['rel']} "
+                f"(name={row['name']}, disposition={row['disposition']})"
+            )
     print("  broad .no-bundled-skills marker: untouched")
 
 
@@ -1634,7 +1816,7 @@ def _apply_skill_policy(
             if archive_dest.exists():
                 raise InstallError(f"skill policy archive collision: {archive_dest}")
             shutil.move(str(src), str(archive_dest))
-            receipt_steps.append({
+            archive_step = {
                 "step": "skill_policy_archive",
                 "profile": profile,
                 "name": row["name"],
@@ -1643,7 +1825,14 @@ def _apply_skill_policy(
                 "archive_dest": str(archive_dest),
                 "rollback": "move-back",
                 "status": "archived",
-            })
+            }
+            if row["kind"] == UNGOVERNED_SKILL_KIND:
+                # Make an ungoverned quarantine self-explanatory in the receipt:
+                # it is the audit trail an operator reads before promoting the
+                # skill into skills-policy.json or discarding it for good.
+                archive_step["disposition"] = row["disposition"]
+                archive_step["disposition_reason"] = row["disposition_reason"]
+            receipt_steps.append(archive_step)
             _remove_empty_skill_parents(src, action["skills_dir"])
 
         suppression_path = action["suppression_path"]
@@ -1683,7 +1872,18 @@ def _apply_skill_policy(
                     "status": "installed",
                 })
 
-        actual = len(_active_skill_manifests(action["skills_dir"]))
+        governed_roots, ungoverned_roots = _classify_active_skill_roots(
+            action["skills_dir"], action["governed_dirs"]
+        )
+        if ungoverned_roots:
+            raise InstallError(
+                f"skill policy left {profile} with ungoverned active skills: "
+                + ", ".join(
+                    root.relative_to(action["skills_dir"]).as_posix()
+                    for root in ungoverned_roots
+                )
+            )
+        actual = len(governed_roots)
         if actual != action["expected_count"]:
             raise InstallError(
                 f"skill policy left {profile} with {actual} active manifests; "
