@@ -980,6 +980,31 @@ if install_governed_fleet_config "$SYMLINK_FLEET_CONFIG_RELEASE"; then
   fail "real cut accepted symlinked fleet-config installer"
 fi
 
+# Regression: install_governed_fleet_config must invoke the fleet-config
+# installer DIRECTLY, never via guarded_or_direct/guarded_production_write.
+# The installer is itself a production-write-lease actor (acquires its own
+# fenced lease + mutation_guard); nesting it inside the cut's own lease guard
+# self-deadlocks the single-writer production-write-lease.db. Stub both
+# guard entry points to fail loudly if the installer is routed through
+# either of them, then prove a real staged bundle still installs cleanly.
+FLEET_CONFIG_DIRECT_RELEASE="$RELEASES_DIR/v1.1.5-direct-fleet-config"
+stage_fleet_config_bundle "$FLEET_CONFIG_DIRECT_RELEASE"
+if (
+  # shellcheck disable=SC2329 # must not be invoked by install_governed_fleet_config.
+  guarded_or_direct() {
+    fail "install_governed_fleet_config routed the installer through guarded_or_direct (self-deadlock regression)"
+  }
+  # shellcheck disable=SC2329 # must not be invoked by install_governed_fleet_config.
+  guarded_production_write() {
+    fail "install_governed_fleet_config routed the installer through guarded_production_write (self-deadlock regression)"
+  }
+  install_governed_fleet_config "$FLEET_CONFIG_DIRECT_RELEASE"
+); then
+  :
+else
+  fail "install_governed_fleet_config failed when invoking its installer directly"
+fi
+
 # A later cut starts with an unarmed in-process marker. If reconciliation fails
 # during validation/before snapshot creation, it must not consume the previous
 # successful generation's rollback pointer.
