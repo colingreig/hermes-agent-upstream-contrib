@@ -17,6 +17,12 @@ is delivery-aware: a signature is persisted only after the send succeeds.
 ``--drill-all`` injects one synthetic finding per contract through the same
 formatter, Slack sender, receipt, and dedupe path without mutating production
 job or LaunchAgent state.
+
+Every run is archived.  The point-in-time receipt is overwritten in place, so
+it can only ever describe the newest probe -- an alarm storm that has since
+churned is untriageable from it.  Each run therefore also appends one bounded
+record to a rotated history ledger, and every alarm-relevant transition keeps a
+full receipt snapshot, so a storm can be reconstructed after the fact.
 """
 
 from __future__ import annotations
@@ -58,6 +64,22 @@ REALERT_SECONDS = 6 * 60 * 60
 NEW_FINDING_CONFIRM_SECONDS = 4 * 60
 RECOVERY_CONFIRM_SECONDS = 4 * 60
 CUTOVER_GRACE_SECONDS = 10 * 60
+# An incident that has stayed open this long with an unchanged finding set is
+# far more often a contract that drifted stale than a live outage, so the alert
+# says so instead of repeating an unactionable page.
+STALE_INCIDENT_SECONDS = 24 * 60 * 60
+HISTORY_MAX_BYTES = 4 * 1024 * 1024
+HISTORY_SNAPSHOT_LIMIT = 240
+HISTORY_DETAIL_CHARS = 300
+NOTABLE_ALARM_ACTIONS = frozenset(
+    {
+        "sent",
+        "recovery-sent",
+        "delivery-failed",
+        "recovery-delivery-failed",
+        "unreported",
+    }
+)
 MONITORED_LABEL_RE = re.compile(
     r"^(?:ai\.hermes\.|com\.hermes\.|com\.ignite\.|com\.colingreig\.(?:hermes|ignite|pull_anthropic))"
 )
@@ -115,6 +137,160 @@ def _load_optional_json(path: Path) -> dict[str, Any]:
     except (OSError, json.JSONDecodeError):
         return {}
     return value if isinstance(value, dict) else {}
+
+
+def _history_paths(receipt_path: Path, history_dir: Path | None = None) -> tuple[Path, Path]:
+    """Return the (ledger, snapshot directory) archive for a probe receipt."""
+    root = (
+        history_dir
+        if history_dir is not None
+        else receipt_path.parent / f"{receipt_path.stem}-history"
+    )
+    return root.parent / f"{root.name}.jsonl", root
+
+
+DEFAULT_HISTORY_LEDGER, DEFAULT_HISTORY_DIR = _history_paths(DEFAULT_RECEIPT)
+
+
+def _history_tail(path: Path, limit: int = 1) -> list[dict[str, Any]]:
+    """Return up to ``limit`` newest archived records, oldest first.
+
+    Only the tail of the ledger is read so a rotated multi-megabyte archive
+    never becomes a reason to skip reading history during triage.
+    """
+    if limit <= 0:
+        return []
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            window = min(size, max(65536, limit * 8192))
+            handle.seek(size - window)
+            data = handle.read(window)
+    except OSError:
+        return []
+    lines = data.decode("utf-8", errors="replace").splitlines()
+    if window < size and lines:
+        # The window can start mid-record; that leading fragment is not JSON.
+        lines = lines[1:]
+    records: list[dict[str, Any]] = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            value = json.loads(stripped)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            records.append(value)
+    return records[-limit:]
+
+
+def _append_history(path: Path, record: dict[str, Any]) -> None:
+    """Append one bounded record, rotating a single previous generation."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    line = json.dumps(record, sort_keys=True) + "\n"
+    try:
+        current = path.stat().st_size
+    except OSError:
+        current = 0
+    if current and current + len(line.encode("utf-8")) > HISTORY_MAX_BYTES:
+        os.replace(path, path.with_name(f"{path.name}.1"))
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(line)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.chmod(path, 0o600)
+
+
+def _prune_history_snapshots(directory: Path, *, limit: int | None = None) -> None:
+    limit = HISTORY_SNAPSHOT_LIMIT if limit is None else limit
+    try:
+        snapshots = sorted(path for path in directory.glob("*.json") if path.is_file())
+    except OSError:
+        return
+    for stale in snapshots[: max(0, len(snapshots) - limit)]:
+        try:
+            stale.unlink()
+        except OSError:
+            continue
+
+
+def _history_record(receipt: dict[str, Any]) -> dict[str, Any]:
+    """Project a receipt onto the compact, storm-triageable ledger shape."""
+    alarm = dict(receipt.get("alarm") or {})
+    return {
+        "checked_at": receipt.get("checked_at"),
+        "mode": receipt.get("mode"),
+        "status": receipt.get("status"),
+        "finding_count": receipt.get("finding_count"),
+        "alarm_action": alarm.get("action"),
+        "alarm_reason": alarm.get("reason"),
+        "alarm_error": alarm.get("error"),
+        "incident_id": alarm.get("incident_id"),
+        "incident_opened_at": alarm.get("incident_opened_at"),
+        "signature": alarm.get("signature"),
+        "suppressed_until": alarm.get("suppressed_until"),
+        "findings": [
+            {
+                "surface": item.get("surface"),
+                "id": item.get("id"),
+                "code": item.get("code"),
+                "detail": str(item.get("detail") or "")[:HISTORY_DETAIL_CHARS],
+            }
+            for item in list(receipt.get("findings") or [])
+        ],
+    }
+
+
+def _is_history_transition(
+    previous: dict[str, Any] | None, record: dict[str, Any]
+) -> bool:
+    """Report whether this run is worth keeping a full receipt snapshot for."""
+    if previous is None:
+        return True
+    if str(record.get("alarm_action") or "") in NOTABLE_ALARM_ACTIONS:
+        return True
+    if previous.get("status") != record.get("status"):
+        return True
+    if previous.get("incident_id") != record.get("incident_id"):
+        return True
+    # Finding-set churn inside one incident is exactly what the overwritten
+    # receipt used to erase, so it earns a snapshot even when it is deduped.
+    return previous.get("signature") != record.get("signature")
+
+
+def archive_probe_run(
+    receipt: dict[str, Any],
+    *,
+    receipt_path: Path,
+    history_dir: Path | None = None,
+    now: datetime,
+) -> dict[str, Any]:
+    """Archive one probe run so an alarm storm stays triageable afterwards."""
+    ledger_path, snapshot_dir = _history_paths(receipt_path, history_dir)
+    record = _history_record(receipt)
+    previous = _history_tail(ledger_path, 1)
+    transition = _is_history_transition(previous[-1] if previous else None, record)
+    summary: dict[str, Any] = {
+        "ledger_path": str(ledger_path),
+        "snapshot_dir": str(snapshot_dir),
+        "transition": transition,
+        "snapshot": None,
+    }
+    if transition:
+        action = str((receipt.get("alarm") or {}).get("action") or "unknown")
+        slug = re.sub(r"[^a-z0-9]+", "-", action.lower()).strip("-") or "unknown"
+        name = f"{now.strftime('%Y%m%dT%H%M%S%f')}-{slug}.json"
+        summary["snapshot"] = name
+        snapshot_receipt = dict(receipt)
+        snapshot_receipt["history"] = dict(summary)
+        _atomic_json(snapshot_dir / name, snapshot_receipt)
+        _prune_history_snapshots(snapshot_dir)
+    record["snapshot"] = summary["snapshot"]
+    _append_history(ledger_path, record)
+    return summary
 
 
 def _expand_path(value: str, *, home: Path) -> Path:
@@ -1050,26 +1226,90 @@ def _release_cut_observed_at(path: Path = DEFAULT_RELEASE_RECEIPT) -> datetime |
         return None
 
 
-def _alert_message(findings: list[dict[str, str]], *, drill: bool) -> str:
+def _format_duration(seconds: float) -> str:
+    total = max(0, int(seconds))
+    hours, remainder = divmod(total, 3600)
+    minutes = remainder // 60
+    if hours:
+        return f"{hours}h {minutes}m"
+    if minutes:
+        return f"{minutes}m"
+    return f"{total}s"
+
+
+def _triage_hint() -> str:
+    return (
+        f"Triage: {DEFAULT_RECEIPT} (latest run) · "
+        f"{DEFAULT_HISTORY_LEDGER} (run-by-run timeline) · "
+        f"{DEFAULT_HISTORY_DIR}/ (full receipts per transition) · "
+        "`hermes fleet incident-report --json`."
+    )
+
+
+def _alert_message(
+    findings: list[dict[str, str]],
+    *,
+    drill: bool,
+    context: dict[str, Any] | None = None,
+) -> str:
+    context = dict(context or {})
     prefix = "SYNTHETIC DRILL — " if drill else ""
     lines = [
         f"🚨 {prefix}Hermes fleet outcome coverage alarm",
         f"{len(findings)} contract failure(s); every listed job lacks current outcome proof.",
     ]
+    incident_id = str(context.get("incident_id") or "")
+    if incident_id:
+        opened_at = context.get("incident_opened_at")
+        alert_count = int(context.get("alert_count") or 0)
+        parts = [f"Incident {incident_id[:12]}"]
+        if isinstance(opened_at, (int, float)) and opened_at:
+            opened = datetime.fromtimestamp(float(opened_at), tz=timezone.utc)
+            age = float(context.get("now_ts") or opened_at) - float(opened_at)
+            parts.append(f"opened {opened.isoformat()} ({_format_duration(age)} ago)")
+        if alert_count:
+            parts.append(f"alert #{alert_count}")
+        lines.append(" · ".join(parts))
+    reason = str(context.get("reason") or "")
+    if reason:
+        lines.append(f"Why this alert fired now: {reason}")
     for item in findings[:40]:
         lines.append(f"• {item['surface']} {item['id']} [{item['code']}]: {item['detail']}")
     if len(findings) > 40:
         lines.append(f"• … {len(findings) - 40} additional finding(s) in the probe receipt")
-    lines.append("Next: inspect ~/.hermes/state/fleet-outcome-probe.json and repair the failed outcome.")
+    if context.get("stale_incident"):
+        lines.append(
+            "⚠️ This incident has stayed open with an unchanged finding set for "
+            f"{_format_duration(float(context.get('incident_age') or 0))}. "
+            "Confirm the contract still matches reality (contract drift) before "
+            "treating it as a live outage."
+        )
+    lines.append(_triage_hint())
     return "\n".join(lines)
 
 
-def _recovery_message(incident_id: str) -> str:
-    return (
-        "✅ Hermes fleet outcome coverage recovered\n"
-        "All declared cron and LaunchAgent outcome contracts are currently satisfied.\n"
-        f"Incident: {incident_id[:12]}"
-    )
+def _recovery_message(
+    incident_id: str,
+    *,
+    context: dict[str, Any] | None = None,
+) -> str:
+    context = dict(context or {})
+    lines = [
+        "✅ Hermes fleet outcome coverage recovered",
+        "All declared cron and LaunchAgent outcome contracts are currently satisfied.",
+        f"Incident: {incident_id[:12]}",
+    ]
+    detail: list[str] = []
+    duration = context.get("incident_age")
+    if isinstance(duration, (int, float)) and duration:
+        detail.append(f"open {_format_duration(float(duration))}")
+    alert_count = int(context.get("alert_count") or 0)
+    if alert_count:
+        detail.append(f"{alert_count} alert(s) delivered")
+    if detail:
+        lines.append(" · ".join(detail))
+    lines.append(f"Timeline: {DEFAULT_HISTORY_LEDGER}")
+    return "\n".join(lines)
 
 
 def _send_slack(message: str) -> subprocess.CompletedProcess[str]:
@@ -1115,6 +1355,11 @@ def route_alarm(
                 or last_signature
                 or _new_incident_id(last_alert_at or now_ts, sorted(delivered))
             )
+            incident_opened_at = float(
+                state.get("incident_opened_at") or last_alert_at or now_ts
+            )
+            incident_age = now_ts - incident_opened_at
+            alert_count = int(state.get("alert_count") or 1)
             pending = dict(state.get("pending_new_findings") or {})
             new_identities = identity_set - delivered
             pending = {
@@ -1124,6 +1369,7 @@ def route_alarm(
             state.update(
                 {
                     "incident_id": incident_id,
+                    "incident_opened_at": incident_opened_at,
                     "delivered_finding_identities": sorted(delivered),
                     "pending_new_findings": pending,
                 }
@@ -1136,18 +1382,51 @@ def route_alarm(
             if new_identities and (in_cutover_grace or not persistent_new):
                 if real_alert:
                     _atomic_json(state_path, state)
+                confirm_at = min(
+                    first_seen + NEW_FINDING_CONFIRM_SECONDS
+                    for first_seen in pending.values()
+                )
+                if in_cutover_grace:
+                    return {
+                        "action": "cutover-suppressed",
+                        "reason": (
+                            f"{len(new_identities)} new contract(s) appeared inside the "
+                            f"{CUTOVER_GRACE_SECONDS // 60}m release-cut grace window; "
+                            "held until the window expires."
+                        ),
+                        "signature": signature,
+                        "incident_id": incident_id,
+                        "incident_opened_at": incident_opened_at,
+                        "suppressed_until": cutover_ts + CUTOVER_GRACE_SECONDS,
+                        "pending_identities": sorted(new_identities),
+                    }
                 return {
-                    "action": "cutover-suppressed" if in_cutover_grace else "new-finding-pending",
+                    "action": "new-finding-pending",
+                    "reason": (
+                        f"{len(new_identities)} new contract(s) joined incident "
+                        f"{incident_id[:12]} but have not yet persisted for "
+                        f"{NEW_FINDING_CONFIRM_SECONDS // 60}m."
+                    ),
                     "signature": signature,
                     "incident_id": incident_id,
+                    "incident_opened_at": incident_opened_at,
+                    "pending_until": confirm_at,
+                    "pending_identities": sorted(new_identities),
                 }
             if not persistent_new and now_ts - last_alert_at < REALERT_SECONDS:
                 if real_alert and state != _load_optional_json(state_path):
                     _atomic_json(state_path, state)
                 return {
                     "action": "deduped",
+                    "reason": (
+                        f"Same incident {incident_id[:12]} (open "
+                        f"{_format_duration(incident_age)}); no new contract and the "
+                        f"{REALERT_SECONDS // 3600}h re-alert interval has not elapsed."
+                    ),
                     "signature": signature,
                     "incident_id": incident_id,
+                    "incident_opened_at": incident_opened_at,
+                    "next_alert_at": last_alert_at + REALERT_SECONDS,
                 }
             if persistent_new:
                 alert_identities = delivered | persistent_new
@@ -1155,23 +1434,42 @@ def route_alarm(
                     item for item in findings
                     if f"{item['surface']}:{item['id']}" in alert_identities
                 ]
+                alert_reason = (
+                    f"{len(persistent_new)} newly persistent contract(s) joined open "
+                    f"incident {incident_id[:12]}: "
+                    + ", ".join(sorted(persistent_new)[:5])
+                )
+            else:
+                alert_reason = (
+                    f"{REALERT_SECONDS // 3600}h re-alert: incident "
+                    f"{incident_id[:12]} has been unresolved for "
+                    f"{_format_duration(incident_age)}."
+                )
+            alert_count += 1
         else:
             incident_id = str(
                 state.get("pending_incident_id")
                 or _new_incident_id(now_ts, identities)
             )
+            incident_opened_at = float(
+                state.get("pending_incident_since") or now_ts
+            )
+            incident_age = now_ts - incident_opened_at
+            alert_count = 1
             pending = dict(state.get("pending_new_findings") or {})
             pending = {
                 key: float(pending.get(key) or now_ts)
                 for key in identities
             }
+            alert_reason = (
+                f"New incident {incident_id[:12]} opened on "
+                f"{len(identities)} contract(s): " + ", ".join(identities[:5])
+            )
             if in_cutover_grace:
                 state.update(
                     {
                         "pending_incident_id": incident_id,
-                        "pending_incident_since": float(
-                            state.get("pending_incident_since") or now_ts
-                        ),
+                        "pending_incident_since": incident_opened_at,
                         "pending_finding_identities": identities,
                         "pending_new_findings": pending,
                         "pending_from_cutover": True,
@@ -1181,8 +1479,16 @@ def route_alarm(
                     _atomic_json(state_path, state)
                 return {
                     "action": "cutover-suppressed",
+                    "reason": (
+                        f"{len(identities)} contract(s) failed inside the "
+                        f"{CUTOVER_GRACE_SECONDS // 60}m release-cut grace window; "
+                        "held until the window expires."
+                    ),
                     "signature": signature,
                     "incident_id": incident_id,
+                    "incident_opened_at": incident_opened_at,
+                    "suppressed_until": cutover_ts + CUTOVER_GRACE_SECONDS,
+                    "pending_identities": identities,
                 }
             if state.get("pending_from_cutover"):
                 persistent_new = {
@@ -1195,49 +1501,80 @@ def route_alarm(
                         _atomic_json(state_path, state)
                     return {
                         "action": "new-finding-pending",
+                        "reason": (
+                            "Release-cut grace window expired; the surviving "
+                            f"{len(identities)} contract(s) still need "
+                            f"{NEW_FINDING_CONFIRM_SECONDS // 60}m of persistence "
+                            "before paging."
+                        ),
                         "signature": signature,
                         "incident_id": incident_id,
+                        "incident_opened_at": incident_opened_at,
+                        "pending_until": min(
+                            first_seen + NEW_FINDING_CONFIRM_SECONDS
+                            for first_seen in pending.values()
+                        ),
+                        "pending_identities": identities,
                     }
                 alert_findings = [
                     item for item in findings
                     if f"{item['surface']}:{item['id']}" in persistent_new
                 ]
+                alert_reason = (
+                    f"{len(persistent_new)} contract(s) outlasted the release-cut "
+                    f"grace window and opened incident {incident_id[:12]}: "
+                    + ", ".join(sorted(persistent_new)[:5])
+                )
             state.update(
                 {
                     "pending_incident_id": incident_id,
-                    "pending_incident_since": float(
-                        state.get("pending_incident_since") or now_ts
-                    ),
+                    "pending_incident_since": incident_opened_at,
                     "pending_finding_identities": identities,
                 }
             )
             if real_alert:
                 _atomic_json(state_path, state)
         delivery_signature = _signature(alert_findings)
-        message = _alert_message(alert_findings, drill=drill)
+        stale_incident = incident_age >= STALE_INCIDENT_SECONDS
+        context = {
+            "incident_id": incident_id,
+            "incident_opened_at": incident_opened_at,
+            "incident_age": incident_age,
+            "alert_count": alert_count,
+            "reason": alert_reason,
+            "stale_incident": stale_incident,
+            "now_ts": now_ts,
+        }
+        message = _alert_message(alert_findings, drill=drill, context=context)
         if not real_alert:
             if emit_dry_run:
                 print(message)
             return {
                 "action": "dry-run",
+                "reason": alert_reason,
                 "signature": delivery_signature,
                 "incident_id": incident_id,
+                "incident_opened_at": incident_opened_at,
             }
         try:
             result = sender(message)
         except (OSError, subprocess.SubprocessError) as exc:
             return {
                 "action": "delivery-failed",
+                "reason": f"Slack delivery raised while sending: {alert_reason}",
                 "signature": delivery_signature,
                 "incident_id": incident_id,
+                "incident_opened_at": incident_opened_at,
                 "error": str(exc)[-500:],
             }
         if result.returncode != 0:
             detail = (result.stderr or result.stdout or "unknown send failure").strip()
             return {
                 "action": "delivery-failed",
+                "reason": f"Slack rejected the send: {alert_reason}",
                 "signature": delivery_signature,
                 "incident_id": incident_id,
+                "incident_opened_at": incident_opened_at,
                 "error": detail[-500:],
             }
         state.update(
@@ -1246,6 +1583,8 @@ def route_alarm(
                 "last_alert_at": now_ts,
                 "active": True,
                 "incident_id": incident_id,
+                "incident_opened_at": incident_opened_at,
+                "alert_count": alert_count,
                 "delivered_finding_identities": sorted(
                     set(state.get("delivered_finding_identities") or [])
                     | set(_finding_identities(alert_findings))
@@ -1269,8 +1608,12 @@ def route_alarm(
         _atomic_json(state_path, state)
         return {
             "action": "sent",
+            "reason": alert_reason,
             "signature": delivery_signature,
             "incident_id": incident_id,
+            "incident_opened_at": incident_opened_at,
+            "alert_count": alert_count,
+            "stale_incident": stale_incident,
         }
 
     previous_signature = str(state.get("delivered_signature") or "")
@@ -1283,36 +1626,83 @@ def route_alarm(
             state.pop("pending_from_cutover", None)
             if real_alert:
                 _atomic_json(state_path, state)
-        return {"action": "clean"}
+        return {
+            "action": "clean",
+            "reason": "Every declared contract satisfied; no incident is open.",
+        }
     incident_id = str(state.get("incident_id") or previous_signature)
+    incident_opened_at = float(
+        state.get("incident_opened_at") or state.get("last_alert_at") or now_ts
+    )
+    incident_age = now_ts - incident_opened_at
+    alert_count = int(state.get("alert_count") or 1)
+    recovery_context = {
+        "incident_id": incident_id,
+        "incident_opened_at": incident_opened_at,
+        "incident_age": incident_age,
+        "alert_count": alert_count,
+    }
     clean_since = float(state.get("clean_since") or now_ts)
     state["clean_since"] = clean_since
     if in_cutover_grace or now_ts - clean_since < RECOVERY_CONFIRM_SECONDS:
         if real_alert:
             _atomic_json(state_path, state)
+        if in_cutover_grace:
+            return {
+                "action": "recovery-suppressed",
+                "reason": (
+                    f"Incident {incident_id[:12]} looks clean inside the "
+                    f"{CUTOVER_GRACE_SECONDS // 60}m release-cut grace window; the "
+                    "recovery is held until the window expires."
+                ),
+                "signature": previous_signature,
+                "incident_id": incident_id,
+                "incident_opened_at": incident_opened_at,
+                "suppressed_until": cutover_ts + CUTOVER_GRACE_SECONDS,
+            }
         return {
-            "action": "recovery-suppressed" if in_cutover_grace else "recovery-pending",
+            "action": "recovery-pending",
+            "reason": (
+                f"Incident {incident_id[:12]} has been clean for "
+                f"{_format_duration(now_ts - clean_since)}; recovery is sent after "
+                f"{RECOVERY_CONFIRM_SECONDS // 60}m of confirmed clean runs."
+            ),
             "signature": previous_signature,
             "incident_id": incident_id,
+            "incident_opened_at": incident_opened_at,
+            "pending_until": clean_since + RECOVERY_CONFIRM_SECONDS,
         }
-    message = _recovery_message(incident_id)
+    recovery_reason = (
+        f"Incident {incident_id[:12]} stayed clean for "
+        f"{RECOVERY_CONFIRM_SECONDS // 60}m after {_format_duration(incident_age)} open."
+    )
+    message = _recovery_message(incident_id, context=recovery_context)
     if not real_alert:
         if emit_dry_run:
             print(message)
-        return {"action": "recovery-dry-run", "signature": previous_signature}
+        return {
+            "action": "recovery-dry-run",
+            "reason": recovery_reason,
+            "signature": previous_signature,
+            "incident_id": incident_id,
+        }
     try:
         result = sender(message)
     except (OSError, subprocess.SubprocessError) as exc:
         return {
             "action": "recovery-delivery-failed",
+            "reason": f"Slack delivery raised while sending recovery: {recovery_reason}",
             "signature": previous_signature,
+            "incident_id": incident_id,
             "error": str(exc)[-500:],
         }
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "unknown send failure").strip()
         return {
             "action": "recovery-delivery-failed",
+            "reason": f"Slack rejected the recovery send: {recovery_reason}",
             "signature": previous_signature,
+            "incident_id": incident_id,
             "error": detail[-500:],
         }
     state.update(
@@ -1321,15 +1711,22 @@ def route_alarm(
             "last_recovery_at": now_ts,
             "recovered_signature": previous_signature,
             "recovered_incident_id": incident_id,
+            "recovered_incident_opened_at": incident_opened_at,
+            "recovered_incident_alert_count": alert_count,
         }
     )
     state.pop("clean_since", None)
     state.pop("pending_new_findings", None)
+    state.pop("incident_opened_at", None)
+    state.pop("alert_count", None)
     _atomic_json(state_path, state)
     return {
         "action": "recovery-sent",
+        "reason": recovery_reason,
         "signature": previous_signature,
         "incident_id": incident_id,
+        "incident_opened_at": incident_opened_at,
+        "alert_count": alert_count,
     }
 
 
@@ -1423,6 +1820,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--launch-agents-dir", type=Path, default=DEFAULT_LAUNCH_AGENTS)
     parser.add_argument("--state", type=Path, default=DEFAULT_STATE)
     parser.add_argument("--receipt", type=Path, default=DEFAULT_RECEIPT)
+    parser.add_argument(
+        "--history-dir",
+        type=Path,
+        help="archive root; defaults to '<receipt stem>-history' beside the receipt",
+    )
     parser.add_argument("--drill-all", action="store_true")
     parser.add_argument(
         "--real-alert",
@@ -1492,6 +1894,22 @@ def main(argv: list[str] | None = None) -> int:
             "evidence": evidence,
             "alarm": alarm,
         }
+        # The receipt above is overwritten every run, so archive this run before
+        # publishing it.  Archiving is best-effort: a failed write records its
+        # reason in the receipt rather than losing the probe result entirely.
+        try:
+            receipt["history"] = archive_probe_run(
+                receipt,
+                receipt_path=receipt_path,
+                history_dir=args.history_dir,
+                now=now,
+            )
+        except OSError as exc:
+            receipt["history"] = {
+                "error": f"{type(exc).__name__}: {exc}"[-300:],
+                "transition": None,
+                "snapshot": None,
+            }
         _atomic_json(receipt_path, receipt)
     if args.json:
         print(json.dumps(receipt, indent=2, sort_keys=True))
