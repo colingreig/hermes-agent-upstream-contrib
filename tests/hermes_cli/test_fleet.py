@@ -61,3 +61,83 @@ def test_incident_report_reads_requested_profile_admission_store(monkeypatch, tm
 
     fleet.collect_incident_report(home=home, root=root)
     assert observed == [home.resolve() / "state/executor-admission.db"]
+
+
+def test_incident_report_surfaces_fleet_outcome_history_not_only_latest_receipt(
+    monkeypatch, tmp_path
+):
+    """The probe receipt is overwritten per run; triage needs the archive."""
+    import hermes_cli.fleet as fleet
+
+    home = tmp_path / "profile"
+    root = tmp_path / "repo"
+    state = home / "state"
+    state.mkdir(parents=True)
+    (root / "machine-setup/mini-scripts").mkdir(parents=True)
+    (root / "machine-setup/mini-scripts/fleet_outcome_manifest.json").write_text(
+        json.dumps({"files": []}), encoding="utf-8"
+    )
+    (state / "fleet-outcome-probe.json").write_text(
+        json.dumps(
+            {
+                "checked_at": "2026-08-03T02:00:00+00:00",
+                "status": "clean",
+                "finding_count": 0,
+                "alarm": {"action": "recovery-sent", "reason": "stayed clean"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (state / "fleet-outcome-alert-state.json").write_text(
+        json.dumps({"active": False}), encoding="utf-8"
+    )
+    (state / "fleet-outcome-probe-history.jsonl").write_text(
+        "\n".join(
+            json.dumps(
+                {
+                    "checked_at": f"2026-08-03T01:{minute:02d}:00+00:00",
+                    "status": "alert",
+                    "finding_count": 3,
+                    "alarm_action": "deduped",
+                    "incident_id": "deadbeef",
+                }
+            )
+            for minute in (10, 15, 20)
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    snapshots = state / "fleet-outcome-probe-history"
+    snapshots.mkdir()
+    (snapshots / "20260803T011000-sent.json").write_text("{}", encoding="utf-8")
+
+    monkeypatch.setattr(fleet, "_process_evidence", lambda: [])
+    monkeypatch.setattr(fleet, "_gateway_evidence", lambda: {"reachable": True})
+    report = fleet.collect_incident_report(home=home, root=root)
+
+    outcome = report["fleet_outcome"]
+    assert outcome["latest"]["status"] == "clean"
+    assert outcome["latest"]["alarm_reason"] == "stayed clean"
+    assert outcome["incident_open"] is False
+    # The storm the current receipt no longer mentions is still reconstructable.
+    assert outcome["history_available"] is True
+    assert [item["finding_count"] for item in outcome["history"]] == [3, 3, 3]
+    assert outcome["recent_snapshots"] == ["20260803T011000-sent.json"]
+
+
+def test_incident_report_reports_a_missing_fleet_outcome_archive(monkeypatch, tmp_path):
+    import hermes_cli.fleet as fleet
+
+    home = tmp_path / "profile"
+    root = tmp_path / "repo"
+    (root / "machine-setup/mini-scripts").mkdir(parents=True)
+    (root / "machine-setup/mini-scripts/fleet_outcome_manifest.json").write_text(
+        json.dumps({"files": []}), encoding="utf-8"
+    )
+    monkeypatch.setattr(fleet, "_process_evidence", lambda: [])
+    monkeypatch.setattr(fleet, "_gateway_evidence", lambda: {"reachable": True})
+
+    outcome = fleet.collect_incident_report(home=home, root=root)["fleet_outcome"]
+    assert outcome["latest"] is None
+    assert outcome["history"] == []
+    assert outcome["history_available"] is False
