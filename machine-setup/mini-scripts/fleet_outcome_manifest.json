@@ -58,7 +58,7 @@
       "destination_root": "scripts",
       "destination": "runtime_current_guard.py",
       "mode": "0755",
-      "sha256": "1706f421d4068f9fcb2ef62ced4bc1281bd3087b981d9d4549aee7e8992aa843"
+      "sha256": "08cb471f4308bbb6239d35926701ccfe5b45f448e2d78034d2dac3bb435293e9"
     },
     {
       "source": "digest_trusted_scripts.json",
@@ -86,7 +86,7 @@
       "destination_root": "scripts",
       "destination": "fleet_outcome_contracts.json",
       "mode": "0644",
-      "sha256": "048feb93addbbc6e37061b28f4eac6067ab36f0527e1f7fb648d5369cb56f568"
+      "sha256": "ecc42b478235db89ae1c866020371373879fd69eaaa36894e9ce7b5cc9aebf4e"
     },
     {
       "source": "mini_local_registry.json",

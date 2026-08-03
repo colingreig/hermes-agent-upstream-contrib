@@ -134,6 +134,14 @@ Usage: mini-release-cut.sh [--ref <branch-or-sha>] [--certified-sha <full-sha>] 
                 gap rather than silently shipping a corrupt release. Prefer
                 the default network clone; use this only when origin is
                 genuinely unreachable.
+
+Exit codes:
+  0   success (cut, no-op, preflight, or rollback)
+  75  DEFERRED — the gateway did not quiesce inside the drain window because
+      the fleet was still working. Nothing was switched, the drain marker was
+      removed, and poll-control was NOT frozen: the next poll retries with the
+      same certified SHA and promotion receipt. Not an error.
+  1   failure (fail-closed; a managed poll cut also freezes poll-control)
 EOF
 }
 
@@ -1694,6 +1702,27 @@ DRAIN_REQUEST_FILE="$HERMES_HOME/.drain_request.json"
 GATEWAY_STATE_FILE="$HERMES_HOME/gateway_state.json"
 RELEASE_DRAIN_ARMED=0
 
+# A drain window that expires because the fleet is still working is NOT a
+# release failure (ClickUp 86e2md9ck).  Nothing has been switched, the
+# certified SHA and promotion receipt are unchanged, and the correct response
+# is to try again on the next 15-minute poll — not to freeze poll-control and
+# demand an operator re-certification.  A normal cron agent run is 25-45
+# minutes, so a 5-minute drain window loses to a busy fleet routinely; before
+# this exit code existed that structurally locked a busy fleet out of its own
+# deploy path.
+#
+# The window itself is deliberately NOT widened to cover a whole agent run:
+# the drain marker refuses new fleet work for as long as it is armed, so a
+# 45-minute blocking wait inside a 15-minute cron would keep the fleet parked
+# in drain permanently.  Short window + cheap automatic retry is the shape.
+#
+# 75 is EX_TEMPFAIL.  It is reserved for exactly one condition: the drain
+# window expired with the marker successfully removed and no operational
+# mutation performed.  Every other nonzero result keeps the original
+# fail-closed freeze.
+RELEASE_DEFER_EXIT=75
+RELEASE_DEFERRED=0
+
 request_release_drain() {
   local runtime_python="$CURRENT_LINK/venv/bin/python"
   if [ "$DRY_RUN" -eq 1 ]; then
@@ -1788,7 +1817,10 @@ wait_for_release_drain() {
     sleep 1
   done
   warn "gateway did not drain within ${DRAIN_TIMEOUT}s; refusing runtime switch/reload"
-  return 1
+  # Distinct from 1: the gateway is healthy and simply still busy.  The caller
+  # turns this into a deferral (see RELEASE_DEFER_EXIT).  Failure to ARM the
+  # drain, by contrast, still returns 1 and stays a hard failure.
+  return "$RELEASE_DEFER_EXIT"
 }
 
 begin_release_drain() {
@@ -2493,6 +2525,10 @@ cleanup_on_exit() {
       RELEASE_DRAIN_ARMED=0
     elif ! production_write_mutation_allowed || ! clear_release_drain; then
       warn "FATAL: release drain cleanup could not be completed"
+      # A marker that cannot be removed parks the whole fleet in drain. That is
+      # a real safety event, so revoke any deferral claim and fall back to the
+      # fail-closed freeze below.
+      RELEASE_DEFERRED=0
       status=70
     fi
   fi
@@ -2513,7 +2549,14 @@ cleanup_on_exit() {
       warn "cleanup: refusing to remove partial release without current production write fence"
     fi
   fi
-  if [ "$status" -ne 0 ]; then
+  if [ "$status" -ne 0 ] && [ "$RELEASE_DEFERRED" -eq 1 ]; then
+    # Deferral, not failure: the runtime was never switched, the drain marker
+    # is off, and the certified SHA + promotion receipt are untouched. Leave
+    # poll-control unfrozen so the next poll retries unattended. RELEASE_DEFERRED
+    # is only ever set on the drain-timeout path, and is revoked above if the
+    # marker could not be cleared.
+    warn "poll freeze skipped: release deferred, not failed; authorization left intact for automatic retry"
+  elif [ "$status" -ne 0 ]; then
     # Fetch/preflight failures happen before lease acquisition.  A trap must
     # leave poll-control state alone in that case (or after fence loss).
     if [ "$LEASE_CUT_READY" -ne 1 ]; then
@@ -2902,8 +2945,31 @@ heartbeat_production_write_lease
 # Quiesce the live gateway before the first pre-switch operational mutation.
 # Timeout clears the marker and aborts before .previous, runtime-current, or
 # any launchd registration is changed.
-if ! begin_release_drain; then
+#
+# Two distinct outcomes (ClickUp 86e2md9ck):
+#   * the drain could not be ARMED, or the marker could not be REMOVED after a
+#     timeout — a genuine operational failure; die() and let the EXIT trap
+#     freeze poll-control for operator reconciliation, exactly as before;
+#   * the drain was armed, the fleet stayed busy, and the marker came back off
+#     cleanly — nothing was switched and nothing was left armed, so this is a
+#     DEFERRAL.  Exit RELEASE_DEFER_EXIT with poll-control untouched so the
+#     next 15-minute poll retries unattended against the same certified SHA
+#     and promotion receipt.  Certification is never weakened here: the retry
+#     re-runs every fetch, promotion-authority, advancement, build, and verify
+#     gate from scratch.
+DRAIN_STATUS=0
+begin_release_drain || DRAIN_STATUS=$?
+if [ "$DRAIN_STATUS" -ne 0 ]; then
   clear_release_drain || warn "release drain remained armed after timeout"
+  if [ "$DRAIN_STATUS" -eq "$RELEASE_DEFER_EXIT" ] && [ "$RELEASE_DRAIN_ARMED" -eq 0 ]; then
+    RELEASE_DEFERRED=1
+    # Single, greppable, fleet-outcome-countable evidence line.  The
+    # release-cut-drain-deferral contract in fleet_outcome_contracts.json
+    # alarms once these repeat inside its window, so a fleet that can NEVER
+    # quiesce pages instead of silently never deploying.
+    warn "release cut deferred: gateway did not quiesce within ${DRAIN_TIMEOUT}s; poll authorization preserved, retrying next poll"
+    exit "$RELEASE_DEFER_EXIT"
+  fi
   die "cut aborted before runtime switch: gateway did not quiesce"
 fi
 heartbeat_production_write_lease

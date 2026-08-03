@@ -77,7 +77,22 @@ git -C "$HERMES_HOME/runtime-current" cat-file blob "$LOCAL_AUTHORITY_REF" > "$R
   --receipt-id "$RECEIPT_ID" \
   --head-sha "$CERTIFIED_SHA" >/dev/null
 
+# Exit 75 (EX_TEMPFAIL, mini-release-cut.sh's RELEASE_DEFER_EXIT) means the cut
+# was DEFERRED because the fleet was still working: nothing switched, the drain
+# marker was removed, and poll-control was deliberately left unfrozen so this
+# very wrapper retries on its next 15-minute invocation (ClickUp 86e2md9ck).
+# Reporting that as a poller failure would be misleading, so it is surfaced as
+# its own log line and a clean exit. Repeated deferrals are counted and alarmed
+# by the release-cut-drain-deferral fleet-outcome contract, which reads the
+# cutter's own "release cut deferred:" line out of this same log — so a fleet
+# that can never quiesce pages rather than quietly never deploying.
+CUT_STATUS=0
 "$CUT" --ref prod-live-patches \
   --certified-sha "$CERTIFIED_SHA" \
   --promotion-receipt-id "$RECEIPT_ID" \
-  --if-advanced --prune
+  --if-advanced --prune || CUT_STATUS=$?
+if [ "$CUT_STATUS" -eq 75 ]; then
+  printf 'mini-release-poll: cut deferred by a busy fleet; authorization intact, retrying next cycle\n'
+  exit 0
+fi
+exit "$CUT_STATUS"

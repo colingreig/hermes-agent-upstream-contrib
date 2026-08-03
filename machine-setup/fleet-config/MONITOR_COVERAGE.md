@@ -91,7 +91,20 @@ admission contention and stale heartbeats, exact owner-dead recovery receipts,
 read-only SQLite busy/`quick_check`/size health, repeated scheduler preflight
 failures, and content-addressed governed-path drift. These checks open SQLite
 with `mode=ro` and a bounded timeout and never reap an owner or acquire a write
-lock. `hermes fleet incident-report [--json]` collects the same incident class
+lock.
+
+`release-cut-drain-deferral` covers the busy-fleet deploy path (ClickUp
+86e2md9ck). A release cut that reaches its drain window while agents are still
+running exits `75` (deferred) with poll-control left unfrozen, so the poller
+retries unattended instead of demanding an operator re-certification. Because
+that retry is silent by design, the contract counts the cutter's
+`release cut deferred: gateway did not quiesce` lines in
+`~/.hermes/logs/mini-release-poll.log` and alarms at 6 inside a 240-minute
+window — a fleet that can never quiesce pages rather than quietly never
+deploying. One or two deferrals are the normal cost of a 25-45 minute agent run
+overlapping a 15-minute poll and deliberately do not alarm.
+
+`hermes fleet incident-report [--json]` collects the same incident class
 alongside the deployment receipt, runtime symlink, worktrees, processes,
 gateway, profile drain, execution/resource admission, production-write leases,
 and database evidence.

@@ -488,6 +488,33 @@ Poll-control changes are content-addressed, persist under `releases/`, and
 require an explicit actor and reason. Missing, corrupt, locked, or
 unsafe-permission control state prevents polling. A failed managed cut records
 a frozen receipt, or remains fail-closed if the control itself is unavailable.
+
+**Deferral is not failure (ClickUp 86e2md9ck).** Before switching the runtime
+the cutter arms the gateway's reversible external drain and waits
+`MINI_RELEASE_DRAIN_TIMEOUT` (default 300s) for `gateway_state=draining` +
+`active_agents=0`. A normal cron agent run is 25-45 minutes, so that window
+routinely expires simply because the fleet is working. When it does — and only
+when the drain marker came back off cleanly and nothing was switched — the
+cutter logs `release cut deferred: gateway did not quiesce ...`, exits **75**
+(`EX_TEMPFAIL`), and deliberately leaves poll-control **unfrozen**: the next
+15-minute poll retries unattended against the same certified SHA and promotion
+receipt, re-running every fetch, promotion-authority, advancement, build, and
+verify gate from scratch. `mini-release-poll.sh` maps that 75 to its own
+`cut deferred by a busy fleet` line and a clean exit.
+
+Everything else keeps the original fail-closed behaviour: a drain that could
+not be *armed*, a marker that could not be *cleared*, and every build/verify
+failure still freeze poll-control for operator reconciliation. Because an
+unattended retry is silent by design, the `release-cut-drain-deferral`
+fleet-outcome contract counts deferral lines in
+`~/.hermes/logs/mini-release-poll.log` and alarms at 6 inside 240 minutes, so a
+fleet that can *never* quiesce pages instead of quietly never deploying.
+
+The drain window is intentionally NOT widened to cover a whole agent run: the
+marker refuses new fleet work for as long as it is armed, so a 45-minute
+blocking wait inside a 15-minute cron would park the fleet in drain
+permanently. Short window plus cheap automatic retry is the contract.
+
 Any deployment that explicitly adopts this contingency must first prove its
 promotion branch contains the active runtime commit; the locked preflight
 accepts only an equal or strict-descendant target and rejects all unverifiable
