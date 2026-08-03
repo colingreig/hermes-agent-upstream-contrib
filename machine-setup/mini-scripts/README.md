@@ -595,6 +595,29 @@ proof packet:
   available, no resource drift), so neither monitor depends on its own
   scheduling plane. The full inventory and outcome mapping is in
   `../fleet-config/MONITOR_COVERAGE.md`.
+- Alarm-storm forensics. `~/.hermes/state/fleet-outcome-probe.json` is
+  overwritten in place every five minutes, so on its own it can only describe
+  the newest run — a storm that has since churned leaves no evidence to triage
+  (this is exactly what blocked the 2026-08-03 round-2 re-validation). Every
+  run therefore also appends one bounded record to
+  `~/.hermes/state/fleet-outcome-probe-history.jsonl` (rotated at 4 MiB, one
+  previous generation kept), and every alarm-relevant transition — status
+  flip, new incident, finding-set churn inside one deduped incident, or any
+  delivery attempt — keeps the full receipt under
+  `~/.hermes/state/fleet-outcome-probe-history/` (newest 240). Archiving is
+  best-effort and records its own failure reason in `history.error` on the
+  receipt rather than losing the probe result. `hermes fleet incident-report
+  --json` joins the latest receipt, the open-incident state, and the archived
+  timeline under `fleet_outcome`.
+- Self-explaining alarms. Every routing decision persists a human `reason`
+  alongside its action, so the receipt and the archive answer "why did this
+  page/not page" without re-deriving state. Slack alerts carry the incident
+  id, when it opened, how long it has been open, which alert number this is,
+  why it fired now (new incident / newly persistent contract / six-hour
+  re-alert), and the triage paths above. Time-bounded suppressions publish
+  their `suppressed_until` / `pending_until` expiry. An incident open more
+  than 24h with an unchanged finding set is labelled probable contract drift
+  rather than repeating an unactionable outage page.
 
 ### Fleet incident report and drain
 
