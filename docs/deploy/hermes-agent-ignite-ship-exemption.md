@@ -95,6 +95,86 @@ SHA-256 verifies, atomically installs, and restores it on rollback.
 `--ref` defaults to `prod-live-patches`. `node`/`npm` live in `/opt/homebrew/bin`
 (not on a non-interactive ssh PATH) — the script extends PATH itself.
 
+## Executor handoff policy for `PLATFORM=manual` repos
+
+**Tracking:** ClickUp `86e2ky2dk`.
+
+The exemption above has a corollary the executor must honor. On a repo classified
+`PLATFORM=manual`, **a CI-green PR is the complete executor deliverable.** Deploy
+is operator/poller gated and is not in the executor's scope, so "I could not
+deploy" is never a reason to hold a finished task.
+
+Therefore, on a manual-platform repo:
+
+- Finished, CI-green work goes to **In Review with a review packet** — the same
+  terminal status the executor uses everywhere else. `ignite-validate` remains the
+  exclusive completion gate.
+- Work is **never** parked in In Progress behind an "ignite- BLOCKED HANDOFF"
+  comment for an undeployable-platform reason. That handoff can never clear: the
+  mini preflight is not something the executor can fix, and the task stalls the
+  status handshake indefinitely. Two runs on 2026-08-03 (PRs #304 and #306, both
+  CI-green) stalled exactly that way, which is what produced this policy.
+- A genuine block (failing CI, missing credential, ambiguous scope) is still a
+  block. This policy only removes *the deploy step* as a handoff precondition.
+
+### The review packet
+
+Every manual-platform handoff carries a packet stating:
+
+1. the PR URL and its green CI evidence;
+2. that `ignite-ship` classifies the repo `PLATFORM=manual` / `DEPLOY_ON_PUSH=false`
+   and deploy is operator/poller gated;
+3. **what to validate now** — the diff against acceptance criteria, plus tests and
+   the linked green CI run;
+4. **what to validate after the next release cut** — post-cut runtime behavior on
+   the mini, since the change is inert until `runtime-current` is repointed.
+
+A validator reading that packet must not treat "not deployed yet" as incomplete
+work.
+
+### Enforcement
+
+The policy is enforced deterministically, not by prompt alone, by
+`machine-setup/mini-scripts/manual_platform_handoff.py`. It runs on the closeout
+cron's cadence (driven from `closeout_actor.py`'s `main()`), and is the exact
+sibling of `closeout_actor`'s own sweep — the two are disjoint on PR state:
+
+| Actor | Precondition | Result |
+|---|---|---|
+| `closeout_actor` | **MERGED** PR + validator PASS | task → `in review` |
+| `manual_platform_handoff` | **OPEN** CI-green PR on a manual-platform repo | task → `in review` + review packet |
+
+Manual-platform classification is read from `ignite-ship`'s own
+`skills/ignite-ship/references/platform-hints.json` in the live `ignite-skills`
+checkout, with a pinned floor (`hermes-agent`, `hermes-agent-upstream-contrib`) so
+the policy still holds when that checkout is absent. A hint can add repos to the
+manual set; it cannot declassify a repo on the floor.
+
+Before any write, all of these must hold — a failure of any one is a logged skip,
+never a silent one:
+
+- the repo is manual-platform **and** on `~/.hermes/allowed-repos.txt` (a missing
+  allowlist yields an empty target set — fail-closed);
+- the PR is OPEN and links exactly one ClickUp task (an ambiguous PR is refused,
+  not guessed);
+- CI is green with at least one check, none failing or pending, and settled at
+  least `--min-idle-minutes` (default 10) ago;
+- `claim_store` reports **no live claim** on the task, so a running executor is
+  never overtaken (an unreadable claim store counts as claimed);
+- the task is in an advanceable in-flight status — anything already review- or
+  complete-class is an idempotent no-op;
+- the newest `ignite-validate:` marker is not FAIL/BLOCK.
+
+Writes are ordered **packet first, then status flip**, so a task can never reach
+the validator's queue in review without its packet; if the packet fails to post,
+the status is left untouched. The flip goes through the guarded `clickup.mjs
+status` path (which re-enforces G1/G2/G3 — Hermes never sets `complete`) and is
+followed by a ClickUp read-after-write confirmation journaled as a
+`review_handoff` event from source `manual-platform-handoff`.
+
+Operate it directly with `manual_platform_handoff.py --dry-run` (reports, writes
+nothing) or `--list-repos` (prints the resolved manual-platform target set).
+
 ## Why not just make `ignite-ship` deploy this repo?
 
 `ignite-ship` is the deploy router for **web** projects (Vercel, Cloudflare

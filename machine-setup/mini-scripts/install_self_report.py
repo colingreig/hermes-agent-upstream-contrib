@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Manifest-verified installer for the hermes-self-report deploy bundle.
 
-This script is the SOLE writer of the eleven hermes-self-report and lifecycle
-continuity artifacts into
+This script is the SOLE writer of the hermes-self-report and lifecycle
+continuity artifacts declared in that manifest, into
 ``~/.hermes/scripts/`` (and ``~/.hermes/skills/hermes-self-report/SKILL.md``).
 It reads ``self_report_manifest.json`` (the declared bundle), verifies every
 source's sha256 against the manifest, snapshots each existing destination, then
@@ -10,8 +10,9 @@ atomically installs and re-verifies the deployed bytes. It NEVER rsyncs the
 scripts dir and NEVER touches any file that is not a manifest destination — in
 particular ``queue_snapshot.json`` and the release venv, which must co-exist
 alongside the bundle (the installer only warns if required co-exist files are
-missing). ``claim_store.py`` and ``closeout_actor.py`` are manifest-governed
-because they are load-bearing producers for the bundled shadow outbox.
+missing). ``claim_store.py``, ``closeout_actor.py`` and
+``manual_platform_handoff.py`` are manifest-governed because they are
+load-bearing producers for the bundled shadow outbox.
 
 stdlib only, ``no_agent``-safe. All destination roots derive from ``--home``
 (default ``~``), so the whole flow is sandbox-testable against a tmp dir with

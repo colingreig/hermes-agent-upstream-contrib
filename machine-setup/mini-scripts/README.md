@@ -883,7 +883,7 @@ never the directory.
 
 ## hermes-self-report bundle (ClickUp 86e2gnz60, 86e2gnz71)
 
-The `hermes-self-report` cron builds and delivers Colin's status email. Its eleven
+The `hermes-self-report` cron builds and delivers Colin's status email. Its
 report and lifecycle-continuity artifacts now deploy through one **declared
 bundle + manifest-verified installer** rather than ad-hoc `scp`. This directory is the deploy mirror; the
 authored report-builder source of truth is Brain
@@ -905,7 +905,8 @@ release blocker. Brain does not deploy anything itself.
 | `report_activity_journal.py` | `~/.hermes/scripts/` | durable Mini lifecycle outbox, immutable required-producer set, and event-specific transition identity |
 | `report_activity_continuity.py` | `~/.hermes/scripts/` | Mini-only nominal-slot two-window continuity, health/provenance, and exact event-kind ClickUp parity adapter |
 | `claim_store.py` | `~/.hermes/scripts/` | durable queue-claim producer for the shadow outbox |
-| `closeout_actor.py` | `~/.hermes/scripts/` | verified review-handoff producer for PR and DB closeout |
+| `closeout_actor.py` | `~/.hermes/scripts/` | verified review-handoff producer for PR and DB closeout; also drives the manual-platform handoff sweep |
+| `manual_platform_handoff.py` | `~/.hermes/scripts/` | verified review-handoff producer for `PLATFORM=manual` repos: an OPEN CI-green PR is the complete executor deliverable, packet posted before the status flip |
 | `SKILL.md` | `~/.hermes/skills/hermes-self-report/` | live RC4 (Brain source; installed only with `--include-skill --brain-path`) |
 
 The report invocation must pass `--scheduled-slot <UTC-slot>` using the
@@ -932,8 +933,9 @@ the **sole writer** of these files. It:
   expected/deployed sha, snapshot location, and overall result;
 - refuses any destination outside `~/.hermes/` or named `queue_snapshot.json`,
   and **warns (never installs)** if required runtime co-exist files such as
-  `queue_snapshot.json` are absent. `claim_store.py` and `closeout_actor.py` are
-  installed and hash-verified because they produce shadow-outbox events.
+  `queue_snapshot.json` are absent. `claim_store.py`, `closeout_actor.py` and
+  `manual_platform_handoff.py` are installed and hash-verified because they
+  produce shadow-outbox events.
 
 ```bash
 # preview: verify all source hashes, print the plan, write nothing
@@ -948,10 +950,10 @@ python3 machine-setup/mini-scripts/install_self_report.py \
 ```
 
 **Never** rsync `~/.hermes/scripts/` (see the wholesale-rsync warning above):
-this installer copies only the eleven declared files by name and touches nothing
+this installer copies only the declared files by name and touches nothing
 else — in particular it never writes `queue_snapshot.json` or the release venv.
 Because release/reconcile passes are known to clobber hand edits, this manifest
-+ installer must be the ONLY writer of these eleven files going forward.
++ installer must be the ONLY writer of those files going forward.
 
 **Activity continuity.** Source consumption is enabled only after the adapter's
 positive and fail-closed tests and the Brain-to-Hermes byte mirror check pass.
