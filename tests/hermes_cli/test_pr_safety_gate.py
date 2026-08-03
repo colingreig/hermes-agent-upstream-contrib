@@ -10,6 +10,8 @@ description doesn't match its diff IS flagged.
 
 from __future__ import annotations
 
+import subprocess
+
 from hermes_cli import pr_safety_gate as psg
 
 
@@ -226,6 +228,74 @@ def test_git_diff_stat_non_fatal_when_not_a_git_repo(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     # No git repo here at all — should not raise, just return "".
     assert psg._git_diff_stat("origin/main") == ""
+
+
+def _init_repo_with_long_path(tmp_path):
+    """Build a throwaway repo whose one changed file has a path long enough
+    that ``git diff --stat`` abbreviates it with a leading ``...``.
+    """
+    def git(*args):
+        subprocess.run(["git", *args], cwd=tmp_path, check=True, capture_output=True)
+
+    git("init", "-q", "-b", "main")
+    git("config", "user.email", "t@example.com")
+    git("config", "user.name", "T")
+    (tmp_path / "README.md").write_text("base\n", encoding="utf-8")
+    git("add", "-A")
+    git("commit", "-qm", "base")
+    # Two files: git sizes --stat's name column against the widest path and
+    # elides anything past the budget, so the deeper path is the one that gets
+    # abbreviated. A single short-path fixture would not reproduce the bug.
+    relpath = (
+        "machine-setup/mini-scripts/pr_pipeline/deeply/nested/"
+        "test_a_very_long_supplementary_path_name_here.py"
+    )
+    for rel in (relpath, "tests/agent/test_credential_pool_no_entries.py"):
+        target = tmp_path / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("# added\n", encoding="utf-8")
+    git("add", "-A")
+    git("commit", "-qm", "add long path")
+    return relpath
+
+
+def test_git_diff_stat_includes_full_paths_that_stat_abbreviates(tmp_path, monkeypatch):
+    """``git diff --stat`` elides long paths with a leading ``...`` to fit its
+    column budget, which made ``flag_recovery_pr_mismatch`` treat an
+    accurately-described file as missing from the diff and false-block the PR.
+    The full path must appear in the returned text.
+    """
+    relpath = _init_repo_with_long_path(tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    # Guard: the bug only reproduces when --stat actually abbreviates. If a
+    # future git stops eliding this path, this assertion tells us the fixture
+    # went stale rather than silently passing for the wrong reason.
+    stat_only = subprocess.run(
+        ["git", "diff", "--stat", "main~1...HEAD"],
+        cwd=tmp_path, capture_output=True, text=True, check=True,
+    ).stdout
+    assert relpath not in stat_only
+    assert "..." in stat_only
+
+    text = psg._git_diff_stat("main~1")
+    assert relpath in text
+
+
+def test_matching_recovery_pr_with_long_path_is_not_blocked(tmp_path, monkeypatch):
+    """End-to-end: a recovery PR that accurately names a long-path file must
+    exit 0. Before the fix this exited 1 purely because of --stat truncation.
+    """
+    relpath = _init_repo_with_long_path(tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    rc = psg.main([
+        "--branch", "recover/lost-work",
+        "--title", "Recovery PR",
+        "--body", f"Recovery PR for stranded worktree, restores `{relpath}`.",
+        "--base-ref", "main~1",
+    ])
+    assert rc == 0
 
 
 # ---------------------------------------------------------------------------

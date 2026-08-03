@@ -62,6 +62,11 @@ _RECOVERY_TITLE_RE = re.compile(r"\b(recovery|stranded|salvage)\b", re.IGNORECAS
 # still overrides this exemption.
 _GATE_OWN_FILES = ("hermes_cli/pr_safety_gate.py", "hermes_cli/content_gate.py")
 
+# Column budget handed to ``git diff --stat=<width>,<name-width>``. Generous
+# enough that no real repo path is abbreviated — see ``_git_diff_stat``.
+_STAT_WIDTH = 1000
+_STAT_NAME_WIDTH = 900
+
 
 class RecoveryPrCheckResult(NamedTuple):
     """Outcome of :func:`check_recovery_pr`."""
@@ -146,6 +151,16 @@ def _git_diff_stat(base_ref: str) -> str:
     ``base_ref`` directly if the merge-base lookup fails (shallow clone,
     detached history, etc.) — non-fatal, mirrors
     ``content_gate.diff_changed_files``'s fallback style.
+
+    The explicit ``--stat=<width>,<name-width>`` matters: bare ``--stat``
+    sizes itself to an 80-column budget and ELIDES long paths with a leading
+    ``...`` (e.g. ``.../nested/test_a_very_long_path.py``).
+    ``flag_recovery_pr_mismatch`` substring-matches filenames named in the PR
+    description against this text, so an abbreviated path made every
+    accurately-described long-path file look absent from the diff and
+    false-blocked the PR. Widening the name column keeps the exact
+    ``path | N +-`` format the mismatch parser expects while guaranteeing
+    every path appears in full.
     """
     try:
         merge_base = subprocess.run(
@@ -155,8 +170,9 @@ def _git_diff_stat(base_ref: str) -> str:
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
         merge_base = base_ref
 
+    diff_range = f"{merge_base}...HEAD" if merge_base != base_ref else base_ref
     proc = subprocess.run(
-        ["git", "diff", "--stat", f"{merge_base}...HEAD" if merge_base != base_ref else base_ref],
+        ["git", "diff", f"--stat={_STAT_WIDTH},{_STAT_NAME_WIDTH}", diff_range],
         capture_output=True, text=True, timeout=30,
     )
     return proc.stdout if proc.returncode == 0 else ""
