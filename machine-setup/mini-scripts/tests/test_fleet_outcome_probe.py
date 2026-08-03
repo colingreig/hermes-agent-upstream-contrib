@@ -209,6 +209,77 @@ def test_unknown_enabled_cron_and_monitored_plist_fail_closed(tmp_path):
     ) in {(item["surface"], item["id"], item["code"]) for item in findings}
 
 
+def test_clickup_executor_accepts_canonical_admission_no_claim_receipt(tmp_path):
+    module = _load_module()
+    outcome = _canonical_contract(cron_name="clickup-executor")["outcome"]
+    artifact = _fresh_artifact(
+        tmp_path,
+        """# Cron Job: clickup-executor
+## Response
+Executor outcome: success-no-claim
+Zero ClickUp claims were started because another fenced owner is active.
+""",
+    )
+
+    assert module._check_text_evidence(
+        surface="cron",
+        identifier="62714b869845",
+        path=artifact,
+        outcome=outcome,
+        now=NOW,
+    ) == []
+
+    artifact.write_text(
+        """# Cron Job: clickup-executor
+## Response
+Zero ClickUp claims and zero swarms were started because another owner is active.
+""",
+        encoding="utf-8",
+    )
+    findings = module._check_text_evidence(
+        surface="cron",
+        identifier="62714b869845",
+        path=artifact,
+        outcome=outcome,
+        now=NOW,
+    )
+    assert {item["code"] for item in findings} == {"success_marker_missing"}
+
+    for negated in (
+        "not one swarm was started",
+        "one swarm failed to start",
+        "a swarm was not started",
+    ):
+        artifact.write_text(
+            f"# Cron Job: clickup-executor\n## Response\n{negated}.\n",
+            encoding="utf-8",
+        )
+        findings = module._check_text_evidence(
+            surface="cron",
+            identifier="62714b869845",
+            path=artifact,
+            outcome=outcome,
+            now=NOW,
+        )
+        assert {item["code"] for item in findings} == {"success_marker_missing"}
+
+    artifact.write_text(
+        """# Cron Job: clickup-executor
+## Response
+0 swarms were started.
+""",
+        encoding="utf-8",
+    )
+    findings = module._check_text_evidence(
+        surface="cron",
+        identifier="62714b869845",
+        path=artifact,
+        outcome=outcome,
+        now=NOW,
+    )
+    assert {item["code"] for item in findings} == {"success_marker_missing"}
+
+
 def test_malformed_plist_is_skipped_with_warning_not_crash(tmp_path):
     """A third-party LaunchAgent plist with invalid XML (e.g. a malformed
     comment) must never crash the probe -- it is skipped and surfaced as a
@@ -268,14 +339,24 @@ def test_route_alarm_timeout_expired_maps_to_delivery_failed_not_crash(tmp_path)
     )
     assert result["action"] == "delivery-failed"
     assert "timed out" in result["error"].lower()
-    assert not state_path.exists()
+    state = json.loads(state_path.read_text())
+    assert state["pending_incident_id"] == result["incident_id"]
+    assert state.get("active") is not True
+    assert "delivered_signature" not in state
 
 
 def test_route_alarm_recovery_timeout_expired_maps_to_recovery_delivery_failed(tmp_path):
     module = _load_module()
     state_path = tmp_path / "state.json"
     state_path.write_text(
-        json.dumps({"active": True, "delivered_signature": "abc123"}), encoding="utf-8"
+        json.dumps(
+            {
+                "active": True,
+                "delivered_signature": "abc123",
+                "clean_since": (NOW - timedelta(minutes=5)).timestamp(),
+            }
+        ),
+        encoding="utf-8",
     )
 
     def hanging_sender(_message):
@@ -354,7 +435,10 @@ def test_main_writes_receipt_and_holds_exit_code_when_alarm_send_times_out(tmp_p
     )
 
     assert exit_code == 1
-    assert not state_path.exists()
+    state = json.loads(state_path.read_text())
+    assert state.get("pending_incident_id")
+    assert state.get("active") is not True
+    assert "delivered_signature" not in state
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
     assert receipt["finding_count"] >= 1
     assert receipt["alarm"]["action"] == "delivery-failed"
@@ -416,7 +500,9 @@ def test_alarm_dedup_state_advances_only_after_confirmed_send(tmp_path):
         sender=lambda _message: _completed(1, stderr="offline"),
     )
     assert failed["action"] == "delivery-failed"
-    assert not state_path.exists()
+    failed_state = json.loads(state_path.read_text())
+    assert failed_state.get("active") is not True
+    assert "delivered_signature" not in failed_state
 
     messages = []
 
@@ -445,7 +531,7 @@ def test_alarm_dedup_state_advances_only_after_confirmed_send(tmp_path):
     assert len(messages) == 1
     assert "SYNTHETIC DRILL" in messages[0]
 
-    recovered = module.route_alarm(
+    pending_recovery = module.route_alarm(
         [],
         state_path=state_path,
         now=NOW + timedelta(minutes=2),
@@ -453,17 +539,309 @@ def test_alarm_dedup_state_advances_only_after_confirmed_send(tmp_path):
         real_alert=True,
         sender=sender,
     )
-    repeated = module.route_alarm(
-        findings,
+    recovered = module.route_alarm(
+        [],
         state_path=state_path,
-        now=NOW + timedelta(minutes=3),
+        now=NOW + timedelta(minutes=7),
         drill=False,
         real_alert=True,
         sender=sender,
     )
+    repeated = module.route_alarm(
+        findings,
+        state_path=state_path,
+        now=NOW + timedelta(minutes=8),
+        drill=False,
+        real_alert=True,
+        sender=sender,
+    )
+    assert pending_recovery["action"] == "recovery-pending"
     assert recovered["action"] == "recovery-sent"
     assert repeated["action"] == "sent"
     assert len(messages) == 3
+
+
+def test_release_cut_boundary_requires_service_affecting_valid_receipt(tmp_path):
+    module = _load_module()
+    receipt_path = tmp_path / "receipt.json"
+    valid = {
+        "schema_version": 2,
+        "event": "advanced",
+        "to_commit": "a" * 40,
+        "runtime_target": "/Users/example/.hermes/releases/v1",
+    }
+    receipt_path.write_text(json.dumps(valid), encoding="utf-8")
+    observed = module._release_cut_observed_at(receipt_path)
+    assert observed is not None
+
+    receipt_path.write_text(json.dumps({**valid, "event": "cut"}), encoding="utf-8")
+    assert module._release_cut_observed_at(receipt_path) is not None
+
+    for event in ("noop", "rejected"):
+        receipt_path.write_text(json.dumps({**valid, "event": event}), encoding="utf-8")
+        assert module._release_cut_observed_at(receipt_path) is None
+    receipt_path.write_text("{not-json", encoding="utf-8")
+    assert module._release_cut_observed_at(receipt_path) is None
+    receipt_path.unlink()
+    assert module._release_cut_observed_at(receipt_path) is None
+
+    receipt_path.write_text(json.dumps({**valid, "event": "rollback"}), encoding="utf-8")
+    assert module._release_cut_observed_at(receipt_path) is not None
+
+
+def test_initial_delivery_retry_keeps_pending_incident_identity(tmp_path):
+    module = _load_module()
+    state_path = tmp_path / "state.json"
+    findings = [module._finding("cron", "one", "failed", "synthetic")]
+
+    failed = module.route_alarm(
+        findings, state_path=state_path, now=NOW, drill=False,
+        real_alert=True, sender=lambda _message: _completed(1, stderr="offline"),
+    )
+    sent = module.route_alarm(
+        findings, state_path=state_path, now=NOW + timedelta(minutes=1),
+        drill=False, real_alert=True, sender=lambda _message: _completed(),
+    )
+    assert failed["action"] == "delivery-failed"
+    assert sent["action"] == "sent"
+    assert failed["incident_id"] == sent["incident_id"]
+    assert sent["incident_id"] == json.loads(state_path.read_text())["incident_id"]
+
+
+def test_alarm_identity_dedupes_code_churn_but_pages_persistent_new_contract(tmp_path):
+    module = _load_module()
+    state_path = tmp_path / "state.json"
+    messages = []
+
+    def sender(message):
+        messages.append(message)
+        return _completed()
+
+    initial = [module._finding("cron", "one", "stale", "old")]
+    changed_code = [module._finding("cron", "one", "failure_marker", "failed")]
+    with_new_contract = [
+        *changed_code,
+        module._finding("launchd", "two", "http_failed", "offline"),
+    ]
+
+    sent = module.route_alarm(
+        initial, state_path=state_path, now=NOW, drill=False,
+        real_alert=True, sender=sender,
+    )
+    deduped = module.route_alarm(
+        changed_code, state_path=state_path, now=NOW + timedelta(minutes=1),
+        drill=False, real_alert=True, sender=sender,
+    )
+    pending = module.route_alarm(
+        with_new_contract, state_path=state_path, now=NOW + timedelta(minutes=2),
+        drill=False, real_alert=True, sender=sender,
+    )
+    persistent = module.route_alarm(
+        with_new_contract, state_path=state_path, now=NOW + timedelta(minutes=7),
+        drill=False, real_alert=True, sender=sender,
+    )
+
+    assert sent["action"] == "sent"
+    assert deduped["action"] == "deduped"
+    assert pending["action"] == "new-finding-pending"
+    assert persistent["action"] == "sent"
+    assert len({item["incident_id"] for item in (sent, deduped, pending, persistent)}) == 1
+    assert len(messages) == 2
+
+
+def test_staggered_new_findings_are_confirmed_individually(tmp_path):
+    module = _load_module()
+    state_path = tmp_path / "state.json"
+    messages = []
+
+    def sender(message):
+        messages.append(message)
+        return _completed()
+
+    base = module._finding("cron", "base", "failed", "base failed")
+    finding_a = module._finding("launchd", "two", "http_failed", "A failed")
+    finding_b = module._finding("launchd", "three", "http_failed", "B transient")
+    module.route_alarm(
+        [base], state_path=state_path, now=NOW, drill=False,
+        real_alert=True, sender=sender,
+    )
+    module.route_alarm(
+        [base, finding_a], state_path=state_path, now=NOW + timedelta(minutes=1),
+        drill=False, real_alert=True, sender=sender,
+    )
+    first_update = module.route_alarm(
+        [base, finding_a, finding_b], state_path=state_path,
+        now=NOW + timedelta(minutes=6), drill=False,
+        real_alert=True, sender=sender,
+    )
+    state = json.loads(state_path.read_text())
+    assert first_update["action"] == "sent"
+    assert "launchd three" not in messages[-1]
+    assert "launchd:three" not in state["delivered_finding_identities"]
+    assert "launchd:three" in state["pending_new_findings"]
+
+    second_update = module.route_alarm(
+        [base, finding_a, finding_b], state_path=state_path,
+        now=NOW + timedelta(minutes=11), drill=False,
+        real_alert=True, sender=sender,
+    )
+    assert second_update["action"] == "sent"
+    assert "launchd three" in messages[-1]
+
+
+def test_old_active_state_migrates_without_upgrade_page(tmp_path):
+    module = _load_module()
+    state_path = tmp_path / "state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "active": True,
+                "delivered_signature": "legacy-signature",
+                "last_alert_at": NOW.timestamp(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    result = module.route_alarm(
+        [module._finding("cron", "one", "failed", "still failed")],
+        state_path=state_path, now=NOW + timedelta(minutes=1), drill=False,
+        real_alert=True, sender=lambda _message: pytest.fail("must not page on migration"),
+    )
+    state = json.loads(state_path.read_text())
+    assert result["action"] == "deduped"
+    assert result["incident_id"] == "legacy-signature"
+    assert state["delivered_finding_identities"] == ["cron:one"]
+
+
+def test_dry_run_does_not_mutate_alarm_state(tmp_path):
+    module = _load_module()
+    state_path = tmp_path / "state.json"
+    result = module.route_alarm(
+        [module._finding("cron", "one", "failed", "failed")],
+        state_path=state_path, now=NOW, drill=False, real_alert=False,
+        emit_dry_run=False,
+    )
+    assert result["action"] == "dry-run"
+    assert not state_path.exists()
+
+
+def test_recovery_delivery_retries_once_then_stays_clean(tmp_path):
+    module = _load_module()
+    state_path = tmp_path / "state.json"
+    findings = [module._finding("cron", "one", "failed", "failed")]
+    module.route_alarm(
+        findings, state_path=state_path, now=NOW, drill=False,
+        real_alert=True, sender=lambda _message: _completed(),
+    )
+    assert module.route_alarm(
+        [], state_path=state_path, now=NOW + timedelta(minutes=1), drill=False,
+        real_alert=True, sender=lambda _message: _completed(),
+    )["action"] == "recovery-pending"
+    failed = module.route_alarm(
+        [], state_path=state_path, now=NOW + timedelta(minutes=6), drill=False,
+        real_alert=True, sender=lambda _message: _completed(1, stderr="offline"),
+    )
+    recovered = module.route_alarm(
+        [], state_path=state_path, now=NOW + timedelta(minutes=7), drill=False,
+        real_alert=True, sender=lambda _message: _completed(),
+    )
+    repeated = module.route_alarm(
+        [], state_path=state_path, now=NOW + timedelta(minutes=8), drill=False,
+        real_alert=True, sender=lambda _message: pytest.fail("must not send twice"),
+    )
+    assert failed["action"] == "recovery-delivery-failed"
+    assert recovered["action"] == "recovery-sent"
+    assert repeated["action"] == "clean"
+
+
+def test_reappearing_finding_resets_clean_confirmation(tmp_path):
+    module = _load_module()
+    state_path = tmp_path / "state.json"
+    findings = [module._finding("cron", "one", "failed", "failed")]
+    sender = lambda _message: _completed()
+    module.route_alarm(
+        findings, state_path=state_path, now=NOW, drill=False,
+        real_alert=True, sender=sender,
+    )
+    assert module.route_alarm(
+        [], state_path=state_path, now=NOW + timedelta(minutes=1), drill=False,
+        real_alert=True, sender=sender,
+    )["action"] == "recovery-pending"
+    assert module.route_alarm(
+        findings, state_path=state_path, now=NOW + timedelta(minutes=2),
+        drill=False, real_alert=True, sender=sender,
+    )["action"] == "deduped"
+    assert module.route_alarm(
+        [], state_path=state_path, now=NOW + timedelta(minutes=5), drill=False,
+        real_alert=True, sender=sender,
+    )["action"] == "recovery-pending"
+
+
+def test_cutover_grace_suppresses_transient_alarm_and_recovery(tmp_path):
+    module = _load_module()
+    state_path = tmp_path / "state.json"
+    findings = [module._finding("launchd", "gateway", "http_failed", "offline")]
+    messages = []
+
+    def sender(message):
+        messages.append(message)
+        return _completed()
+
+    suppressed = module.route_alarm(
+        findings, state_path=state_path, now=NOW + timedelta(minutes=1),
+        cutover_at=NOW, drill=False, real_alert=True, sender=sender,
+    )
+    cleared = module.route_alarm(
+        [], state_path=state_path, now=NOW + timedelta(minutes=6),
+        cutover_at=NOW, drill=False, real_alert=True, sender=sender,
+    )
+    assert suppressed["action"] == "cutover-suppressed"
+    assert cleared["action"] == "clean"
+    assert messages == []
+    assert json.loads(state_path.read_text()).get("pending_incident_id") is None
+
+    sent = module.route_alarm(
+        findings, state_path=state_path, now=NOW + timedelta(minutes=11),
+        cutover_at=NOW, drill=False, real_alert=True, sender=sender,
+    )
+    recovery_suppressed = module.route_alarm(
+        [], state_path=state_path, now=NOW + timedelta(minutes=12),
+        cutover_at=NOW + timedelta(minutes=11), drill=False,
+        real_alert=True, sender=sender,
+    )
+    assert sent["action"] == "sent"
+    assert recovery_suppressed["action"] == "recovery-suppressed"
+    assert len(messages) == 1
+
+
+def test_finding_first_seen_near_cutover_end_still_requires_confirmation(tmp_path):
+    module = _load_module()
+    state_path = tmp_path / "state.json"
+    finding_a = module._finding("launchd", "a", "http_failed", "A failed")
+    finding_b = module._finding("launchd", "b", "http_failed", "B failed")
+    messages = []
+
+    def sender(message):
+        messages.append(message)
+        return _completed()
+
+    assert module.route_alarm(
+        [finding_a], state_path=state_path, now=NOW + timedelta(minutes=1),
+        cutover_at=NOW, drill=False, real_alert=True, sender=sender,
+    )["action"] == "cutover-suppressed"
+    assert module.route_alarm(
+        [finding_b], state_path=state_path, now=NOW + timedelta(minutes=9),
+        cutover_at=NOW, drill=False, real_alert=True, sender=sender,
+    )["action"] == "cutover-suppressed"
+    assert module.route_alarm(
+        [finding_b], state_path=state_path, now=NOW + timedelta(minutes=11),
+        cutover_at=NOW, drill=False, real_alert=True, sender=sender,
+    )["action"] == "new-finding-pending"
+    assert module.route_alarm(
+        [finding_b], state_path=state_path, now=NOW + timedelta(minutes=14),
+        cutover_at=NOW, drill=False, real_alert=True, sender=sender,
+    )["action"] == "sent"
+    assert len(messages) == 1
 
 
 def test_canonical_contract_inventory_covers_exact_jobs_and_semantic_outcomes():
@@ -1244,7 +1622,6 @@ remove-failed current run
         now=NOW,
     )
     assert {item["code"] for item in findings} == {"success_marker_missing"}
-
 
 def test_clickup_lifecycle_accepts_human_headings_but_requires_all_sections(tmp_path):
     module = _load_module()

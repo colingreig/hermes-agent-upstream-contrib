@@ -864,6 +864,7 @@ def test_shared_run_body_records_clean_no_claim_before_agent_dispatch(monkeypatc
     }
     assert saved["job_id"] == "62714b869845"
     assert "## Response" in saved["output"]
+    assert "Executor outcome: success-no-claim" in saved["output"]
     assert "Zero ClickUp claims and zero swarms" in saved["output"]
     assert "another positively observed fenced executor owner" in saved["output"]
 

@@ -11,7 +11,7 @@
         "max_age_seconds": 7200,
         "response_only": true,
         "success_patterns": [
-          "swarm",
+          "^Executor outcome: success-no-claim$",
           "No actionable",
           "no eligible",
           "claimed",
