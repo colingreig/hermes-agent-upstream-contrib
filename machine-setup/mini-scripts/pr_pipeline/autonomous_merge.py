@@ -248,7 +248,7 @@ def _pr_state(repo, pr):
     the GATING failing/pending check names (monitoring smokes excluded). Uses the
     REST checks API (App-token-safe), not the GraphQL rollup. reason set only on
     a fetch error."""
-    data, err = _gh_json(repo, pr, "state,headRefOid,mergeable,mergeStateStatus,isDraft,labels")
+    data, err = _gh_json(repo, pr, "state,headRefOid,baseRefOid,mergeable,mergeStateStatus,isDraft,labels")
     if err:
         return None, err
     head = data.get("headRefOid") or ""
@@ -295,6 +295,7 @@ def _pr_state(repo, pr):
     return {
         "state": data.get("state"),
         "head": head,
+        "base": data.get("baseRefOid") or "",
         "mergeable": data.get("mergeable"),
         "merge_state": (data.get("mergeStateStatus") or "").upper(),
         "draft": bool(data.get("isDraft")),
@@ -394,7 +395,9 @@ def _merge_readiness(repo, pr, verdict, allowlist):
     if info["head"] != stored_head:
         return "blocked", (f"PASS was for {stored_head[:8]} but live head is "
                            f"{info['head'][:8]}; re-validate")
-    ok, why = validator_verdict.is_pass_fresh(repo, pr, info["head"])
+    ok, why = validator_verdict.is_pass_fresh(
+        repo, pr, info["head"], current_base_sha=info.get("base") or ""
+    )
     if not ok:
         return "skip", why
     # GitHub-native hard gates (honor branch protection if any exists).

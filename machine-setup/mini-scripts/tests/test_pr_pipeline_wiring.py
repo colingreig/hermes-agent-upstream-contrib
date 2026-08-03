@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 import inspect
 import io
 import json
@@ -146,49 +147,514 @@ class RuntimeWiringTests(unittest.TestCase):
                 connection.execute("INSERT INTO finalizations DEFAULT VALUES")
             self.assertEqual(validator_verdict.finalization_count(ledger), 1)
 
-    def test_legacy_status_reordering_keeps_the_trusted_identity_stable(self) -> None:
+    def _resolve_legacy_statuses(
+        self,
+        statuses: list[dict[str, object]],
+        checks: list[dict[str, object]] | None = None,
+        strict: object = True,
+    ) -> TrustedMergeIdentity:
         base_sha, head_sha, merge_sha = "a" * 40, "b" * 40, "c" * 40
-        path_prefix = "repos/acme/widget"
-        first_statuses = [
-            {
-                "context": "legacy-ci", "state": "success", "sha": merge_sha,
-                "target_url": "https://ci.example.test/runs/first", "description": "first duplicate",
-            },
-            {
-                "context": "legacy-ci", "state": "success", "sha": merge_sha,
-                "target_url": "https://ci.example.test/runs/second", "description": "second duplicate",
-            },
-        ]
+        prefix = "repos/acme/widget"
         replies = {
-            f"{path_prefix}/pulls/7": {
+            f"{prefix}/pulls/7": {
                 "base": {"sha": base_sha, "ref": "main"},
                 "head": {"sha": head_sha},
                 "merge_commit_sha": merge_sha,
             },
-            f"{path_prefix}/git/commits/{merge_sha}": {
+            f"{prefix}/git/commits/{merge_sha}": {
                 "parents": [{"sha": base_sha}, {"sha": head_sha}],
             },
-            # The identity binds the base the synthetic merge was actually tested
-            # against, and requires it to still be the live protected-branch tip.
-            f"{path_prefix}/git/ref/heads/main": {"object": {"sha": base_sha}},
-            f"{path_prefix}/branches/main/protection/required_status_checks": {"contexts": ["legacy-ci"]},
-            f"{path_prefix}/commits/{merge_sha}/check-runs": {"check_runs": []},
+            f"{prefix}/git/ref/heads/main": {"object": {"sha": base_sha}},
+            f"{prefix}/branches/main/protection/required_status_checks": {
+                "contexts": ["legacy-ci"],
+                **({"strict": strict} if strict is not None else {}),
+            },
+            f"{prefix}/commits/{merge_sha}/check-runs?per_page=100&page=1": {
+                "total_count": len(checks or []), "check_runs": checks or [],
+            },
+            f"{prefix}/commits/{merge_sha}/statuses?per_page=100&page=1": statuses,
+        }
+        with mock.patch.object(validator_verdict, "_gh_json", side_effect=lambda path: replies[path]):
+            return validator_verdict.resolve_shadow_identity("acme/widget", 7, task_id="86e2gh04e")
+
+    def test_trusted_identity_requires_strict_up_to_date_branch_protection(self) -> None:
+        status = [{
+            "id": 2, "context": "legacy-ci", "state": "success", "sha": "c" * 40,
+        }]
+        for scenario, strict in (
+            ("false", False),
+            ("missing", None),
+            ("string", "true"),
+            ("integer", 1),
+            ("mapping", {"enabled": True}),
+        ):
+            with self.subTest(scenario=scenario), self.assertRaisesRegex(
+                validator_verdict.VerdictStoreError, "strict|up-to-date"
+            ):
+                self._resolve_legacy_statuses(status, strict=strict)
+
+    def test_trusted_identity_is_minted_when_strict_protection_is_true(self) -> None:
+        trusted = self._resolve_legacy_statuses([{
+            "id": 2, "context": "legacy-ci", "state": "success", "sha": "c" * 40,
+        }], strict=True)
+        self.assertEqual(trusted.base_sha, "a" * 40)
+        self.assertEqual(trusted.head_sha, "b" * 40)
+
+    def test_latest_legacy_failure_cannot_be_overridden_by_older_success(self) -> None:
+        merge_sha = "c" * 40
+        statuses = [
+            {"id": 2, "context": "legacy-ci", "state": "failure", "sha": merge_sha},
+            {"id": 1, "context": "legacy-ci", "state": "success", "sha": merge_sha},
+        ]
+        with self.assertRaises(validator_verdict.VerdictStoreError):
+            self._resolve_legacy_statuses(statuses)
+
+    def test_latest_legacy_pending_cannot_be_overridden_by_older_success(self) -> None:
+        merge_sha = "c" * 40
+        statuses = [
+            {"id": 2, "context": "legacy-ci", "state": "pending", "sha": merge_sha},
+            {"id": 1, "context": "legacy-ci", "state": "success", "sha": merge_sha},
+        ]
+        with self.assertRaises(validator_verdict.VerdictStoreError):
+            self._resolve_legacy_statuses(statuses)
+
+    def test_observed_required_check_run_cannot_be_overridden_by_successful_legacy_status(self) -> None:
+        merge_sha = "c" * 40
+        successful_legacy = [
+            {"id": 202, "context": "legacy-ci", "state": "success", "sha": merge_sha},
+        ]
+        scenarios = (
+            ("failed", {"status": "completed", "conclusion": "failure"}),
+            ("pending", {"status": "in_progress", "conclusion": None}),
+            ("malformed", {"conclusion": "success"}),
+        )
+        for scenario, state in scenarios:
+            check = {
+                "id": 101,
+                "name": "legacy-ci",
+                "head_sha": merge_sha,
+                "app": {"id": 15368},
+                **state,
+            }
+            with self.subTest(scenario=scenario), self.assertRaises(
+                validator_verdict.VerdictStoreError
+            ):
+                self._resolve_legacy_statuses(successful_legacy, [check])
+
+    def test_latest_legacy_success_is_used_despite_older_failure(self) -> None:
+        merge_sha = "c" * 40
+        trusted = self._resolve_legacy_statuses([
+            {"id": 2, "context": "legacy-ci", "state": "success", "sha": merge_sha},
+            {"id": 1, "context": "legacy-ci", "state": "failure", "sha": merge_sha},
+        ])
+        self.assertEqual(trusted.ci_run_ids, ("status:merge:id:2",))
+
+    def test_stale_tested_base_is_rejected_even_when_it_is_an_ancestor(self) -> None:
+        base_sha, live_base_sha, head_sha, merge_sha = "a" * 40, "d" * 40, "b" * 40, "c" * 40
+        prefix = "repos/acme/widget"
+        replies = {
+            f"{prefix}/pulls/7": {"base": {"ref": "main"}, "head": {"sha": head_sha}, "merge_commit_sha": merge_sha},
+            f"{prefix}/git/commits/{merge_sha}": {"parents": [{"sha": base_sha}, {"sha": head_sha}]},
+            f"{prefix}/git/ref/heads/main": {"object": {"sha": live_base_sha}},
+            f"{prefix}/compare/{base_sha}...{live_base_sha}": {"status": "ahead"},
+            f"{prefix}/branches/main/protection/required_status_checks": {"strict": True, "contexts": ["legacy-ci"]},
+            f"{prefix}/commits/{merge_sha}/check-runs?per_page=100&page=1": {"total_count": 0, "check_runs": []},
+            f"{prefix}/commits/{merge_sha}/statuses?per_page=100&page=1": [
+                {"id": 1, "context": "legacy-ci", "state": "success", "sha": merge_sha},
+            ],
+        }
+        with mock.patch.object(validator_verdict, "_gh_json", side_effect=lambda path: replies[path]), self.assertRaises(
+            validator_verdict.VerdictStoreError
+        ):
+            validator_verdict.resolve_shadow_identity("acme/widget", 7)
+
+    def test_finalized_pass_is_refused_when_protected_base_advances_before_autonomous_merge(self) -> None:
+        trusted = identity()
+        moved_base = "d" * 40
+        green_on_new_base = {
+            "state": "OPEN", "head": trusted.head_sha, "base": moved_base,
+            "mergeable": "MERGEABLE", "merge_state": "CLEAN", "draft": False,
+            "labels": [], "failing": [], "pending": [], "ignored": [],
+            "gating_green": ["Lint, typecheck, test"],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = Path(directory) / "verdicts.sqlite3"
+            with mock.patch.dict(os.environ, _merge_env(
+                HERMES_MERGE_ACTIVE="1",
+                HERMES_VALIDATOR_FINALIZE_TOKEN="test-token",
+            )):
+                session = validator_verdict.begin_shadow_review(trusted, path=ledger)
+                verdict, _ = validator_verdict.finalize_shadow_review(
+                    session,
+                    {
+                        "verdict": "PASS", "tier": "low", "head_sha": trusted.head_sha,
+                        "expected_repo": trusted.canonical_repo, "model_used": "test",
+                        "findings": [], "ts": validator_verdict._now_iso(),
+                    },
+                    validator_review=True,
+                )
+            bound_store = SimpleNamespace(
+                merge_shadow_active=validator_verdict.merge_shadow_active,
+                is_pass_fresh=lambda repo, pr, head_sha="", *args, **kwargs:
+                    validator_verdict.is_pass_fresh(repo, pr, head_sha, path=ledger, *args, **kwargs),
+                verdict_for=lambda repo, pr, path=None, head_sha="", *args, **kwargs:
+                    validator_verdict.verdict_for(repo, pr, path=ledger, head_sha=head_sha),
+            )
+            with (
+                mock.patch.dict(os.environ, _merge_env(
+                    HERMES_MERGE_ACTIVE="1", HERMES_AUTONOMOUS_MERGE="1",
+                )),
+                mock.patch.object(autonomous_merge, "validator_verdict", bound_store),
+                mock.patch.object(autonomous_merge, "_pr_state", return_value=(green_on_new_base, None)),
+                mock.patch.object(autonomous_merge, "_head_trips_tripwire", return_value=(False, [], "")),
+            ):
+                action, detail = autonomous_merge.evaluate(
+                    "acme/widget", 7, verdict, {"acme/widget"}
+                )
+        self.assertNotEqual(action, "merge")
+        self.assertIn("base", detail.lower())
+        self.assertIn("re-validate", detail)
+
+    def test_base_movement_during_identity_resolution_fails_closed(self) -> None:
+        base_sha, moved_base_sha, head_sha, merge_sha = "a" * 40, "d" * 40, "b" * 40, "c" * 40
+        prefix = "repos/acme/widget"
+        ref_path = f"{prefix}/git/ref/heads/main"
+        replies = {
+            f"{prefix}/pulls/7": {"base": {"ref": "main"}, "head": {"sha": head_sha}, "merge_commit_sha": merge_sha},
+            f"{prefix}/git/commits/{merge_sha}": {"parents": [{"sha": base_sha}, {"sha": head_sha}]},
+            f"{prefix}/branches/main/protection/required_status_checks": {"strict": True, "contexts": ["legacy-ci"]},
+            f"{prefix}/commits/{merge_sha}/check-runs?per_page=100&page=1": {"total_count": 0, "check_runs": []},
+            f"{prefix}/commits/{merge_sha}/statuses?per_page=100&page=1": [
+                {"id": 1, "context": "legacy-ci", "state": "success", "sha": merge_sha},
+            ],
+        }
+        ref_tips = iter((base_sha, moved_base_sha))
+
+        def api(path: str) -> object:
+            if path == ref_path:
+                return {"object": {"sha": next(ref_tips)}}
+            return replies[path]
+
+        with mock.patch.object(validator_verdict, "_gh_json", side_effect=api), self.assertRaises(
+            validator_verdict.VerdictStoreError
+        ):
+            validator_verdict.resolve_shadow_identity("acme/widget", 7)
+
+    def _valid_head_fallback_replies(self) -> tuple[dict[str, object], str, str, str, str]:
+        base_sha, head_sha, merge_sha = "a" * 40, "b" * 40, "c" * 40
+        prefix = "repos/acme/widget"
+        association = {"number": 7, "base": {"sha": base_sha}, "head": {"sha": head_sha}}
+        replies: dict[str, object] = {
+            f"{prefix}/pulls/7": {"base": {"ref": "main"}, "head": {"sha": head_sha}, "merge_commit_sha": merge_sha},
+            f"{prefix}/git/commits/{merge_sha}": {"parents": [{"sha": base_sha}, {"sha": head_sha}]},
+            f"{prefix}/git/ref/heads/main": {"object": {"sha": base_sha}},
+            f"{prefix}/branches/main/protection/required_status_checks": {
+                "strict": True, "contexts": [], "checks": [{"context": "required", "app_id": 15368}],
+            },
+            f"{prefix}/commits/{merge_sha}/check-runs?per_page=100&page=1": {"total_count": 0, "check_runs": []},
+            f"{prefix}/commits/{merge_sha}/statuses?per_page=100&page=1": [],
+            f"{prefix}/commits/{head_sha}/check-runs?per_page=100&page=1": {
+                "total_count": 1,
+                "check_runs": [{
+                    "id": 91, "name": "required", "head_sha": head_sha,
+                    "status": "completed", "conclusion": "success", "app": {"id": 15368},
+                    "pull_requests": [association], "check_suite": {"id": 1234},
+                }],
+            },
+            f"{prefix}/actions/runs?check_suite_id=1234&per_page=100&page=1": {
+                "total_count": 1,
+                "workflow_runs": [{
+                    "id": 30, "event": "pull_request", "status": "completed", "conclusion": "success",
+                    "head_sha": head_sha, "pull_requests": [association],
+                }],
+            },
+        }
+        return replies, prefix, base_sha, head_sha, merge_sha
+
+    def test_inconsistent_total_count_envelopes_fail_closed_for_all_ci_evidence(self) -> None:
+        for scenario in ("merge-checks", "head-checks", "workflow-runs"):
+            replies, prefix, _base_sha, head_sha, merge_sha = self._valid_head_fallback_replies()
+            if scenario == "merge-checks":
+                replies[f"{prefix}/commits/{merge_sha}/check-runs?per_page=100&page=1"] = {
+                    "total_count": 1, "check_runs": [],
+                }
+            elif scenario == "head-checks":
+                replies[f"{prefix}/commits/{head_sha}/check-runs?per_page=100&page=1"]["total_count"] = 2
+            else:
+                replies[f"{prefix}/actions/runs?check_suite_id=1234&per_page=100&page=1"]["total_count"] = 2
+            with self.subTest(scenario=scenario), mock.patch.object(
+                validator_verdict, "_gh_json", side_effect=lambda path, replies=replies: replies[path]
+            ), self.assertRaises(validator_verdict.VerdictStoreError):
+                validator_verdict.resolve_shadow_identity("acme/widget", 7)
+
+    def test_malformed_check_run_ids_and_app_shapes_fail_closed(self) -> None:
+        scenarios: tuple[tuple[str, str, object], ...] = (
+            ("merge-missing-id", "merge", None),
+            ("merge-zero-id", "merge", 0),
+            ("merge-boolean-id", "merge", True),
+            ("merge-malformed-app", "merge-app", "invalid"),
+            ("merge-missing-app-id", "merge-app", {}),
+            ("merge-boolean-app-id", "merge-app", {"id": True}),
+            ("head-zero-id", "head", 0),
+            ("head-malformed-app", "head-app", "invalid"),
+        )
+        for scenario, target, value in scenarios:
+            replies, prefix, _base_sha, head_sha, merge_sha = self._valid_head_fallback_replies()
+            if target.startswith("merge"):
+                check: dict[str, object] = {
+                    "id": 101, "name": "required", "head_sha": merge_sha,
+                    "status": "completed", "conclusion": "success", "app": {"id": 15368},
+                }
+                if target == "merge":
+                    if value is None:
+                        check.pop("id")
+                    else:
+                        check["id"] = value
+                else:
+                    check["app"] = value
+                replies[f"{prefix}/commits/{merge_sha}/check-runs?per_page=100&page=1"] = {
+                    "total_count": 1, "check_runs": [check],
+                }
+            else:
+                envelope = replies[f"{prefix}/commits/{head_sha}/check-runs?per_page=100&page=1"]
+                check = envelope["check_runs"][0]
+                check["id" if target == "head" else "app"] = value
+            with self.subTest(scenario=scenario), mock.patch.object(
+                validator_verdict, "_gh_json", side_effect=lambda path, replies=replies: replies[path]
+            ), self.assertRaises(validator_verdict.VerdictStoreError):
+                validator_verdict.resolve_shadow_identity("acme/widget", 7)
+
+    def test_malformed_or_missing_workflow_run_ids_fail_closed(self) -> None:
+        for workflow_id in (None, 0, True, "30"):
+            replies, prefix, _base_sha, _head_sha, _merge_sha = self._valid_head_fallback_replies()
+            envelope = replies[f"{prefix}/actions/runs?check_suite_id=1234&per_page=100&page=1"]
+            workflow = envelope["workflow_runs"][0]
+            if workflow_id is None:
+                workflow.pop("id")
+            else:
+                workflow["id"] = workflow_id
+            with self.subTest(workflow_id=workflow_id), mock.patch.object(
+                validator_verdict, "_gh_json", side_effect=lambda path, replies=replies: replies[path]
+            ), self.assertRaises(validator_verdict.VerdictStoreError):
+                validator_verdict.resolve_shadow_identity("acme/widget", 7)
+
+    def test_empty_merge_evidence_uses_exact_app_bound_pull_request_actions_check_on_head(self) -> None:
+        base_sha, head_sha, merge_sha = "a" * 40, "b" * 40, "c" * 40
+        prefix = "repos/acme/widget"
+        association = {
+            "number": 7,
+            "base": {"sha": base_sha},
+            "head": {"sha": head_sha},
+        }
+        replies = {
+            f"{prefix}/pulls/7": {
+                "base": {"sha": base_sha, "ref": "main"},
+                "head": {"sha": head_sha},
+                "merge_commit_sha": merge_sha,
+            },
+            f"{prefix}/git/commits/{merge_sha}": {
+                "parents": [{"sha": base_sha}, {"sha": head_sha}],
+            },
+            f"{prefix}/git/ref/heads/main": {"object": {"sha": base_sha}},
+            f"{prefix}/branches/main/protection/required_status_checks": {
+                "strict": True,
+                "contexts": [],
+                "checks": [{"context": "All required checks pass", "app_id": 15368}],
+            },
+            f"{prefix}/commits/{merge_sha}/check-runs?per_page=100&page=1": {"total_count": 0, "check_runs": []},
+            f"{prefix}/commits/{merge_sha}/statuses?per_page=100&page=1": [],
+            f"{prefix}/commits/{head_sha}/check-runs?per_page=100&page=1": {
+                "total_count": 1,
+                "check_runs": [{
+                    "id": 91733948587,
+                    "name": "All required checks pass",
+                    "head_sha": head_sha,
+                    "status": "completed",
+                    "conclusion": "success",
+                    "app": {"id": 15368},
+                    "pull_requests": [association],
+                    "check_suite": {"id": 1234},
+                }],
+            },
+            f"{prefix}/commits/{head_sha}/status": {"statuses": []},
+            f"{prefix}/actions/runs?check_suite_id=1234&per_page=100&page=1": {
+                "total_count": 1,
+                "workflow_runs": [{
+                    "id": 30827778653,
+                    "event": "pull_request",
+                    "status": "completed",
+                    "conclusion": "success",
+                    "head_sha": head_sha,
+                    "pull_requests": [association],
+                }],
+            },
+        }
+        with mock.patch.object(validator_verdict, "_gh_json", side_effect=lambda path: replies[path]):
+            trusted = validator_verdict.resolve_shadow_identity(
+                "acme/widget", 7, task_id="86e2kt7qb"
+            )
+
+        self.assertEqual(trusted.base_sha, base_sha)
+        self.assertEqual(trusted.head_sha, head_sha)
+        self.assertEqual(trusted.tested_merge_sha, merge_sha)
+        self.assertEqual(trusted.ci_run_ids, ("check-run:head:91733948587",))
+
+    def test_head_fallback_rejects_wrong_or_ambiguous_actions_evidence(self) -> None:
+        base_sha, head_sha, merge_sha = "a" * 40, "b" * 40, "c" * 40
+        prefix = "repos/acme/widget"
+        association = {"number": 7, "base": {"sha": base_sha}, "head": {"sha": head_sha}}
+        check = {
+            "id": 91, "name": "required", "head_sha": head_sha,
+            "status": "completed", "conclusion": "success", "app": {"id": 15368},
+            "pull_requests": [association], "check_suite": {"id": 1234},
+        }
+        workflow = {
+            "id": 30, "event": "pull_request", "status": "completed", "conclusion": "success",
+            "head_sha": head_sha, "pull_requests": [association],
+        }
+        base_replies = {
+            f"{prefix}/pulls/7": {"base": {"ref": "main"}, "head": {"sha": head_sha}, "merge_commit_sha": merge_sha},
+            f"{prefix}/git/commits/{merge_sha}": {"parents": [{"sha": base_sha}, {"sha": head_sha}]},
+            f"{prefix}/git/ref/heads/main": {"object": {"sha": base_sha}},
+            f"{prefix}/branches/main/protection/required_status_checks": {
+                "strict": True, "contexts": [], "checks": [{"context": "required", "app_id": 15368}],
+            },
+            f"{prefix}/commits/{merge_sha}/check-runs?per_page=100&page=1": {"total_count": 0, "check_runs": []},
+            f"{prefix}/commits/{merge_sha}/statuses?per_page=100&page=1": [],
+            f"{prefix}/commits/{head_sha}/check-runs?per_page=100&page=1": {"total_count": 1, "check_runs": [check]},
+            f"{prefix}/actions/runs?check_suite_id=1234&per_page=100&page=1": {"total_count": 1, "workflow_runs": [workflow]},
         }
 
-        def resolve(statuses: list[dict[str, str]]) -> TrustedMergeIdentity:
-            with mock.patch.object(
-                validator_verdict,
-                "_gh_json",
-                side_effect=lambda path: {**replies, f"{path_prefix}/commits/{merge_sha}/status": {"statuses": statuses}}[path],
-            ):
-                return validator_verdict.resolve_shadow_identity("acme/widget", 7, task_id="86e2gh04e")
+        def wrong_app(replies: dict[str, object]) -> None:
+            replies[f"{prefix}/commits/{head_sha}/check-runs?per_page=100&page=1"]["check_runs"][0]["app"]["id"] = 1
 
-        first = resolve(first_statuses)
-        reordered = resolve(list(reversed(first_statuses)))
+        def wrong_event(replies: dict[str, object]) -> None:
+            replies[f"{prefix}/actions/runs?check_suite_id=1234&per_page=100&page=1"]["workflow_runs"][0]["event"] = "push"
 
-        self.assertEqual(first, reordered)
-        self.assertEqual(first.fingerprint, reordered.fingerprint)
-        self.assertTrue(first.ci_run_ids[0].startswith("status:sha256:"))
+        def wrong_pr(replies: dict[str, object]) -> None:
+            replies[f"{prefix}/commits/{head_sha}/check-runs?per_page=100&page=1"]["check_runs"][0]["pull_requests"][0]["number"] = 8
+
+        def wrong_base(replies: dict[str, object]) -> None:
+            replies[f"{prefix}/actions/runs?check_suite_id=1234&per_page=100&page=1"]["workflow_runs"][0]["pull_requests"][0]["base"]["sha"] = "d" * 40
+
+        def wrong_head(replies: dict[str, object]) -> None:
+            replies[f"{prefix}/commits/{head_sha}/check-runs?per_page=100&page=1"]["check_runs"][0]["head_sha"] = "d" * 40
+
+        def malformed_association(replies: dict[str, object]) -> None:
+            replies[f"{prefix}/commits/{head_sha}/check-runs?per_page=100&page=1"]["check_runs"][0]["pull_requests"][0]["base"] = "invalid"
+
+        def pending_check(replies: dict[str, object]) -> None:
+            replies[f"{prefix}/commits/{head_sha}/check-runs?per_page=100&page=1"]["check_runs"][0]["status"] = "in_progress"
+
+        def failed_workflow(replies: dict[str, object]) -> None:
+            replies[f"{prefix}/actions/runs?check_suite_id=1234&per_page=100&page=1"]["workflow_runs"][0]["conclusion"] = "failure"
+
+        def ambiguous_workflow(replies: dict[str, object]) -> None:
+            envelope = replies[f"{prefix}/actions/runs?check_suite_id=1234&per_page=100&page=1"]
+            runs = envelope["workflow_runs"]
+            runs.append(copy.deepcopy(runs[0]))
+            envelope["total_count"] = 2
+
+        def missing_check(replies: dict[str, object]) -> None:
+            envelope = replies[f"{prefix}/commits/{head_sha}/check-runs?per_page=100&page=1"]
+            envelope["check_runs"] = []
+            envelope["total_count"] = 0
+
+        def merge_evidence_disables_fallback(replies: dict[str, object]) -> None:
+            replies[f"{prefix}/commits/{merge_sha}/statuses?per_page=100&page=1"] = [
+                {"context": "unrelated", "state": "success", "sha": merge_sha}
+            ]
+
+        for name, mutate in (
+            ("wrong-app", wrong_app), ("wrong-event", wrong_event), ("wrong-pr", wrong_pr),
+            ("wrong-base", wrong_base), ("wrong-head", wrong_head),
+            ("malformed-association", malformed_association), ("pending", pending_check),
+            ("failed", failed_workflow), ("ambiguous", ambiguous_workflow),
+            ("missing", missing_check), ("merge-evidence", merge_evidence_disables_fallback),
+        ):
+            replies = copy.deepcopy(base_replies)
+            mutate(replies)
+            with self.subTest(name=name), mock.patch.object(
+                validator_verdict, "_gh_json", side_effect=lambda path, replies=replies: replies[path]
+            ), self.assertRaises(validator_verdict.VerdictStoreError):
+                validator_verdict.resolve_shadow_identity("acme/widget", 7)
+
+    def test_app_bound_required_check_cannot_use_legacy_status(self) -> None:
+        base_sha, head_sha, merge_sha = "a" * 40, "b" * 40, "c" * 40
+        prefix = "repos/acme/widget"
+        replies = {
+            f"{prefix}/pulls/7": {"base": {"ref": "main"}, "head": {"sha": head_sha}, "merge_commit_sha": merge_sha},
+            f"{prefix}/git/commits/{merge_sha}": {"parents": [{"sha": base_sha}, {"sha": head_sha}]},
+            f"{prefix}/git/ref/heads/main": {"object": {"sha": base_sha}},
+            f"{prefix}/branches/main/protection/required_status_checks": {
+                "strict": True, "contexts": [], "checks": [{"context": "required", "app_id": 15368}],
+            },
+            f"{prefix}/commits/{merge_sha}/check-runs?per_page=100&page=1": {"total_count": 0, "check_runs": []},
+            f"{prefix}/commits/{merge_sha}/statuses?per_page=100&page=1": [
+                {"context": "required", "state": "success", "sha": merge_sha}
+            ],
+        }
+        with mock.patch.object(validator_verdict, "_gh_json", side_effect=lambda path: replies[path]), self.assertRaises(
+            validator_verdict.VerdictStoreError
+        ):
+            validator_verdict.resolve_shadow_identity("acme/widget", 7)
+
+    def test_complete_merge_evidence_is_read_before_considering_head_fallback(self) -> None:
+        base_sha, head_sha, merge_sha = "a" * 40, "b" * 40, "c" * 40
+        prefix = "repos/acme/widget"
+        filler = [{"id": index, "name": f"unrequired-{index}"} for index in range(100)]
+        required = {
+            "id": 101, "name": "required", "head_sha": merge_sha,
+            "status": "completed", "conclusion": "success", "app": {"id": 15368},
+        }
+        fixed = {
+            f"{prefix}/pulls/7": {"base": {"ref": "main"}, "head": {"sha": head_sha}, "merge_commit_sha": merge_sha},
+            f"{prefix}/git/commits/{merge_sha}": {"parents": [{"sha": base_sha}, {"sha": head_sha}]},
+            f"{prefix}/git/ref/heads/main": {"object": {"sha": base_sha}},
+            f"{prefix}/branches/main/protection/required_status_checks": {
+                "strict": True, "contexts": [], "checks": [{"context": "required", "app_id": 15368}],
+            },
+            f"{prefix}/commits/{merge_sha}/check-runs?per_page=100&page=1": {"total_count": 101, "check_runs": filler},
+            f"{prefix}/commits/{merge_sha}/statuses?per_page=100&page=1": [],
+        }
+
+        def api(path: str) -> object:
+            if path == f"{prefix}/commits/{merge_sha}/check-runs?per_page=100&page=1":
+                return {"total_count": 101, "check_runs": filler}
+            if path == f"{prefix}/commits/{merge_sha}/check-runs?per_page=100&page=2":
+                return {"total_count": 101, "check_runs": [required]}
+            if path == f"{prefix}/commits/{merge_sha}/statuses?per_page=100&page=1":
+                return []
+            return fixed[path]
+
+        with mock.patch.object(validator_verdict, "_gh_json", side_effect=api):
+            trusted = validator_verdict.resolve_shadow_identity("acme/widget", 7)
+        self.assertEqual(trusted.tested_merge_sha, merge_sha)
+        self.assertEqual(trusted.ci_run_ids, ("check-run:merge:101",))
+
+    def test_ambiguous_required_merge_checks_fail_closed(self) -> None:
+        base_sha, head_sha, merge_sha = "a" * 40, "b" * 40, "c" * 40
+        prefix = "repos/acme/widget"
+        check = {
+            "name": "required", "head_sha": merge_sha,
+            "status": "completed", "conclusion": "success", "app": {"id": 15368},
+        }
+        replies = {
+            f"{prefix}/pulls/7": {"base": {"ref": "main"}, "head": {"sha": head_sha}, "merge_commit_sha": merge_sha},
+            f"{prefix}/git/commits/{merge_sha}": {"parents": [{"sha": base_sha}, {"sha": head_sha}]},
+            f"{prefix}/git/ref/heads/main": {"object": {"sha": base_sha}},
+            f"{prefix}/branches/main/protection/required_status_checks": {
+                "strict": True, "contexts": [], "checks": [{"context": "required", "app_id": 15368}],
+            },
+            f"{prefix}/commits/{merge_sha}/check-runs?per_page=100&page=1": {
+                "total_count": 2, "check_runs": [{**check, "id": 101}, {**check, "id": 102}],
+            },
+            f"{prefix}/commits/{merge_sha}/statuses?per_page=100&page=1": [],
+        }
+        with mock.patch.object(validator_verdict, "_gh_json", side_effect=lambda path: replies[path]), self.assertRaises(
+            validator_verdict.VerdictStoreError
+        ):
+            validator_verdict.resolve_shadow_identity("acme/widget", 7)
 
     def test_validator_exception_releases_the_exact_lease_for_an_immediate_retry(self) -> None:
         trusted = identity()
