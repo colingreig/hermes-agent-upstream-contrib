@@ -1224,8 +1224,9 @@ def acquire_job_admission_lease(
 ) -> Optional[AdmissionLease]:
     """Acquire one generic admission lease or return ``None`` for contention.
 
-    An expired owner is never removed here.  It remains an explicit, fenced
-    uncertainty until the durable execution ledger proves the exact owner dead.
+    An expired owner is never removed based on expiry.  Acquisition gives the
+    existing execution-ledger reaper one bounded opportunity to prove and
+    recover exact dead owners, then retries under a fresh write transaction.
     """
     if not requires_llm_admission(job):
         return None
@@ -1233,66 +1234,85 @@ def acquire_job_admission_lease(
     run_id = str(owner_run_id or uuid.uuid4().hex)
     if not job_id or not run_id or not ledger_execution_id:
         raise ExecutorAdmissionError("job_id, owner_run_id and ledger_execution_id are required")
-    resolved_task = str(task_id or job.get("admission_task_id") or job.get("executor_task_id") or "__scheduled__")
-    now = _now()
-    now_iso = _iso(now)
-    expires_iso = _iso(now + timedelta(seconds=max(1, int(lease_seconds))))
+    requested_task = str(task_id or job.get("admission_task_id") or job.get("executor_task_id") or "__scheduled__")
     conn = _generic_connect()
+    recovery_attempted = False
     try:
-        deadline = time.monotonic() + _SQLITE_BUSY_DEADLINE_SECONDS
-        _begin_immediate(conn, deadline=deadline)
-        pending = conn.execute(
-            "SELECT task_id FROM pending_wakes WHERE job_id=?", (job_id,)
-        ).fetchone()
-        if resolved_task in _SENTINEL_TASK_IDS and pending is not None:
-            resolved_task = str(pending["task_id"])
-        profile, resources = _validate_admission_metadata(job, task_id=resolved_task)
-        active = conn.execute("SELECT * FROM admission_leases WHERE state='active'").fetchall()
-        if profile == "root/executor":
-            legacy = conn.execute(
-                "SELECT expires_at FROM executor_lease WHERE singleton=1 AND state='active'"
+        while True:
+            deadline = time.monotonic() + _SQLITE_BUSY_DEADLINE_SECONDS
+            _begin_immediate(conn, deadline=deadline)
+            now = _now()
+            now_iso = _iso(now)
+            expires_iso = _iso(now + timedelta(seconds=max(1, int(lease_seconds))))
+            pending = conn.execute(
+                "SELECT task_id FROM pending_wakes WHERE job_id=?", (job_id,)
             ).fetchone()
-            if legacy is not None:
+            resolved_task = requested_task
+            if resolved_task in _SENTINEL_TASK_IDS and pending is not None:
+                resolved_task = str(pending["task_id"])
+            profile, resources = _validate_admission_metadata(job, task_id=resolved_task)
+            active = conn.execute("SELECT * FROM admission_leases WHERE state='active'").fetchall()
+            expired_blocker: str | None = None
+            if profile == "root/executor":
+                legacy = conn.execute(
+                    "SELECT expires_at FROM executor_lease WHERE singleton=1 AND state='active'"
+                ).fetchone()
+                if legacy is not None:
+                    conn.execute("ROLLBACK")
+                    if legacy["expires_at"] < now_iso:
+                        expired_blocker = "legacy executor lease is expired and its owner is uncertain; exact stale-owner recovery is required"
+                    else:
+                        return None
+            if expired_blocker is None:
+                expired = [row for row in active if row["expires_at"] < now_iso]
+                if expired:
+                    conn.execute("ROLLBACK")
+                    expired_blocker = "active admission lease is expired and its owner is uncertain; exact stale-owner recovery is required"
+            if expired_blocker is not None:
+                if recovery_attempted:
+                    raise ExecutorAdmissionError(expired_blocker)
+                recovery_attempted = True
+                try:
+                    from cron.executions import recover_interrupted_executions
+
+                    recover_interrupted_executions()
+                except ExecutorAdmissionError:
+                    raise
+                except Exception as exc:
+                    raise ExecutorAdmissionError(
+                        f"expired admission recovery failed: {exc}"
+                    ) from exc
+                continue
+            active_resources = {
+                resource
+                for row in active
+                for resource in json.loads(row["mutable_resources_json"])
+            }
+            if (
+                sum(row["admission_profile"] == profile for row in active) >= ADMISSION_PROFILE_CAPACITY
+                or _resource_conflicts(resources, active_resources)
+                or _active_task_conflicts(resolved_task, active)
+            ):
                 conn.execute("ROLLBACK")
-                if legacy["expires_at"] < now_iso:
-                    raise ExecutorAdmissionError("legacy executor lease is expired and its owner is uncertain; exact stale-owner recovery is required")
                 return None
-        expired = [row for row in active if row["expires_at"] < now_iso]
-        if expired:
-            conn.execute("ROLLBACK")
-            raise ExecutorAdmissionError(
-                "active admission lease is expired and its owner is uncertain; exact stale-owner recovery is required"
+            token = int(conn.execute(
+                "SELECT last_fencing_token FROM admission_state WHERE singleton=1"
+            ).fetchone()[0]) + 1
+            conn.execute("UPDATE admission_state SET last_fencing_token=? WHERE singleton=1", (token,))
+            conn.execute(
+                """INSERT INTO admission_leases(
+                     fencing_token,task_id,job_id,owner_run_id,admission_profile,
+                     mutable_resources_json,acquired_at,heartbeat_at,expires_at,
+                     ledger_execution_id,state
+                   ) VALUES (?,?,?,?,?,?,?,?,?,?, 'active')""",
+                (token, resolved_task, job_id, run_id, profile, json.dumps(resources), now_iso,
+                 now_iso, expires_iso, str(ledger_execution_id)),
             )
-        active_resources = {
-            resource
-            for row in active
-            for resource in json.loads(row["mutable_resources_json"])
-        }
-        if (
-            sum(row["admission_profile"] == profile for row in active) >= ADMISSION_PROFILE_CAPACITY
-            or _resource_conflicts(resources, active_resources)
-            or _active_task_conflicts(resolved_task, active)
-        ):
-            conn.execute("ROLLBACK")
-            return None
-        token = int(conn.execute(
-            "SELECT last_fencing_token FROM admission_state WHERE singleton=1"
-        ).fetchone()[0]) + 1
-        conn.execute("UPDATE admission_state SET last_fencing_token=? WHERE singleton=1", (token,))
-        conn.execute(
-            """INSERT INTO admission_leases(
-                 fencing_token,task_id,job_id,owner_run_id,admission_profile,
-                 mutable_resources_json,acquired_at,heartbeat_at,expires_at,
-                 ledger_execution_id,state
-               ) VALUES (?,?,?,?,?,?,?,?,?,?, 'active')""",
-            (token, resolved_task, job_id, run_id, profile, json.dumps(resources), now_iso,
-             now_iso, expires_iso, str(ledger_execution_id)),
-        )
-        if pending is not None:
-            conn.execute("DELETE FROM pending_wakes WHERE job_id=?", (job_id,))
-        _commit(conn, deadline=deadline)
-        return AdmissionLease(resolved_task, job_id, run_id, token, now_iso, now_iso,
-                              expires_iso, str(ledger_execution_id), profile, resources)
+            if pending is not None:
+                conn.execute("DELETE FROM pending_wakes WHERE job_id=?", (job_id,))
+            _commit(conn, deadline=deadline)
+            return AdmissionLease(resolved_task, job_id, run_id, token, now_iso, now_iso,
+                                  expires_iso, str(ledger_execution_id), profile, resources)
     except ExecutorAdmissionError:
         if conn.in_transaction:
             conn.execute("ROLLBACK")
