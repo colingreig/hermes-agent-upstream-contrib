@@ -495,6 +495,8 @@ def is_pass_fresh(
     head_sha: str = "",
     max_age_h: float = DEFAULT_MAX_AGE_H,
     path: str | os.PathLike[str] | None = None,
+    *,
+    current_base_sha: str | None = None,
 ) -> tuple[bool, str]:
     """Default deny unless the ledger has a current, exact, non-shadow PASS."""
     if not head_sha:
@@ -506,6 +508,16 @@ def is_pass_fresh(
         return False, f"validator verdict is {verdict.get('verdict')!r}, not PASS"
     if verdict.get("shadow") is not False:
         return False, "verdict is shadow-only; live merge ownership is disabled"
+    if current_base_sha is not None:
+        identity = verdict.get("identity")
+        trusted_base_sha = identity.get("base_sha") if isinstance(identity, Mapping) else None
+        if not current_base_sha:
+            return False, "current protected-base tip is unreadable (fail-closed); re-validate"
+        if trusted_base_sha != current_base_sha:
+            return False, (
+                "protected base advanced after verdict finalization; PASS does not cover "
+                "the current base; re-validate"
+            )
     age = _age_hours(str(verdict.get("ts", "")))
     if age > max_age_h:
         return False, f"verdict is stale ({age:.1f}h > {max_age_h}h); re-validate"
@@ -527,6 +539,40 @@ def _gh_json(path: str) -> Any:
         raise VerdictStoreError("GitHub identity query returned malformed JSON") from exc
 
 
+def _gh_paginated_items(path: str, key: str | None = None) -> list[Any]:
+    """Read every REST page, rejecting malformed or implausibly large evidence."""
+    items: list[Any] = []
+    expected_total: int | None = None
+    separator = "&" if "?" in path else "?"
+    for page in range(1, 1001):
+        payload = _gh_json(f"{path}{separator}per_page=100&page={page}")
+        if key is None:
+            page_items = payload
+        else:
+            if not isinstance(payload, Mapping):
+                raise VerdictStoreError("GitHub returned malformed paginated CI evidence")
+            total_count = payload.get("total_count")
+            if isinstance(total_count, bool) or not isinstance(total_count, int) or total_count < 0:
+                raise VerdictStoreError("GitHub returned malformed paginated CI evidence count")
+            if total_count > 100_000:
+                raise VerdictStoreError("GitHub CI evidence exceeded the fail-closed pagination limit")
+            if expected_total is None:
+                expected_total = total_count
+            elif total_count != expected_total:
+                raise VerdictStoreError("GitHub paginated CI evidence count changed between pages")
+            page_items = payload.get(key)
+        if not isinstance(page_items, list):
+            raise VerdictStoreError("GitHub returned malformed paginated CI evidence")
+        items.extend(page_items)
+        if expected_total is not None and len(items) > expected_total:
+            raise VerdictStoreError("GitHub paginated CI evidence exceeded its total count")
+        if len(page_items) < 100:
+            if expected_total is not None and len(items) != expected_total:
+                raise VerdictStoreError("GitHub paginated CI evidence did not match its total count")
+            return items
+    raise VerdictStoreError("GitHub CI evidence exceeded the fail-closed pagination limit")
+
+
 def _status_run_id(status: Mapping[str, Any]) -> str:
     """Return an order-independent, candidate-safe legacy-status identifier.
 
@@ -545,21 +591,93 @@ def _status_run_id(status: Mapping[str, Any]) -> str:
             continue
         token = str(value)
         if _STATUS_PROVIDER_ID.fullmatch(token):
-            return f"status:{field}:{token}"
+            return f"status:merge:{field}:{token}"
     try:
         canonical = json.dumps(dict(status), sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False)
     except (TypeError, ValueError) as exc:
         raise VerdictStoreError("legacy CI status cannot form stable identity evidence") from exc
-    return "status:sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return "status:merge:sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _has_exact_pr_association(
+    payload: Mapping[str, Any], *, pr: int, base_sha: str, head_sha: str,
+) -> bool:
+    associations = payload.get("pull_requests")
+    if not isinstance(associations, list) or len(associations) != 1:
+        return False
+    association = associations[0]
+    if not isinstance(association, Mapping):
+        return False
+    associated_base = association.get("base")
+    associated_head = association.get("head")
+    if not isinstance(associated_base, Mapping) or not isinstance(associated_head, Mapping):
+        return False
+    return (
+        association.get("number") == pr
+        and associated_base.get("sha") == base_sha
+        and associated_head.get("sha") == head_sha
+    )
+
+
+def _positive_provider_id(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _check_run_app_id(item: Mapping[str, Any]) -> int:
+    app = item.get("app")
+    if not isinstance(app, Mapping) or not _positive_provider_id(app.get("id")):
+        raise VerdictStoreError("GitHub returned a malformed check-run app")
+    return int(app["id"])
+
+
+def _head_actions_candidate(
+    canonical: str, item: Mapping[str, Any], *, name: str, expected_app_id: int,
+    pr: int, base_sha: str, head_sha: str,
+) -> CIRun | None:
+    run_id = item.get("id")
+    suite = item.get("check_suite")
+    suite_id = suite.get("id") if isinstance(suite, Mapping) else None
+    if not _positive_provider_id(run_id) or not _positive_provider_id(suite_id):
+        raise VerdictStoreError("GitHub returned a malformed head check-run id")
+    app_id = _check_run_app_id(item)
+    if (
+        item.get("name") != name
+        or item.get("status") != "completed"
+        or item.get("conclusion") != "success"
+        or item.get("head_sha") != head_sha
+        or app_id != expected_app_id
+        or not _has_exact_pr_association(item, pr=pr, base_sha=base_sha, head_sha=head_sha)
+    ):
+        return None
+    workflow_runs = _gh_paginated_items(
+        f"repos/{canonical}/actions/runs?check_suite_id={suite_id}", "workflow_runs"
+    )
+    if len(workflow_runs) != 1:
+        return None
+    workflow = workflow_runs[0]
+    if not isinstance(workflow, Mapping):
+        raise VerdictStoreError("GitHub returned a malformed workflow run")
+    workflow_id = workflow.get("id")
+    if not _positive_provider_id(workflow_id):
+        raise VerdictStoreError("GitHub returned a malformed workflow-run id")
+    if (
+        workflow.get("event") != "pull_request"
+        or workflow.get("status") != "completed"
+        or workflow.get("conclusion") != "success"
+        or workflow.get("head_sha") != head_sha
+        or not _has_exact_pr_association(workflow, pr=pr, base_sha=base_sha, head_sha=head_sha)
+    ):
+        return None
+    return CIRun(f"check-run:head:{run_id}", name, "success", head_sha)
 
 
 def resolve_shadow_identity(repo: str, pr: int, task_id: str = "", expected_repo: str = "") -> TrustedMergeIdentity:
     """Build a strict identity from GitHub's PR, branch policy, and exact CI.
 
-    The branch-protection required-check list is the policy source.  Every one
-    must have an exact successful run on GitHub's immutable synthetic merge; an
-    inaccessible protection rule, an excluded check, or a stale/head-only run is
-    a hard failure rather than a permissive best effort.
+    The branch-protection required-check list is the policy source. Merge-SHA
+    evidence is preferred. Only a completely evidence-free synthetic merge may
+    use a fully associated, app-bound pull-request Actions run on the exact head.
+    Every incomplete, ambiguous, stale, or mismatched result fails closed.
     """
     canonical = _canonical_repo(repo)
     if expected_repo and _canonical_repo(expected_repo) != canonical:
@@ -587,19 +705,12 @@ def resolve_shadow_identity(repo: str, pr: int, task_id: str = "", expected_repo
     # fleet, including the only allowlisted PR with a protected base.
     #
     # The base that matters for trust is the one CI actually merged against —
-    # the synthetic merge's FIRST parent.  Bind that, and keep the boundary
+    # the synthetic merge's FIRST parent. Bind that, and keep the boundary
     # fail-closed by proving:
     #   (a) the tested merge is an exact two-parent merge,
     #   (b) its second parent is byte-identical to the reviewed PR head, and
-    #   (c) its first parent is genuine history of the protected base branch
-    #       (identical to, or an ancestor of, the live tip) — never an arbitrary
-    #       or forked commit.
-    # Being *behind* the live tip is deliberately not fatal here: the merge-time
-    # gates (mergeable_state, gating-CI-green on the live head, and branch
-    # protection's own "require branches up to date" setting) own that call, and
-    # merge ownership itself is still disabled by _shadow().  ACTIVATION REVIEW
-    # MUST RECONFIRM THIS: graduating out of shadow means deciding whether a
-    # behind-but-green base is acceptable to merge unattended.
+    #   (c) its first parent is still the exact protected-base tip before and
+    #       after all CI evidence is resolved.
     commit = _gh_json(f"repos/{canonical}/git/commits/{tested_merge_sha}")
     parents = tuple((item or {}).get("sha") for item in (commit.get("parents") or []))
     if len(parents) != 2 or not all(isinstance(value, str) and len(value) in (40, 64) for value in parents):
@@ -612,15 +723,33 @@ def resolve_shadow_identity(repo: str, pr: int, task_id: str = "", expected_repo
     if not isinstance(live_base_sha, str) or len(live_base_sha) not in (40, 64):
         raise VerdictStoreError("protected base branch has no readable immutable tip")
     if base_sha != live_base_sha:
-        comparison = _gh_json(f"repos/{canonical}/compare/{base_sha}...{live_base_sha}")
-        if comparison.get("status") not in {"identical", "ahead"}:
-            raise VerdictStoreError("tested merge base is not an ancestor of the protected base branch")
+        raise VerdictStoreError("tested merge base is not the current protected base tip")
 
     protection = _gh_json(f"repos/{canonical}/branches/{base_ref}/protection/required_status_checks")
+    # The explicit base-tip checks fence identity resolution. Requiring GitHub's
+    # strict up-to-date check policy closes the later validation-to-merge race:
+    # GitHub itself atomically rejects the merge if the protected base advances.
+    if not isinstance(protection, dict) or protection.get("strict") is not True:
+        raise VerdictStoreError(
+            "protected base must require strict up-to-date status checks"
+        )
     contexts = protection.get("contexts") or []
     checks = protection.get("checks") or []
     required = {str(value) for value in contexts if isinstance(value, str) and value}
-    required.update(str(item.get("context")) for item in checks if isinstance(item, dict) and item.get("context"))
+    required_apps: dict[str, int | None] = {name: None for name in required}
+    check_apps: dict[str, int | None] = {}
+    for item in checks:
+        if not isinstance(item, Mapping) or not isinstance(item.get("context"), str) or not item.get("context"):
+            raise VerdictStoreError("protected base branch returned a malformed required check")
+        name = str(item["context"])
+        app_id = item.get("app_id")
+        if app_id is not None and (isinstance(app_id, bool) or not isinstance(app_id, int) or app_id <= 0):
+            raise VerdictStoreError("protected base branch returned an invalid required-check app id")
+        if name in check_apps and check_apps[name] != app_id:
+            raise VerdictStoreError("protected base branch returned ambiguous required-check app ids")
+        check_apps[name] = app_id
+        required.add(name)
+        required_apps[name] = app_id
     if not required:
         raise VerdictStoreError("protected base branch declares no required CI checks")
     manifest = parse_policy_manifest(json.dumps({
@@ -630,30 +759,86 @@ def resolve_shadow_identity(repo: str, pr: int, task_id: str = "", expected_repo
     }))
 
     candidates: dict[str, CIRun] = {}
-    check_runs = _gh_json(f"repos/{canonical}/commits/{tested_merge_sha}/check-runs")
-    for item in check_runs.get("check_runs") or []:
+    merge_checks = _gh_paginated_items(
+        f"repos/{canonical}/commits/{tested_merge_sha}/check-runs", "check_runs"
+    )
+    merge_statuses = _gh_paginated_items(
+        f"repos/{canonical}/commits/{tested_merge_sha}/statuses"
+    )
+    ci_evidence_sha = tested_merge_sha
+    for name in required:
+        if sum(1 for item in merge_checks if isinstance(item, Mapping) and item.get("name") == name) > 1:
+            raise VerdictStoreError("GitHub returned ambiguous required-check evidence")
+    observed_check_contexts: set[str] = set()
+    for item in merge_checks:
+        if not isinstance(item, Mapping):
+            raise VerdictStoreError("GitHub returned a malformed check run")
         name, run_id = item.get("name"), item.get("id")
-        if name not in required or item.get("status") != "completed" or item.get("conclusion") != "success":
+        if name not in required:
+            continue
+        # Provider precedence is context-wide, not success-candidate-wide. Once
+        # GitHub reports a Check Run for a required context, that provider is
+        # authoritative even when the run failed, is pending, or is malformed.
+        # A successful legacy status with the same context must never revive it.
+        observed_check_contexts.add(str(name))
+        if not _positive_provider_id(run_id):
+            raise VerdictStoreError("GitHub returned a malformed merge check-run id")
+        app_id = _check_run_app_id(item)
+        if item.get("status") != "completed" or item.get("conclusion") != "success":
             continue
         if item.get("head_sha") != tested_merge_sha:
             continue
-        candidates[name] = CIRun(f"check-run:{run_id}", name, "success", tested_merge_sha)
-    statuses = _gh_json(f"repos/{canonical}/commits/{tested_merge_sha}/status")
-    for item in statuses.get("statuses") or []:
+        expected_app_id = required_apps.get(name)
+        if expected_app_id is not None and app_id != expected_app_id:
+            continue
+        candidates[name] = CIRun(f"check-run:merge:{run_id}", name, "success", tested_merge_sha)
+    latest_statuses: dict[str, Mapping[str, Any]] = {}
+    for item in merge_statuses:
         if not isinstance(item, Mapping):
             raise VerdictStoreError("GitHub returned a malformed legacy CI status")
         name = item.get("context")
+        if isinstance(name, str) and name not in latest_statuses:
+            # GitHub returns commit statuses newest-first. Only the first status
+            # for a context is authoritative; older successes cannot revive a
+            # context whose latest state is failure or pending.
+            latest_statuses[name] = item
+    for name, item in latest_statuses.items():
         if name not in required or item.get("state") != "success":
+            continue
+        if required_apps.get(name) is not None:
             continue
         if item.get("sha") != tested_merge_sha:
             continue
-        candidate = CIRun(_status_run_id(item), name, "success", tested_merge_sha)
-        # A check run takes precedence over a legacy status.  Multiple legacy
-        # statuses for one required context are selected by immutable evidence
-        # id, never the API's arbitrary list ordering.
-        previous = candidates.get(name)
-        if previous is None or (previous.run_id.startswith("status:") and candidate.run_id < previous.run_id):
-            candidates[name] = candidate
+        # Any observed Check Run for the required context is authoritative,
+        # including a non-successful or malformed run that produced no candidate.
+        if name not in observed_check_contexts:
+            candidates[name] = CIRun(_status_run_id(item), name, "success", tested_merge_sha)
+    if not merge_checks and not merge_statuses:
+        ci_evidence_sha = head_sha
+        head_checks = _gh_paginated_items(
+            f"repos/{canonical}/commits/{head_sha}/check-runs", "check_runs"
+        )
+        by_name: dict[str, list[Mapping[str, Any]]] = {name: [] for name in required}
+        for item in head_checks:
+            if not isinstance(item, Mapping):
+                raise VerdictStoreError("GitHub returned a malformed head check run")
+            if item.get("name") in by_name:
+                by_name[str(item["name"])].append(item)
+        for name in sorted(required):
+            expected_app_id = required_apps.get(name)
+            evidence = by_name[name]
+            if expected_app_id is None or len(evidence) != 1:
+                continue
+            candidate = _head_actions_candidate(
+                canonical, evidence[0], name=name, expected_app_id=expected_app_id,
+                pr=pr, base_sha=base_sha, head_sha=head_sha,
+            )
+            if candidate is not None:
+                candidates[name] = candidate
+    final_live_base = _gh_json(f"repos/{canonical}/git/ref/heads/{base_ref}")
+    final_live_base_sha = ((final_live_base or {}).get("object") or {}).get("sha")
+    if final_live_base_sha != base_sha:
+        raise VerdictStoreError("protected base branch moved during identity resolution")
     try:
         return manifest.bind_identity(
             canonical_repo=canonical,
@@ -662,6 +847,7 @@ def resolve_shadow_identity(repo: str, pr: int, task_id: str = "", expected_repo
             base_sha=base_sha,
             head_sha=head_sha,
             tested_merge_sha=tested_merge_sha,
+            ci_evidence_sha=ci_evidence_sha,
             runs=tuple(candidates.values()),
         )
     except (IdentityError, PolicyError) as exc:

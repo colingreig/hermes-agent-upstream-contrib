@@ -195,7 +195,7 @@ class MergeGuardVerdictGateTests(unittest.TestCase):
 
     def _gate(self, repo, pr, pr_state_head, pr_state_err=None, ledger=None):
         env = _merge_env(HERMES_MERGE_ACTIVE="1", HERMES_AUTONOMOUS_MERGE="1")
-        info = None if pr_state_err else {"head": pr_state_head}
+        info = None if pr_state_err else {"head": pr_state_head, "base": "a" * 40}
         with (
             mock.patch.dict(os.environ, env),
             mock.patch.object(merge_guard, "validator_verdict",
@@ -222,6 +222,23 @@ class MergeGuardVerdictGateTests(unittest.TestCase):
             ledger = Path(directory) / "verdicts.sqlite3"
             self._seed_pass(trusted, ledger, tier="high")
             ok, why = self._gate("acme/widget", 7, trusted.head_sha, ledger=ledger)
+        self.assertFalse(ok)
+        self.assertIn("NEVER", why)
+
+    def test_force_push_back_to_high_risk_head_cannot_inherit_newer_low_risk_tier(self) -> None:
+        """A PR can have verdicts for multiple heads. If B's newer low-risk
+        verdict is latest but GitHub is force-pushed back to A, both freshness
+        and tier authorization must be read from exact current head A.
+        """
+        high_head = _identity(head="6" * 40)
+        low_head = _identity(head="7" * 40)
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = Path(directory) / "verdicts.sqlite3"
+            self._seed_pass(high_head, ledger, tier="high")
+            self._seed_pass(low_head, ledger, tier="low")
+            ok, why = self._gate(
+                "acme/widget", 7, high_head.head_sha, ledger=ledger
+            )
         self.assertFalse(ok)
         self.assertIn("NEVER", why)
 
@@ -254,10 +271,10 @@ def _bound_verdict_store(ledger):
     test ledger path, mirroring merge_guard's own module-level calls (which
     take no `path` kwarg and therefore hit the default STORE_PATH in prod)."""
     return SimpleNamespace(
-        is_pass_fresh=lambda repo, pr, head_sha="": validator_verdict.is_pass_fresh(
-            repo, pr, head_sha, path=ledger),
-        verdict_for=lambda repo, pr: validator_verdict.verdict_for(
-            repo, pr, path=ledger),
+        is_pass_fresh=lambda repo, pr, head_sha="", **kwargs: validator_verdict.is_pass_fresh(
+            repo, pr, head_sha, path=ledger, **kwargs),
+        verdict_for=lambda repo, pr, head_sha="": validator_verdict.verdict_for(
+            repo, pr, path=ledger, head_sha=head_sha),
     )
 
 

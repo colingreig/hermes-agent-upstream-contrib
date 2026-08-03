@@ -405,7 +405,10 @@ def cmd_merge_pr(a):
     # The authoritative SQLite verdict is candidate-bound.  Do not accept a
     # PASS until GitHub has supplied the exact current head it must match.
     validated_head = ci_info.get("head") or ""
-    ok, why = validator_verdict.is_pass_fresh(a.repo, a.pr_number, validated_head)
+    ok, why = validator_verdict.is_pass_fresh(
+        a.repo, a.pr_number, validated_head,
+        current_base_sha=ci_info.get("base") or "",
+    )
     if not ok:
         print(f"ERROR: validator verdict gate refuses merge of {a.repo}#{a.pr_number}: "
               f"{why}", file=sys.stderr)

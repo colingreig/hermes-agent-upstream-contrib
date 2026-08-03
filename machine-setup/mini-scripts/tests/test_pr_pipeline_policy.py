@@ -14,6 +14,7 @@ from pr_pipeline.policy import CIRun, PolicyError, parse_policy_manifest  # noqa
 
 
 MERGE = "c" * 40
+HEAD = "b" * 40
 
 
 def manifest() -> str:
@@ -56,6 +57,28 @@ class PolicyManifestTests(unittest.TestCase):
         for conclusion in ("skipped", "neutral", "cancelled", "failure"):
             with self.subTest(conclusion=conclusion), self.assertRaises(PolicyError):
                 CIRun("101", "unit", conclusion, MERGE)
+
+    def test_head_ci_evidence_does_not_replace_the_tested_merge_identity(self) -> None:
+        policy = parse_policy_manifest(manifest())
+        runs = (
+            CIRun("check-run:head:101", "unit", "success", HEAD),
+            CIRun("check-run:head:102", "lint", "success", HEAD),
+        )
+        identity = policy.bind_identity(
+            canonical_repo="acme/widget", pr_number=7, trusted_task_id="86e2kt7qb",
+            base_sha="a" * 40, head_sha=HEAD, tested_merge_sha=MERGE,
+            ci_evidence_sha=HEAD, runs=runs,
+        )
+        self.assertEqual(identity.tested_merge_sha, MERGE)
+        self.assertEqual(identity.head_sha, HEAD)
+        self.assertEqual(identity.ci_run_ids, ("check-run:head:101", "check-run:head:102"))
+        with self.assertRaises(PolicyError):
+            policy.bind_identity(
+                canonical_repo="acme/widget", pr_number=7, trusted_task_id="86e2kt7qb",
+                base_sha="a" * 40, head_sha=HEAD, tested_merge_sha=MERGE,
+                ci_evidence_sha=HEAD,
+                runs=(runs[0], CIRun("check-run:head:102", "lint", "success", "d" * 40)),
+            )
 
 
 if __name__ == "__main__":

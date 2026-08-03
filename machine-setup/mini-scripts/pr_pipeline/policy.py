@@ -59,12 +59,12 @@ def _full_sha(value: object) -> str:
 
 @dataclass(frozen=True, slots=True)
 class CIRun:
-    """One selected required CI result, bound to the tested merge object."""
+    """One selected required CI result, bound to its immutable evidence SHA."""
 
     run_id: str
     check_id: str
     conclusion: str
-    tested_merge_sha: str
+    ci_evidence_sha: str
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "run_id", _run(self.run_id))
@@ -73,7 +73,7 @@ class CIRun:
         # skipped, cancelled, or action_required status conclusions.
         if self.conclusion != "success":
             raise PolicyError("only a literal CI conclusion of 'success' is accepted")
-        object.__setattr__(self, "tested_merge_sha", _full_sha(self.tested_merge_sha))
+        object.__setattr__(self, "ci_evidence_sha", _full_sha(self.ci_evidence_sha))
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,7 +92,8 @@ class CIPolicyManifest:
         return canonical
 
     def successful_run_ids(
-        self, *, repository: str, tested_merge_sha: str, runs: Iterable[CIRun]
+        self, *, repository: str, tested_merge_sha: str,
+        ci_evidence_sha: str | None = None, runs: Iterable[CIRun]
     ) -> tuple[str, ...]:
         """Return run IDs only if every required check is exact-success.
 
@@ -101,7 +102,8 @@ class CIPolicyManifest:
         stale run.  Run IDs returned here must be copied into the identity.
         """
         self.require_repo(repository)
-        merge_sha = _full_sha(tested_merge_sha)
+        _full_sha(tested_merge_sha)
+        evidence_sha = _full_sha(ci_evidence_sha or tested_merge_sha)
         selected = tuple(runs)
         if len(selected) != len(self.required_checks):
             raise PolicyError("CI evidence must include exactly one run per required check")
@@ -114,8 +116,8 @@ class CIPolicyManifest:
                 raise PolicyError(f"CI evidence contains unrequired check {run.check_id!r}")
             if run.check_id in by_check or run.run_id in seen_ids:
                 raise PolicyError("CI evidence contains duplicate checks or run ids")
-            if run.conclusion != "success" or run.tested_merge_sha != merge_sha:
-                raise PolicyError("required CI run is not an exact successful tested-merge run")
+            if run.conclusion != "success" or run.ci_evidence_sha != evidence_sha:
+                raise PolicyError("required CI run is not an exact successful evidence-SHA run")
             by_check[run.check_id] = run
             seen_ids.add(run.run_id)
         if set(by_check) != set(self.required_checks):
@@ -124,14 +126,16 @@ class CIPolicyManifest:
 
     def bind_identity(
         self, *, canonical_repo: str, pr_number: int, trusted_task_id: str,
-        base_sha: str, head_sha: str, tested_merge_sha: str, runs: Iterable[CIRun],
+        base_sha: str, head_sha: str, tested_merge_sha: str,
+        ci_evidence_sha: str | None = None, runs: Iterable[CIRun],
     ) -> TrustedMergeIdentity:
         return TrustedMergeIdentity(
             canonical_repo=canonical_repo, pr_number=pr_number, trusted_task_id=trusted_task_id,
             base_sha=base_sha, head_sha=head_sha, tested_merge_sha=tested_merge_sha,
             ci_policy_id=self.policy_id,
             ci_run_ids=self.successful_run_ids(
-                repository=canonical_repo, tested_merge_sha=tested_merge_sha, runs=runs,
+                repository=canonical_repo, tested_merge_sha=tested_merge_sha,
+                ci_evidence_sha=ci_evidence_sha, runs=runs,
             ),
         )
 

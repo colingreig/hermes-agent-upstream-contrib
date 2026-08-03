@@ -170,10 +170,14 @@ def _verdict_gate(tool_name, tool_input, cmd):
         if err or not info or not info.get("head"):
             return False, (f"could not resolve the PR's current head (fail-closed): "
                            f"{err or 'no head returned'}")
-        ok, why = validator_verdict.is_pass_fresh(repo, pr, info["head"])
+        ok, why = validator_verdict.is_pass_fresh(
+            repo, pr, info["head"], current_base_sha=info.get("base") or ""
+        )
         if not ok:
             return False, why
-        tier = (validator_verdict.verdict_for(repo, pr) or {}).get("tier", "high")
+        tier = (validator_verdict.verdict_for(
+            repo, pr, head_sha=info["head"]
+        ) or {}).get("tier", "high")
         if not _tier_autonomy_enabled(tier):
             normalized = tier.strip().lower() if isinstance(tier, str) else ""
             if normalized not in ("low", "medium"):
