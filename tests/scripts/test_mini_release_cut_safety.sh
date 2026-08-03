@@ -1747,4 +1747,221 @@ fi
 [ ! -e "$FENCE_EXIT_ROOT/freeze-should-not-run" ] \
   || fail "fence-loss EXIT cleanup attempted poll freeze"
 
+# ---------------------------------------------------------------------------
+# runtime-current pointer health (ClickUp 86e2kt3yr).
+#
+# The 2026-08-02 incident left runtime-current as a BARE-NAME relative symlink
+# (`v0.18.2-<sha>`), which resolves against $HERMES_HOME instead of releases/
+# and therefore dangled. These checks pin every corruption shape the pointer
+# contract must reject, and prove the healthy case still passes.
+# ---------------------------------------------------------------------------
+POINTER_ROOT="$TEST_ROOT/pointer"
+POINTER_HOME="$POINTER_ROOT/.hermes"
+POINTER_RELEASES="$POINTER_HOME/releases"
+POINTER_ACTIVE="$POINTER_RELEASES/v9.9.9-abcdef123456"
+mkdir -p "$POINTER_ACTIVE/venv/bin"
+printf '#!/bin/sh\nexit 0\n' > "$POINTER_ACTIVE/venv/bin/python"
+chmod 0755 "$POINTER_ACTIVE/venv/bin/python"
+POINTER_HOME="$(cd -P "$POINTER_HOME" && pwd -P)"
+POINTER_RELEASES="$POINTER_HOME/releases"
+POINTER_ACTIVE="$POINTER_RELEASES/v9.9.9-abcdef123456"
+POINTER_LINK="$POINTER_HOME/runtime-current"
+
+pointer_health() (
+  HERMES_HOME="$POINTER_HOME"
+  RELEASES_DIR="$POINTER_RELEASES"
+  CURRENT_LINK="$POINTER_LINK"
+  current_link_health
+)
+pointer_structure() (
+  HERMES_HOME="$POINTER_HOME"
+  RELEASES_DIR="$POINTER_RELEASES"
+  CURRENT_LINK="$POINTER_LINK"
+  current_link_structure_ok
+)
+
+# Missing pointer.
+rm -f "$POINTER_LINK"
+POINTER_OUT="$(pointer_health || true)"
+case "$POINTER_OUT" in
+  *"runtime-current is missing"*) ;;
+  *) fail "missing pointer was not reported as missing: $POINTER_OUT" ;;
+esac
+if pointer_health >/dev/null 2>&1; then fail "missing pointer reported healthy"; fi
+
+# A regular directory in place of the pointer is not a symlink.
+mkdir -p "$POINTER_LINK"
+POINTER_OUT="$(pointer_health || true)"
+case "$POINTER_OUT" in
+  *"runtime-current is not a symlink"*) ;;
+  *) fail "non-symlink pointer was not detected: $POINTER_OUT" ;;
+esac
+rmdir "$POINTER_LINK"
+
+# THE INCIDENT SHAPE: bare-name relative link. It must be rejected on the raw
+# link text, before any resolution, and must never be reported healthy.
+ln -sfn "v9.9.9-abcdef123456" "$POINTER_LINK"
+POINTER_OUT="$(pointer_health || true)"
+case "$POINTER_OUT" in
+  *"relative symlink"*) ;;
+  *) fail "bare-name relative pointer was not rejected: $POINTER_OUT" ;;
+esac
+if pointer_health >/dev/null 2>&1; then fail "bare-name relative pointer reported healthy"; fi
+if pointer_structure >/dev/null 2>&1; then fail "bare-name relative pointer passed the structural check"; fi
+
+# A relative link that DOES resolve is still out of contract: the receipt
+# records an absolute runtime_target and consumers string-join onto it.
+ln -sfn "releases/v9.9.9-abcdef123456" "$POINTER_LINK"
+POINTER_OUT="$(pointer_health || true)"
+case "$POINTER_OUT" in
+  *"relative symlink"*) ;;
+  *) fail "resolvable relative pointer was not rejected: $POINTER_OUT" ;;
+esac
+
+# Absolute but non-canonical (traversal through releases/..) is rejected.
+ln -sfn "$POINTER_RELEASES/../releases/v9.9.9-abcdef123456" "$POINTER_LINK"
+POINTER_OUT="$(pointer_health || true)"
+case "$POINTER_OUT" in
+  *"not canonical"*) ;;
+  *) fail "non-canonical absolute pointer was not rejected: $POINTER_OUT" ;;
+esac
+
+# Absolute link that escapes releases/ entirely.
+mkdir -p "$POINTER_ROOT/outside"
+ln -sfn "$POINTER_ROOT/outside" "$POINTER_LINK"
+POINTER_OUT="$(pointer_health || true)"
+case "$POINTER_OUT" in
+  *"escapes releases dir"*) ;;
+  *) fail "escaping pointer was not rejected: $POINTER_OUT" ;;
+esac
+
+# Absolute, canonical, but dangling.
+ln -sfn "$POINTER_RELEASES/v0.0.0-deadbeefcafe" "$POINTER_LINK"
+POINTER_OUT="$(pointer_health || true)"
+case "$POINTER_OUT" in
+  *"dangling"*) ;;
+  *) fail "dangling pointer was not rejected: $POINTER_OUT" ;;
+esac
+
+# Structurally valid but the release has no usable runtime interpreter. The
+# full health contract rejects it; the structural contract (used by the swap
+# primitive itself) accepts it.
+POINTER_NOVENV="$POINTER_RELEASES/v9.9.9-000000000000"
+mkdir -p "$POINTER_NOVENV"
+ln -sfn "$POINTER_NOVENV" "$POINTER_LINK"
+POINTER_OUT="$(pointer_health || true)"
+case "$POINTER_OUT" in
+  *"no usable runtime Python"*) ;;
+  *) fail "pointer with no runtime Python was not rejected: $POINTER_OUT" ;;
+esac
+pointer_structure >/dev/null 2>&1 \
+  || fail "structural check rejected a release whose venv is absent"
+
+# Healthy pointer: reports the resolved target and exits 0.
+ln -sfn "$POINTER_ACTIVE" "$POINTER_LINK"
+POINTER_OUT="$(pointer_health)" || fail "healthy pointer was reported corrupt: $POINTER_OUT"
+[ "$POINTER_OUT" = "$POINTER_ACTIVE" ] \
+  || fail "healthy pointer did not report its resolved target: $POINTER_OUT"
+
+# assert_current_link_healthy must die (not warn) on a corrupt pointer, and
+# must name the repair path so an operator is not left guessing.
+ln -sfn "v9.9.9-abcdef123456" "$POINTER_LINK"
+ASSERT_OUT="$(
+  (
+    HERMES_HOME="$POINTER_HOME"
+    RELEASES_DIR="$POINTER_RELEASES"
+    CURRENT_LINK="$POINTER_LINK"
+    assert_current_link_healthy
+  ) 2>&1 || true
+)"
+case "$ASSERT_OUT" in
+  *"CORRUPT"*"--repair-pointer"*) ;;
+  *) fail "assert_current_link_healthy did not report a corrupt pointer with a repair hint: $ASSERT_OUT" ;;
+esac
+if (
+  HERMES_HOME="$POINTER_HOME"
+  RELEASES_DIR="$POINTER_RELEASES"
+  CURRENT_LINK="$POINTER_LINK"
+  assert_current_link_healthy
+) >/dev/null 2>&1; then
+  fail "assert_current_link_healthy accepted a corrupt pointer"
+fi
+
+# repoint_symlink must fail closed when its own swap leaves a pointer that
+# violates the contract. Simulate a faulty mv that writes a bare-name link
+# with the right basename: target equality alone would have accepted it.
+rm -f "$POINTER_LINK"
+if (
+  HERMES_HOME="$POINTER_HOME"
+  RELEASES_DIR="$POINTER_RELEASES"
+  CURRENT_LINK="$POINTER_LINK"
+  DRY_RUN=0
+  # shellcheck disable=SC2329 # invoked by repoint_symlink.
+  guarded_or_direct() {
+    if [ "${1:-}" = mv ]; then
+      rm -f "${!#}" "${@: -2:1}"
+      ln -sfn "v9.9.9-abcdef123456" "$CURRENT_LINK"
+      return 0
+    fi
+    "$@"
+  }
+  repoint_symlink "$POINTER_ACTIVE"
+) >/dev/null 2>&1; then
+  fail "repoint_symlink accepted a bare-name pointer after the swap"
+fi
+
+# The happy path still succeeds and leaves an absolute canonical pointer.
+rm -f "$POINTER_LINK"
+(
+  HERMES_HOME="$POINTER_HOME"
+  RELEASES_DIR="$POINTER_RELEASES"
+  CURRENT_LINK="$POINTER_LINK"
+  DRY_RUN=0
+  repoint_symlink "$POINTER_ACTIVE"
+) >/dev/null || fail "repoint_symlink failed on a healthy target"
+[ "$(readlink "$POINTER_LINK")" = "$POINTER_ACTIVE" ] \
+  || fail "repoint_symlink did not leave an absolute canonical pointer"
+
+# receipt_verified_runtime_target only trusts a receipt that byte-matches its
+# content-addressed twin, so a hand-edited pointer cannot become a repair
+# source.
+RECEIPT_ROOT="$TEST_ROOT/receipt-repair"
+RECEIPT_RELEASES="$RECEIPT_ROOT/releases"
+mkdir -p "$RECEIPT_RELEASES/v9.9.9-abcdef123456"
+RECEIPT_RELEASES="$(cd -P "$RECEIPT_RELEASES" && pwd -P)"
+RECEIPT_ACTIVE="$RECEIPT_RELEASES/v9.9.9-abcdef123456"
+RECEIPT_LAST="$RECEIPT_RELEASES/.mini-release-last-receipt.json"
+printf '{"event":"cut","runtime_target":"%s","schema_version":2}\n' "$RECEIPT_ACTIVE" > "$RECEIPT_LAST"
+RECEIPT_DIGEST="$(shasum -a 256 "$RECEIPT_LAST" | cut -d' ' -f1)"
+
+# No content-addressed twin yet -> refuse.
+if (
+  RELEASES_DIR="$RECEIPT_RELEASES"
+  LAST_RECEIPT_FILE="$RECEIPT_LAST"
+  receipt_verified_runtime_target
+) >/dev/null 2>&1; then
+  fail "receipt repair source accepted a receipt with no content-addressed twin"
+fi
+
+cp "$RECEIPT_LAST" "$RECEIPT_RELEASES/.mini-release-receipt-$RECEIPT_DIGEST.json"
+RECEIPT_OUT="$(
+  RELEASES_DIR="$RECEIPT_RELEASES"
+  LAST_RECEIPT_FILE="$RECEIPT_LAST"
+  receipt_verified_runtime_target
+)" || fail "receipt repair source rejected a valid content-addressed receipt"
+[ "$RECEIPT_OUT" = "$RECEIPT_ACTIVE" ] \
+  || fail "receipt repair source returned the wrong target: $RECEIPT_OUT"
+
+# A receipt naming a target outside releases/ must never be a repair source.
+printf '{"event":"cut","runtime_target":"%s","schema_version":2}\n' "$RECEIPT_ROOT" > "$RECEIPT_LAST"
+RECEIPT_DIGEST="$(shasum -a 256 "$RECEIPT_LAST" | cut -d' ' -f1)"
+cp "$RECEIPT_LAST" "$RECEIPT_RELEASES/.mini-release-receipt-$RECEIPT_DIGEST.json"
+if (
+  RELEASES_DIR="$RECEIPT_RELEASES"
+  LAST_RECEIPT_FILE="$RECEIPT_LAST"
+  receipt_verified_runtime_target
+) >/dev/null 2>&1; then
+  fail "receipt repair source accepted a target outside releases/"
+fi
+
 printf 'mini-release-cut safety checks passed\n'

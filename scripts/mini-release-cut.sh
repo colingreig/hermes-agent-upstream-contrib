@@ -94,6 +94,8 @@ IF_ADVANCED=0
 LAUNCHD_ENV_CHANGED=0
 MARKETPLACE_SKILLS_CHANGED=0
 PREFLIGHT=0
+VERIFY_POINTER=0
+REPAIR_POINTER=0
 CERTIFIED_SHA=""
 PROMOTION_RECEIPT_ID=""
 PR_PIPELINE_CHANGED=0
@@ -104,7 +106,23 @@ FLEET_OUTCOMES_CHANGED=0
 usage() {
   cat <<'EOF'
 Usage: mini-release-cut.sh [--ref <branch-or-sha>] [--certified-sha <full-sha>] [--promotion-receipt-id <sha256>] [--if-advanced] [--preflight] [--rollback] [--prune] [--dry-run] [--offline]
+       mini-release-cut.sh --verify-pointer | --repair-pointer
 
+  --verify-pointer
+                Read-only probe of the runtime-current pointer. Exits 0 and
+                prints the resolved release when the pointer is a symlink
+                holding an ABSOLUTE path to a canonical direct child of
+                releases/ that resolves to a directory with a usable
+                venv/bin/python. Exits 1 with a one-line reason otherwise.
+                Takes no lock, acquires no lease, and mutates nothing.
+  --repair-pointer
+                Repoint runtime-current at the release recorded in
+                ~/.hermes/releases/.mini-release-last-receipt.json, after
+                verifying that receipt byte-matches its content-addressed
+                twin. Serialized by the normal cut lock. Use only when
+                --verify-pointer reports a corrupt pointer; a corrupt pointer
+                makes the normal cut/rollback paths (which need the release
+                venv) unusable.
   --ref <ref>   Branch or sha to cut (default: prod-live-patches).
   --certified-sha <sha>
                 Bind the cut/preflight to one exact certified source commit.
@@ -151,6 +169,8 @@ while [ $# -gt 0 ]; do
     --offline)  OFFLINE=1; shift ;;
     --if-advanced) IF_ADVANCED=1; shift ;;
     --preflight) PREFLIGHT=1; IF_ADVANCED=1; shift ;;
+    --verify-pointer) VERIFY_POINTER=1; shift ;;
+    --repair-pointer) REPAIR_POINTER=1; shift ;;
     -h|--help)  usage; exit 0 ;;
     *) echo "ERROR: unknown argument: ${1:-}" >&2; usage >&2; exit 2 ;;
   esac
@@ -973,6 +993,224 @@ http_ok() {
 }
 
 # ---------------------------------------------------------------------------
+# runtime-current pointer health (read-only).
+#
+# Forensics (2026-08-02, ClickUp 86e2kt3yr): runtime-current was found as a
+# BARE-NAME relative symlink (`v0.18.2-aae777c146da`, no directory prefix).
+# A relative symlink resolves against the LINK's directory ($HERMES_HOME), not
+# releases/, so the pointer was dangling: every process that dereferenced
+# $HERMES_HOME/runtime-current/venv/bin/python got ENOENT for ~3 minutes, which
+# silently degraded the gateway's pre-tool-call shell hooks (merge_guard.py,
+# git_commit_identity_guard.py) to warnings while a cron agent ran.
+#
+# This helper is the single definition of "the pointer is healthy". It is
+# deliberately read-only and dependency-free (no git, no release venv, no
+# production-write lease) so it still works when the pointer is the broken
+# thing. It checks the RAW link text, not just the resolved path: a relative
+# link that happens to resolve (e.g. `releases/v0.18.2-xxxx`) is still a
+# defect, because the receipt contract records an absolute runtime_target.
+#
+# Prints a one-line reason to stdout and returns non-zero when unhealthy.
+# ---------------------------------------------------------------------------
+_current_link_check() {
+  local require_runtime="${1:-1}" link="${2:-$CURRENT_LINK}"
+  local raw releases_canon parent_canon base target
+  if [ ! -L "$link" ]; then
+    if [ -e "$link" ]; then
+      printf 'runtime-current is not a symlink: %s\n' "$link"
+    else
+      printf 'runtime-current is missing: %s\n' "$link"
+    fi
+    return 1
+  fi
+  raw="$(readlink "$link")" || {
+    printf 'runtime-current could not be read: %s\n' "$link"
+    return 1
+  }
+  case "$raw" in
+    /*) ;;
+    *)
+      printf 'runtime-current is a relative symlink (must be absolute): %s -> %s\n' "$link" "$raw"
+      return 1
+      ;;
+  esac
+  releases_canon="$(canonical_existing_dir "$RELEASES_DIR")" || {
+    printf 'releases dir does not exist: %s\n' "$RELEASES_DIR"
+    return 1
+  }
+  base="$(basename -- "$raw")"
+  case "$base" in
+    ''|.|..)
+      printf 'runtime-current target has no release component: %s -> %s\n' "$link" "$raw"
+      return 1
+      ;;
+  esac
+  parent_canon="$(canonical_existing_dir "$(dirname -- "$raw")")" || {
+    printf 'runtime-current target parent does not exist: %s -> %s\n' "$link" "$raw"
+    return 1
+  }
+  [ "$parent_canon" = "$releases_canon" ] || {
+    printf 'runtime-current escapes releases dir: %s -> %s (parent resolved: %s)\n' \
+      "$link" "$raw" "$parent_canon"
+    return 1
+  }
+  # Reject traversal (`releases/../releases/x`) and dot components. The parent
+  # check above already pins the link into releases/, but it canonicalizes, so
+  # on its own it would accept a path that walks out of releases/ and back in.
+  # Scanning the raw text keeps that closed without assuming a particular
+  # spelling of $HOME: the mini's home can legitimately sit under a symlinked
+  # prefix (macOS /var -> /private/var), so a literal string comparison
+  # against $RELEASES_DIR would reject healthy pointers. Repeated slashes are
+  # deliberately tolerated — they are cosmetic and enable no escape.
+  case "$raw" in
+    */../*|*/..|*/./*|*/.)
+      printf 'runtime-current target is not canonical: %s -> %s\n' "$link" "$raw"
+      return 1
+      ;;
+  esac
+  target="$raw"
+  [ -d "$target" ] || {
+    printf 'runtime-current target is dangling or not a directory: %s -> %s\n' "$link" "$raw"
+    return 1
+  }
+  if [ "$require_runtime" = 1 ]; then
+    [ -x "$target/venv/bin/python" ] || {
+      printf 'runtime-current target has no usable runtime Python: %s/venv/bin/python\n' "$target"
+      return 1
+    }
+  fi
+  printf '%s\n' "$target"
+  return 0
+}
+
+# Full operational health: structure + a usable runtime interpreter. This is
+# the contract every consumer of $HERMES_HOME/runtime-current actually depends
+# on, so it is what --verify-pointer and the poller assert.
+current_link_health() { _current_link_check 1 "${1:-$CURRENT_LINK}"; }
+
+# Structural health only: symlink, absolute, canonical direct child of
+# releases/, resolves to a directory. Used by the swap primitive itself, which
+# must stay usable for a rollback to a generation whose venv is being repaired.
+current_link_structure_ok() { _current_link_check 0 "${1:-$CURRENT_LINK}"; }
+
+# Fail-closed wrapper. A corrupt pointer must never be silently propagated into
+# PREV_TARGET/.previous or into a receipt, so every mutating mode calls this
+# before it touches release state.
+assert_current_link_healthy() {
+  local detail
+  if detail="$(current_link_health)"; then
+    return 0
+  fi
+  die "runtime-current pointer is CORRUPT: $detail
+     repair: $HERMES_HOME/runtime-current/scripts/mini-release-cut.sh --repair-pointer
+     (or, if the pointer is unusable: bash <checkout>/scripts/mini-release-cut.sh --repair-pointer)"
+}
+
+# Read the receipt-verified runtime target without trusting runtime-current.
+# The last receipt is content-addressed: it must byte-match its immutable
+# .mini-release-receipt-<sha256>.json twin, which is what makes it a safe
+# repair source. Uses the SYSTEM python3 on purpose — the release venv is
+# reached through the very pointer being repaired.
+receipt_verified_runtime_target() {
+  local py
+  py="$(command -v python3 || true)"
+  [ -n "$py" ] || { printf 'system python3 not found\n' >&2; return 1; }
+  RELEASES_DIR="$RELEASES_DIR" LAST_RECEIPT_FILE="$LAST_RECEIPT_FILE" "$py" - <<'PY'
+import hashlib
+import json
+import os
+import sys
+
+releases = os.environ["RELEASES_DIR"]
+last = os.environ["LAST_RECEIPT_FILE"]
+
+
+def fail(msg):
+    print(msg, file=sys.stderr)
+    raise SystemExit(1)
+
+
+try:
+    raw = open(last, "rb").read()
+except OSError as exc:
+    fail(f"last release receipt unreadable: {exc}")
+
+digest = hashlib.sha256(raw).hexdigest()
+immutable = os.path.join(releases, f".mini-release-receipt-{digest}.json")
+if os.path.islink(immutable) or not os.path.isfile(immutable):
+    fail("last release receipt has no content-addressed twin")
+if open(immutable, "rb").read() != raw:
+    fail("last release receipt differs from its content-addressed receipt")
+
+try:
+    payload = json.loads(raw.decode("utf-8"))
+except ValueError as exc:
+    fail(f"last release receipt is not valid JSON: {exc}")
+if payload.get("schema_version") != 2:
+    fail("last release receipt has an unsupported schema_version")
+if payload.get("event") not in {"noop", "rejected", "advanced", "cut", "rollback"}:
+    fail("last release receipt has an invalid event")
+
+target = payload.get("runtime_target")
+if not isinstance(target, str) or not target.startswith("/"):
+    fail("last release receipt runtime_target is not an absolute path")
+if os.path.dirname(target) != os.path.realpath(releases):
+    fail("last release receipt runtime_target is not a direct child of releases/")
+if not os.path.isdir(target):
+    fail("last release receipt runtime_target does not exist on disk")
+print(target)
+PY
+}
+
+# Lease-free mutex for --repair-pointer. Uses the same lock path and the same
+# exclusive os.link(2) primitive as acquire_cut_lock, so a live cutter and a
+# repair can never both own it; unlike acquire_cut_lock it does not require a
+# production-write lease, which cannot be bootstrapped while the pointer that
+# reaches the runtime clone is broken. It also never recovers a "stale" owner:
+# a repair must not evict a cutter, it must refuse.
+POINTER_REPAIR_LOCK_HELD=0
+acquire_pointer_repair_lock() {
+  assert_release_target "$CUT_LOCK_DIR"
+  python3 -c '
+import json, os, sys, tempfile, time
+path = sys.argv[1]
+payload = json.dumps(
+    {
+        "schema_version": 1,
+        "pointer_repair": True,
+        "pid": os.getpid(),
+        "acquired_at": time.time(),
+    },
+    sort_keys=True,
+    separators=(",", ":"),
+).encode("utf-8")
+parent = os.path.dirname(path)
+fd, staged = tempfile.mkstemp(prefix=".mini-release-pointer-repair.", dir=parent)
+try:
+    os.fchmod(fd, 0o600)
+    os.write(fd, payload)
+    os.fsync(fd)
+finally:
+    os.close(fd)
+try:
+    os.link(staged, path)
+except FileExistsError:
+    raise SystemExit(17)
+finally:
+    os.unlink(staged)
+' "$CUT_LOCK_DIR" \
+    || die "release-cut lock is held ($CUT_LOCK_DIR); refusing pointer repair while a cut may be in flight"
+  POINTER_REPAIR_LOCK_HELD=1
+}
+
+# shellcheck disable=SC2329 # registered as an EXIT trap by the repair mode.
+release_pointer_repair_lock() {
+  [ "$POINTER_REPAIR_LOCK_HELD" -eq 1 ] || return 0
+  POINTER_REPAIR_LOCK_HELD=0
+  rm -f "$CUT_LOCK_DIR" || warn "could not release pointer-repair lock: $CUT_LOCK_DIR"
+}
+
+# ---------------------------------------------------------------------------
 # Symlink repoint (atomic) — one of the two permitted out-of-releases writes.
 # ---------------------------------------------------------------------------
 repoint_symlink() {
@@ -1001,6 +1239,13 @@ repoint_symlink() {
   # invariant that was silently violated before the -h fix above).
   [ "$(readlink "$CURRENT_LINK")" = "$target" ] \
     || die "repoint_symlink: swap did not take effect (runtime-current still -> $(readlink "$CURRENT_LINK" 2>/dev/null))"
+  # Re-assert the full pointer contract, not just target equality: the link
+  # must be absolute, a canonical direct child of releases/, and resolve to a
+  # real directory. Equality alone would accept a relative link whose text
+  # happened to match, which is the exact 2026-08-02 corruption shape.
+  local structure
+  structure="$(current_link_structure_ok)" \
+    || die "repoint_symlink: post-swap pointer is not healthy: $structure"
   ok "runtime-current → $target"
 }
 
@@ -2439,6 +2684,61 @@ CUT_LOCK_DIR="$RELEASES_DIR/.mini-release-cut.lock"
 LAST_RECEIPT_FILE="$RELEASES_DIR/.mini-release-last-receipt.json"
 REFRESH_BACKUP_FILE="$RELEASES_DIR/.clickup_workspace_refresh.previous"
 
+# ===========================================================================
+# MODE: pointer probe / pointer repair (ClickUp 86e2kt3yr)
+#
+# Both run before certification-argument validation on purpose. A corrupt
+# runtime-current pointer makes the release venv unreachable, so the poller
+# cannot mint a certified sha and the operator has nothing to pass. These are
+# also the only two modes that must keep working when the pointer is broken.
+# ===========================================================================
+if [ "$VERIFY_POINTER" -eq 1 ] || [ "$REPAIR_POINTER" -eq 1 ]; then
+  [ "$VERIFY_POINTER" -eq 0 ] || [ "$REPAIR_POINTER" -eq 0 ] \
+    || die "--verify-pointer and --repair-pointer are mutually exclusive"
+  if [ "$DO_ROLLBACK" -eq 1 ] || [ "$DO_PRUNE" -eq 1 ] || [ "$PREFLIGHT" -eq 1 ] \
+     || [ "$OFFLINE" -eq 1 ] || [ "$DRY_RUN" -eq 1 ]; then
+    die "pointer modes cannot be combined with --rollback, --prune, --preflight, --offline, or --dry-run"
+  fi
+fi
+
+if [ "$VERIFY_POINTER" -eq 1 ]; then
+  POINTER_DETAIL=""
+  if POINTER_DETAIL="$(current_link_health)"; then
+    ok "runtime-current OK → $POINTER_DETAIL"
+    exit 0
+  fi
+  printf '\033[31m✗ runtime-current CORRUPT: %s\033[0m\n' "$POINTER_DETAIL" >&2
+  exit 1
+fi
+
+if [ "$REPAIR_POINTER" -eq 1 ]; then
+  # The production-write lease is bootstrapped from the ACTIVE runtime clone
+  # (git_current rev-parse), which a corrupt pointer makes unreachable — the
+  # lease is therefore structurally unobtainable in exactly the situation this
+  # mode exists for. Repair instead takes the SAME single-instance cut lock
+  # file with the same exclusive-link primitive, without a lease: it never
+  # holds it across a build, and it refuses outright if a real cutter already
+  # owns it. A healthy cut never exposes a corrupt pointer anyway (the swap
+  # stages under a separate .swap name and renames atomically), so a repair
+  # racing a live cutover is not a reachable state.
+  acquire_pointer_repair_lock
+  trap 'release_pointer_repair_lock' EXIT
+  if POINTER_DETAIL="$(current_link_health)"; then
+    ok "runtime-current already healthy → $POINTER_DETAIL (no repair needed)"
+    exit 0
+  fi
+  warn "runtime-current is corrupt: $POINTER_DETAIL"
+  RECEIPT_TARGET="$(receipt_verified_runtime_target)" \
+    || die "cannot repair: no receipt-verified runtime target available"
+  log "repairing runtime-current from receipt-verified target: $RECEIPT_TARGET"
+  repoint_symlink "$RECEIPT_TARGET"
+  POINTER_DETAIL="$(current_link_health)" \
+    || die "repair did not produce a healthy pointer: $POINTER_DETAIL"
+  ok "runtime-current repaired → $POINTER_DETAIL"
+  warn "services still run from their pre-repair image; restart them if the gateway or dashboard failed during the outage"
+  exit 0
+fi
+
 if [ "$PREFLIGHT" -eq 1 ] && {
   [ "$DRY_RUN" -eq 1 ] || [ "$DO_ROLLBACK" -eq 1 ] \
     || [ "$DO_PRUNE" -eq 1 ] || [ "$OFFLINE" -eq 1 ]
@@ -2463,6 +2763,12 @@ fi
 # fetch.  Fetch and promotion authority verification both materialize git and
 # receipt state, so they cannot precede the production-write fence.
 if [ "$DRY_RUN" -eq 0 ]; then
+  # Assert the pointer BEFORE the first dereference of $CURRENT_LINK. Without
+  # this, a corrupt pointer surfaced as "could not resolve active runtime
+  # commit for bootstrap lease" — a misleading message that names neither the
+  # real defect nor the repair. It also stops a corrupt pointer from being
+  # copied into PREV_TARGET/.previous or a receipt by a later stage.
+  assert_current_link_healthy
   SHA="$(git_current rev-parse --verify "HEAD^{commit}")" \
     || die "could not resolve active runtime commit for bootstrap lease"
   bootstrap_production_write_lease

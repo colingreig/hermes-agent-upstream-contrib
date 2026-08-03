@@ -844,7 +844,8 @@
         "path": "~/.hermes/logs/mini-release-poll.log",
         "max_age_seconds": 1800,
         "success_patterns": ["^mini-release-poll: heartbeat "],
-        "required_patterns": ["^mini-release-poll: heartbeat "]
+        "required_patterns": ["^mini-release-poll: heartbeat "],
+        "failure_patterns": ["^mini-release-poll: runtime-current pointer corrupt: "]
       }
     }
   ]

@@ -37,14 +37,14 @@
       "destination_root": "scripts",
       "destination": "verify_governed_paths.py",
       "mode": "0755",
-      "sha256": "b8882d8b8d7f5c224b1ae852fe8d500539a9dec530e113532d9ebd3c974e9e01"
+      "sha256": "b69d75a88e7d55d4cbd4f3ea34230713446ce48f066d9b96912a8c263eab7d87"
     },
     {
       "source": "fleet_outcome_contracts.json",
       "destination_root": "scripts",
       "destination": "fleet_outcome_contracts.json",
       "mode": "0644",
-      "sha256": "b706c6b112b3dd257128b6bd9d9072378afc1cef1d166cf4d27490431e20ceca"
+      "sha256": "04e2fbf5f3fd3711f983c1fde52bab0898402d603c3b02c7e8180db3aadf7dea"
     },
     {
       "source": "hermes_usage_alert.py",
