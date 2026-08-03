@@ -91,6 +91,42 @@ class TestWeightedLaneDispatch:
         assert rendered["no_fallback"] is True
         assert job["no_fallback"] is False
 
+    def test_content_dispatch_pins_governed_content_model_not_job_primary_tier(
+        self, tmp_cron_dir
+    ):
+        """86e2kj1tr: a unified job's primary tier must never leak into content.
+
+        Once the dedicated content-lane-executor job is operator-retired, the
+        unified clickup-executor job's own `model`/`provider` describe its
+        primary (coder) tier, e.g. openai-codex/gpt-5.6-sol. A content-lane
+        draw off that same job must still execute on
+        anthropic/claude-sonnet-5 with no substitution, per the standing
+        content-sonnet-only-no-rampdown policy.
+        """
+        from cron.jobs import create_job, update_job
+        from cron.scheduler import CONTENT_LANE_MODEL, CONTENT_LANE_PROVIDER
+
+        job = create_job(
+            prompt="/ignite-execute --lane {lane}",
+            schedule="every 1h",
+            lane_weights={"code": 0.5, "content": 0.5},
+            model="gpt-5.6-sol",
+            provider="openai-codex",
+            no_fallback=False,
+        )
+        update_job(job["id"], {"lane_state": {"counter": 1}})
+        job["lane_state"] = {"counter": 1}
+
+        rendered, lane = _apply_weighted_lane_to_job(job)
+
+        assert lane == "content"
+        assert rendered["model"] == CONTENT_LANE_MODEL == "claude-sonnet-5"
+        assert rendered["provider"] == CONTENT_LANE_PROVIDER == "anthropic"
+        assert rendered["no_fallback"] is True
+        # The stored job record is untouched — only the per-run copy is pinned.
+        assert job["model"] == "gpt-5.6-sol"
+        assert job["provider"] == "openai-codex"
+
     def test_code_dispatch_preserves_configured_fallback_policy(self, tmp_cron_dir):
         from cron.jobs import create_job
 
@@ -98,6 +134,8 @@ class TestWeightedLaneDispatch:
             prompt="/ignite-execute --lane {lane}",
             schedule="every 1h",
             lane_weights={"code": 0.5, "content": 0.5},
+            model="gpt-5.6-sol",
+            provider="openai-codex",
             no_fallback=False,
         )
 
@@ -105,6 +143,8 @@ class TestWeightedLaneDispatch:
 
         assert lane == "code"
         assert rendered["no_fallback"] is False
+        assert rendered["model"] == "gpt-5.6-sol"
+        assert rendered["provider"] == "openai-codex"
 
 
 class TestPerJobToolsetMcpMerge:
@@ -2985,8 +3025,11 @@ class TestRunJobConfigEnvVarExpansion:
             mock_agent_cls.return_value = mock_agent
             success, _, final_response, error = run_job(job)
 
-        resolve_runtime.assert_called_once_with(requested="openai-codex")
         if expected_lane == "content":
+            # 86e2kj1tr: content-lane draws off the unified job must resolve
+            # against the governed content provider (anthropic), never the
+            # job's own primary (openai-codex) tier.
+            resolve_runtime.assert_called_once_with(requested="anthropic")
             assert success is False
             assert final_response == ""
             assert error is not None
@@ -2994,6 +3037,7 @@ class TestRunJobConfigEnvVarExpansion:
             fallback_chain.assert_not_called()
             mock_agent_cls.assert_not_called()
         else:
+            resolve_runtime.assert_called_once_with(requested="openai-codex")
             assert success is True
             assert error is None
             assert final_response == "ok"
