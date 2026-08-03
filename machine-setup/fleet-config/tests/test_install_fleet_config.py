@@ -20,6 +20,7 @@ import pytest
 import yaml
 
 SCRIPT = Path(__file__).resolve().parents[1] / "install_fleet_config.py"
+JOBS_HELPER = SCRIPT.parent / "fleet_job_payload.py"
 _spec = importlib.util.spec_from_file_location("install_fleet_config_under_test", SCRIPT)
 install_mod = importlib.util.module_from_spec(_spec)
 sys.modules[_spec.name] = install_mod
@@ -72,6 +73,8 @@ def bundle(tmp_path):
 
     jobs_data = json.dumps({"jobs": [{"id": "1", "name": "synthetic-job"}]}).encode()
     (bundle_root / "jobs.json").write_bytes(jobs_data)
+    jobs_helper_data = JOBS_HELPER.read_bytes()
+    (bundle_root / "fleet_job_payload.py").write_bytes(jobs_helper_data)
 
     manifest = {
         "bundle": "fleet-config-test",
@@ -91,6 +94,12 @@ def bundle(tmp_path):
                 "sha256": _sha(jobs_data),
                 "role": "synthetic jobs",
                 "deploy_mode": "jobs_json",
+            },
+            {
+                "src_rel": "fleet_job_payload.py",
+                "sha256": _sha(jobs_helper_data),
+                "role": "synthetic jobs payload helper",
+                "deploy_mode": "jobs_payload_helper",
             },
         ],
     }
@@ -174,7 +183,7 @@ def test_dry_run_and_activation_materialize_the_same_job_prompt_postconditions(
     calls = []
     real_load_jobs_payload = install_mod._load_jobs_payload
 
-    def recording_load_jobs_payload(item, *, verified_bytes=None):
+    def recording_load_jobs_payload(item, *, helper_item, verified_bytes=None):
         calls.append((item["src"], verified_bytes))
         if verified_bytes is not None:
             item["src"].write_text(
@@ -191,7 +200,9 @@ def test_dry_run_and_activation_materialize_the_same_job_prompt_postconditions(
                 ),
                 encoding="utf-8",
             )
-        return real_load_jobs_payload(item, verified_bytes=verified_bytes)
+        return real_load_jobs_payload(
+            item, helper_item=helper_item, verified_bytes=verified_bytes
+        )
 
     monkeypatch.setattr(install_mod, "_load_jobs_payload", recording_load_jobs_payload)
 
@@ -226,6 +237,105 @@ def test_dry_run_and_activation_materialize_the_same_job_prompt_postconditions(
             }
         ]
     }
+
+
+def test_installer_executes_manifest_verified_bundle_jobs_helper(bundle):
+    jobs_payload = {
+        "jobs": [{"id": "1", "name": "synthetic-job", "prompt": "base prompt"}],
+        "job_prompt_postconditions": {"1": "required postcondition"},
+    }
+    jobs_data = json.dumps(jobs_payload).encode()
+    (bundle["bundle_root"] / "jobs.json").write_bytes(jobs_data)
+    jobs_entry = next(
+        entry
+        for entry in bundle["manifest"]["files"]
+        if entry["deploy_mode"] == "jobs_json"
+    )
+    jobs_entry["sha256"] = _sha(jobs_data)
+
+    helper_data = b'''import json
+class FleetJobPayloadError(ValueError):
+    pass
+def materialize_jobs_payload(payload_bytes):
+    payload = json.loads(payload_bytes)
+    postconditions = payload.pop("job_prompt_postconditions", {})
+    for job in payload["jobs"]:
+        postcondition = postconditions.get(str(job["id"]))
+        if postcondition:
+            job["prompt"] += "\\n\\nbundle-helper:" + postcondition
+    return payload
+'''
+    helper_path = bundle["bundle_root"] / "fleet_job_payload.py"
+    helper_path.write_bytes(helper_data)
+    helper_entry = next(
+        entry
+        for entry in bundle["manifest"]["files"]
+        if entry["deploy_mode"] == "jobs_payload_helper"
+    )
+    helper_entry["sha256"] = _sha(helper_data)
+    bundle["manifest_path"].write_text(
+        json.dumps(bundle["manifest"], indent=2), encoding="utf-8"
+    )
+
+    assert install_mod.install(
+        bundle["manifest"],
+        home=bundle["home"],
+        bundle_root=bundle["bundle_root"],
+        manifest_path=bundle["manifest_path"],
+        dry_run=False,
+    ) == 0
+
+    installed = json.loads(
+        (bundle["home"] / ".hermes" / "cron" / "jobs.json").read_text()
+    )
+    assert installed["jobs"][0]["prompt"] == (
+        "base prompt\n\nbundle-helper:required postcondition"
+    )
+
+
+def test_installer_rejects_jobs_helper_bytes_that_drift_from_manifest(bundle):
+    (bundle["bundle_root"] / "fleet_job_payload.py").write_text(
+        "raise RuntimeError('unverified helper executed')\n", encoding="utf-8"
+    )
+
+    with pytest.raises(install_mod.InstallError, match="source hash drift.*fleet_job_payload"):
+        install_mod.install(
+            bundle["manifest"],
+            home=bundle["home"],
+            bundle_root=bundle["bundle_root"],
+            manifest_path=bundle["manifest_path"],
+            dry_run=True,
+        )
+
+    assert not (bundle["home"] / ".hermes" / "cron" / "jobs.json").exists()
+
+
+def test_installer_rejects_jobs_helper_with_non_exception_error_type(bundle):
+    helper_data = b'''class FleetJobPayloadError:
+    pass
+def materialize_jobs_payload(payload_bytes):
+    return {"jobs": []}
+'''
+    helper_path = bundle["bundle_root"] / "fleet_job_payload.py"
+    helper_path.write_bytes(helper_data)
+    helper_entry = next(
+        entry
+        for entry in bundle["manifest"]["files"]
+        if entry["deploy_mode"] == "jobs_payload_helper"
+    )
+    helper_entry["sha256"] = _sha(helper_data)
+    bundle["manifest_path"].write_text(
+        json.dumps(bundle["manifest"], indent=2), encoding="utf-8"
+    )
+
+    with pytest.raises(install_mod.InstallError, match="required contract"):
+        install_mod.install(
+            bundle["manifest"],
+            home=bundle["home"],
+            bundle_root=bundle["bundle_root"],
+            manifest_path=bundle["manifest_path"],
+            dry_run=True,
+        )
 
 
 def test_protected_atomic_write_refuses_poller_deploy_paths_without_lease(bundle):

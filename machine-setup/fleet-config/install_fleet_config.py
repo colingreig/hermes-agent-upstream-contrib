@@ -408,7 +408,11 @@ def _verify_sources(manifest: dict, bundle_root: Path) -> list[dict]:
         src = bundle_root / entry["src_rel"]
         if not src.is_file():
             raise InstallError(f"source missing for {entry['src_rel']!r}: {src}")
-        actual = _sha256(src)
+        try:
+            source_bytes = src.read_bytes()
+        except OSError as exc:
+            raise InstallError(f"cannot read source for {entry['src_rel']!r}: {src}: {exc}") from exc
+        actual = _sha256_bytes(source_bytes)
         expected = entry["sha256"]
         if actual != expected:
             raise InstallError(
@@ -417,6 +421,8 @@ def _verify_sources(manifest: dict, bundle_root: Path) -> list[dict]:
             )
         merged = dict(entry)
         merged["src"] = src
+        if entry.get("deploy_mode") == "jobs_payload_helper":
+            merged["verified_bytes"] = source_bytes
         verified.append(merged)
     return verified
 
@@ -479,6 +485,7 @@ def build_plan(manifest: dict, *, home: Path, bundle_root: Path) -> dict:
         "jobs_json": None,
         "skill_policy": None,
         "installer_source": None,
+        "jobs_payload_helper": None,
     }
 
     for entry in verified:
@@ -488,6 +495,9 @@ def build_plan(manifest: dict, *, home: Path, bundle_root: Path) -> dict:
             continue
         if mode == "installer_source":
             plan["installer_source"] = entry
+            continue
+        if mode == "jobs_payload_helper":
+            plan["jobs_payload_helper"] = entry
             continue
         dest = _expand(entry["dest_abs"], home)
         _check_dest_in_bounds(dest, entry["dest_abs"], allowed_root)
@@ -505,6 +515,8 @@ def build_plan(manifest: dict, *, home: Path, bundle_root: Path) -> dict:
         raise InstallError("manifest has no config_overlay entry")
     if plan["jobs_json"] is None:
         raise InstallError("manifest has no jobs_json entry")
+    if plan["jobs_payload_helper"] is None:
+        raise InstallError("manifest has no jobs_payload_helper entry")
     if not plan["profiles"]:
         raise InstallError("manifest has no profile_file entries")
 
@@ -512,7 +524,11 @@ def build_plan(manifest: dict, *, home: Path, bundle_root: Path) -> dict:
     if fleet_contract is not None and fleet_contract != FLEET_JOBS_CONTRACT:
         raise InstallError(f"unknown fleet jobs contract {fleet_contract!r}")
     if fleet_contract == FLEET_JOBS_CONTRACT:
-        _validate_direct_clickup_jobs(_load_jobs_payload(plan["jobs_json"]))
+        _validate_direct_clickup_jobs(
+            _load_jobs_payload(
+                plan["jobs_json"], helper_item=plan["jobs_payload_helper"]
+            )
+        )
 
     return plan
 
@@ -566,9 +582,9 @@ def _print_profiles_plan(items: list[dict]) -> None:
     print(f"  bootstrap dirs per profile ({', '.join(PROFILE_BOOTSTRAP_DIRS)}) for: {', '.join(names)}")
 
 
-def _print_jobs_plan(item: dict, *, home: Path) -> None:
+def _print_jobs_plan(item: dict, *, helper_item: dict, home: Path) -> None:
     dest = item["dest"]
-    bundled_payload = _load_jobs_payload(item)
+    bundled_payload = _load_jobs_payload(item, helper_item=helper_item)
     bundled_jobs = bundled_payload.get("jobs", [])
     print(f"jobs.json -> {dest}:")
     live_payload: dict[str, Any] | None = None
@@ -670,6 +686,7 @@ def merge_jobs_json(
 def _load_jobs_payload(
     item: dict,
     *,
+    helper_item: dict,
     verified_bytes: bytes | None = None,
 ) -> dict[str, Any]:
     """Read one bundled jobs payload and reject malformed scheduler input."""
@@ -677,28 +694,33 @@ def _load_jobs_payload(
         payload_bytes = (
             verified_bytes if verified_bytes is not None else item["src"].read_bytes()
         )
-        payload = json.loads(payload_bytes)
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+    except OSError as exc:
         raise InstallError(f"bundled jobs.json is not valid JSON: {exc}") from exc
-    if not isinstance(payload, dict) or not isinstance(payload.get("jobs"), list):
-        raise InstallError("bundled jobs.json has no top-level 'jobs' list — refusing")
-    postconditions = payload.pop("job_prompt_postconditions", {})
-    if not isinstance(postconditions, dict):
-        raise InstallError("job_prompt_postconditions must be an object keyed by job id")
-    jobs_by_id = {
-        str(job.get("id")): job for job in payload["jobs"] if isinstance(job, dict)
+    helper_bytes = helper_item.get("verified_bytes")
+    if not isinstance(helper_bytes, bytes):
+        raise InstallError("jobs payload helper has no manifest-verified source bytes")
+    if _sha256_bytes(helper_bytes) != helper_item.get("sha256"):
+        raise InstallError("jobs payload helper verified bytes do not match its manifest hash")
+    namespace: dict[str, Any] = {
+        "__file__": str(helper_item["src"]),
+        "__name__": "_verified_fleet_job_payload",
     }
-    for job_id, postcondition in postconditions.items():
-        job = jobs_by_id.get(str(job_id))
-        if job is None:
-            raise InstallError(f"prompt postcondition targets missing job id {job_id!r}")
-        if not isinstance(postcondition, str) or not postcondition.strip():
-            raise InstallError(f"prompt postcondition for job {job_id!r} is empty")
-        prompt = job.get("prompt")
-        if not isinstance(prompt, str):
-            raise InstallError(f"prompt postcondition target {job_id!r} has no string prompt")
-        job["prompt"] = prompt.rstrip() + "\n\n" + postcondition.strip()
-    return payload
+    try:
+        exec(compile(helper_bytes, str(helper_item["src"]), "exec"), namespace)
+        error_type = namespace["FleetJobPayloadError"]
+        materialize = namespace["materialize_jobs_payload"]
+    except Exception as exc:
+        raise InstallError(f"jobs payload helper cannot be loaded: {exc}") from exc
+    if (
+        not isinstance(error_type, type)
+        or not issubclass(error_type, Exception)
+        or not callable(materialize)
+    ):
+        raise InstallError("jobs payload helper does not expose its required contract")
+    try:
+        return materialize(payload_bytes)
+    except error_type as exc:
+        raise InstallError(str(exc)) from exc
 
 
 def _validate_direct_clickup_jobs(payload: dict[str, Any]) -> None:
@@ -1726,7 +1748,9 @@ def install(
         print()
         _print_profiles_plan(plan["profiles"])
         print()
-        _print_jobs_plan(plan["jobs_json"], home=home)
+        _print_jobs_plan(
+            plan["jobs_json"], helper_item=plan["jobs_payload_helper"], home=home
+        )
         if skill_policy is not None:
             print()
             _print_skill_policy_plan(skill_policy, skill_actions)
@@ -1934,7 +1958,11 @@ def install(
         # Materialize prompt postconditions through the same parser used by
         # planning/dry-run.  Reading the raw JSON here bypasses those governed
         # additions and makes a successful dry-run impossible to activate.
-        parsed = _load_jobs_payload(jobs_item, verified_bytes=bundled_bytes)
+        parsed = _load_jobs_payload(
+            jobs_item,
+            helper_item=plan["jobs_payload_helper"],
+            verified_bytes=bundled_bytes,
+        )
         live_document: dict[str, Any] | None = None
         if jdest.is_file():
             try:
