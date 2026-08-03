@@ -23,7 +23,7 @@
       "destination_root": "scripts",
       "destination": "fleet_outcome_probe.py",
       "mode": "0755",
-      "sha256": "658c30ff40583dc5e1b39ee29094eb5911a1de78be3a47d56f7daccb864e2401"
+      "sha256": "8bc9b0926c78c8052eaa16f7f9819355687dfdc2026f8a22ebc80e8fa03f9b23"
     },
     {
       "source": "fleet_incident_report.py",
@@ -44,7 +44,14 @@
       "destination_root": "scripts",
       "destination": "fleet_outcome_contracts.json",
       "mode": "0644",
-      "sha256": "0d1e25fbda7023d100ccde70200b55dd085f96350a4b23a6a98886fa6190920d"
+      "sha256": "93cf1e1b4aa48656903c48ef6245f290c24231808066895952e43986bb260659"
+    },
+    {
+      "source": "mini_local_registry.json",
+      "destination_root": "scripts",
+      "destination": "mini_local_registry.json",
+      "mode": "0644",
+      "sha256": "b4b96a92d7b7c2bedefd439c2a9e0b4ae03556bc66e5bdd9a00caf8a46697b0b"
     },
     {
       "source": "hermes_usage_alert.py",
@@ -75,6 +82,20 @@
       "sha256": "a067ac94d344e9c856d7342c2bc5f0561466a340410572e9c0d86b0c07e0b7f2"
     },
     {
+      "source": "codex_quota_probe.py",
+      "destination_root": "scripts",
+      "destination": "codex_quota_probe.py",
+      "mode": "0755",
+      "sha256": "12adc80619d1d9a90c6dba48f8ff7de816c7557b8a7c8d9e8a483ceaa2ed17ab"
+    },
+    {
+      "source": "silent_delivery_monitor.py",
+      "destination_root": "scripts",
+      "destination": "silent_delivery_monitor.py",
+      "mode": "0755",
+      "sha256": "0f0e958a9a0bfa425dad4c01cefd54cec9e65139a5471abab079be6ac013c519"
+    },
+    {
       "source": "launchd/com.colingreig.hermes.fleet-outcome-probe.plist",
       "destination_root": "launch_agents",
       "destination": "com.colingreig.hermes.fleet-outcome-probe.plist",
@@ -87,6 +108,20 @@
       "destination": "com.colingreig.hermes.usage-alert.plist",
       "mode": "0644",
       "sha256": "d79dd91da4de834242de7be3bff3d07800b049b9da0a641a115e5bcf75e1de4b"
+    },
+    {
+      "source": "launchd/com.colingreig.hermes.codex-quota-probe.plist",
+      "destination_root": "launch_agents",
+      "destination": "com.colingreig.hermes.codex-quota-probe.plist",
+      "mode": "0644",
+      "sha256": "3594ef05e1222d99b84981c24f40e2b0d9b951abc75ceba8ae6c83b23ae57f3c"
+    },
+    {
+      "source": "launchd/com.colingreig.hermes.silent-delivery-monitor.plist",
+      "destination_root": "launch_agents",
+      "destination": "com.colingreig.hermes.silent-delivery-monitor.plist",
+      "mode": "0644",
+      "sha256": "53c1a63ae75e0052fc681808b81fbdb683dbc1aff57c4ea7914caa5f8ef40c3a"
     }
   ],
   "cron_updates": [

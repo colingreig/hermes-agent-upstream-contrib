@@ -1,0 +1,767 @@
+{
+ "schema_version": 1,
+ "registry": "hermes-mini-local-registry",
+ "source_task": "86e2m2c1g",
+ "generated": "2026-08-03",
+ "description": "Machine-readable deployment-coverage declaration for every file the Hermes Mini runtime executes from ~/.hermes/scripts and ~/Library/LaunchAgents. Every live file must be (a) governed by one of the listed bundle manifests, (b) a declared direct-deploy file that must byte-match its release mirror (machine-setup/mini-scripts under runtime-current), or (c) an explicitly declared mini-local file with a reason. The fleet-outcome probe's deployment_coverage operational check enforces this; an undeclared live file is an alarm, ending the class where 'intentionally local' and 'forgotten' were indistinguishable. Pinned exceptions accept a known-drifted live sha until their reconcile task lands; a pinned file may also match its governed source (the pin is then stale and reported as evidence only).",
+ "release_mirror_rel": "machine-setup/mini-scripts",
+ "bundles": [
+  {
+   "manifest_rel": "spend_manifest.json",
+   "schema": "dest_map",
+   "installer": "install_spend.py"
+  },
+  {
+   "manifest_rel": "self_report_manifest.json",
+   "schema": "dest_map",
+   "installer": "install_self_report.py"
+  },
+  {
+   "manifest_rel": "disk_lifecycle_manifest.json",
+   "schema": "dest_map",
+   "installer": "install_disk_lifecycle.py"
+  },
+  {
+   "manifest_rel": "github_app_manifest.json",
+   "schema": "dest_map",
+   "installer": "install_github_app.py"
+  },
+  {
+   "manifest_rel": "fleet_outcome_manifest.json",
+   "schema": "fleet_outcome",
+   "installer": "reconcile_fleet_outcomes.py"
+  },
+  {
+   "manifest_rel": "pr_pipeline/manifest.json",
+   "schema": "pr_pipeline",
+   "installer": "reconcile_pr_pipeline.py"
+  }
+ ],
+ "direct_deploy": [
+  {
+   "src_rel": "chrome_cdp_launch.sh",
+   "dest": "scripts/chrome_cdp_launch.sh"
+  },
+  {
+   "src_rel": "clickup_workspace_refresh.py",
+   "dest": "scripts/clickup_workspace_refresh.py"
+  },
+  {
+   "src_rel": "content-research-baseline.json",
+   "dest": "scripts/content-research-baseline.json"
+  },
+  {
+   "src_rel": "dashboard_secrets_wrap.sh",
+   "dest": "scripts/dashboard_secrets_wrap.sh"
+  },
+  {
+   "src_rel": "gateway_launch_inner.sh",
+   "dest": "scripts/gateway_launch_inner.sh"
+  },
+  {
+   "src_rel": "gateway_secrets_wrap.sh",
+   "dest": "scripts/gateway_secrets_wrap.sh"
+  },
+  {
+   "src_rel": "ignite-skills-pull.sh",
+   "dest": "scripts/ignite-skills-pull.sh"
+  },
+  {
+   "src_rel": "launchd-secrets.op-env.template",
+   "dest": "scripts/launchd-secrets.op-env.template"
+  },
+  {
+   "src_rel": "op_sdk_resolve.py",
+   "dest": "scripts/op_sdk_resolve.py"
+  },
+  {
+   "src_rel": "pull_anthropic_agent_skills.sh",
+   "dest": "scripts/pull_anthropic_agent_skills.sh"
+  },
+  {
+   "src_rel": "reconcile_launchd_environment.py",
+   "dest": "scripts/reconcile_launchd_environment.py"
+  },
+  {
+   "src_rel": "reconcile_marketplace_skills.py",
+   "dest": "scripts/reconcile_marketplace_skills.py"
+  },
+  {
+   "src_rel": "record_skill_pull_success.py",
+   "dest": "scripts/record_skill_pull_success.py"
+  },
+  {
+   "src_rel": "research-stage-monitor-cron.py",
+   "dest": "scripts/research-stage-monitor-cron.py"
+  },
+  {
+   "src_rel": "research_exec.py",
+   "dest": "scripts/research_exec.py"
+  },
+  {
+   "src_rel": "research_outcome_metrics.py",
+   "dest": "scripts/research_outcome_metrics.py"
+  },
+  {
+   "src_rel": "sentinel_run.sh",
+   "dest": "scripts/sentinel_run.sh"
+  },
+  {
+   "src_rel": "skill_pull_guard.py",
+   "dest": "scripts/skill_pull_guard.py"
+  },
+  {
+   "src_rel": "tests/test_validator_panel_parse_failure.py",
+   "dest": "scripts/tests/test_validator_panel_parse_failure.py"
+  },
+  {
+   "src_rel": "wt-new",
+   "dest": "scripts/wt-new"
+  },
+  {
+   "src_rel": "db_publish_task.py",
+   "dest": "scripts/db_publish_task.py"
+  },
+  {
+   "src_rel": "install_self_report.py",
+   "dest": "scripts/install_self_report.py"
+  },
+  {
+   "src_rel": "research_stage_monitor.py",
+   "dest": "scripts/research_stage_monitor.py"
+  },
+  {
+   "src_rel": "verify-writer-chain.py",
+   "dest": "scripts/verify-writer-chain.py"
+  },
+  {
+   "src_rel": "tests/test_op_sdk_consumers.sh",
+   "dest": "scripts/tests/test_op_sdk_consumers.sh"
+  },
+  {
+   "src_rel": "tests/test_op_sdk_resolve.py",
+   "dest": "scripts/tests/test_op_sdk_resolve.py"
+  },
+  {
+   "src_rel": "tests/test_sentinel_run.sh",
+   "dest": "scripts/tests/test_sentinel_run.sh"
+  },
+  {
+   "src_rel": "launchd/com.colingreig.chrome-cdp.plist",
+   "dest": "launch_agents/com.colingreig.chrome-cdp.plist"
+  },
+  {
+   "src_rel": "launchd/com.colingreig.hermes.degraded-secrets-monitor.plist",
+   "dest": "launch_agents/com.colingreig.hermes.degraded-secrets-monitor.plist"
+  },
+  {
+   "src_rel": "launchd/com.colingreig.hermes.mcp-serve-reaper.plist",
+   "dest": "launch_agents/com.colingreig.hermes.mcp-serve-reaper.plist"
+  },
+  {
+   "src_rel": "launchd/com.colingreig.ignite-skills-pull.plist",
+   "dest": "launch_agents/com.colingreig.ignite-skills-pull.plist"
+  },
+  {
+   "src_rel": "launchd/com.colingreig.pull_anthropic_skills.plist",
+   "dest": "launch_agents/com.colingreig.pull_anthropic_skills.plist"
+  },
+  {
+   "src_rel": "com.hermes.opendesign.plist",
+   "dest": "launch_agents/com.hermes.opendesign.plist"
+  }
+ ],
+ "pinned_exceptions": {
+  "scripts/db_publish_task.py": {
+   "sha256": "64cb440902a83ffd74c6dc6baff465805b811b7e85c3c3b304bba4fdebb7a5af",
+   "reason": "live copy drifted from the repo source before this registry existed; accepted as-is pending reconciliation",
+   "reconcile_task": "86e2m63ua"
+  },
+  "scripts/install_self_report.py": {
+   "sha256": "c99fac35088cb532c46acc2918e387842d45e8a366b533fe6051a76c221f8a99",
+   "reason": "live copy drifted from the repo source before this registry existed; accepted as-is pending reconciliation",
+   "reconcile_task": "86e2m63ua"
+  },
+  "scripts/research_stage_monitor.py": {
+   "sha256": "87c90dd734e8f90f782695d0c5e983e3e38a2eb8e83aa03aade13ff78cb03558",
+   "reason": "live copy drifted from the repo source before this registry existed; accepted as-is pending reconciliation",
+   "reconcile_task": "86e2m63ua"
+  },
+  "scripts/verify-writer-chain.py": {
+   "sha256": "f26ab519392252df1c74fb49b1e1c0e07726b99c44bc7a59df20ff2241c008fa",
+   "reason": "live copy drifted from the repo source before this registry existed; accepted as-is pending reconciliation",
+   "reconcile_task": "86e2m63ua"
+  },
+  "scripts/tests/test_op_sdk_consumers.sh": {
+   "sha256": "43db4a2c106ecd35470e1365b632735ebf0832b556c24a6fd463bb41898b60df",
+   "reason": "live copy drifted from the repo source before this registry existed; accepted as-is pending reconciliation",
+   "reconcile_task": "86e2m63ua"
+  },
+  "scripts/tests/test_op_sdk_resolve.py": {
+   "sha256": "84b01188cbde2f1fc9dc838f232e040abfad4638fc7f2874c8d791637c647440",
+   "reason": "live copy drifted from the repo source before this registry existed; accepted as-is pending reconciliation",
+   "reconcile_task": "86e2m63ua"
+  },
+  "scripts/tests/test_sentinel_run.sh": {
+   "sha256": "13dba7f0b5a73bfa6b31894d28882c74543564a06781e8cc351b0bd1758ae211",
+   "reason": "live copy drifted from the repo source before this registry existed; accepted as-is pending reconciliation",
+   "reconcile_task": "86e2m63ua"
+  },
+  "launch_agents/com.hermes.opendesign.plist": {
+   "sha256": "c7f5ca68b3e55203d5ab5a5b2fd46571712b3bc1a4647f660b658c5cd40aa86b",
+   "reason": "live plist drifted from repo copy before this registry existed; accepted pending reconciliation",
+   "reconcile_task": "86e2m63ua"
+  },
+  "scripts/opencode_exec.py": {
+   "sha256": "fb5b81cffb1f51b3cebf1a54a8e2d2bd500ec01f5aaf888d378f38a51d71fa16",
+   "reason": "live spend-bundle copy predates the current spend_manifest sha; accepted pending install_spend.py rerun",
+   "reconcile_task": "86e2m63ua"
+  }
+ },
+ "mini_local": [
+  {
+   "path": "scripts/.gitignore",
+   "category": "tooling",
+   "reason": "local scratch gitignore for the scripts dir"
+  },
+  {
+   "path": "scripts/accumulate-labels.py",
+   "category": "email-triage",
+   "reason": "mini-only email triage / Postmark / Purelymail pipeline component; no repo source"
+  },
+  {
+   "path": "scripts/adversarial_review.py",
+   "category": "legacy",
+   "reason": "flat legacy copy of pr_pipeline/adversarial_review.py; superseded by the package copy; legacy or superseded mini-local copy; cleanup candidate, kept declared until retired"
+  },
+  {
+   "path": "scripts/attach_deliverable.py",
+   "category": "clickup-ops",
+   "reason": "mini-only ClickUp ops chokepoint script; no repo source yet (see hermes-cron-executes-from-scripts-dir-not-release); vendor into machine-setup/mini-scripts before changing"
+  },
+  {
+   "path": "scripts/check_routing_sync.py",
+   "category": "monitor",
+   "reason": "mini-local monitor/ops script; no repo source"
+  },
+  {
+   "path": "scripts/cleanup_hermes_baks.py",
+   "category": "hygiene",
+   "reason": "mini-local repo/worktree/disk hygiene tooling; no repo source"
+  },
+  {
+   "path": "scripts/cleanup_hermes_local_ignite_shadows.py",
+   "category": "hygiene",
+   "reason": "mini-local repo/worktree/disk hygiene tooling; no repo source"
+  },
+  {
+   "path": "scripts/clickup/*",
+   "category": "clickup-ops",
+   "reason": "vendored clickup.mjs CLI + caches/ids; mini-local install of the ignite clickup skill tooling",
+   "glob": true
+  },
+  {
+   "path": "scripts/clickup/references/*",
+   "category": "clickup-ops",
+   "reason": "clickup CLI reference data",
+   "glob": true
+  },
+  {
+   "path": "scripts/clickup_closeout_audit.py",
+   "category": "clickup-ops",
+   "reason": "mini-only ClickUp ops chokepoint script; no repo source yet (see hermes-cron-executes-from-scripts-dir-not-release); vendor into machine-setup/mini-scripts before changing"
+  },
+  {
+   "path": "scripts/clickup_drift_reconciler.py",
+   "category": "clickup-ops",
+   "reason": "mini-only ClickUp ops chokepoint script; no repo source yet (see hermes-cron-executes-from-scripts-dir-not-release); vendor into machine-setup/mini-scripts before changing"
+  },
+  {
+   "path": "scripts/clickup_email_triage_gate.py",
+   "category": "clickup-ops",
+   "reason": "mini-only ClickUp ops chokepoint script; no repo source yet (see hermes-cron-executes-from-scripts-dir-not-release); vendor into machine-setup/mini-scripts before changing"
+  },
+  {
+   "path": "scripts/clickup_groomer.py",
+   "category": "clickup-ops",
+   "reason": "mini-only ClickUp ops chokepoint script; no repo source yet (see hermes-cron-executes-from-scripts-dir-not-release); vendor into machine-setup/mini-scripts before changing"
+  },
+  {
+   "path": "scripts/clickup_poll_gate.py",
+   "category": "clickup-ops",
+   "reason": "mini-only ClickUp ops chokepoint script; no repo source yet (see hermes-cron-executes-from-scripts-dir-not-release); vendor into machine-setup/mini-scripts before changing"
+  },
+  {
+   "path": "scripts/clickup_review_sla.py",
+   "category": "clickup-ops",
+   "reason": "mini-only ClickUp ops chokepoint script; no repo source yet (see hermes-cron-executes-from-scripts-dir-not-release); vendor into machine-setup/mini-scripts before changing"
+  },
+  {
+   "path": "scripts/clickup_status_guard.py",
+   "category": "clickup-ops",
+   "reason": "mini-only ClickUp ops chokepoint script; no repo source yet (see hermes-cron-executes-from-scripts-dir-not-release); vendor into machine-setup/mini-scripts before changing"
+  },
+  {
+   "path": "scripts/clickup_sync.py",
+   "category": "clickup-ops",
+   "reason": "mini-only ClickUp ops chokepoint script; no repo source yet (see hermes-cron-executes-from-scripts-dir-not-release); vendor into machine-setup/mini-scripts before changing"
+  },
+  {
+   "path": "scripts/clickup_triage_ops.py",
+   "category": "clickup-ops",
+   "reason": "mini-only ClickUp ops chokepoint script; no repo source yet (see hermes-cron-executes-from-scripts-dir-not-release); vendor into machine-setup/mini-scripts before changing"
+  },
+  {
+   "path": "scripts/codex_relogin_reminder.sh",
+   "category": "monitor",
+   "reason": "mini-local monitor/ops script; no repo source"
+  },
+  {
+   "path": "scripts/collect-labels.py",
+   "category": "email-triage",
+   "reason": "mini-only email triage / Postmark / Purelymail pipeline component; no repo source"
+  },
+  {
+   "path": "scripts/collect-m365-placements.py",
+   "category": "email-triage",
+   "reason": "mini-only email triage / Postmark / Purelymail pipeline component; no repo source"
+  },
+  {
+   "path": "scripts/create_clickup_task.py",
+   "category": "clickup-ops",
+   "reason": "mini-only ClickUp ops chokepoint script; no repo source yet (see hermes-cron-executes-from-scripts-dir-not-release); vendor into machine-setup/mini-scripts before changing"
+  },
+  {
+   "path": "scripts/daily_spend_alert.py",
+   "category": "monitor",
+   "reason": "mini-local daily spend Slack alert (paired LaunchAgent com.colingreig.hermes.daily-spend-alert); no repo source"
+  },
+  {
+   "path": "scripts/db_apply.py",
+   "category": "clickup-ops",
+   "reason": "mini-only state-db publish/closeout chain component; no repo source"
+  },
+  {
+   "path": "scripts/db_closeout_actor.py",
+   "category": "clickup-ops",
+   "reason": "mini-only state-db publish/closeout chain component; no repo source"
+  },
+  {
+   "path": "scripts/db_publish_and_closeout.py",
+   "category": "clickup-ops",
+   "reason": "mini-only state-db publish/closeout chain component; no repo source"
+  },
+  {
+   "path": "scripts/db_site_config.py",
+   "category": "clickup-ops",
+   "reason": "mini-only state-db publish/closeout chain component; no repo source"
+  },
+  {
+   "path": "scripts/ensure-screensharing.sh",
+   "category": "monitor",
+   "reason": "keeps Screen Sharing enabled (paired com.colingreig.screensharing-watch LaunchAgent)"
+  },
+  {
+   "path": "scripts/fss_checkin.py",
+   "category": "monitor",
+   "reason": "mini-local monitor/ops script; no repo source"
+  },
+  {
+   "path": "scripts/git_commit_identity_guard.py",
+   "category": "monitor",
+   "reason": "mini-local monitor/ops script; no repo source"
+  },
+  {
+   "path": "scripts/github_pat_cred.sh",
+   "category": "legacy",
+   "reason": "retired broad-PAT credential helper; superseded by github_app_cred.sh; legacy or superseded mini-local copy; cleanup candidate, kept declared until retired"
+  },
+  {
+   "path": "scripts/hermes-engine-upgrade.sh",
+   "category": "tooling",
+   "reason": "mini-local engine upgrade helper; no repo source"
+  },
+  {
+   "path": "scripts/hermes_constants.py",
+   "category": "clickup-ops",
+   "reason": "shared constants for the mini-only ClickUp ops scripts; no repo source"
+  },
+  {
+   "path": "scripts/hermes_heartbeat.sh",
+   "category": "monitor",
+   "reason": "heartbeat probe (paired com.colingreig.hermes.heartbeat LaunchAgent)"
+  },
+  {
+   "path": "scripts/hermes_self_report_run.py",
+   "category": "monitor",
+   "reason": "mini-local self-report runner shim outside the governed self-report bundle"
+  },
+  {
+   "path": "scripts/hermes_validate_size_monitor.py",
+   "category": "monitor",
+   "reason": "mini-local monitor/ops script; no repo source"
+  },
+  {
+   "path": "scripts/ignite-board-sync.sh",
+   "category": "skills-sync",
+   "reason": "mini-local skills-sync tooling; no repo source"
+  },
+  {
+   "path": "scripts/ignite-marketplace-sync.sh",
+   "category": "skills-sync",
+   "reason": "mini-local skills-sync tooling; no repo source (paired com.colingreig.ignite-marketplace-sync LaunchAgent)"
+  },
+  {
+   "path": "scripts/ignite-model-deprecation-check.sh",
+   "category": "skills-sync",
+   "reason": "mini-local skills-sync tooling; no repo source"
+  },
+  {
+   "path": "scripts/ignite-sentinel-config.yaml.reference",
+   "category": "sentinel",
+   "reason": "reference copy of the ignite-sentinel config; live config is external"
+  },
+  {
+   "path": "scripts/inbound_routing.json",
+   "category": "email-triage",
+   "reason": "mini-local inbound email routing table"
+  },
+  {
+   "path": "scripts/launchd-secrets.op-env",
+   "category": "secrets",
+   "reason": "mini-local secret/env material; intentionally never in git (repo carries only launchd-secrets.op-env.template)"
+  },
+  {
+   "path": "scripts/localization_deny_ids.json",
+   "category": "clickup-ops",
+   "reason": "mini-local deny list consumed by poll-gate localization"
+  },
+  {
+   "path": "scripts/m365_feedback_source.py",
+   "category": "email-triage",
+   "reason": "mini-only email triage / Postmark / Purelymail pipeline component; no repo source"
+  },
+  {
+   "path": "scripts/marketplace_update_hook.sh",
+   "category": "skills-sync",
+   "reason": "mini-local skills-sync tooling; no repo source"
+  },
+  {
+   "path": "scripts/mcp_secrets_wrap.sh",
+   "category": "secrets",
+   "reason": "mini-local MCP secrets wrapper; env-specific"
+  },
+  {
+   "path": "scripts/notify-poller.config.json",
+   "category": "email-triage",
+   "reason": "config for purelymail-notify-poller"
+  },
+  {
+   "path": "scripts/op-secrets.env",
+   "category": "secrets",
+   "reason": "mini-local secret/env material; intentionally never in git"
+  },
+  {
+   "path": "scripts/orphan_unpushed_cron.sh",
+   "category": "hygiene",
+   "reason": "mini-local repo/worktree/disk hygiene tooling; no repo source"
+  },
+  {
+   "path": "scripts/postmark-only.env",
+   "category": "secrets",
+   "reason": "mini-local secret/env material; intentionally never in git"
+  },
+  {
+   "path": "scripts/postmark_inbound_gate.py",
+   "category": "email-triage",
+   "reason": "mini-only email triage / Postmark / Purelymail pipeline component; no repo source"
+  },
+  {
+   "path": "scripts/postmark_mark_processed.py",
+   "category": "email-triage",
+   "reason": "mini-only email triage / Postmark / Purelymail pipeline component; no repo source"
+  },
+  {
+   "path": "scripts/prune_orphan_worktrees_86e1zf4r9.py",
+   "category": "one-off",
+   "reason": "one-off task artifact kept for audit; cleanup candidate"
+  },
+  {
+   "path": "scripts/purelymail-notify-poller.py",
+   "category": "email-triage",
+   "reason": "mini-only email triage / Postmark / Purelymail pipeline component; no repo source"
+  },
+  {
+   "path": "scripts/purelymail-notify-poller.release.json",
+   "category": "email-triage",
+   "reason": "release/receipt metadata for the notify poller"
+  },
+  {
+   "path": "scripts/purelymail_learning.py",
+   "category": "email-triage",
+   "reason": "mini-only email triage / Postmark / Purelymail pipeline component; no repo source"
+  },
+  {
+   "path": "scripts/reap_stranded_claims.py",
+   "category": "clickup-ops",
+   "reason": "mini-only ClickUp ops chokepoint script; no repo source yet (see hermes-cron-executes-from-scripts-dir-not-release); vendor into machine-setup/mini-scripts before changing"
+  },
+  {
+   "path": "scripts/repo_baseline.py",
+   "category": "hygiene",
+   "reason": "mini-local repo/worktree/disk hygiene tooling; no repo source"
+  },
+  {
+   "path": "scripts/repo_gc_sweep.py",
+   "category": "hygiene",
+   "reason": "mini-local repo/worktree/disk hygiene tooling; no repo source"
+  },
+  {
+   "path": "scripts/repo_hygiene_daily.sh",
+   "category": "hygiene",
+   "reason": "mini-local repo/worktree/disk hygiene tooling; no repo source"
+  },
+  {
+   "path": "scripts/reports/*",
+   "category": "artifact",
+   "reason": "mini-generated audit/report artifacts",
+   "glob": true
+  },
+  {
+   "path": "scripts/resolve_repo.py",
+   "category": "clickup-ops",
+   "reason": "shared repo-alias resolver for the mini-only ClickUp ops scripts"
+  },
+  {
+   "path": "scripts/runtime_artifact_cleanup.py",
+   "category": "hygiene",
+   "reason": "mini-local repo/worktree/disk hygiene tooling; no repo source (paired com.colingreig.hermes.runtime-artifact-cleanup LaunchAgent)"
+  },
+  {
+   "path": "scripts/sentinel_digest_run.sh",
+   "category": "sentinel",
+   "reason": "mini-local sentinel digest runner; no repo source"
+  },
+  {
+   "path": "scripts/skills_pull_hardening.README.md",
+   "category": "skills-sync",
+   "reason": "mini-local skills-sync tooling; no repo source"
+  },
+  {
+   "path": "scripts/skills_pull_hardening.py",
+   "category": "skills-sync",
+   "reason": "mini-local skills-sync tooling; no repo source"
+  },
+  {
+   "path": "scripts/spam-gate-collect.sh",
+   "category": "email-triage",
+   "reason": "mini-only email triage / Postmark / Purelymail pipeline component; no repo source"
+  },
+  {
+   "path": "scripts/staleness_sweep.py",
+   "category": "clickup-ops",
+   "reason": "mini-only ClickUp ops chokepoint script; no repo source yet (see hermes-cron-executes-from-scripts-dir-not-release); vendor into machine-setup/mini-scripts before changing"
+  },
+  {
+   "path": "scripts/stalled_task_reconciler.py",
+   "category": "clickup-ops",
+   "reason": "mini-only ClickUp ops chokepoint script; no repo source yet (see hermes-cron-executes-from-scripts-dir-not-release); vendor into machine-setup/mini-scripts before changing"
+  },
+  {
+   "path": "scripts/supabase_rls_guard.py",
+   "category": "monitor",
+   "reason": "mini-local monitor/ops script; no repo source"
+  },
+  {
+   "path": "scripts/sync_ignite_skills_to_hermes.sh",
+   "category": "skills-sync",
+   "reason": "mini-local skills-sync tooling; no repo source"
+  },
+  {
+   "path": "scripts/task_action_lock.py",
+   "category": "clickup-ops",
+   "reason": "shared lock helper for the mini-only ClickUp ops scripts"
+  },
+  {
+   "path": "scripts/test_ci_base_fix_exempt.py",
+   "category": "test",
+   "reason": "mini-local test copy exercised on the mini only"
+  },
+  {
+   "path": "scripts/test_staleness_sweep.py",
+   "category": "test",
+   "reason": "mini-local test copy exercised on the mini only"
+  },
+  {
+   "path": "scripts/test_validator.py",
+   "category": "test",
+   "reason": "mini-local test copy exercised on the mini only"
+  },
+  {
+   "path": "scripts/tests/check_task_lifecycle_contract_live.py",
+   "category": "test",
+   "reason": "mini-local test copy exercised on the mini only"
+  },
+  {
+   "path": "scripts/tests/stage_unsatisfiable_dry_run.py",
+   "category": "test",
+   "reason": "mini-local test copy exercised on the mini only"
+  },
+  {
+   "path": "scripts/tests/test_clickup_sync_blocklist.py",
+   "category": "test",
+   "reason": "mini-local test copy exercised on the mini only"
+  },
+  {
+   "path": "scripts/tests/test_poll_gate_localization.py",
+   "category": "test",
+   "reason": "mini-local test copy exercised on the mini only"
+  },
+  {
+   "path": "scripts/tests/test_poll_gate_unsatisfiable.py",
+   "category": "test",
+   "reason": "mini-local test copy exercised on the mini only"
+  },
+  {
+   "path": "scripts/tests/test_pr_pipeline_verdict_and_conflicts.py",
+   "category": "test",
+   "reason": "mini-local test copy exercised on the mini only"
+  },
+  {
+   "path": "scripts/tests/test_review_poll_gate.py",
+   "category": "test",
+   "reason": "mini-local test copy exercised on the mini only"
+  },
+  {
+   "path": "scripts/thermal-db-role-proof-86e2gdb3k.sh",
+   "category": "one-off",
+   "reason": "one-off task artifact kept for audit; cleanup candidate"
+  },
+  {
+   "path": "scripts/validator_autonomy.py",
+   "category": "legacy",
+   "reason": "explicitly excluded from pr_pipeline managed roots (unmanaged_root_exclusions); legacy or superseded mini-local copy; cleanup candidate, kept declared until retired"
+  },
+  {
+   "path": "scripts/verify_ignite_skills_external.py",
+   "category": "skills-sync",
+   "reason": "mini-local skills-sync tooling; no repo source"
+  },
+  {
+   "path": "scripts/writer-served-monitor.py",
+   "category": "monitor",
+   "reason": "mini-local monitor/ops script; no repo source"
+  },
+  {
+   "path": "scripts/zshenv-path-additions.sh",
+   "category": "tooling",
+   "reason": "mini-local PATH additions sourced by shells"
+  },
+  {
+   "path": "launch_agents/ai.hermes.codex-proxy.plist",
+   "category": "service",
+   "reason": "codex OAuth proxy LaunchAgent; managed by hermes auth tooling, not the release tree"
+  },
+  {
+   "path": "launch_agents/ai.hermes.gateway.plist",
+   "category": "service",
+   "reason": "gateway LaunchAgent; managed via launchd-secrets contract, env-specific"
+  },
+  {
+   "path": "launch_agents/com.colingreig.hermes-dashboard.plist",
+   "category": "service",
+   "reason": "dashboard LaunchAgent; env-specific"
+  },
+  {
+   "path": "launch_agents/com.colingreig.hermes.daily-spend-alert.plist",
+   "category": "monitor",
+   "reason": "pairs mini-local daily_spend_alert.py"
+  },
+  {
+   "path": "launch_agents/com.colingreig.hermes.heartbeat.plist",
+   "category": "monitor",
+   "reason": "pairs mini-local hermes_heartbeat.sh"
+  },
+  {
+   "path": "launch_agents/com.colingreig.hermes.ignite-sentinel.plist",
+   "category": "sentinel",
+   "reason": "ignite-sentinel monitor LaunchAgent; sentinel stack is mini-local"
+  },
+  {
+   "path": "launch_agents/com.colingreig.hermes.ignite-sentinel-digest.plist",
+   "category": "sentinel",
+   "reason": "ignite-sentinel digest LaunchAgent; sentinel stack is mini-local"
+  },
+  {
+   "path": "launch_agents/com.colingreig.hermes.release-poll.plist",
+   "category": "service",
+   "reason": "release poller LaunchAgent (reinstated seq 22); env-specific"
+  },
+  {
+   "path": "launch_agents/com.colingreig.hermes.runtime-artifact-cleanup.plist",
+   "category": "hygiene",
+   "reason": "pairs mini-local runtime_artifact_cleanup.py"
+  },
+  {
+   "path": "launch_agents/com.colingreig.ignite-marketplace-sync.plist",
+   "category": "skills-sync",
+   "reason": "pairs mini-local ignite-marketplace-sync.sh"
+  },
+  {
+   "path": "launch_agents/com.colingreig.jump-connect.plist",
+   "category": "third-party",
+   "reason": "Jump Desktop remote-access agent"
+  },
+  {
+   "path": "launch_agents/com.colingreig.screensharing-watch.plist",
+   "category": "monitor",
+   "reason": "pairs mini-local ensure-screensharing.sh"
+  },
+  {
+   "path": "launch_agents/com.hermes.offbox-restic-backup.plist",
+   "category": "service",
+   "reason": "restic R2 backup LaunchAgent; script offbox_restic_backup.py is fleet-outcome governed, plist is mini-local"
+  },
+  {
+   "path": "launch_agents/com.google.*",
+   "category": "third-party",
+   "reason": "Google updater/keystone agents installed by Chrome",
+   "glob": true
+  }
+ ],
+ "state": {
+  "description": "Runtime state, caches, backups, and editor debris. Never deployed, never alarmed on.",
+  "dir_parts": [
+   "__pycache__",
+   ".pytest_cache"
+  ],
+  "dir_part_prefixes": [
+   ".bak-"
+  ],
+  "basename_patterns": [
+   "*.pyc",
+   "*.bak",
+   "*.bak-*",
+   "*.bak.*",
+   "*.backup-*",
+   "*.prev",
+   "*.prev.*",
+   "*.rej",
+   "*.retired",
+   "*.reference.pre-*",
+   "*.reference.prev*",
+   ".*.lock"
+  ],
+  "dot_state_suffixes": [
+   ".json",
+   ".sqlite3",
+   ".lock"
+  ],
+  "files": [
+   "scripts/queue_snapshot.json",
+   "scripts/review_snapshot.json",
+   "scripts/pr_pipeline_state.json",
+   "scripts/email_triage_snapshot.json"
+  ]
+ }
+}

@@ -1046,6 +1046,286 @@ def _check_launch_contracts(
     return findings, evidence
 
 
+def _coverage_dest_key(dest: object) -> str | None:
+    """Normalize a manifest destination to a coverage key, or None if outside scope."""
+    if not isinstance(dest, str):
+        return None
+    if dest.startswith("~/.hermes/scripts/"):
+        return "scripts/" + dest[len("~/.hermes/scripts/") :]
+    if dest.startswith("~/Library/LaunchAgents/"):
+        return "launch_agents/" + dest[len("~/Library/LaunchAgents/") :]
+    return None
+
+
+def _coverage_state_matcher(state: dict[str, Any]) -> Callable[[str], bool]:
+    """Build a matcher for runtime state, caches, and backup debris."""
+    import fnmatch
+
+    dir_parts = set(state.get("dir_parts", []))
+    dir_part_prefixes = tuple(state.get("dir_part_prefixes", []))
+    basename_patterns = list(state.get("basename_patterns", []))
+    dot_suffixes = tuple(state.get("dot_state_suffixes", []))
+    exact = set(state.get("files", []))
+
+    def matches(key: str) -> bool:
+        if key in exact:
+            return True
+        parts = key.split("/")
+        basename = parts[-1]
+        for part in parts[:-1]:
+            if part in dir_parts or (dir_part_prefixes and part.startswith(dir_part_prefixes)):
+                return True
+        for pattern in basename_patterns:
+            if fnmatch.fnmatch(basename, pattern):
+                return True
+        return basename.startswith(".") and basename.endswith(dot_suffixes)
+
+    return matches
+
+
+def _coverage_aggregate(
+    identifier: str, code: str, keys: list[str], *, limit: int = 6
+) -> dict[str, str]:
+    ordered = sorted(keys)
+    shown = ", ".join(ordered[:limit])
+    if len(ordered) > limit:
+        shown += f" (+{len(ordered) - limit} more)"
+    return _finding("operational", identifier, code, f"{len(ordered)} file(s): {shown}")
+
+
+def _check_deployment_coverage(
+    contract: dict[str, Any], *, home: Path
+) -> tuple[list[dict[str, str]], list[dict[str, Any]]]:
+    """Every live scripts/LaunchAgents file must be governed, direct-deployed, or declared.
+
+    Enforces machine-setup/mini-scripts/mini_local_registry.json: an undeclared
+    live file alarms (ends the 'intentionally local vs forgotten' ambiguity), a
+    declared direct-deploy file that no longer byte-matches its release mirror
+    alarms (ends the 86e2hap1g merged-but-inert class), and a bundle-governed
+    file that drifted from its manifest sha alarms.  Pinned exceptions accept
+    one known live sha until their reconcile task lands.
+    """
+    import fnmatch
+
+    identifier = str(contract.get("id") or "deployment-coverage")
+    findings: list[dict[str, str]] = []
+    registry_path = _expand_path(str(contract.get("path") or ""), home=home)
+    if not registry_path.is_file():
+        return (
+            [_finding("operational", identifier, "coverage_registry_missing", str(registry_path))],
+            [],
+        )
+    try:
+        registry = json.loads(registry_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return (
+            [_finding("operational", identifier, "coverage_registry_invalid", f"{registry_path}: {exc}")],
+            [],
+        )
+    if not isinstance(registry, dict) or registry.get("schema_version") != 1:
+        return (
+            [_finding("operational", identifier, "coverage_registry_invalid", f"{registry_path}: unsupported schema")],
+            [],
+        )
+
+    release_root = _expand_path(
+        str(contract.get("release_root") or "~/.hermes/runtime-current"), home=home
+    )
+    mirror_root = release_root / str(registry.get("release_mirror_rel") or "machine-setup/mini-scripts")
+    scripts_dir = _expand_path(str(contract.get("scripts_dir") or "~/.hermes/scripts"), home=home)
+    agents_dir = _expand_path(
+        str(contract.get("launch_agents_dir") or "~/Library/LaunchAgents"), home=home
+    )
+
+    governed: dict[str, str | None] = {}
+    pr_root_patterns: list[str] = []
+    pr_root_exclusions: set[str] = set()
+    pr_package_prefixes: list[str] = []
+    for bundle in registry.get("bundles", []):
+        if not isinstance(bundle, dict):
+            continue
+        manifest_rel = str(bundle.get("manifest_rel") or "")
+        manifest_path = mirror_root / manifest_rel
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            findings.append(
+                _finding("operational", identifier, "coverage_manifest_unreadable", f"{manifest_path}: {exc}")
+            )
+            continue
+        # The bundle manifest itself is deployed alongside its files (e.g.
+        # self_report_manifest.json, fleet_outcome_manifest.json land in
+        # ~/.hermes/scripts); a listed bundle's manifest is accounted for by
+        # construction, so its live copy is never "undeclared".
+        governed.setdefault(f"scripts/{manifest_rel}", None)
+        schema = bundle.get("schema")
+        if schema == "dest_map":
+            for entry in manifest.get("files", []):
+                if isinstance(entry, dict):
+                    key = _coverage_dest_key(entry.get("dest_abs"))
+                    if key:
+                        governed[key] = entry.get("sha256")
+        elif schema == "fleet_outcome":
+            for entry in manifest.get("files", []):
+                if not isinstance(entry, dict):
+                    continue
+                root = entry.get("destination_root")
+                prefix = "scripts" if root == "scripts" else "launch_agents" if root == "launch_agents" else None
+                if prefix and isinstance(entry.get("destination"), str):
+                    governed[f"{prefix}/{entry['destination']}"] = entry.get("sha256")
+        elif schema == "pr_pipeline":
+            for field in ("source_root_entrypoints", "legacy_flat_entrypoints"):
+                for name in manifest.get(field, []):
+                    if isinstance(name, str):
+                        governed[f"scripts/{name}"] = None
+            for name in manifest.get("expected_local_patches", {}):
+                governed[f"scripts/{name}"] = None
+            pr_root_patterns.extend(
+                pattern for pattern in manifest.get("managed_root_patterns", []) if isinstance(pattern, str)
+            )
+            pr_root_exclusions.update(
+                name for name in manifest.get("unmanaged_root_exclusions", []) if isinstance(name, str)
+            )
+            package_destination = manifest.get("package_destination")
+            if isinstance(package_destination, str) and package_destination:
+                pr_package_prefixes.append(f"scripts/{package_destination}/")
+        else:
+            findings.append(
+                _finding("operational", identifier, "coverage_registry_invalid", f"unsupported bundle schema {schema!r}")
+            )
+
+    direct = {
+        str(entry.get("dest")): str(entry.get("src_rel"))
+        for entry in registry.get("direct_deploy", [])
+        if isinstance(entry, dict) and entry.get("dest") and entry.get("src_rel")
+    }
+    pins = registry.get("pinned_exceptions", {})
+    if not isinstance(pins, dict):
+        pins = {}
+    local_exact: set[str] = set()
+    local_globs: list[str] = []
+    for entry in registry.get("mini_local", []):
+        if not isinstance(entry, dict) or not isinstance(entry.get("path"), str):
+            continue
+        if entry.get("glob"):
+            local_globs.append(entry["path"])
+        else:
+            local_exact.add(entry["path"])
+    state_matches = _coverage_state_matcher(registry.get("state", {}) or {})
+
+    live: dict[str, Path] = {}
+    for base, prefix in ((scripts_dir, "scripts"), (agents_dir, "launch_agents")):
+        if not base.is_dir():
+            findings.append(
+                _finding("operational", identifier, "coverage_root_missing", str(base))
+            )
+            continue
+        for path in base.rglob("*"):
+            if path.is_symlink() or not path.is_file():
+                continue
+            live[f"{prefix}/{path.relative_to(base).as_posix()}"] = path
+
+    def _pin_accepts(key: str, actual_sha: str) -> bool:
+        pin = pins.get(key)
+        return isinstance(pin, dict) and pin.get("sha256") == actual_sha
+
+    undeclared: list[str] = []
+    bundle_drift: list[str] = []
+    direct_drift: list[str] = []
+    mirror_missing: list[str] = []
+    pinned_accepted: list[str] = []
+    for key, path in live.items():
+        if state_matches(key):
+            continue
+        if key in governed:
+            expected = governed[key]
+            if expected:
+                try:
+                    actual = hashlib.sha256(path.read_bytes()).hexdigest()
+                except OSError:
+                    bundle_drift.append(key)
+                    continue
+                if actual != expected and not _pin_accepts(key, actual):
+                    bundle_drift.append(key)
+                elif actual != expected:
+                    pinned_accepted.append(key)
+            continue
+        if any(key.startswith(prefix) for prefix in pr_package_prefixes):
+            continue
+        rel = key.split("/", 1)[1]
+        if (
+            key.startswith("scripts/")
+            and "/" not in rel
+            and rel not in pr_root_exclusions
+            and any(fnmatch.fnmatch(rel, pattern) for pattern in pr_root_patterns)
+        ):
+            continue
+        if key in direct:
+            source = mirror_root / direct[key]
+            if not source.is_file():
+                mirror_missing.append(key)
+                continue
+            try:
+                live_bytes = path.read_bytes()
+                if source.read_bytes() != live_bytes:
+                    actual = hashlib.sha256(live_bytes).hexdigest()
+                    if _pin_accepts(key, actual):
+                        pinned_accepted.append(key)
+                    else:
+                        direct_drift.append(key)
+            except OSError:
+                direct_drift.append(key)
+            continue
+        if key in local_exact or any(fnmatch.fnmatch(key, pattern) for pattern in local_globs):
+            continue
+        if path == registry_path:
+            # Self-reference: this is the registry the check is reading, so it
+            # is accounted for by definition and can never be "forgotten".
+            # In production the fleet-outcome manifest also governs it, and
+            # that stronger sha check above still runs first.
+            continue
+        undeclared.append(key)
+
+    direct_missing: list[str] = []
+    pending_release: list[str] = []
+    for key, src_rel in direct.items():
+        if key in live:
+            continue
+        if (mirror_root / src_rel).is_file():
+            direct_missing.append(key)
+        else:
+            # Source not in the deployed release yet: deployment cannot be
+            # expected before the next cut, so record it without alarming.
+            pending_release.append(key)
+    stale_entries = sorted(key for key in local_exact if key not in live)
+
+    if undeclared:
+        findings.append(_coverage_aggregate(identifier, "undeclared_file", undeclared))
+    if bundle_drift:
+        findings.append(_coverage_aggregate(identifier, "bundle_sha_drift", bundle_drift))
+    if direct_drift:
+        findings.append(_coverage_aggregate(identifier, "direct_deploy_drift", direct_drift))
+    if direct_missing:
+        findings.append(_coverage_aggregate(identifier, "direct_deploy_missing", direct_missing))
+    if mirror_missing:
+        findings.append(_coverage_aggregate(identifier, "mirror_source_missing", mirror_missing))
+    if stale_entries:
+        findings.append(_coverage_aggregate(identifier, "registry_stale_entry", stale_entries))
+    evidence = [
+        {
+            "surface": "operational",
+            "id": identifier,
+            "live_files": len(live),
+            "governed": len(governed),
+            "direct_declared": len(direct),
+            "mini_local_declared": len(local_exact) + len(local_globs),
+            "pinned_accepted": sorted(pinned_accepted),
+            "pending_release": sorted(pending_release),
+        }
+    ]
+    return findings, evidence
+
+
 def _check_operational_contracts(
     contracts: list[dict[str, Any]], *, home: Path, now: datetime
 ) -> tuple[list[dict[str, str]], list[dict[str, Any]]]:
@@ -1135,6 +1415,10 @@ def _check_operational_contracts(
                 if actual != item.get("sha256"):
                     findings.append(_finding("operational", identifier, "governed_path_drift", f"hash drift: {source}"))
             evidence.append({"surface": "operational", "id": identifier, "path": str(path)})
+        elif kind == "deployment_coverage":
+            coverage_findings, coverage_evidence = _check_deployment_coverage(contract, home=home)
+            findings.extend(coverage_findings)
+            evidence.extend(coverage_evidence)
         else:
             raise ProbeError(f"operational check {identifier} has unsupported kind {kind!r}")
     return findings, evidence
