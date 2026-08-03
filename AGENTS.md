@@ -818,6 +818,13 @@ completion gate. Executors hand work to review with the required proof packet;
 they do not mark implementation tasks complete. Use `/ignite-ship` for
 deployment rather than hand-rolling a platform deploy.
 
+On a repo `ignite-ship` classifies `PLATFORM=manual` (this one included), deploy
+is operator/poller gated and a CI-green PR is the complete executor deliverable.
+Hand that work to In Review with a review packet stating what to validate now
+versus after the next release cut; never park it In Progress behind an
+undeployable-platform block. Policy and enforcement:
+[hermes-agent-ignite-ship-exemption](docs/deploy/hermes-agent-ignite-ship-exemption.md).
+
 Content-bearing and hybrid Ignite work fails closed. Use the required blog or
 content skill, run the configured/probed `content-qa/v1` path, certify the exact
 changed paths, and provide the bound JSON report in the handoff. Never alter
