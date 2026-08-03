@@ -53,8 +53,10 @@ Token: CLICKUP_API_TOKEN (Doppler-injected into the gateway env).
 import fcntl
 import json
 import os
+import random
 import sys
 import time
+import urllib.error
 import urllib.parse
 import re
 import urllib.request
@@ -271,9 +273,69 @@ def _token():
     return value.strip()
 
 
+# ── ClickUp call retry/backoff (86e2kxk4z, 2026-08-03) ───────────────────────
+# This gate is EXECUTOR_ID's (62714b869845) admission chokepoint: it calls
+# ClickUp on every 15-min tick to scan the queue and to claim/stamp/unpark
+# tasks. Every one of those calls used to be a single bare `urlopen` — a
+# transient 429/5xx or network blip aborted the whole tick with no retry,
+# which is exactly the "shows up sporadically, easy to miss" failure mode
+# described in the task. Retries here are additive only: a non-retryable
+# error (4xx other than 429, or retries exhausted) still raises/propagates
+# exactly as before, so existing fail-open/fail-closed call sites keep their
+# original behavior — they just no longer trip on a single transient blip.
+_CLICKUP_RETRYABLE_STATUSES = frozenset({429, 500, 502, 503, 504})
+_CLICKUP_RETRY_MAX_ATTEMPTS = 4  # 1 initial try + 3 retries
+_CLICKUP_RETRY_BASE_DELAY_S = 1.0
+_CLICKUP_RETRY_MAX_DELAY_S = 20.0
+
+
+def _clickup_retry_delay(attempt, retry_after_header=None):
+    """Seconds to sleep before retry `attempt` (0-indexed). Honors a
+    Retry-After header (seconds form) when ClickUp sends one; otherwise
+    exponential backoff with +/-25% jitter to avoid thundering-herd retries
+    across the fleet's other cron ticks."""
+    if retry_after_header:
+        try:
+            return min(float(retry_after_header), _CLICKUP_RETRY_MAX_DELAY_S)
+        except (TypeError, ValueError):
+            pass
+    base = min(_CLICKUP_RETRY_BASE_DELAY_S * (2 ** attempt), _CLICKUP_RETRY_MAX_DELAY_S)
+    return base * (1 + random.random() * 0.25)
+
+
+def _urlopen_with_retry(req, *, timeout=30, max_attempts=_CLICKUP_RETRY_MAX_ATTEMPTS):
+    """`urllib.request.urlopen(req, timeout=timeout)` with retry/backoff on
+    ClickUp rate-limit (429) / transient (5xx) responses and on connection
+    errors. Re-raises the final error once attempts are exhausted or the
+    error is non-retryable (e.g. 401/404), so callers' existing exception
+    handling is unchanged."""
+    last_exc = None
+    for attempt in range(max_attempts):
+        try:
+            return urllib.request.urlopen(req, timeout=timeout)
+        except urllib.error.HTTPError as exc:
+            last_exc = exc
+            if exc.code not in _CLICKUP_RETRYABLE_STATUSES or attempt == max_attempts - 1:
+                raise
+            retry_after = exc.headers.get("Retry-After") if exc.headers else None
+            delay = _clickup_retry_delay(attempt, retry_after)
+        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as exc:
+            last_exc = exc
+            if attempt == max_attempts - 1:
+                raise
+            delay = _clickup_retry_delay(attempt)
+        print(
+            f"[gate] ClickUp call failed (attempt {attempt + 1}/{max_attempts}): "
+            f"{last_exc!r}; retrying in {delay:.1f}s",
+            file=sys.stderr,
+        )
+        time.sleep(delay)
+    raise last_exc  # pragma: no cover - loop above always returns or raises
+
+
 def _get(url):
     req = urllib.request.Request(url, headers={"Authorization": _token()})
-    with urllib.request.urlopen(req, timeout=30) as resp:
+    with _urlopen_with_retry(req, timeout=30) as resp:
         return json.loads(resp.read().decode("utf-8", "replace"))
 
 
@@ -726,7 +788,7 @@ def _delete_tag(task_id, tag):
             method="DELETE",
             headers={"Authorization": _token()},
         )
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with _urlopen_with_retry(req, timeout=30) as resp:
             print(f"[gate] DELETE /tag/{tag} on {task_id}: rc={resp.status}")
     except Exception as e:
         # 404 = tag was never on the task (already clean). Anything else is
@@ -771,7 +833,7 @@ def _stamp_worked_by_hermes(task_id):
                 "Content-Type": "application/json",
             },
         )
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with _urlopen_with_retry(req, timeout=30) as resp:
             print(f"[gate] POST /field/Worked-By on {task_id}: rc={resp.status}")
     except Exception as e:
         # Best-effort: a failed stamp must never block the wake it rides
