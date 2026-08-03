@@ -9,7 +9,7 @@
       "destination_root": "scripts",
       "destination": "reconcile_fleet_outcomes.py",
       "mode": "0755",
-      "sha256": "20f0b64403096e06c3947f137f0ce71e86c8d08dc3a3c3938f7a7beaab643b13"
+      "sha256": "4e7a83e415c3724f127e784af24aacc40a28a58cd63056c544eccc05548623b8"
     },
     {
       "source": "ci-health-watch-cron.py",
