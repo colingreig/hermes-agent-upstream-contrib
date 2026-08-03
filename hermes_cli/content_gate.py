@@ -201,8 +201,15 @@ def open_parent_summaries(conn: sqlite3.Connection, task_id: str) -> list[dict]:
 # Check 3: recovery/stranded-worktree PR description-vs-diff integrity
 # ---------------------------------------------------------------------------
 
+# Structural phrases, not the bare word "recovery" -- domain vocabulary like
+# "alarm recovery-sent codes" or "lease recovery lifecycle" uses "recovery"
+# on its own and must NOT key this check (see PR #318, #321, both false-
+# blocked on 2026-08-03 for exactly this). A genuine stranded-worktree
+# recovery PR names the concept explicitly ("recovery PR", "stranded
+# worktree") rather than using "recovery" as an adjective for unrelated
+# domain state.
 _RECOVERY_SIGNAL_RE = re.compile(
-    r"\b(recovery|stranded worktree|stranded-worktree|recovered branch)\b",
+    r"\b(recovery pr|stranded worktree|stranded-worktree|recovered branch)\b",
     re.IGNORECASE,
 )
 

@@ -76,6 +76,21 @@ else
   echo "$TS sentinel_run: WARNING: could not read local gateway key from config.yaml — diagnosis will degrade to None (Lane A triage only, no self-heal this run)" >> "$LOG"
 fi
 
+# 86e2gda8g: fatal-issue immediate escalation (notify.send_slack in
+# ignite_sentinel.monitor) is the PRIMARY transport, but a single broken
+# `hermes send` CLI call must not leave a fatal alert completely unnotified.
+# notify.py's SMTP fallback (notify.send) needs SENTINEL_SMTP_URL — construct
+# it from POSTMARK_SERVER_TOKEN (Postmark's SMTP relay authenticates with the
+# server token as BOTH username and password; same account
+# postmark_send_report.py uses for the Hermes status digest). Warn and
+# degrade rather than fail closed: Slack remains the working primary path
+# even when this fallback isn't configured, so this must never block the run.
+if [ -n "${POSTMARK_SERVER_TOKEN:-}" ]; then
+  export SENTINEL_SMTP_URL="smtp://${POSTMARK_SERVER_TOKEN}:${POSTMARK_SERVER_TOKEN}@smtp.postmarkapp.com:587"
+else
+  echo "$TS sentinel_run: WARNING: POSTMARK_SERVER_TOKEN not resolved — fatal-alert SMTP fallback unavailable (Slack remains the primary transport)" >> "$LOG"
+fi
+
 echo "$TS sentinel_run: secrets resolved, running monitor.py" >> "$LOG"
 cd "$SENTINEL_DIR" || exit 1
 exec "$SENTINEL_PYTHON" -m ignite_sentinel.monitor --json >> "$LOG" 2>&1
