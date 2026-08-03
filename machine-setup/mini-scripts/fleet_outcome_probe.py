@@ -41,7 +41,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 from xml.parsers.expat import ExpatError
@@ -1400,12 +1400,45 @@ def _check_operational_contracts(
             # contract's own kind so distinct alarm classes (stale preflight
             # vs silent release drift) stay distinguishable in incident
             # reports even though they share this implementation.
+            #
+            # tail_bytes alone is a BYTE window, not a TIME window: for a
+            # low-volume log (e.g. a poller that writes a few lines every 15
+            # minutes) it can span days, so historical matches from an
+            # already-resolved incident keep counting toward the threshold
+            # forever. A contract can opt into a real recency window by
+            # declaring "window_minutes" + "timestamp_pattern" (a regex with
+            # a named "ts" group). Each line updates a running "most recent
+            # known timestamp" when it matches timestamp_pattern (this
+            # tolerates logs like mini-release-poll.log where only the
+            # per-invocation heartbeat line carries a timestamp and the
+            # alarm-pattern line that follows it in the same invocation does
+            # not); only alarm-pattern matches at-or-after that running
+            # timestamp count toward the threshold. Contracts that omit
+            # either field keep the original byte-window-only behavior.
             try:
                 text = path.read_text(encoding="utf-8", errors="replace")
             except OSError:
                 continue
             pattern = str(contract.get("pattern") or "preflight.*(?:fail|error)")
-            count = len(re.findall(pattern, text[-int(contract.get("tail_bytes", 262144)):], re.IGNORECASE))
+            tail_text = text[-int(contract.get("tail_bytes", 262144)):]
+            regex = re.compile(pattern, re.IGNORECASE)
+            window_minutes = contract.get("window_minutes")
+            timestamp_pattern = contract.get("timestamp_pattern")
+            if window_minutes and timestamp_pattern:
+                ts_regex = re.compile(str(timestamp_pattern))
+                cutoff = now - timedelta(minutes=float(window_minutes))
+                current_ts: datetime | None = None
+                count = 0
+                for line in tail_text.splitlines():
+                    ts_match = ts_regex.search(line)
+                    if ts_match:
+                        parsed = _parse_time(ts_match.group("ts"))
+                        if parsed is not None:
+                            current_ts = parsed
+                    if regex.search(line) and current_ts is not None and current_ts >= cutoff:
+                        count += 1
+            else:
+                count = len(regex.findall(tail_text))
             if count >= int(contract.get("threshold", 3)):
                 findings.append(_finding("operational", identifier, kind, f"{count} recent matching records in {path}"))
             evidence.append({"surface": "operational", "id": identifier, "matches": count})

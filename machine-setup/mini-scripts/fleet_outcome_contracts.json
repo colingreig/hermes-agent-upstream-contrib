@@ -462,7 +462,9 @@
       "path": "~/.hermes/logs/mini-release-poll.log",
       "pattern": "remote prod SHA does not match governed control",
       "threshold": 3,
-      "tail_bytes": 262144
+      "tail_bytes": 262144,
+      "window_minutes": 90,
+      "timestamp_pattern": "ts=(?P<ts>\\S+)"
     },
     {
       "id": "governed-path-integrity",
@@ -910,6 +912,7 @@
         "kind": "text_artifact",
         "path": "~/.hermes/logs/mini-release-poll.log",
         "max_age_seconds": 1800,
+        "tail_lines": 4000,
         "success_patterns": ["^mini-release-poll: heartbeat "],
         "required_patterns": ["^mini-release-poll: heartbeat "]
       }
