@@ -103,10 +103,6 @@
    "dest": "scripts/research_outcome_metrics.py"
   },
   {
-   "src_rel": "sentinel_run.sh",
-   "dest": "scripts/sentinel_run.sh"
-  },
-  {
    "src_rel": "skill_pull_guard.py",
    "dest": "scripts/skill_pull_guard.py"
   },
