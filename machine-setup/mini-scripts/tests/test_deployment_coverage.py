@@ -133,6 +133,23 @@ def test_undeclared_live_file_alarms_with_aggregated_paths(tmp_path):
     assert detail.startswith("2 file(s):")
 
 
+def test_symlinked_live_entries_alarm_instead_of_disappearing_from_inventory(tmp_path):
+    module = _load_module()
+    contract, _r, _rp, scripts, agents, _m = _fixture(tmp_path)
+    outside_script = tmp_path / "outside.py"
+    outside_script.write_bytes(b"arbitrary undeclared bytes\n")
+    (scripts / "linked.py").symlink_to(outside_script)
+    outside_agent = tmp_path / "outside.plist"
+    outside_agent.write_bytes(b"<plist>arbitrary</plist>\n")
+    (agents / "com.example.linked.plist").symlink_to(outside_agent)
+
+    findings, _ = module._check_deployment_coverage(contract, home=tmp_path)
+
+    assert _codes(findings) == ["symlink_entry"]
+    assert "scripts/linked.py" in findings[0]["detail"]
+    assert "launch_agents/com.example.linked.plist" in findings[0]["detail"]
+
+
 def test_direct_deploy_drift_alarms_and_pin_accepts_known_sha(tmp_path):
     module = _load_module()
     contract, registry, registry_path, scripts, _a, _m = _fixture(tmp_path)

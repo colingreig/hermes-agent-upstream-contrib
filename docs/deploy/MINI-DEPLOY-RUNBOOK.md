@@ -22,6 +22,12 @@ Companion docs this runbook routes to (it does not replace them):
 
 ## Shipping a change
 
+The release cut runs a fail-closed admission check immediately after resolving
+the active and target commits, before build or `runtime-current` mutation. Any
+changed file under `machine-setup/mini-scripts/` that is outside all deploy
+manifests/cutter-owned paths rejects the cut; there is no warning-only release.
+Classify and govern the file first, then rerun the cut.
+
 **A. File already governed by a bundle manifest.** Edit the source under
 `machine-setup/mini-scripts/` (or `machine-setup/fleet-config/`), update the
 bundle manifest's `sha256` for that file, merge, cut a release

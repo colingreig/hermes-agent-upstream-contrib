@@ -464,9 +464,11 @@
     },
     {
       "id": "session-db-health",
-      "kind": "sqlite_health",
+      "kind": "session_db_health",
       "path": "~/.hermes/state.db",
-      "max_size_bytes": 1073741824
+      "max_size_bytes": 8589934592,
+      "profile_max_size_bytes": 8589934592,
+      "root_max_size_bytes": 8589934592
     },
     {
       "id": "repeated-preflight-failures",

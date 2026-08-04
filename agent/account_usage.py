@@ -879,12 +879,20 @@ def fetch_account_usage(
     if normalized in {"", "auto", "custom"}:
         return None
     try:
+        snapshot = None
         if normalized == "openai-codex":
-            return _fetch_codex_account_usage(base_url=base_url, api_key=api_key)
-        if normalized == "anthropic":
-            return _fetch_anthropic_account_usage()
-        if normalized == "openrouter":
-            return _fetch_openrouter_account_usage(base_url, api_key)
+            snapshot = _fetch_codex_account_usage(base_url=base_url, api_key=api_key)
+        elif normalized == "anthropic":
+            snapshot = _fetch_anthropic_account_usage()
+        elif normalized == "openrouter":
+            snapshot = _fetch_openrouter_account_usage(base_url, api_key)
+        if snapshot is not None:
+            try:
+                from agent.ops_alerts import alert_usage_headroom
+
+                alert_usage_headroom(snapshot)
+            except Exception:
+                logger.debug("Usage headroom alert failed", exc_info=True)
+        return snapshot
     except Exception:
         return None
-    return None

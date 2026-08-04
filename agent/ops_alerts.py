@@ -34,8 +34,10 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import time
 from pathlib import Path
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +55,8 @@ OPS_ALERT_RECEIPTS_LEDGER = os.path.expanduser(
 # like degraded_secrets_monitor.py), so a gateway restart is itself a natural
 # "the situation may have changed" reset point.
 _ALERTED_SIGNATURES: set = set()
+_ALERTED_SIGNATURES_LOCK = threading.Lock()
+USAGE_HEADROOM_WARNING_PERCENT = 85.0
 _RECEIPT_HEADER_SECRET = re.compile(
     r"(?i)\b(authorization|proxy-authorization|cookie|set-cookie)\s*:\s*[^\r\n]+"
 )
@@ -73,14 +77,54 @@ def alert_once(signature: str, message: str) -> bool:
     as a repeat. Never raises — alerting must never interfere with the
     caller's own error handling / re-raise.
     """
-    if signature in _ALERTED_SIGNATURES:
-        return False
-    _ALERTED_SIGNATURES.add(signature)
+    with _ALERTED_SIGNATURES_LOCK:
+        if signature in _ALERTED_SIGNATURES:
+            return False
+        _ALERTED_SIGNATURES.add(signature)
     try:
         _send_slack(message, signature=signature)
     except Exception:
         logger.debug("ops_alerts: alert send failed", exc_info=True)
     return True
+
+
+def alert_provider_failure(failure_kind: str, *, provider: str = "unknown") -> bool:
+    """Emit a one-shot, taxonomy-preserving provider failure alert."""
+    normalized_kind = str(failure_kind or "unknown").strip().lower() or "unknown"
+    normalized_provider = str(provider or "unknown").strip().lower() or "unknown"
+    return alert_once(
+        f"provider_failure:{normalized_provider}:{normalized_kind}",
+        f"Provider failure ({normalized_kind}) · provider={normalized_provider}",
+    )
+
+
+def alert_usage_headroom(
+    snapshot: Any,
+    *,
+    threshold_percent: float = USAGE_HEADROOM_WARNING_PERCENT,
+) -> bool:
+    """Warn once for usage windows nearing, but not at, exhaustion.
+
+    The exclusion of 100%-used windows keeps this an early warning path rather
+    than an exhaustion simulator. Repeated /usage polls dedupe via alert_once.
+    """
+    provider = str(getattr(snapshot, "provider", "unknown") or "unknown").strip().lower()
+    fired = False
+    for window in getattr(snapshot, "windows", ()) or ():
+        used = getattr(window, "used_percent", None)
+        if not isinstance(used, (int, float)) or isinstance(used, bool):
+            continue
+        if not threshold_percent <= float(used) < 100.0:
+            continue
+        label = str(getattr(window, "label", "window") or "window").strip().lower()
+        signature = f"usage_headroom:{provider}:{label}:{threshold_percent:g}"
+        remaining = max(0.0, 100.0 - float(used))
+        fired = alert_once(
+            signature,
+            f"Usage headroom low · provider={provider} · {label}={used:g}% used "
+            f"({remaining:g}% remaining)",
+        ) or fired
+    return fired
 
 
 def _redact_receipt_text(value: object, *, limit: int = 500) -> str:
@@ -218,4 +262,5 @@ def _send_slack(message: str, *, signature: str = "") -> bool:
 
 def reset_for_tests() -> None:
     """Test-only: clear in-process dedup state between test cases."""
-    _ALERTED_SIGNATURES.clear()
+    with _ALERTED_SIGNATURES_LOCK:
+        _ALERTED_SIGNATURES.clear()

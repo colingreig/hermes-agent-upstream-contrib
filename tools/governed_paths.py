@@ -160,10 +160,39 @@ def _is_mini_production_context(hermes: Path) -> bool:
     return sys.platform == "darwin" and hermes == _MINI_PRODUCTION_HOME
 
 
-_CUTTER_SHA256 = "9d9d7493ace0006081e44b9f6fb8f211692b38db2bcae4fc799ec1b36dc73b7f"
+_CUTTER_TRUST_MANIFEST = (
+    Path(__file__).resolve().parents[1]
+    / "machine-setup"
+    / "mini-scripts"
+    / "governed_path_trust.json"
+)
 _RELEASE_NAME = re.compile(r"^v[0-9][0-9A-Za-z.!+_-]*-[0-9a-f]{12,64}$")
 _CUTTER_VALUE_FLAGS = {"--ref", "--certified-sha", "--promotion-receipt-id"}
 _CUTTER_BOOL_FLAGS = {"--if-advanced", "--preflight", "--rollback", "--prune", "--dry-run", "--offline"}
+
+
+def _trusted_cutter_sha256() -> str | None:
+    """Load the cutter pin from this immutable release's trust manifest."""
+    try:
+        if _CUTTER_TRUST_MANIFEST.is_symlink() or not _CUTTER_TRUST_MANIFEST.is_file():
+            return None
+        manifest = json.loads(_CUTTER_TRUST_MANIFEST.read_text(encoding="utf-8"))
+        if not isinstance(manifest, dict):
+            return None
+        entry = manifest["trusted_cutter"]
+        if not isinstance(entry, dict):
+            return None
+        digest = entry["sha256"]
+    except (OSError, KeyError, TypeError, json.JSONDecodeError):
+        return None
+    if (
+        manifest.get("schema_version") != 1
+        or entry.get("source") != "scripts/mini-release-cut.sh"
+        or not isinstance(digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+    ):
+        return None
+    return digest
 
 
 def _trusted_cutter_bootstrap(command: str, hermes: Path) -> bool:
@@ -208,7 +237,8 @@ def _trusted_cutter_bootstrap(command: str, hermes: Path) -> bool:
             return False
         if relative.parts[1:] != ("scripts", "mini-release-cut.sh") or script.is_symlink():
             return False
-        return hashlib.sha256(actual.read_bytes()).hexdigest() == _CUTTER_SHA256
+        trusted_digest = _trusted_cutter_sha256()
+        return trusted_digest is not None and hashlib.sha256(actual.read_bytes()).hexdigest() == trusted_digest
     except (OSError, ValueError):
         return False
 
