@@ -31,6 +31,26 @@ failure and `return []` — indistinguishable from "read fine, no errors."
 Fixed: an unreadable jobs.json now produces its own distinct `monitor_error`
 alert (own cooldown, so a persistently broken file re-alerts periodically
 instead of spamming every tick) instead of silently reporting all-clear.
+
+(86e2mb8p5, PR 3/4 of the adversarial provider-failure taxonomy epic)
+Credential pool / probe state is now the PRIMARY source for the two
+sharpest usage signals — `usage_cap` and `missing_credential` — read via
+`degraded_secrets_monitor.check_credential_pool()` (loaded as a sibling
+module; both scripts live beside each other in this directory and both are
+vendored as a matched pair by the release manifest). The `usage_limit`
+log-grep signatures below stay wired as a SECONDARY/fallback detector for
+real-time signals not yet reflected on disk — pool state is authoritative
+and sibling-aware (see `degraded_secrets_monitor`'s own docstring for the
+taxonomy), log-grep is a coarser safety net, never the other way around.
+
+Two taxonomy classes are deliberately excluded from ever paging here,
+matching `degraded_secrets_monitor`'s own non-paging notices: unconfigured
+providers/entries (nothing routes to them) and an idle-but-refreshable
+`exhausted_session` (the runtime refreshes it transparently on next use —
+see ClickUp 86e2mdfhx, the nous tier-3 fallback that re-paged every idle
+hour before this fix). `usage_cap` additionally never pages before ANY
+currently-capped entry's own reset_at, on top of a floor cooldown — see
+`_pool_cooldown_elapsed`.
 """
 
 from __future__ import annotations
@@ -43,9 +63,13 @@ import re
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 from typing import Any
 
 HOME = os.path.expanduser("~")
+# Overridable so tests can point at a fixture auth.json without depending on
+# (or clobbering) live mini state — same convention as JOBS_PATH below.
+AUTH_PATH = os.environ.get("HERMES_USAGE_ALERT_AUTH_PATH") or os.path.join(HOME, ".hermes/auth.json")
 LOGS = [
     os.path.join(HOME, ".hermes/logs/agent.log"),
     os.path.join(HOME, ".hermes/logs/gateway.log"),
@@ -108,7 +132,25 @@ SIGNATURES = [
     },
 ]
 
-GROUP_ORDER = ("monitor_error", "cron_error", "fallback_exhausted", "usage_limit")
+# Pool/probe-driven kinds (86e2mb8p5, PR 3/4) — primary detection for the two
+# taxonomy classes degraded_secrets_monitor.classify_credential_pool() always
+# pages (missing_credential, exhausted_cap — reported here as "usage_cap" to
+# match this alarm's existing usage-focused vocabulary). Never fed
+# unconfigured_provider/unconfigured_entry/exhausted_session hits — those are
+# excluded from `hits` entirely by the sibling module (see its own
+# docstring), so this script never even sees them.
+USAGE_CAP_KIND = "usage_cap"
+MISSING_CREDENTIAL_KIND = "missing_credential"
+# A floor cooldown even when a reset_at is present, so a burst of new
+# entries hitting cap in the same tick can't fire more than once per floor
+# window; also the WHOLE cooldown when no reset_at is parseable at all.
+USAGE_CAP_FLOOR_COOLDOWN_S = int(os.environ.get("HERMES_USAGE_CAP_MIN_COOLDOWN_MIN", "15")) * 60
+MISSING_CREDENTIAL_COOLDOWN_S = int(os.environ.get("HERMES_MISSING_CREDENTIAL_ALERT_COOLDOWN_MIN", "60")) * 60
+
+GROUP_ORDER = (
+    "monitor_error", "cron_error", "fallback_exhausted",
+    USAGE_CAP_KIND, MISSING_CREDENTIAL_KIND, "usage_limit",
+)
 GROUP_META = {
     "monitor_error": {
         "emoji": "🆘",
@@ -133,6 +175,18 @@ GROUP_META = {
         "headline": "Hermes hit a usage / quota limit.",
         "next_step": "Check the logs and refill or rotate the exhausted pool entry.",
         "cooldown_s": DEFAULT_COOLDOWN_S,
+    },
+    USAGE_CAP_KIND: {
+        "emoji": "🛑",
+        "headline": "Credential pool: a provider hit its usage cap with no healthy sibling.",
+        "next_step": "Wait for the cap to reset or add/rotate a sibling credential.",
+        "cooldown_s": USAGE_CAP_FLOOR_COOLDOWN_S,
+    },
+    MISSING_CREDENTIAL_KIND: {
+        "emoji": "🆘",
+        "headline": "Credential pool: a provider has a broken/missing credential with no healthy sibling.",
+        "next_step": "Repair or replace the credential in auth.json / 1Password.",
+        "cooldown_s": MISSING_CREDENTIAL_COOLDOWN_S,
     },
 }
 
@@ -300,6 +354,80 @@ def _scan_cron_errors(state, now: float | None = None):
     return events
 
 
+_DEGRADED_SECRETS_MONITOR_MODULE: Any = None
+
+
+def _load_degraded_secrets_monitor():
+    """Load degraded_secrets_monitor.py as a sibling module (importlib, not
+
+    sys.path mutation — the pattern machine-setup/mini-scripts/provider_probe.py
+    established for codex_quota_probe.py, avoiding this directory's known
+    cross-file `sys.modules` pollution when scripts do plain sibling
+    imports). Cached: the auth.json path/now are passed per-call, the module
+    object itself never changes.
+    """
+    global _DEGRADED_SECRETS_MONITOR_MODULE
+    if _DEGRADED_SECRETS_MONITOR_MODULE is not None:
+        return _DEGRADED_SECRETS_MONITOR_MODULE
+    path = Path(__file__).resolve().parent / "degraded_secrets_monitor.py"
+    if not path.is_file():
+        return None
+    spec = importlib.util.spec_from_file_location("degraded_secrets_monitor_sibling", path)
+    if spec is None or spec.loader is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        return None
+    _DEGRADED_SECRETS_MONITOR_MODULE = module
+    return module
+
+
+# Taxonomy classes that always page in degraded_secrets_monitor's own
+# classification, mapped to this alarm's kind names. Anything else
+# (unconfigured_provider, unconfigured_entry, exhausted_session) never
+# reaches `hits` at all — see that module's docstring — so no exclusion
+# list is needed here; this map is exhaustive by construction and a
+# not-in-map status is simply skipped (fail closed: never invent a new
+# paging kind for a taxonomy class this script doesn't know how to word).
+_POOL_STATUS_TO_KIND = {
+    "exhausted_cap": USAGE_CAP_KIND,
+    "missing_credential": MISSING_CREDENTIAL_KIND,
+}
+
+
+def _scan_pool_events(auth_path: str, now: float) -> list[dict[str, Any]]:
+    """Pool/probe state is the PRIMARY source for usage_cap and
+
+    missing_credential — see the module docstring's 86e2mb8p5 note. Reuses
+    degraded_secrets_monitor's classification so both scripts can never
+    disagree about which taxonomy class an entry is in.
+    """
+    dsm = _load_degraded_secrets_monitor()
+    if dsm is None:
+        return []
+    now_dt = datetime.fromtimestamp(now, tz=timezone.utc)
+    try:
+        result = dsm.check_credential_pool(auth_path, now=now_dt)
+    except Exception:
+        return []
+    events = []
+    for hit in result.get("hits", []):
+        kind = _POOL_STATUS_TO_KIND.get(hit.get("status"))
+        if kind is None:
+            continue
+        events.append({
+            "kind": kind,
+            "label": f"credential pool {hit['status']}: provider={hit['provider']} id={hit['id']}",
+            "cooldown_s": GROUP_META[kind]["cooldown_s"],
+            "key": f"{hit['provider']}:{hit['id']}",
+            "line": f"provider={hit['provider']} entry={hit['id']} status={hit['status']}",
+            "retry_at": hit.get("retry_at"),
+        })
+    return events
+
+
 def _build_alert(kind: str, events: list[dict[str, Any]], now: float) -> str:
     script_root = Path(__file__).resolve().parent
     formatter = script_root / "slack_msg_builder.py"
@@ -339,6 +467,44 @@ def _cooldown_key(kind: str) -> str:
     return f"last_alert_ts:{kind}"
 
 
+def _parse_epoch(raw: Any) -> float | None:
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(str(raw).replace("Z", "+00:00")).timestamp()
+    except (ValueError, TypeError):
+        return None
+
+
+def _pool_cooldown_elapsed(
+    kind: str, events: list[dict[str, Any]], last_alert: float, now: float
+) -> bool:
+    """Per-kind cooldown gate. usage_cap gets a DYNAMIC cooldown — once it
+
+    has alerted at least once, it must not RE-page before ANY
+    currently-capped entry's own reset_at, on top of a floor so a burst of
+    new caps in one tick can't fire faster than that floor allows. The very
+    first time a kind is ever seen (last_alert is falsy — no prior alert
+    recorded) always fires immediately regardless of how far out reset_at
+    is; the reset_at gate only suppresses REPEATS of an already-announced
+    cap. Every other kind (including missing_credential) keeps the existing
+    fixed-duration GROUP_META cooldown_s.
+    """
+    floor_s = GROUP_META[kind]["cooldown_s"]
+    if kind != USAGE_CAP_KIND:
+        return not floor_s or (now - last_alert) >= floor_s
+    if (now - last_alert) < floor_s:
+        return False
+    if not last_alert:
+        return True
+    reset_ats = [ts for ts in (_parse_epoch(e.get("retry_at")) for e in events) if ts is not None]
+    if not reset_ats:
+        # No parseable reset_at on any current event (legacy pool entry) —
+        # the floor above is the whole cooldown.
+        return True
+    return now >= min(reset_ats)
+
+
 def _send_slack(message: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [HERMES_BIN, "send", "--to", SLACK_TARGET, message],
@@ -357,12 +523,14 @@ def main():
             matches, _offset = _scan_new_lines(path, 0)
             events.extend(matches)
         events.extend(_scan_cron_errors(state))
+        events.extend(_scan_pool_events(AUTH_PATH, time.time()))
         print(json.dumps({"status": "alert" if events else "clean", "events": events}, sort_keys=True))
         return 1 if events else 0
 
     if os.environ.get("HERMES_USAGE_ALERT_DISABLE") == "1":
         return 0
 
+    now = time.time()
     state = _load_state()
     offsets = state.setdefault("offsets", {})
     last_alert_by_kind = state.setdefault("last_alert_ts_by_kind", {})
@@ -385,23 +553,28 @@ def main():
         for event in matches:
             events_by_kind.setdefault(event["kind"], []).append(event)
 
-    for event in _scan_cron_errors(state):
+    for event in _scan_cron_errors(state, now=now):
+        events_by_kind.setdefault(event["kind"], []).append(event)
+
+    # Pool/probe state is PRIMARY for usage_cap/missing_credential — see the
+    # module docstring's 86e2mb8p5 note. Read every tick (not gated on the
+    # log-scan early-return below) so a pool-only signal with no matching
+    # log line still surfaces.
+    for event in _scan_pool_events(AUTH_PATH, now):
         events_by_kind.setdefault(event["kind"], []).append(event)
 
     if not events_by_kind:
         _save_state(state)
-        _write_receipt(status="clean", delivery="confirmed", now=time.time())
+        _write_receipt(status="clean", delivery="confirmed", now=now)
         return 0  # silent — empty stdout
 
-    now = time.time()
     printed = []
     for kind in GROUP_ORDER:
         events = events_by_kind.get(kind, [])
         if not events:
             continue
-        cooldown_s = GROUP_META[kind]["cooldown_s"]
         last_alert = float(last_alert_by_kind.get(kind, 0) or 0)
-        if cooldown_s and (now - last_alert) < cooldown_s:
+        if not _pool_cooldown_elapsed(kind, events, last_alert, now):
             continue
         msg = _build_alert(kind, events, now)
         print(msg)  # → delivered to Slack by the cron job

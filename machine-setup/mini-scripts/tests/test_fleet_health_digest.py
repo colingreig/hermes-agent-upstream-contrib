@@ -137,6 +137,9 @@ def test_usage_alert_direct_probe_is_pure_and_clean(monkeypatch, tmp_path, capsy
     jobs.write_text('{"jobs": []}\n', encoding="utf-8")
     monkeypatch.setattr(module, "LOGS", [str(tmp_path / "missing-agent.log")])
     monkeypatch.setattr(module, "JOBS_PATH", str(jobs))
+    # Isolate from the real dev/mini auth.json — see hermes_usage_alert.py's
+    # own test fixture note on AUTH_PATH (86e2mb8p5).
+    monkeypatch.setattr(module, "AUTH_PATH", str(tmp_path / "auth.json"))
     monkeypatch.setattr(module, "STATE_PATH", str(tmp_path / "must-not-write-state.json"))
     monkeypatch.setattr(module, "RECEIPT_PATH", str(tmp_path / "must-not-write-receipt.json"))
     monkeypatch.setattr(sys, "argv", [str(path), "--probe"])

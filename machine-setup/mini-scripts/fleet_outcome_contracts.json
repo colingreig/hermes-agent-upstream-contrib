@@ -487,6 +487,16 @@
       "timestamp_pattern": "ts=(?P<ts>\\S+)"
     },
     {
+      "id": "release-cut-drain-deferral",
+      "kind": "repeated_release_drift",
+      "path": "~/.hermes/logs/mini-release-poll.log",
+      "pattern": "release cut deferred: gateway did not quiesce",
+      "threshold": 6,
+      "tail_bytes": 262144,
+      "window_minutes": 240,
+      "timestamp_pattern": "ts=(?P<ts>\\S+)"
+    },
+    {
       "id": "governed-path-integrity",
       "kind": "governed_manifest",
       "path": "~/.hermes/scripts/fleet_outcome_manifest.json"
@@ -495,6 +505,15 @@
       "id": "deployment-coverage",
       "kind": "deployment_coverage",
       "path": "~/.hermes/scripts/mini_local_registry.json"
+    },
+    {
+      "id": "credential-taxonomy-health",
+      "kind": "credential_taxonomy",
+      "path": "~/.hermes/auth.json",
+      "expected_providers": ["anthropic", "openai-codex"],
+      "dead_stale_hours": 6,
+      "probe_stale_hours": 24,
+      "note": "86e2mb8pb (PR4/4 of the provider-failure taxonomy epic 86e2mb8k3): alarms ONLY on credential-pool states the taxonomy (PR1 86e2mb8nv classifier, PR2 86e2mb8p0 provider_probe.py, PR3 86e2mb8p5 per-class alerting) never self-heals from -- (1) unconfigured_expected_provider: a provider in expected_providers has zero configured credentials (an unlisted provider being empty is normal and never checked here -- that's exactly the unconfigured_provider false-page PR3 fixed for degraded_secrets_monitor.py); (2) credential_stuck_dead: an entry terminal (dead/invalid/error) or auth_permanent-quarantined for >= dead_stale_hours without recovering -- a *fresh* terminal mark is not this contract's job, the existing per-hit Slack/ClickUp alerting (degraded_secrets_monitor.py) already pages that immediately, this is the backstop for 'that page was missed/dismissed and it's still broken hours later'; (3) stale_probe_receipt: an entry that HAS a prior provider_probe.py verdict (last_probe_verdict_at set) older than probe_stale_hours while still exhausted -- signals the probe stopped running; a provider never probed (provider_probe.py has no scheduled cron yet per PR2's own out-of-scope note) produces zero findings here BY DESIGN, so this can never become a permanently-red flag for infrastructure that doesn't exist yet. Deliberately NEVER alarms on a plain exhausted_cap (usage_cap) credential, including one with a stale probe receipt: a usage cap is expected to sit exhausted until its own reset_at and already has dedicated alerting via hermes_usage_alert.py's usage_cap kind (PR3) -- re-paging it here would be a second, redundant, eventually-desynced alarm for a condition that is expected and self-resolving, not stuck."
     }
   ],
   "launch_agents": [

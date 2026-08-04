@@ -161,6 +161,35 @@ def _format_exhausted_status(entry) -> str:
     return f" {label}{reason_text}{code} ({wait} left)"
 
 
+def _format_taxonomy_suffix(entry) -> str:
+    """Render the provider-failure taxonomy fields (86e2mb8nv/86e2mb8p0/
+    86e2mb8p5) a pool entry may carry: ``last_failure_kind`` (the deeper
+    classification beyond ``last_status``, e.g. ``auth_permanent`` vs a
+    plain ``exhausted``), the out-of-band probe verdict that corroborated
+    or denied it, and remaining usage headroom when a provider exposes one.
+
+    Every field is optional (most entries — and every ``PooledCredential``
+    written before 86e2mb8nv landed — carry none of them), so this returns
+    ``""`` unless at least one piece has a value; callers append the result
+    directly to an existing status line without needing to know which
+    fields, if any, were populated.
+    """
+    parts = []
+    kind = getattr(entry, "last_failure_kind", None)
+    if isinstance(kind, str) and kind.strip():
+        parts.append(f"kind={kind.strip()}")
+    verdict = getattr(entry, "last_probe_verdict", None)
+    if isinstance(verdict, str) and verdict.strip():
+        parts.append(f"probe={verdict.strip()}")
+    usage_percent = getattr(entry, "usage_percent", None)
+    if isinstance(usage_percent, (int, float)):
+        headroom = max(0.0, min(100.0, 100.0 - float(usage_percent)))
+        parts.append(f"headroom={headroom:.0f}%")
+    if not parts:
+        return ""
+    return f" [{' '.join(parts)}]"
+
+
 def auth_add_command(args) -> None:
     provider = _normalize_provider(getattr(args, "provider", ""))
     if provider not in PROVIDER_REGISTRY and provider != "openrouter" and not provider.startswith(CUSTOM_POOL_PREFIX):
@@ -456,8 +485,9 @@ def auth_list_command(args) -> None:
             if current is not None and entry.id == current.id:
                 marker = "← "
             status = _format_exhausted_status(entry)
+            taxonomy = _format_taxonomy_suffix(entry)
             source = _display_source(entry.source)
-            print(f"  #{idx}  {entry.label:<20} {entry.auth_type:<7} {source}{status} {marker}".rstrip())
+            print(f"  #{idx}  {entry.label:<20} {entry.auth_type:<7} {source}{status}{taxonomy} {marker}".rstrip())
         print()
 
 
@@ -557,6 +587,7 @@ def auth_codex_list_command(args) -> None:
                 status = f"dead ({reason} — re-login required)"
             else:
                 status = _format_exhausted_status(entry).strip() or "ok"
+            status = f"{status}{_format_taxonomy_suffix(entry)}"
         elif acct["has_tokens"]:
             token = ""
             status = "ok (not yet seeded into pool)"
@@ -626,6 +657,43 @@ def auth_reset_command(args) -> None:
     print(f"Reset status on {count} {provider} credentials")
 
 
+def _print_pool_taxonomy(provider: str) -> None:
+    """Print any taxonomy fields (86e2mb8nv/86e2mb8p0/86e2mb8p5) recorded
+    against ``provider``'s credential-pool entries: ``last_failure_kind``,
+    the out-of-band probe verdict, and usage headroom.
+
+    Read-only via ``agent.credential_pool.failure_summary()`` (never seeds,
+    refreshes, or mutates the pool) and safe to call regardless of whether
+    ``get_auth_status`` reports logged in or out — a dead/quarantined pool
+    entry's ``last_failure_kind`` is often exactly why a provider shows
+    logged out, and is useful there too. Silently prints nothing when the
+    provider has no pool entries or none carry a taxonomy field (most
+    entries, and every ``PooledCredential`` written before 86e2mb8nv
+    landed, carry none).
+    """
+    try:
+        from agent.credential_pool import failure_summary
+
+        summary = failure_summary(provider)
+    except Exception:
+        return
+    rows = summary.get(provider) or []
+    printed_header = False
+    for row in rows:
+        suffix = _format_taxonomy_suffix(SimpleNamespace(
+            last_failure_kind=row.get("last_failure_kind"),
+            last_probe_verdict=row.get("last_probe_verdict"),
+            usage_percent=row.get("usage_percent"),
+        ))
+        if not suffix:
+            continue
+        if not printed_header:
+            print("  taxonomy:")
+            printed_header = True
+        label = row.get("label") or row.get("id") or "?"
+        print(f"    {label}:{suffix}")
+
+
 def auth_status_command(args) -> None:
     provider = _normalize_provider(getattr(args, "provider", "") or "")
     if not provider:
@@ -637,6 +705,7 @@ def auth_status_command(args) -> None:
             print(f"{provider}: logged out ({reason})")
         else:
             print(f"{provider}: logged out")
+        _print_pool_taxonomy(provider)
         return
 
     print(f"{provider}: logged in")
@@ -644,6 +713,7 @@ def auth_status_command(args) -> None:
         value = status.get(key)
         if value:
             print(f"  {key}: {value}")
+    _print_pool_taxonomy(provider)
 
 
 def auth_logout_command(args) -> None:
