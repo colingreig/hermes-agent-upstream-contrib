@@ -32,6 +32,19 @@ window drops back under both thresholds, the signature clears and a future
 recurrence alerts again. The alarm is therefore satisfiable — it does not
 latch permanently red the way an any-imperfection flag would.
 
+ClickUp 86e2mg7jb (2026-08-03): ci-health-watch (job e835c614cfb2, a */5min
+no_agent tick) emits a by-design [SILENT] ending on EVERY healthy run — it
+writes a JSON artifact and delivers nothing else, so it alone produced 9-12
+silent endings per rolling 60-minute window, above PER_JOB_THRESHOLD on its
+own and rolling straight into a chronic false TOTAL_THRESHOLD "possible total
+fleet outage" alarm. ``BY_DESIGN_SILENT_JOB_IDS`` now excludes ci-health-watch
+plus the other no_agent jobs that are silent on literally every healthy tick
+(review-poll-gate, spend-meter, reap-stranded-claims,
+clickup-workspace-refresh) from both counters below. Agent cron jobs that go
+[SILENT] only some of the time are deliberately NOT in that table — a job
+that's normally chatty going quiet on every tick is exactly the regression
+this monitor exists to catch.
+
 Usage:
   silent_delivery_monitor.py                    # check, human summary, exit 1 if triggered
   silent_delivery_monitor.py --json              # emit JSON result
@@ -87,6 +100,104 @@ DEFAULT_TOTAL_THRESHOLD = 8
 SLACK_TARGET = os.environ.get("CRON_SILENT_ALERT_SLACK", "slack:D0BA2PM9CFM")
 SLACK_MENTION = "<@UN4CQ1EGG>"
 
+# ── By-design-silent no_agent jobs (ClickUp 86e2mg7jb) ──────────────────────
+# These no_agent jobs are EXPECTED to end [SILENT] on essentially every
+# healthy tick — see each job's own machine-setup/mini-scripts/
+# fleet_outcome_contracts.json cron entry, which already treats a silent
+# ending as literal SUCCESS for these jobs specifically (either a
+# "Status:** silent" success_pattern, or — for ci-health-watch and
+# clickup-workspace-refresh — a json_artifact outcome that never inspects
+# cron_output/delivery text at all). Before this fix, ci-health-watch (job
+# e835c614cfb2, a */5min no_agent tick) alone produced 9-12 [SILENT] endings
+# per rolling 60-minute window on a totally healthy fleet — above
+# PER_JOB_THRESHOLD (4) by itself, and its count rolled into TOTAL_THRESHOLD
+# (8) fleet-wide too, driving a chronic false "possible total fleet outage"
+# alarm with zero actual outage.
+#
+# This table is the source of truth for which no_agent jobs get excluded
+# from BOTH the per-job and fleet-wide counters in evaluate_silent_rate().
+# Deliberately NOT every no_agent job with a "silent" success marker: jobs
+# like clickup-poll-gate, validator-live-trigger, clickup-review-sla, and
+# ignite-board-sync are silent only SOME ticks (most runs have real work) —
+# excluding them too would blind the monitor to a genuine claim/routing
+# regression that makes one of them go quiet on every tick instead of its
+# normal partial rate, exactly the failure class this monitor exists to
+# catch. Only jobs that are silent on literally every healthy run belong
+# here.
+#
+# Keep this in sync with machine-setup/fleet-config/jobs.json (mirrored to
+# the live ~/.hermes/cron/jobs.json on the Mini): each id below must resolve
+# to the same job name there. _fleet_config_drift_warnings() below performs
+# that cross-check whenever a fleet config file is reachable and returns
+# (never raises) a list of drift warnings, so a rename or retirement is loud
+# instead of silently stale.
+BY_DESIGN_SILENT_JOB_IDS = {
+    "e835c614cfb2": "ci-health-watch",
+    "8d3b1d53470d": "review-poll-gate",
+    "b0c4c5cc70c1": "spend-meter",
+    "dd73a5e578e4": "reap-stranded-claims",
+    "bcf275768661": "clickup-workspace-refresh",
+}
+
+
+def _fleet_config_candidates() -> List[str]:
+    """Paths to try for the live/source-of-truth fleet job config, in order.
+
+    The live Mini path (``~/.hermes/cron/jobs.json``) is authoritative in
+    production; the repo-relative fleet-config file is the fallback so this
+    check still works from a plain repo checkout (tests, CI, a fresh clone).
+    """
+    candidates = []
+    override = os.environ.get("HERMES_FLEET_CONFIG_PATH")
+    if override:
+        candidates.append(override)
+    candidates.append(os.path.expanduser("~/.hermes/cron/jobs.json"))
+    candidates.append(
+        os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "..", "fleet-config", "jobs.json",
+        )
+    )
+    return candidates
+
+
+def _fleet_config_drift_warnings(
+    job_ids: Optional[Dict[str, str]] = None,
+) -> List[str]:
+    """Best-effort drift check between BY_DESIGN_SILENT_JOB_IDS and whichever
+    fleet config file is reachable. Returns human-readable warning strings;
+    never raises, and returns [] both when nothing is reachable and when
+    everything matches — this must never blind or crash the monitor."""
+    job_ids = BY_DESIGN_SILENT_JOB_IDS if job_ids is None else job_ids
+    for path in _fleet_config_candidates():
+        try:
+            with open(path, encoding="utf-8") as f:
+                payload = json.load(f)
+        except Exception:
+            continue
+        jobs = payload.get("jobs") if isinstance(payload, dict) else None
+        if not isinstance(jobs, list):
+            continue
+        by_id = {
+            str(job.get("id")): str(job.get("name") or "")
+            for job in jobs
+            if isinstance(job, dict)
+        }
+        warnings = []
+        for job_id, expected_name in job_ids.items():
+            if job_id not in by_id:
+                warnings.append(
+                    f"by-design-silent job id {job_id!r} ({expected_name!r}) not "
+                    f"found in {path} — exclusion table may be stale"
+                )
+            elif by_id[job_id] != expected_name:
+                warnings.append(
+                    f"by-design-silent job id {job_id!r} name drifted: expected "
+                    f"{expected_name!r}, fleet config has {by_id[job_id]!r}"
+                )
+        return warnings
+    return []
+
 
 def _now() -> float:
     import time
@@ -138,6 +249,7 @@ def evaluate_silent_rate(
     window_min: int = DEFAULT_WINDOW_MIN,
     per_job_threshold: int = DEFAULT_PER_JOB_THRESHOLD,
     total_threshold: int = DEFAULT_TOTAL_THRESHOLD,
+    excluded_job_ids: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     now = _now() if now is None else now
     window_start = now - (window_min * 60)
@@ -146,8 +258,15 @@ def evaluate_silent_rate(
         if isinstance(r.get("at"), (int, float)) and window_start <= r["at"] <= now
     ]
 
-    per_job_counts = Counter(str(r["job_id"]) for r in in_window)
-    total_count = len(in_window)
+    excluded_job_ids = (
+        BY_DESIGN_SILENT_JOB_IDS if excluded_job_ids is None else excluded_job_ids
+    )
+    excluded = [r for r in in_window if str(r["job_id"]) in excluded_job_ids]
+    counted = [r for r in in_window if str(r["job_id"]) not in excluded_job_ids]
+
+    per_job_counts = Counter(str(r["job_id"]) for r in counted)
+    total_count = len(counted)
+    excluded_per_job_counts = Counter(str(r["job_id"]) for r in excluded)
     breached_jobs = sorted(
         job_id for job_id, count in per_job_counts.items() if count >= per_job_threshold
     )
@@ -161,6 +280,8 @@ def evaluate_silent_rate(
         "total_threshold": total_threshold,
         "total_count": total_count,
         "per_job_counts": dict(sorted(per_job_counts.items())),
+        "excluded_total_count": len(excluded),
+        "excluded_per_job_counts": dict(sorted(excluded_per_job_counts.items())),
         "breached_jobs": breached_jobs,
         "total_breached": total_breached,
         "triggered": triggered,
@@ -246,12 +367,16 @@ def main() -> None:
         per_job_threshold=args.per_job_threshold, total_threshold=args.total_threshold,
     )
 
+    for warning in _fleet_config_drift_warnings():
+        print(f"[silent-delivery-monitor] WARNING: {warning}", file=sys.stderr)
+
     if args.json:
         print(json.dumps(result, indent=2))
     elif not result["triggered"]:
         print(
             f"[silent-delivery-monitor] healthy (total={result['total_count']}/"
-            f"{args.total_threshold} in {args.window_min}min)"
+            f"{args.total_threshold} in {args.window_min}min, "
+            f"excluded={result['excluded_total_count']} by-design-silent)"
         )
     else:
         for job_id in result["breached_jobs"]:

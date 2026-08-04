@@ -459,7 +459,16 @@ def _check_text_evidence(
                         f"{path} has no declared outcome record",
                     )
                 ]
-            text = records[-1]
+            # 86e2mg7j3: evaluate success/failure markers against EVERY
+            # matching record still inside the tail window, not just the
+            # physically-last one. A monitor can print multiple distinct
+            # per-tick status lines in one run (e.g. degraded_secrets_monitor
+            # prints one line per degraded credential, or a placeholder
+            # warning followed by a routine "credential pool degraded" line)
+            # -- checking only the last line lets an earlier, still-current
+            # malfunction marker from the SAME tick go undetected purely
+            # because something else printed after it.
+            text = "\n".join(records)
     if outcome.get("response_only"):
         marker = "## Response"
         failed_evidence = _canonical_failed_cron_evidence(text)
