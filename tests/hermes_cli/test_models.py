@@ -70,7 +70,12 @@ class TestFetchOpenRouterModels:
                 return b'{"data":[{"id":"anthropic/claude-opus-4.8","pricing":{"prompt":"0.000015","completion":"0.000075"}},{"id":"qwen/qwen3.7-max","pricing":{"prompt":"0.000000325","completion":"0.00000195"}},{"id":"nvidia/nemotron-3-super-120b-a12b:free","pricing":{"prompt":"0","completion":"0"}}]}'
 
         monkeypatch.setattr(_models_mod, "_openrouter_catalog_cache", None)
-        with patch("hermes_cli.models._urlopen_model_catalog_request", return_value=_Resp()):
+        # Pin the remote manifest out too — otherwise the "preferred ids" list
+        # this builds on top of silently depends on whatever the deployed
+        # catalog currently contains (flaky/live-network, see the sibling
+        # test_falls_back_to_static_snapshot_on_fetch_failure pin above).
+        with patch("hermes_cli.model_catalog.get_curated_openrouter_models", return_value=None), \
+             patch("hermes_cli.models._urlopen_model_catalog_request", return_value=_Resp()):
             models = fetch_openrouter_models(force_refresh=True)
 
         assert models == [
@@ -167,7 +172,10 @@ class TestFetchOpenRouterModels:
                 )
 
         monkeypatch.setattr(_models_mod, "_openrouter_catalog_cache", None)
-        with patch("hermes_cli.models._urlopen_model_catalog_request", return_value=_Resp()):
+        # Pin the remote manifest out too — see the sibling
+        # test_falls_back_to_static_snapshot_on_fetch_failure pin comment.
+        with patch("hermes_cli.model_catalog.get_curated_openrouter_models", return_value=None), \
+             patch("hermes_cli.models._urlopen_model_catalog_request", return_value=_Resp()):
             models = fetch_openrouter_models(force_refresh=True)
 
         ids = [mid for mid, _ in models]

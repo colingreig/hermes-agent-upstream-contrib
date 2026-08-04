@@ -46,6 +46,8 @@ from pathlib import Path
 from typing import Any, Callable
 from xml.parsers.expat import ExpatError
 
+from agent.failure_taxonomy import FAILURE_KIND_AUTH_PERMANENT, FAILURE_KIND_USAGE_CAP
+
 
 HOME = Path.home()
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -83,6 +85,13 @@ NOTABLE_ALARM_ACTIONS = frozenset(
 MONITORED_LABEL_RE = re.compile(
     r"^(?:ai\.hermes\.|com\.hermes\.|com\.ignite\.|com\.colingreig\.(?:hermes|ignite|pull_anthropic))"
 )
+# ``last_status`` values that mean an entry is terminal (never self-heals via
+# TTL) — matches degraded_secrets_monitor.py's TERMINAL_POOL_STATUSES, kept
+# as a local constant rather than an import since it's a legacy pool-status
+# vocabulary, not a failure_taxonomy kind.
+TERMINAL_POOL_STATUSES = frozenset({"dead", "invalid", "error"})
+DEFAULT_CREDENTIAL_TAXONOMY_DEAD_STALE_HOURS = 6
+DEFAULT_CREDENTIAL_TAXONOMY_PROBE_STALE_HOURS = 24
 
 
 class ProbeError(RuntimeError):
@@ -103,6 +112,21 @@ def _parse_time(value: object) -> datetime | None:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
+
+
+def _entry_age_seconds(value: object, now_ts: float) -> float | None:
+    """Seconds since a credential-pool timestamp field, tolerating both the
+    raw epoch float ``agent.credential_pool`` persists (``time.time()``) and
+    an ISO8601 string, should a future writer ever emit one."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return max(0.0, now_ts - float(value))
+    if isinstance(value, str) and value.strip():
+        parsed = _parse_time(value)
+        if parsed is not None:
+            return max(0.0, now_ts - parsed.timestamp())
+    return None
 
 
 def _atomic_json(path: Path, value: dict[str, Any]) -> None:
@@ -1326,6 +1350,96 @@ def _check_deployment_coverage(
     return findings, evidence
 
 
+def _check_credential_taxonomy(
+    contract: dict[str, Any], *, home: Path, now: datetime
+) -> tuple[list[dict[str, str]], list[dict[str, Any]]]:
+    """Alarm on credential-pool taxonomy (86e2mb8nv/86e2mb8p0/86e2mb8p5)
+    states that never self-heal, without duplicating the alerting those
+    prior PRs already ship. See ``fleet_outcome_contracts.json``'s
+    ``credential-taxonomy-health`` entry's ``note`` field for the full
+    intentional-suppression rationale (deliberately not repeated here —
+    the decided convention for this contract is documentation lives next
+    to the check in JSON, not in a code comment).
+    """
+    findings: list[dict[str, str]] = []
+    evidence: list[dict[str, Any]] = []
+    identifier = str(contract.get("id") or "credential-taxonomy")
+    path = _expand_path(str(contract.get("path") or "~/.hermes/auth.json"), home=home)
+    payload = _load_optional_json(path)
+    pool = payload.get("credential_pool")
+    if not isinstance(pool, dict):
+        evidence.append({"surface": "operational", "id": identifier, "path": str(path), "providers": 0})
+        return findings, evidence
+
+    expected_providers = sorted({str(p) for p in (contract.get("expected_providers") or [])})
+    dead_stale_seconds = (
+        float(contract.get("dead_stale_hours", DEFAULT_CREDENTIAL_TAXONOMY_DEAD_STALE_HOURS)) * 3600.0
+    )
+    probe_stale_seconds = (
+        float(contract.get("probe_stale_hours", DEFAULT_CREDENTIAL_TAXONOMY_PROBE_STALE_HOURS)) * 3600.0
+    )
+    now_ts = now.timestamp()
+
+    for provider in expected_providers:
+        entries = pool.get(provider)
+        if not isinstance(entries, list) or not entries:
+            findings.append(_finding(
+                "operational", identifier, "unconfigured_expected_provider",
+                f"provider {provider!r} has zero configured credentials but is declared expected_providers",
+            ))
+
+    stuck_dead: list[str] = []
+    stale_probe: list[str] = []
+    for raw_provider, raw_entries in pool.items():
+        if not isinstance(raw_entries, list):
+            continue
+        provider = str(raw_provider)
+        for entry in raw_entries:
+            if not isinstance(entry, dict):
+                continue
+            entry_id = str(entry.get("id") or "unknown")
+            status = str(entry.get("last_status") or "").strip().lower()
+            failure_kind = str(entry.get("last_failure_kind") or "").strip().lower()
+
+            if status in TERMINAL_POOL_STATUSES or failure_kind == FAILURE_KIND_AUTH_PERMANENT:
+                age = _entry_age_seconds(entry.get("last_status_at"), now_ts)
+                if age is not None and age >= dead_stale_seconds:
+                    stuck_dead.append(f"{provider}:{entry_id}")
+
+            # A plain usage_cap credential is EXPECTED to still be exhausted
+            # between probes (it self-clears at its own reset_at and already
+            # has dedicated alerting — see the contract's ``note``) so it is
+            # excluded here even when it carries a stale probe receipt.
+            if status == "exhausted" and failure_kind != FAILURE_KIND_USAGE_CAP:
+                probe_age = _entry_age_seconds(entry.get("last_probe_verdict_at"), now_ts)
+                if probe_age is not None and probe_age >= probe_stale_seconds:
+                    stale_probe.append(f"{provider}:{entry_id}")
+
+    if stuck_dead:
+        findings.append(_finding(
+            "operational", identifier, "credential_stuck_dead",
+            f"{len(stuck_dead)} credential(s) terminal/quarantined ≥{dead_stale_seconds / 3600:.0f}h: "
+            f"{', '.join(sorted(stuck_dead))}",
+        ))
+    if stale_probe:
+        findings.append(_finding(
+            "operational", identifier, "stale_probe_receipt",
+            f"{len(stale_probe)} credential(s) probed ≥{probe_stale_seconds / 3600:.0f}h ago and still "
+            f"exhausted: {', '.join(sorted(stale_probe))}",
+        ))
+
+    evidence.append({
+        "surface": "operational",
+        "id": identifier,
+        "path": str(path),
+        "providers": len(pool),
+        "expected_providers": expected_providers,
+        "stuck_dead_count": len(stuck_dead),
+        "stale_probe_count": len(stale_probe),
+    })
+    return findings, evidence
+
+
 def _check_operational_contracts(
     contracts: list[dict[str, Any]], *, home: Path, now: datetime
 ) -> tuple[list[dict[str, str]], list[dict[str, Any]]]:
@@ -1472,6 +1586,10 @@ def _check_operational_contracts(
             coverage_findings, coverage_evidence = _check_deployment_coverage(contract, home=home)
             findings.extend(coverage_findings)
             evidence.extend(coverage_evidence)
+        elif kind == "credential_taxonomy":
+            taxonomy_findings, taxonomy_evidence = _check_credential_taxonomy(contract, home=home, now=now)
+            findings.extend(taxonomy_findings)
+            evidence.extend(taxonomy_evidence)
         else:
             raise ProbeError(f"operational check {identifier} has unsupported kind {kind!r}")
     return findings, evidence
