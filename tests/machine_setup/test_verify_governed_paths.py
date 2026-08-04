@@ -77,7 +77,8 @@ def _install_fixture(home: Path) -> Path:
     launch_agents.mkdir(parents=True)
     shutil.copy2(MINI_SCRIPTS / "fleet_outcome_manifest.json", scripts / "fleet_outcome_manifest.json")
     for entry in outcome_manifest["files"]:
-        source = MINI_SCRIPTS / entry["source"]
+        source_base = REPO_ROOT if entry.get("source_root") == "repo" else MINI_SCRIPTS
+        source = source_base / entry["source"]
         destination = (scripts if entry["destination_root"] == "scripts" else launch_agents) / entry["destination"]
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, destination)
@@ -315,6 +316,17 @@ def test_deployed_default_fleet_root_uses_active_release(tmp_path):
     deployed_machine_setup.mkdir(parents=True)
     shutil.copytree(FLEET_ROOT, deployed_fleet)
     shutil.copytree(MINI_SCRIPTS, deployed_machine_setup / "mini-scripts")
+    # A release directory is a full repo checkout: entries declaring
+    # "source_root": "repo" (e.g. scripts/clickup_poll_gate.py) resolve
+    # against the release root itself, not machine-setup/mini-scripts.
+    outcome_manifest = json.loads((MINI_SCRIPTS / "fleet_outcome_manifest.json").read_text())
+    for entry in outcome_manifest["files"]:
+        if entry.get("source_root") != "repo":
+            continue
+        repo_source = REPO_ROOT / entry["source"]
+        repo_destination = active / entry["source"]
+        repo_destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(repo_source, repo_destination)
 
     result = subprocess.run(
         [

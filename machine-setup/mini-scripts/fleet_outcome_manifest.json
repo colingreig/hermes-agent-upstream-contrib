@@ -37,7 +37,7 @@
       "destination_root": "scripts",
       "destination": "verify_governed_paths.py",
       "mode": "0755",
-      "sha256": "066ec23fe90d62f85b011382bc9cb203ece3b23d0fb8a83f54af70992d00d27a"
+      "sha256": "3768b1fc86841d092ec617e2ae12d13694febafe77c1e2e6f9a3f6ee1b107603"
     },
     {
       "source": "verify_governed_paths_launcher.py",
