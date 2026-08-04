@@ -128,7 +128,14 @@
       "destination_root": "scripts",
       "destination": "codex_quota_probe.py",
       "mode": "0755",
-      "sha256": "12adc80619d1d9a90c6dba48f8ff7de816c7557b8a7c8d9e8a483ceaa2ed17ab"
+      "sha256": "88d90dc01bf2a3743afe50053f0774b0a1ae0bc17f2bc1eb650c9b178c278b68"
+    },
+    {
+      "source": "provider_probe.py",
+      "destination_root": "scripts",
+      "destination": "provider_probe.py",
+      "mode": "0755",
+      "sha256": "528386174d944419a8c7532d90cc26192cac6e10831b32a23727f1ad854dbc7e"
     },
     {
       "source": "silent_delivery_monitor.py",
