@@ -685,6 +685,45 @@ def test_run_job_script_required_environment_is_all_or_nothing(
     run.assert_not_called()
 
 
+def test_run_job_script_mixed_optional_and_required_declarations(
+    hermes_env, monkeypatch
+):
+    """Regression for 86e2m2c1g (fleet-health-digest): a job declaring both
+    an absent optional var and an absent required var must skip the
+    optional one and still fail closed on the required one — the scheduler
+    enforcement gate already treats ``{"optional": true}`` as skippable, but
+    only if the *stored* job data still carries that shape (cron.jobs used
+    to flatten it away on every pause/resume)."""
+    from agent.lazy_secret_resolver import RequiredSecretMissingError
+    from cron.scheduler import _run_job_script
+
+    optional_name = "OPTIONAL_MIXED_DECLARATION_TOKEN"
+    required_name = "REQUIRED_MIXED_DECLARATION_TOKEN"
+    _write_secret_probe(hermes_env, "mixed_declaration.py", required_name)
+    monkeypatch.delenv(optional_name, raising=False)
+    monkeypatch.delenv(required_name, raising=False)
+
+    def resolve(name):
+        raise RequiredSecretMissingError(name)
+
+    with (
+        patch("agent.lazy_secret_resolver.get_required", side_effect=resolve),
+        patch("cron.scheduler.subprocess.run") as run,
+    ):
+        ok, output = _run_job_script(
+            "mixed_declaration.py",
+            required_environment_variables=[
+                {"name": optional_name, "optional": True},
+                required_name,
+            ],
+        )
+
+    assert ok is False
+    assert required_name in output
+    assert "classification=missing" in output
+    run.assert_not_called()
+
+
 @pytest.mark.parametrize(
     ("job_name", "script_name"),
     [
