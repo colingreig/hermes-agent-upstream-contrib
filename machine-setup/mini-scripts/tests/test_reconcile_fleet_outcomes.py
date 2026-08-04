@@ -357,12 +357,14 @@ class FleetOutcomeReconcilerTests(unittest.TestCase):
 
 def test_repository_manifest_is_content_addressed() -> None:
     source_root = SCRIPT.parent
+    repo_root = source_root.parent.parent
     with tempfile.TemporaryDirectory() as temporary:
         home = Path(temporary)
         reconciler = module.Reconciler(
             source_root=source_root,
             manifest_path=source_root / "fleet_outcome_manifest.json",
             home=home,
+            repo_root=repo_root,
         )
         reconciler.validate_sources()
         assert reconciler.manifest["files"]
@@ -382,6 +384,72 @@ def test_repository_manifest_is_content_addressed() -> None:
             "name": "ci-health-watch",
             "fields": {"script": "ci-health-watch-cron.py"},
         }
+
+
+def test_clickup_poll_gate_is_fleet_outcome_governed() -> None:
+    """Regression test for 86e2kxk4z: PR #317's retry/backoff fix to
+    scripts/clickup_poll_gate.py merged to main but had no manifest entry
+    anywhere, so it silently never reached the live mini even though
+    machine-setup/fleet-config/jobs.json invokes it by flat filename every
+    executor tick. clickup_poll_gate.py's single canonical source lives at
+    the repo root (scripts/), covered by its own tests/scripts/test_*
+    suite, so it is governed via source_root="repo" instead of being
+    vendored into machine-setup/mini-scripts (which would fork the file).
+    """
+    source_root = SCRIPT.parent
+    repo_root = source_root.parent.parent
+    manifest = json.loads(
+        (source_root / "fleet_outcome_manifest.json").read_text(encoding="utf-8")
+    )
+    entry = next(
+        (
+            f
+            for f in manifest["files"]
+            if f.get("destination") == "clickup_poll_gate.py"
+        ),
+        None,
+    )
+    assert entry is not None, "clickup_poll_gate.py has no fleet_outcome_manifest entry"
+    assert entry["destination_root"] == "scripts"
+    assert entry["source"] == "scripts/clickup_poll_gate.py"
+    assert entry["source_root"] == "repo"
+
+    real_source = repo_root / "scripts" / "clickup_poll_gate.py"
+    assert real_source.is_file()
+    actual = hashlib.sha256(real_source.read_bytes()).hexdigest()
+    assert entry["sha256"] == actual, (
+        "fleet_outcome_manifest.json clickup_poll_gate.py sha256 is stale — "
+        "the exact silent-never-deploys gap this entry exists to close"
+    )
+
+    with tempfile.TemporaryDirectory() as temporary:
+        home = Path(temporary)
+        reconciler = module.Reconciler(
+            source_root=source_root,
+            manifest_path=source_root / "fleet_outcome_manifest.json",
+            home=home,
+            repo_root=repo_root,
+        )
+        targets = reconciler.target_map()
+        target = reconciler.scripts_dir / "clickup_poll_gate.py"
+        assert target in targets
+        resolved_source, mode = targets[target]
+        assert resolved_source == real_source
+        assert mode == 0o644
+
+
+def test_clickup_poll_gate_is_no_longer_an_inert_mini_local_declaration() -> None:
+    """The old mini_local_registry.json entry declared clickup_poll_gate.py
+    as 'no repo source yet' — now that it is fleet-outcome governed, that
+    declaration must be gone or the deployment-coverage probe would treat
+    the live file as simultaneously mini-local AND bundle-governed.
+    """
+    source_root = SCRIPT.parent
+    registry = json.loads(
+        (source_root / "mini_local_registry.json").read_text(encoding="utf-8")
+    )
+    mini_local_paths = {entry["path"] for entry in registry["mini_local"]}
+    assert "scripts/clickup_poll_gate.py" not in mini_local_paths
 
 
 if __name__ == "__main__":

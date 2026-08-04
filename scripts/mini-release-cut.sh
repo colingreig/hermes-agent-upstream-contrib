@@ -710,8 +710,8 @@ install_governed_fleet_outcomes() {
   if [ "$DRY_RUN" -eq 1 ]; then
     dry_run_target_regular_file_metadata "$VENDORED_FLEET_OUTCOMES_RECONCILER_REL" || return 1
     dry_run_target_regular_file_metadata "$VENDORED_FLEET_OUTCOMES_MANIFEST_REL" || return 1
-    printf '\033[35m[DRY-RUN]\033[0m %s %s install --source-root %s --manifest %s --home %s --hermes-home %s --reload\n' \
-      "$release_dir/venv/bin/python" "$reconciler" "$source_root" "$manifest" \
+    printf '\033[35m[DRY-RUN]\033[0m %s %s install --source-root %s --repo-root %s --manifest %s --home %s --hermes-home %s --reload\n' \
+      "$release_dir/venv/bin/python" "$reconciler" "$source_root" "$release_dir" "$manifest" \
       "$HOME" "$HERMES_HOME"
     return 0
   fi
@@ -720,7 +720,7 @@ install_governed_fleet_outcomes() {
   [ -f "$manifest" ] && [ ! -L "$manifest" ] \
     || { warn "fleet-outcome manifest missing or symlinked: $manifest"; return 1; }
   if ! guarded_or_direct "$release_dir/venv/bin/python" "$reconciler" install \
-    --source-root "$source_root" --manifest "$manifest" \
+    --source-root "$source_root" --repo-root "$release_dir" --manifest "$manifest" \
     --home "$HOME" --hermes-home "$HERMES_HOME" --reload; then
     return 1
   fi

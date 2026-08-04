@@ -9,7 +9,7 @@
       "destination_root": "scripts",
       "destination": "reconcile_fleet_outcomes.py",
       "mode": "0755",
-      "sha256": "4e7a83e415c3724f127e784af24aacc40a28a58cd63056c544eccc05548623b8"
+      "sha256": "f7214a24aee54f70e1d6299d082fd765e719b0fe3d7d2134caea7c6972c7341a"
     },
     {
       "source": "ci-health-watch-cron.py",
@@ -100,7 +100,7 @@
       "destination_root": "scripts",
       "destination": "mini_local_registry.json",
       "mode": "0644",
-      "sha256": "87d9e4b1ebaa873435a3f595d4a7ec7ab3ac1bf4ff062b527e8078229d27c96a"
+      "sha256": "1f3fd77705bc707528510fa4a8d1be313ea902c3a85f71b5af6bedb3c9cf44da"
     },
     {
       "source": "hermes_usage_alert.py",
@@ -234,6 +234,14 @@
       "destination": "closeout_actor.py",
       "mode": "0644",
       "sha256": "abcdb6d7e9b6c5dae03618693bdac8f12ce9272ca6f0802e1aad4763656f6dbd"
+    },
+    {
+      "source": "scripts/clickup_poll_gate.py",
+      "source_root": "repo",
+      "destination_root": "scripts",
+      "destination": "clickup_poll_gate.py",
+      "mode": "0644",
+      "sha256": "59708d963a8e701eb2e35538099092cd1a979ec33da2de0102336b4b54f95cdf"
     }
   ],
   "cron_updates": [
