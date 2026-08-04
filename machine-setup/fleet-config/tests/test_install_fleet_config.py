@@ -166,6 +166,106 @@ def test_real_install_writes_all_three_destinations(bundle):
         assert (bundle["home"] / ".hermes" / "profiles" / "ops" / sub).is_dir()
 
 
+def test_install_round_trips_optional_environment_variable_dict_shape(bundle):
+    """A curated ``required_environment_variables`` entry that marks a name
+    optional (``{"name": ..., "optional": true}``) must survive install
+    byte-for-byte, even when the live jobs.json already holds a flattened
+    plain-string list for the same job id (e.g. from an older release or a
+    hand edit). ``cron/scheduler.py::_normalize_environment_variable_
+    declarations`` treats a bare string as REQUIRED, so a flattened optional
+    entry silently hard-fails the job with ``CronRequiredEnvironmentError``
+    instead of degrading gracefully when the credential is absent — the
+    exact drift found live 2026-08-03 on fleet-health-digest (f23a03e9d1b2).
+    """
+    required_env = [
+        {"name": "SUPABASE_ACCESS_TOKEN", "optional": True},
+        {"name": "IGNITE_SKILLS_ROOT", "optional": True},
+    ]
+    jobs_payload = {
+        "jobs": [
+            {
+                "id": "1",
+                "name": "synthetic-job",
+                "required_environment_variables": required_env,
+            }
+        ]
+    }
+    jobs_data = json.dumps(jobs_payload).encode()
+    (bundle["bundle_root"] / "jobs.json").write_bytes(jobs_data)
+    jobs_entry = next(
+        entry
+        for entry in bundle["manifest"]["files"]
+        if entry["deploy_mode"] == "jobs_json"
+    )
+    jobs_entry["sha256"] = _sha(jobs_data)
+    bundle["manifest_path"].write_text(
+        json.dumps(bundle["manifest"], indent=2), encoding="utf-8"
+    )
+
+    jobs_path = bundle["home"] / ".hermes" / "cron" / "jobs.json"
+    jobs_path.parent.mkdir(parents=True, exist_ok=True)
+    # Live jobs.json already holds the pre-fix flattened plain-string shape
+    # for the same job id.
+    live_jobs = {
+        "jobs": [
+            {
+                "id": "1",
+                "name": "synthetic-job",
+                "required_environment_variables": [
+                    "SUPABASE_ACCESS_TOKEN",
+                    "IGNITE_SKILLS_ROOT",
+                ],
+            }
+        ]
+    }
+    jobs_path.write_text(json.dumps(live_jobs, indent=2), encoding="utf-8")
+
+    rc = install_mod.install(
+        bundle["manifest"],
+        home=bundle["home"],
+        bundle_root=bundle["bundle_root"],
+        manifest_path=bundle["manifest_path"],
+        dry_run=False,
+    )
+    assert rc == 0
+
+    installed = json.loads(jobs_path.read_text(encoding="utf-8"))
+    assert installed["jobs"][0]["required_environment_variables"] == required_env
+
+
+def test_assert_required_environment_variables_roundtrip_fails_closed_on_drift():
+    """Direct unit coverage for the tripwire itself: if a future regression
+    in ``merge_jobs_json`` ever flattened an optional-dict declaration, this
+    guard must refuse the install rather than silently write a job whose
+    optional environment variable would become required.
+    """
+    bundled_jobs = [
+        {
+            "id": "1",
+            "name": "synthetic-job",
+            "required_environment_variables": [
+                {"name": "IGNITE_SKILLS_ROOT", "optional": True},
+            ],
+        }
+    ]
+    drifted_merged_jobs = [
+        {
+            "id": "1",
+            "name": "synthetic-job",
+            "required_environment_variables": ["IGNITE_SKILLS_ROOT"],
+        }
+    ]
+    with pytest.raises(install_mod.InstallError, match="did not round-trip the merge"):
+        install_mod._assert_required_environment_variables_roundtrip(
+            drifted_merged_jobs, bundled_jobs
+        )
+
+    # A byte-identical round trip must not raise.
+    install_mod._assert_required_environment_variables_roundtrip(
+        bundled_jobs, bundled_jobs
+    )
+
+
 def test_dry_run_and_activation_materialize_the_same_job_prompt_postconditions(
     bundle, monkeypatch
 ):
