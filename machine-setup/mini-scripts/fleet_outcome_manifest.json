@@ -23,8 +23,9 @@
       "destination_root": "scripts",
       "destination": "fleet_outcome_probe.py",
       "mode": "0755",
-      "sha256": "91c7d5df81e2a58a7d48f76e269dd1715f5978de2cab203ce2a679355559e4eb"
-    },    {
+      "sha256": "e50fe60b03b544f6272030197ca1ac7fc36b9672dfade3d0744fd08d94bd0d28"
+    },
+    {
       "source": "fleet_incident_report.py",
       "destination_root": "scripts",
       "destination": "fleet_incident_report.py",
@@ -64,7 +65,7 @@
       "destination_root": "scripts",
       "destination": "governed_path_trust.json",
       "mode": "0644",
-      "sha256": "4f8ec6c60b72458c9d9c6ab52f10311acf306b28915f0cd0d91802c50343a7ac"
+      "sha256": "c607fdd02bb9e6eca2c6f62ab7c2f9d7610409c0daf57f53b118e3a794f97910"
     },
     {
       "source": "digest_trusted_scripts.json",
@@ -92,13 +93,15 @@
       "destination_root": "scripts",
       "destination": "fleet_outcome_contracts.json",
       "mode": "0644",
-      "sha256": "511250efb7f3328821c5f421421175b0fd38b370d5ffe9f75765944b49f5f9a7"    },
+      "sha256": "0e57eb085a4c9bbdabf3672a2b9249996d03ea35ba60fd0b70f0c3546562ccfe"
+    },
     {
       "source": "mini_local_registry.json",
       "destination_root": "scripts",
       "destination": "mini_local_registry.json",
       "mode": "0644",
-      "sha256": "f381c928375d9714ac8ee9aee006e7c1a066241d63bf33e37b5808a2483c255c"    },
+      "sha256": "87d9e4b1ebaa873435a3f595d4a7ec7ab3ac1bf4ff062b527e8078229d27c96a"
+    },
     {
       "source": "hermes_usage_alert.py",
       "destination_root": "scripts",
