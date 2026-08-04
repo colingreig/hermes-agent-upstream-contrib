@@ -585,6 +585,7 @@
     {
       "label": "com.colingreig.hermes.degraded-secrets-monitor",
       "expected": "loaded",
+      "note_86e2mg7j3": "credential pool degraded is deliberately a SUCCESS marker, not a failure one, for this LaunchAgent-health contract: degraded_secrets_monitor.py already runs its own signature-deduped Slack DM + ClickUp comment escalation for a degraded credential pool (see that script's module docstring), so this probe's job is only to confirm the AGENT ITSELF is alive and functioning -- not to re-page the same known, already-alerted condition on every tick forever. A new alert line only prints once per distinct signature (see _signature()/dedup in degraded_secrets_monitor.py main()), so a routine 'credential pool degraded: ...' line -- with no accompanying 'alerted' line -- is the NORMAL shape of every tick for the remaining duration of a long-running incident; treating it as a failure_marker made this contract permanently red for as long as an already-known degradation persisted (an any-imperfection alarm -- see hermes-agent memory degraded-flag-unsatisfiable). Genuine AGENT malfunction (FATAL-loop, gateway parked, unresolved placeholder, and any delivery failure) stays in failure_patterns below and still pages. Paired with fleet_outcome_probe.py evaluating ALL matching latest_record_pattern lines in the tail window, not only the last one, so a genuine malfunction marker earlier in the same tick's output is never masked by a later routine line.",
       "outcome": {
         "kind": "text_artifact",
         "path": "~/.hermes/logs/degraded-secrets-monitor.launchd.log",
@@ -592,10 +593,9 @@
         "tail_lines": 5,
         "latest_record_pattern": "\\[degraded-secrets-monitor\\] (?:healthy|FATAL-loop|gateway parked|unresolved placeholder|credential pool degraded|alerted|alert delivery incomplete|recovered)",
         "success_patterns": [
-          "degraded-secrets-monitor.*(?:healthy|alerted|recovered)"
+          "degraded-secrets-monitor.*(?:healthy|alerted|recovered|credential pool degraded)"
         ],
         "failure_patterns": [
-          "credential pool degraded",
           "FATAL-loop",
           "gateway parked",
           "unresolved placeholder",

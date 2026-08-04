@@ -2252,6 +2252,126 @@ def test_degraded_secrets_monitor_success_marker_survives_trailing_diagnostics(t
     assert findings == []
 
 
+def test_degraded_secrets_monitor_deduped_ongoing_degradation_produces_zero_findings(tmp_path):
+    """86e2mg7j3: degraded_secrets_monitor.py only prints an 'alerted' line
+    once per DISTINCT breach signature (see its own dedup) — for the rest of
+    a long-running, already-known, already-paged incident every subsequent
+    tick just reprints the routine 'credential pool degraded: ...' line, so
+    the 'alerted'/'healthy'/'recovered' markers age out of a 5-line tail
+    almost immediately. Treating the routine line as a probe-level failure
+    made this LaunchAgent contract permanently red for as long as the
+    (already independently alerted) degradation persisted. This is the
+    deduped-degraded log shape: five ticks, no 'alerted' anywhere, must
+    produce zero findings."""
+    module = _load_module()
+    label = "com.colingreig.hermes.degraded-secrets-monitor"
+    outcome = _canonical_contract(launch_label=label)["outcome"]
+
+    deduped_tail = "".join(
+        "[degraded-secrets-monitor] credential pool degraded: "
+        "provider=anthropic id=backup status=missing_credential\n"
+        for _ in range(5)
+    )
+    artifact = _fresh_artifact(tmp_path, deduped_tail)
+    checked_outcome = {**outcome, "path": str(artifact)}
+
+    findings = module._check_artifact(
+        surface="launchd",
+        identifier=label,
+        outcome=checked_outcome,
+        home=tmp_path,
+        now=NOW,
+    )
+    assert findings == []
+
+
+def test_degraded_secrets_monitor_fresh_alerted_degradation_still_produces_zero_findings(tmp_path):
+    """Regression guard: a freshly-degraded tick that alerts successfully
+    (the FIRST tick of an incident) must keep behaving as it always has —
+    the probe defers entirely to degraded_secrets_monitor.py's own
+    successful Slack+ClickUp escalation and does not double-page."""
+    module = _load_module()
+    label = "com.colingreig.hermes.degraded-secrets-monitor"
+    outcome = _canonical_contract(launch_label=label)["outcome"]
+
+    fresh_tail = (
+        "[degraded-secrets-monitor] credential pool degraded: "
+        "provider=anthropic id=backup status=missing_credential\n"
+        "[degraded-secrets-monitor] alerted (slack=True clickup=True)\n"
+    )
+    artifact = _fresh_artifact(tmp_path, fresh_tail)
+    checked_outcome = {**outcome, "path": str(artifact)}
+
+    findings = module._check_artifact(
+        surface="launchd",
+        identifier=label,
+        outcome=checked_outcome,
+        home=tmp_path,
+        now=NOW,
+    )
+    assert findings == []
+
+
+def test_degraded_secrets_monitor_real_malfunction_still_surfaces_even_when_not_last_line(tmp_path):
+    """86e2mg7j3: a genuine agent malfunction (here, an unresolved secret
+    placeholder) that happened earlier in the tail window than a LATER,
+    routine 'credential pool degraded' line must still surface as a
+    failure_marker — the fix that stops routine degraded-status noise from
+    permanently reddening this contract must not also blind it to a real
+    malfunction just because something else printed after it."""
+    module = _load_module()
+    label = "com.colingreig.hermes.degraded-secrets-monitor"
+    outcome = _canonical_contract(launch_label=label)["outcome"]
+
+    mixed_tail = (
+        "[degraded-secrets-monitor] unresolved placeholder: "
+        "server=some-mcp var=SOME_API_KEY\n"
+        "[degraded-secrets-monitor] credential pool degraded: "
+        "provider=anthropic id=backup status=missing_credential\n"
+    )
+    artifact = _fresh_artifact(tmp_path, mixed_tail)
+    checked_outcome = {**outcome, "path": str(artifact)}
+
+    findings = module._check_artifact(
+        surface="launchd",
+        identifier=label,
+        outcome=checked_outcome,
+        home=tmp_path,
+        now=NOW,
+    )
+    assert [item["code"] for item in findings] == ["failure_marker"]
+
+
+def test_degraded_secrets_monitor_alert_delivery_failure_still_surfaces_as_failure(tmp_path):
+    """86e2mg7j3 acceptance: 'fresh degradation still ... surfaces as real
+    failure when appropriate' — specifically, when degraded_secrets_monitor's
+    OWN alerting pipeline fails to deliver, that is a genuine malfunction of
+    the agent itself (not just a known, already-paged world-state) and must
+    still trip failure_marker even though a routine 'credential pool
+    degraded' line (now a success marker) appears earlier in the window."""
+    module = _load_module()
+    label = "com.colingreig.hermes.degraded-secrets-monitor"
+    outcome = _canonical_contract(launch_label=label)["outcome"]
+
+    delivery_failure_tail = (
+        "[degraded-secrets-monitor] credential pool degraded: "
+        "provider=anthropic id=backup status=missing_credential\n"
+        "[degraded-secrets-monitor] alert delivery incomplete "
+        "(slack=False clickup=True); dedupe state NOT advanced\n"
+    )
+    artifact = _fresh_artifact(tmp_path, delivery_failure_tail)
+    checked_outcome = {**outcome, "path": str(artifact)}
+
+    findings = module._check_artifact(
+        surface="launchd",
+        identifier=label,
+        outcome=checked_outcome,
+        home=tmp_path,
+        now=NOW,
+    )
+    assert [item["code"] for item in findings] == ["failure_marker"]
+
+
 def _run_main(
     module,
     monkeypatch,
