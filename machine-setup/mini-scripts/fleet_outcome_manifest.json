@@ -100,14 +100,14 @@
       "destination_root": "scripts",
       "destination": "hermes_usage_alert.py",
       "mode": "0755",
-      "sha256": "396972cd6890db6ebaae1be47c2227f80dc7b617798bc1c2676d0ff073192b9f"
+      "sha256": "6540e0f430a8104157ae49da3201e60c6d7dd8a902704121cf01ab1b99c8d31a"
     },
     {
       "source": "degraded_secrets_monitor.py",
       "destination_root": "scripts",
       "destination": "degraded_secrets_monitor.py",
       "mode": "0755",
-      "sha256": "38b001098b9bb8aa532a28ab0815a170e0773b54df1bcc08e41a67715f8e8954"
+      "sha256": "71f785db1cb24ce0dbf4652521087bf951cf9beecb21ddf8ee9685b6b02c44ab"
     },
     {
       "source": "mcp_serve_reaper.py",
