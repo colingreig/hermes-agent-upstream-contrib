@@ -1,19 +1,19 @@
 ---
 title: REBUILD 7 content-lane canary
-date: 2026-08-01
+date: 2026-08-03
 doc_type: canary
 ---
 
-This canary re-verifies that the Hermes Mini `content-lane-executor` job reaches the governed
-ClickUp review handoff through the approved direct path: cron job `dcab830aa41c` invoking
-`/ignite-execute --lane content` on a fresh tick, with no manual intervention in between.
+This canary verifies the Hermes Mini content lane's fail-closed model routing after the
+dedicated content-lane-executor job was operator-retired in favor of the unified
+clickup-executor job. The unified job's own model/provider fields describe its primary
+coder tier (openai-codex/gpt-5.6-sol), so a content-lane draw could no longer inherit
+correctness by construction the way the dedicated job once did.
 
-The prior canary run (task 86e2kj1tr, first pass) was FAILed by the validator: the executor posted
-an interim BLOCKED HANDOFF while its PR sat unmerged, and only reached the real `ignite- HANDOFF: v1`
-packet roughly 26 minutes later, after a manual merge. This run is the repair: the same cron job,
-same fail-closed content profile (`provider: anthropic`, `model: claude-sonnet-5`,
-`no_fallback: true`), executed end-to-end in one continuous pass, producing this rewritten artifact
-and its handoff packet together, with no BLOCKED intermediate this time.
-
-The task reaches In Review purely on durable, criterion-by-criterion evidence: the merged commit,
-green CI, the deployed runtime, and an attached content-qa/v1 report bound to the exact commit hash.
+PR #319 closed that gap: `_apply_weighted_lane_to_job` in `cron/scheduler.py` now pins
+`provider=anthropic` and `model=claude-sonnet-5` whenever the selected lane is
+`content`, in addition to the existing `no_fallback=true`. Code-lane dispatch is
+unchanged. This run — session `cron_62714b869845_20260803_170030` — is the first live
+content-lane draw of the unified job since that fix merged and deployed, and the agent
+turn log confirms every API call in this session used `model=claude-sonnet-5
+provider=anthropic`, with zero fallback attempts observed.
