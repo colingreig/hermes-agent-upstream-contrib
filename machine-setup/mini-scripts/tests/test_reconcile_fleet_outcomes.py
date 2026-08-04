@@ -391,10 +391,28 @@ def test_clickup_poll_gate_is_fleet_outcome_governed() -> None:
     scripts/clickup_poll_gate.py merged to main but had no manifest entry
     anywhere, so it silently never reached the live mini even though
     machine-setup/fleet-config/jobs.json invokes it by flat filename every
-    executor tick. clickup_poll_gate.py's single canonical source lives at
-    the repo root (scripts/), covered by its own tests/scripts/test_*
-    suite, so it is governed via source_root="repo" instead of being
-    vendored into machine-setup/mini-scripts (which would fork the file).
+    executor tick.
+
+    clickup_poll_gate.py's single canonical source lives at the repo root
+    (scripts/), covered by its own tests/scripts/test_* suite. PR #349
+    originally governed it via source_root="repo" (resolving straight to
+    the repo-root file, no duplicate) plus a --repo-root flag threaded
+    through reconcile_fleet_outcomes.py and mini-release-cut.sh's
+    install_governed_fleet_outcomes(). That shipped in a single commit with
+    the manifest entry that depends on it — a self-hosting deadlock: every
+    Mini cut is executed by the CURRENTLY ACTIVE (old) cutter, which does
+    not know about --repo-root, so the very first cutover to that commit
+    fails fleet-outcome reconciliation and rolls back, forever, since the
+    old cutter can never become new without a successful cut. See the
+    2026-08-04 promotion incident for #349 (36e3a6da8).
+
+    Bundle-vendoring a byte-identical copy here breaks that deadlock: the
+    OLD cutter can deploy this commit fine (no --repo-root dependency), and
+    once it does, the (by-then-current) cutter already carries the
+    --repo-root plumbing inertly, so a fast-follow PR can safely flip this
+    entry back to source_root="repo" and delete the duplicate. Until that
+    fast-follow lands, this test pins both copies byte-identical so they
+    cannot silently drift apart.
     """
     source_root = SCRIPT.parent
     repo_root = source_root.parent.parent
@@ -412,14 +430,26 @@ def test_clickup_poll_gate_is_fleet_outcome_governed() -> None:
     assert entry is not None, "clickup_poll_gate.py has no fleet_outcome_manifest entry"
     assert entry["destination_root"] == "scripts"
     assert entry["source"] == "scripts/clickup_poll_gate.py"
-    assert entry["source_root"] == "repo"
+    assert entry.get("source_root", "bundle") == "bundle", (
+        "clickup_poll_gate.py is temporarily bundle-vendored (see docstring) "
+        "pending a fast-follow that bootstraps the Mini cutter's --repo-root "
+        "support before switching back to source_root=repo"
+    )
 
-    real_source = repo_root / "scripts" / "clickup_poll_gate.py"
-    assert real_source.is_file()
-    actual = hashlib.sha256(real_source.read_bytes()).hexdigest()
+    bundled_source = source_root / "scripts" / "clickup_poll_gate.py"
+    assert bundled_source.is_file()
+    actual = hashlib.sha256(bundled_source.read_bytes()).hexdigest()
     assert entry["sha256"] == actual, (
         "fleet_outcome_manifest.json clickup_poll_gate.py sha256 is stale — "
         "the exact silent-never-deploys gap this entry exists to close"
+    )
+
+    real_source = repo_root / "scripts" / "clickup_poll_gate.py"
+    assert real_source.is_file()
+    assert bundled_source.read_bytes() == real_source.read_bytes(), (
+        "machine-setup/mini-scripts/scripts/clickup_poll_gate.py has drifted "
+        "from the canonical scripts/clickup_poll_gate.py — resync the "
+        "bundled copy (or land the source_root=repo fast-follow)"
     )
 
     with tempfile.TemporaryDirectory() as temporary:
@@ -434,7 +464,7 @@ def test_clickup_poll_gate_is_fleet_outcome_governed() -> None:
         target = reconciler.scripts_dir / "clickup_poll_gate.py"
         assert target in targets
         resolved_source, mode = targets[target]
-        assert resolved_source == real_source
+        assert resolved_source == bundled_source
         assert mode == 0o644
 
 
