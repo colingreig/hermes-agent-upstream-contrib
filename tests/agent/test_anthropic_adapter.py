@@ -391,6 +391,44 @@ class TestResolveAnthropicToken:
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
         assert resolve_anthropic_token() is None
 
+    def test_total_miss_persists_diagnostic_on_pool_entry(self, monkeypatch, tmp_path):
+        """86e2mg0g7: a bare resolution miss (no source had a token) must
+        leave a trail on any existing anthropic pool entry instead of
+        silently returning None with last_status/last_error_reason still
+        null forever."""
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
+        monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+        monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path / "home")
+        hermes_home = tmp_path / "hermes"
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        from agent.credential_pool import STATUS_UNRESOLVED
+
+        hermes_home.mkdir(parents=True, exist_ok=True)
+        (hermes_home / "auth.json").write_text(json.dumps({
+            "credential_pool": {
+                "anthropic": [{
+                    "id": "cred-1",
+                    "provider": "anthropic",
+                    "label": "env:ANTHROPIC_API_KEY",
+                    "auth_type": "api_key",
+                    "priority": 0,
+                    "source": "env:ANTHROPIC_API_KEY",
+                    "access_token": "sk-ant-api03-stale",
+                    "request_count": 0,
+                }]
+            }
+        }))
+
+        assert resolve_anthropic_token() is None
+
+        persisted = json.loads((hermes_home / "auth.json").read_text())
+        entry = persisted["credential_pool"]["anthropic"][0]
+        assert entry["last_status"] == STATUS_UNRESOLVED
+        assert entry["last_error_reason"]
+        assert "env_visibility" in entry["last_error_reason"]
+
     def test_falls_back_to_claude_code_oauth_token(self, monkeypatch, tmp_path):
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)

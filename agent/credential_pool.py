@@ -75,6 +75,16 @@ STATUS_EXHAUSTED = "exhausted"
 # login) rewrites the tokens.
 STATUS_DEAD = "dead"
 
+# Diagnostic-only — the resolver could not find a usable credential from ANY
+# configured source (env, OAuth file, pool) at request time, but no request
+# was ever sent so there is no upstream verdict to classify as
+# exhausted/dead. Deliberately excluded from every ``_available_entries``
+# gating check so it never blocks rotation the way EXHAUSTED/DEAD do; it
+# exists purely so ``last_status``/``last_error_reason`` stop reading null
+# after an intermittent resolution miss (see 86e2mg0g7 — resolution failures
+# on the raw env-key path never touched a pool entry at all).
+STATUS_UNRESOLVED = "unresolved"
+
 # OAuth error reasons that indicate the credential is permanently invalid
 # server-side and cannot be recovered by retry/refresh.  Sourced from
 # OpenAI Codex Responses API, Anthropic, xAI, and Google OAuth spec.
@@ -2985,6 +2995,52 @@ def record_probe_verdict(
             return False
         _save_auth_store(auth_store)
         return True
+
+
+def record_resolution_failure(provider: str, reason: str) -> int:
+    """Persist a diagnostic marker when a token resolver found NO usable
+    credential from any source (env, OAuth file, pool) before a single
+    request went out.
+
+    This path normally never touches ``PooledCredential`` state at all — the
+    request-time failure handlers (``_mark_exhausted`` et al.) only run
+    *after* a request is attempted, so a pure resolution miss leaves
+    ``last_status``/``last_error_reason`` permanently null even when it
+    recurs (see 86e2mg0g7: an intermittent "No Anthropic credentials found"
+    had zero corresponding pool state, indistinguishable from "never
+    happened"). Writes ``STATUS_UNRESOLVED`` — never EXHAUSTED/DEAD — so this
+    is pure instrumentation and never affects rotation.
+
+    Every entry for the provider is marked, since a bare resolution miss
+    (as opposed to a request-time 401/429 against one specific key) isn't
+    attributable to a single entry.
+
+    Returns the number of entries updated (0 if the provider has no pool
+    entries at all — a valid "never configured" state, not an error).
+    """
+    provider = (provider or "").strip().lower()
+    if not provider or not reason:
+        return 0
+    updated = 0
+    with _auth_store_lock():
+        auth_store = _load_auth_store()
+        pool = auth_store.get("credential_pool")
+        if not isinstance(pool, dict):
+            return 0
+        raw_entries = pool.get(provider)
+        if not isinstance(raw_entries, list):
+            return 0
+        now = time.time()
+        for payload in raw_entries:
+            if not isinstance(payload, dict):
+                continue
+            payload["last_status"] = STATUS_UNRESOLVED
+            payload["last_status_at"] = now
+            payload["last_error_reason"] = reason
+            updated += 1
+        if updated:
+            _save_auth_store(auth_store)
+        return updated
 
 
 def failure_summary(provider: Optional[str] = None) -> Dict[str, List[Dict[str, Any]]]:
