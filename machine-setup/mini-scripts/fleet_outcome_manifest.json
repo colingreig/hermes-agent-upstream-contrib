@@ -65,7 +65,7 @@
       "destination_root": "scripts",
       "destination": "governed_path_trust.json",
       "mode": "0644",
-      "sha256": "c607fdd02bb9e6eca2c6f62ab7c2f9d7610409c0daf57f53b118e3a794f97910"
+      "sha256": "8cbd8ecb1d7c3b69df897536dc3cba6f182c0327d837d313604325fda55905f8"
     },
     {
       "source": "digest_trusted_scripts.json",
