@@ -93,7 +93,7 @@
       "destination_root": "scripts",
       "destination": "mini_local_registry.json",
       "mode": "0644",
-      "sha256": "da9b739aa8cb806e2eabfb0b4ab652a26e1b4cefbdddf2a90edf4596eee54e6c"
+      "sha256": "babe156b6717bf26ba4d5595da6ce42ba0edfab27143d82bec1b0ab8744b2f59"
     },
     {
       "source": "hermes_usage_alert.py",
@@ -213,6 +213,20 @@
       "destination": "supabase_rls_guard.py",
       "mode": "0755",
       "sha256": "fee1c085fc0ba16795f4f65421d26f4d54bc0199afeebf628f7cbaaba1782ae2"
+    },
+    {
+      "source": "sentinel_run.sh",
+      "destination_root": "scripts",
+      "destination": "sentinel_run.sh",
+      "mode": "0755",
+      "sha256": "762a4431f3289bd57ba38b050e64ffe2c313719d0e64bec205d457abf4cc2500"
+    },
+    {
+      "source": "closeout_actor.py",
+      "destination_root": "scripts",
+      "destination": "closeout_actor.py",
+      "mode": "0644",
+      "sha256": "abcdb6d7e9b6c5dae03618693bdac8f12ce9272ca6f0802e1aad4763656f6dbd"
     }
   ],
   "cron_updates": [
