@@ -417,8 +417,28 @@ def _apply_skill_fields(job: Dict[str, Any]) -> Dict[str, Any]:
     return normalized
 
 
-def _normalize_required_environment_variables(value: Any) -> List[str]:
-    """Return an ordered, unique list of valid shell environment names."""
+def _normalize_required_environment_variables(value: Any) -> List[Any]:
+    """Return an ordered, unique list of shell environment declarations.
+
+    Shape-preserving for the one bit of information a plain string can't
+    carry: a dict entry declaring ``optional: true`` is kept as
+    ``{"name": ..., "optional": True}``; every other entry (a plain string,
+    or a dict with no/false ``optional``) canonicalizes to a bare name
+    string, since that's semantically identical to a non-optional dict and
+    is the existing on-disk shape for most jobs. Names are always
+    validated/cleaned and unknown dict keys are dropped.
+
+    This mirrors ``cron.scheduler._normalize_environment_variable_declarations``,
+    whose consumers — the required-env enforcement gate and
+    ``_install_cron_child_env`` — already depend on seeing the ``optional``
+    flag on stored job data (curated fleet-config installs write dict-shaped
+    optional entries directly). Previously this function collapsed *every*
+    entry to a bare name string, which meant every ``update_job()`` call (the
+    write path behind ``pause_job``/``resume_job``/``trigger_job`` and the
+    agent ``cronjob`` tool) silently dropped ``optional: true`` from stored
+    jobs, turning declared-optional variables into hard requirements
+    (86e2m2c1g).
+    """
     if isinstance(value, str):
         entries = [value]
     elif isinstance(value, (list, tuple)):
@@ -426,17 +446,36 @@ def _normalize_required_environment_variables(value: Any) -> List[str]:
     else:
         return []
 
-    names: List[str] = []
+    normalized: List[Any] = []
+    indexes: Dict[str, int] = {}
     for entry in entries:
-        raw_name = entry.get("name") if isinstance(entry, dict) else entry
+        if isinstance(entry, dict):
+            raw_name = entry.get("name")
+            optional = bool(entry.get("optional"))
+        else:
+            raw_name = entry
+            optional = False
         if not isinstance(raw_name, str):
             continue
         name = raw_name.strip()
         if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
             continue
-        if name not in names:
-            names.append(name)
-    return names
+        rendered: Any = {"name": name, "optional": True} if optional else name
+
+        existing_index = indexes.get(name)
+        if existing_index is None:
+            indexes[name] = len(normalized)
+            normalized.append(rendered)
+            continue
+
+        existing = normalized[existing_index]
+        existing_optional = isinstance(existing, dict)
+        if existing_optional and not optional:
+            # A required declaration wins over an optional duplicate,
+            # mirroring the scheduler's declaration merge so stored job data
+            # and enforcement never disagree.
+            normalized[existing_index] = rendered
+    return normalized
 
 
 def _coerce_job_text(value: Any, fallback: str = "") -> str:

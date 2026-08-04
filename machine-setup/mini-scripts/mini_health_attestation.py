@@ -777,11 +777,24 @@ def collect_live(home: Path, hermes_home: Path) -> dict[str, Any]:
 
     credentials: list[dict[str, Any]] = []
     for job in jobs:
-        for name in job.get("required_environment_variables") or []:
+        for entry in job.get("required_environment_variables") or []:
+            # Entries are shape-preserving (cron.jobs._normalize_required_environment_variables,
+            # 86e2m2c1g): a plain string is a required var name, a dict
+            # carries {"name": ..., "optional": ...}. Extract the name
+            # explicitly instead of str()-ing the raw entry, which would
+            # otherwise stringify a dict into a garbage credential name.
+            if isinstance(entry, dict):
+                name = entry.get("name")
+                optional = bool(entry.get("optional"))
+            else:
+                name = entry
+                optional = False
+            if not isinstance(name, str) or not name:
+                continue
             available = False
             classification = "fatal"
             try:
-                value = get_required(str(name)) if get_required is not None else None
+                value = get_required(name) if get_required is not None else None
                 available = bool(value)
                 if get_required is not None:
                     classification = "available" if available else "missing"
@@ -792,7 +805,8 @@ def collect_live(home: Path, hermes_home: Path) -> dict[str, Any]:
             credentials.append(
                 {
                     "job": job.get("name") or job.get("id"),
-                    "name": str(name),
+                    "name": name,
+                    "optional": optional,
                     "available": available,
                     "classification": classification,
                 }
