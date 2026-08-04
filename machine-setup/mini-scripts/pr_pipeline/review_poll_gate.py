@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 # intentionally only a compatibility shim, so implementation dependencies stay
 # inside the package and can never fall back to retired flat helper modules.
 from . import autonomous_merge
+from . import hermes_validate_ops
 from . import pr_pipeline_event_driven
 from . import pr_pipeline_improvements
 from . import validator_verdict
@@ -212,10 +213,6 @@ def _revalidation_sweep():
 
     Best-effort — never fatal. Returns number of tasks re-tagged."""
     try:
-        # ~/.hermes/hermes-agent/venv no longer exists post 2026-07-19 deploy
-        # topology change (releases/vX.Y.Z-<sha>/ + runtime-current symlink).
-        PY = os.path.expanduser("~/.hermes/runtime-current/venv/bin/python3.11")
-        VAL_OPS = os.path.join(SCRIPTS_DIR, "hermes_validate_ops.py")
         gaps = autonomous_merge.sweep_gaps()
         retagged = 0
         for g in gaps:
@@ -232,15 +229,11 @@ def _revalidation_sweep():
                     )
                     continue
                 try:
-                    r = subprocess.run(
-                        [PY, VAL_OPS, "add-tag", task_id, "needs-validation"],
-                        capture_output=True, text=True, timeout=30)
-                    if r.returncode == 0:
+                    if hermes_validate_ops.add_tag(task_id, NEEDS_TAG):
                         print(f"[review-gate] re-tagged {task_id} with needs-validation")
                         retagged += 1
                     else:
-                        print(f"[review-gate] re-tag {task_id} failed: {r.stderr.strip()[:120]}",
-                              file=sys.stderr)
+                        print(f"[review-gate] re-tag {task_id} failed", file=sys.stderr)
                 except Exception as e:
                     print(f"[review-gate] re-tag {task_id} error: {e!r}", file=sys.stderr)
             else:
@@ -342,16 +335,12 @@ def _orphan_pr_sweep():
         if (time.time() - last_scan) < ORPHAN_SCAN_INTERVAL_S:
             return 0  # not time yet — skip silently
 
-        # ~/.hermes/hermes-agent/venv no longer exists post 2026-07-19 deploy
-        # topology change (releases/vX.Y.Z-<sha>/ + runtime-current symlink).
-        PY = os.path.expanduser("~/.hermes/runtime-current/venv/bin/python3.11")
-        VAL_OPS = os.path.join(SCRIPTS_DIR, "hermes_validate_ops.py")
-
         allowlist = autonomous_merge._load_allowlist()
         store = validator_verdict.load_verdicts()
         stored_keys = set(store.keys())  # e.g. {"owner/repo#72", ...}
 
         tagged = 0
+        write_failed = False
         scanned_repos = 0
 
         for repo in sorted(allowlist):
@@ -382,30 +371,42 @@ def _orphan_pr_sweep():
                         continue
                     if _task_has_needs_validation_tag(task_id):
                         continue  # already tagged — validator will pick it up
+                    if _task_is_human_fenced(task_id):
+                        print(
+                            f"[review-gate] preserving human fence on {task_id}; "
+                            "not orphan-tagging needs-validation"
+                        )
+                        continue
                     print(f"[review-gate] orphan-pr {repo}#{pr_num} — no verdict in "
                           f"store, task {task_id} lacks needs-validation; re-tagging")
                     try:
-                        r2 = subprocess.run(
-                            [PY, VAL_OPS, "add-tag", task_id, NEEDS_TAG],
-                            capture_output=True, text=True, timeout=30)
-                        if r2.returncode == 0:
+                        if hermes_validate_ops.add_tag(task_id, NEEDS_TAG):
                             print(f"[review-gate] orphan-tagged {task_id} "
                                   f"({repo}#{pr_num}) with needs-validation")
                             tagged += 1
                         else:
-                            print(f"[review-gate] orphan-tag {task_id} failed: "
-                                  f"{r2.stderr.strip()[:120]}", file=sys.stderr)
+                            write_failed = True
+                            print(f"[review-gate] orphan-tag {task_id} failed", file=sys.stderr)
                     except Exception as e:
+                        write_failed = True
                         print(f"[review-gate] orphan-tag {task_id} error: {e!r}",
                               file=sys.stderr)
             except Exception as e:
                 print(f"[review-gate] orphan scan {repo} error (non-fatal): {e!r}",
                       file=sys.stderr)
 
-        # Record the scan time (so the throttle suppresses until next window)
-        state = _load(STATE_PATH, {})
-        state["last_orphan_scan_ts"] = time.time()
-        _save(STATE_PATH, state)
+        # Only throttle a completed scan.  A failed ClickUp write must be retried
+        # on the next gate tick rather than hidden for the full two-hour window.
+        if not write_failed:
+            state = _load(STATE_PATH, {})
+            state["last_orphan_scan_ts"] = time.time()
+            _save(STATE_PATH, state)
+        else:
+            print(
+                "[review-gate] orphan-pr-sweep had failed tag write(s); "
+                "leaving scan timestamp unchanged for next-tick retry",
+                file=sys.stderr,
+            )
         print(f"[review-gate] orphan-pr-sweep complete: "
               f"{tagged} orphan(s) re-tagged, {scanned_repos} repos scanned")
         return tagged
