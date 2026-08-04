@@ -749,7 +749,7 @@
       "skills": [],
       "skill_scope": "ops",
       "max_turns": 40,
-      "required_environment_variables": null,
+      "required_environment_variables": [],
       "context_from": null,
       "enabled_toolsets": null,
       "repeat": {
