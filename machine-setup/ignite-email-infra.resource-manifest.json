@@ -8,9 +8,9 @@
   "cron_schedule_authority": {
     "hermes_cron_job_id": "6e25865a22a4",
     "job_name": "Purelymail notify-me poller",
-    "live_schedule_expr": "*/45 * * * *",
-    "live_schedule_display": "*/45 * * * *",
-    "notes": "Schedule authority lives in Hermes fleet jobs.json once aligned; live Mini cadence is */45 as of 2026-08-01. Skip escalation SLA is ~135 minutes (three missed fires) versus ~45 minutes at the former */15 cadence."
+    "live_schedule_expr": "*/15 * * * *",
+    "live_schedule_display": "*/15 * * * *",
+    "notes": "Schedule authority lives in Hermes fleet jobs.json once aligned; live Mini cadence reconciled back to */15 on 2026-08-03 (the */45 cadence recorded 2026-08-01 was scheduler drift, not an intended change; runbook and contract expect */15). Skip escalation SLA is ~45 minutes (three missed fires)."
   },
   "runtime_lock": {
     "path": "~/.hermes/state/purelymail-poller/.lock",

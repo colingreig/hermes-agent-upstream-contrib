@@ -85,7 +85,7 @@
     {
       "src_rel": "jobs.json",
       "dest_abs": "~/.hermes/cron/jobs.json",
-      "sha256": "68180623c0f4d9f1fd4ce22acab90ba8dce7d170d4607b8abb10b047616708d1",
+      "sha256": "4d7109c63b589c9e86d6c9a259122201d7d8b8897559ceb0e100b07838239f50",
       "role": "curated 17-job cron set (12 kept + 3 consolidated + Purelymail poller; direct ClickUp executor prompts; hermes-pr-validate re-enabled 2026-07-31 and pinned to IGNITE_SKILLS_ROOT); merges bundled definitions while preserving scheduler runtime for unchanged job ids; validator-live-trigger added 2026-08-03 (86e2m44np) as the deterministic fenced validate_pr.py producer with job-scoped HERMES_VALIDATOR_FINALIZE_TOKEN",
       "deploy_mode": "jobs_json"
     },

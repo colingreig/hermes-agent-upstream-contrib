@@ -51,12 +51,14 @@ mutation registry.
 | --- | --- |
 | Hermes cron job id | `6e25865a22a4` |
 | Job name | Purelymail notify-me poller |
-| Live cadence (2026-08-01) | `*/45 * * * *` |
+| Live cadence (2026-08-03, reconciled) | `*/15 * * * *` |
 | Retired job id (must stay absent) | `6139465f559f` |
 
-**SLA tradeoff:** at `*/45`, three consecutive scheduler misses imply ~135 minutes
-before a skip is treated as an outage signal. The former `*/15` cadence implied
-~45 minutes for the same three-miss window. Schedule changes are Hermes-side
+**SLA tradeoff:** at `*/15`, three consecutive scheduler misses imply ~45 minutes
+before a skip is treated as an outage signal. A `*/45` cadence was briefly live
+2026-08-01 through 2026-08-03 (scheduler drift, not an intended change) and
+implied ~135 minutes for the same three-miss window; reconciled back to `*/15`
+2026-08-03. Schedule changes are Hermes-side
 (`machine-setup/fleet-config/jobs.json` via the fleet installer) but must not
 change poller script bytes — those remain ignite-email-infra owned.
 

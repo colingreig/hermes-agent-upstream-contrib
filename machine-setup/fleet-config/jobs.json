@@ -772,10 +772,10 @@
       "name": "Purelymail notify-me poller",
       "schedule": {
         "kind": "cron",
-        "expr": "*/45 * * * *",
-        "display": "*/45 * * * *"
+        "expr": "*/15 * * * *",
+        "display": "*/15 * * * *"
       },
-      "schedule_display": "*/45 * * * *",
+      "schedule_display": "*/15 * * * *",
       "enabled": true,
       "state": "scheduled",
       "no_agent": true,

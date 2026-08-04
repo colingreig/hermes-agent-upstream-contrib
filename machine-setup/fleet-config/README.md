@@ -59,7 +59,7 @@ evidence; it writes an immutable recovery receipt.
 
 The ignite-email-infra Purelymail poller boundary is documented in
 `machine-setup/cross-repo-operating-contract.md` (schedule authority cron id
-`6e25865a22a4`, live `*/45 * * * *`). Poller script deploys stay in the
+`6e25865a22a4`, live `*/15 * * * *`). Poller script deploys stay in the
 partner repo — Hermes registers the cron schedule only.
 
 ## Production release path
