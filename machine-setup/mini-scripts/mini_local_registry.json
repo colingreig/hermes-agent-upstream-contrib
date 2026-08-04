@@ -288,11 +288,6 @@
    "reason": "mini-only ClickUp ops chokepoint script; no repo source yet (see hermes-cron-executes-from-scripts-dir-not-release); vendor into machine-setup/mini-scripts before changing"
   },
   {
-   "path": "scripts/clickup_poll_gate.py",
-   "category": "clickup-ops",
-   "reason": "mini-only ClickUp ops chokepoint script; no repo source yet (see hermes-cron-executes-from-scripts-dir-not-release); vendor into machine-setup/mini-scripts before changing"
-  },
-  {
    "path": "scripts/clickup_review_sla.py",
    "category": "clickup-ops",
    "reason": "mini-only ClickUp ops chokepoint script; no repo source yet (see hermes-cron-executes-from-scripts-dir-not-release); vendor into machine-setup/mini-scripts before changing"
