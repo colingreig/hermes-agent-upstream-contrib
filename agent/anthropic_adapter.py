@@ -1332,6 +1332,35 @@ def resolve_anthropic_token() -> Optional[str]:
     if api_key:
         return api_key
 
+    # Nothing resolved from any of the 5 sources above. Log exactly what this
+    # call observed — env-var presence, not values — so an intermittent miss
+    # (86e2mg0g7: "No Anthropic credentials found" with zero corresponding
+    # 429/exhaustion evidence from api.anthropic.com) is diagnosable instead
+    # of unexplainable. A genuine "never configured" provider looks the same
+    # as a transient visibility gap in the error text alone; this line tells
+    # them apart after the fact.
+    env_visibility = {
+        "ANTHROPIC_TOKEN": bool(token),
+        "CLAUDE_CODE_OAUTH_TOKEN": bool(cc_token),
+        "claude_code_credentials_file": bool(creds),
+        "claude_code_credentials_usable": bool(resolved_claude_token),
+        "credential_pool_oauth_entry": bool(resolved_pool_token),
+        "ANTHROPIC_API_KEY": bool(api_key),
+    }
+    logger.warning(
+        "resolve_anthropic_token: no credential resolved from any source [env_visibility=%s]",
+        env_visibility,
+    )
+    try:
+        from agent.credential_pool import record_resolution_failure
+
+        record_resolution_failure(
+            "anthropic",
+            f"resolve_anthropic_token found nothing; env_visibility={env_visibility}",
+        )
+    except Exception:
+        logger.debug("record_resolution_failure(anthropic) failed", exc_info=True)
+
     return None
 
 
