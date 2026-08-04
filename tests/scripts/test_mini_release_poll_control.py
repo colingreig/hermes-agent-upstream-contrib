@@ -82,13 +82,18 @@ def test_corrupt_or_unsafe_state_fails_closed_without_repair(tmp_path: Path) -> 
 
 def _poll_fixture(tmp_path: Path) -> tuple[Path, Path]:
     hermes = tmp_path / ".hermes"
-    runtime = hermes / "runtime-current"
-    scripts = runtime / "scripts"
-    python_dir = runtime / "venv" / "bin"
     releases = hermes / "releases"
+    # runtime-current must be an ABSOLUTE symlink to a direct child of
+    # releases/ -- the poller now fails closed on any other pointer shape
+    # (ClickUp 86e2kt3yr), so the fixture has to model the real topology
+    # rather than a plain directory standing in for the active release.
+    release = releases / "v9.9.9-abcdef123456"
+    runtime = hermes / "runtime-current"
+    scripts = release / "scripts"
+    python_dir = release / "venv" / "bin"
     scripts.mkdir(parents=True)
     python_dir.mkdir(parents=True)
-    releases.mkdir()
+    runtime.symlink_to(release)
     shutil.copy2(WRAPPER, scripts / WRAPPER.name)
     shutil.copy2(CONTROL, scripts / CONTROL.name)
     shutil.copy2(CERTIFIER, scripts / CERTIFIER.name)

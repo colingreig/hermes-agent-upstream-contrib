@@ -165,7 +165,7 @@
       "current_lock_or_transaction_boundary": {
         "kind": "directory lease and atomic release pointer swap",
         "path_or_identity": "~/.hermes/releases/.mini-release-cut.lock",
-        "behavior": "Builds and validates a fresh release before atomically repointing runtime-current; serializes cuts, rollback, and prune."
+        "behavior": "Builds and validates a fresh release before atomically repointing runtime-current; serializes cuts, rollback, prune, and --repair-pointer. --repair-pointer is the one mode that takes this lock WITHOUT a production-write lease (the lease bootstraps from the active clone, which a corrupt runtime-current makes unreachable); it never evicts a stale owner, refuses outright if a cutter holds the lock, and can only repoint at the runtime_target of a receipt that byte-matches its content-addressed twin."
       },
       "rollback_surface": {
         "surface": "~/.hermes/releases/.previous and .mini-release-last-receipt.json",

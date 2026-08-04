@@ -160,7 +160,7 @@ def _is_mini_production_context(hermes: Path) -> bool:
     return sys.platform == "darwin" and hermes == _MINI_PRODUCTION_HOME
 
 
-_CUTTER_SHA256 = "3876981a873ba1ffc1bd8ee86cb2a73acb165e26cf9d9e2eade1cfb8e17792fb"
+_CUTTER_SHA256 = "9d9d7493ace0006081e44b9f6fb8f211692b38db2bcae4fc799ec1b36dc73b7f"
 _RELEASE_NAME = re.compile(r"^v[0-9][0-9A-Za-z.!+_-]*-[0-9a-f]{12,64}$")
 _CUTTER_VALUE_FLAGS = {"--ref", "--certified-sha", "--promotion-receipt-id"}
 _CUTTER_BOOL_FLAGS = {"--if-advanced", "--preflight", "--rollback", "--prune", "--dry-run", "--offline"}

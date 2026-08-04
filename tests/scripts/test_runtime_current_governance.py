@@ -233,7 +233,12 @@ def test_bare_relative_runtime_pointer_has_distinct_persisted_failure(tmp_path):
     persisted = json.loads(receipt.read_text(encoding="utf-8"))
     assert persisted["status"] == "failed"
     assert persisted["failure_code"] == "runtime_current_broken"
-    assert "runtime-current target is missing" in persisted["failure_reason"]
+    # Before ClickUp 86e2kt3yr this shape was only caught downstream, as
+    # "runtime-current target is missing" -- true but misleading, because it
+    # reads as a pruned release rather than a malformed pointer. The verifier
+    # now inspects the raw link text first, so the persisted reason names the
+    # actual defect and the operator knows to repair the pointer, not re-cut.
+    assert "relative symlink" in persisted["failure_reason"]
 
 
 def test_guard_and_verifier_are_explicitly_hash_pinned_for_scripts_deployment():
