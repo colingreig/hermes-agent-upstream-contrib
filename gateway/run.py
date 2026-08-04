@@ -4775,7 +4775,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 gateway_state=gateway_state,
                 exit_reason=exit_reason,
                 restart_requested=self._restart_requested,
-                active_agents=self._active_work_count(),
+                active_agents=self._active_work_count,
             )
         except Exception:
             pass
@@ -4798,7 +4798,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         try:
             from gateway.status import write_runtime_status
-            write_runtime_status(active_agents=self._active_work_count())
+            write_runtime_status(active_agents=self._active_work_count)
         except Exception:
             pass
 

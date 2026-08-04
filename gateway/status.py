@@ -886,8 +886,14 @@ def write_runtime_status(
     error_message: Any = _UNSET,
     served_profiles: Any = _UNSET,
 ) -> None:
-    """Persist gateway runtime health information for diagnostics/status."""
+    """Persist gateway runtime health information for diagnostics/status.
+
+    ``active_agents`` may be a zero-argument provider so callers can take the
+    live-work snapshot inside the same lock that serializes the merge/write.
+    """
     with _runtime_status_write_lock:
+        if callable(active_agents):
+            active_agents = active_agents()
         _write_runtime_status_unlocked(
             gateway_state=gateway_state,
             exit_reason=exit_reason,
