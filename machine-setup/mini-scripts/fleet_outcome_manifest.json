@@ -240,7 +240,7 @@
       "destination_root": "scripts",
       "destination": "clickup_poll_gate.py",
       "mode": "0644",
-      "sha256": "59708d963a8e701eb2e35538099092cd1a979ec33da2de0102336b4b54f95cdf"
+      "sha256": "71f04d309f0546f61af7ead99800b031afe6a82c998d13b3a2e55e96efa1566c"
     }
   ],
   "cron_updates": [

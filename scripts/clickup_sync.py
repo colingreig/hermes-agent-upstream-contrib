@@ -128,8 +128,8 @@ def _curl(path: str, *, timeout: int = 45) -> Dict[str, Any]:
         status = 0
     if status in {401, 403}:
         raise PermissionError(f"ClickUp auth failed (HTTP {status}) on {path}: {body_text[:200]}")
-    if status >= 500 or status == 0:
-        raise RuntimeError(f"ClickUp server/network error (HTTP {status}) on {path}: {body_text[:200]}")
+    if status >= 400 or status == 0:
+        raise RuntimeError(f"ClickUp HTTP failure (HTTP {status}) on {path}: {body_text[:200]}")
     try:
         return json.loads(body_text) if body_text.strip() else {}
     except json.JSONDecodeError as exc:
