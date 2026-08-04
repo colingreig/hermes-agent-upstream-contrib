@@ -739,12 +739,14 @@ def _admit_api_agent_request(handler):
         reservation = {"active": True}
         token = _api_agent_request_reservation.set(reservation)
         self._pending_agent_requests += 1
+        self._notify_active_agent_work_changed()
         try:
             return await handler(self, request, *args, **kwargs)
         finally:
             if reservation["active"]:
                 reservation["active"] = False
                 self._pending_agent_requests = max(0, self._pending_agent_requests - 1)
+                self._notify_active_agent_work_changed()
             _api_agent_request_reservation.reset(token)
 
     return _wrapped
@@ -755,6 +757,7 @@ def _release_pending_api_work(adapter, reservation: dict[str, bool]) -> None:
     if reservation["active"]:
         reservation["active"] = False
         adapter._pending_agent_requests = max(0, adapter._pending_agent_requests - 1)
+        adapter._notify_active_agent_work_changed()
 
 
 @contextmanager
@@ -766,6 +769,7 @@ def _reserve_pending_api_work(adapter):
     """
     reservation = {"active": True, "detached": False}
     adapter._pending_agent_requests += 1
+    adapter._notify_active_agent_work_changed()
     try:
         yield reservation
     finally:
@@ -1026,6 +1030,10 @@ class APIServerAdapter(BasePlatformAdapter):
         # (the /v1/runs path tracks its own in-flight set via
         # _active_run_tasks).
         self._inflight_agent_runs: int = 0
+        # Executor threads cannot be cancelled by cancelling their asyncio
+        # wrappers. Structured /v1/runs tasks that unwind while their thread is
+        # still alive transfer here so admission and shutdown remain truthful.
+        self._detached_executor_runs: int = 0
         # Back-reference to the owning GatewayRunner (set by gateway/run.py)
         # so /api/platforms/{platform}/events can resolve sibling adapters.
         # BasePlatformAdapter declares the class-level default of None.
@@ -1047,10 +1055,32 @@ class APIServerAdapter(BasePlatformAdapter):
             return (
                 int(getattr(self, "_pending_agent_requests", 0))
                 + int(self._inflight_agent_runs)
-                + sum(not task.done() for task in self._active_run_tasks.values())
+                + int(getattr(self, "_detached_executor_runs", 0))
+                + sum(not task.done() for task in list(self._active_run_tasks.values()))
             )
         except Exception:
             return 0
+
+    def _notify_active_agent_work_changed(self) -> None:
+        """Persist the owning gateway's aggregate count at API boundaries."""
+        try:
+            callback = getattr(self.gateway_runner, "_persist_active_agents", None)
+            if callable(callback):
+                callback()
+        except Exception:
+            logger.debug("API active-work status callback failed", exc_info=True)
+
+    def _track_detached_executor_run(self, future: "asyncio.Future") -> None:
+        """Keep a non-cancellable executor thread visible after wrapper cancel."""
+        if future.done():
+            return
+        self._detached_executor_runs += 1
+
+        def _release(_future) -> None:
+            self._detached_executor_runs = max(0, self._detached_executor_runs - 1)
+            self._notify_active_agent_work_changed()
+
+        future.add_done_callback(_release)
 
     @staticmethod
     def _gateway_is_draining() -> bool:
@@ -4633,10 +4663,18 @@ class APIServerAdapter(BasePlatformAdapter):
 
         self._activate_admitted_request()
         self._inflight_agent_runs += 1
-        try:
-            return await loop.run_in_executor(None, _run)
-        finally:
-            self._inflight_agent_runs -= 1
+        self._notify_active_agent_work_changed()
+        executor_future = loop.run_in_executor(None, _run)
+
+        def _release_inflight(_future) -> None:
+            self._inflight_agent_runs = max(0, self._inflight_agent_runs - 1)
+            self._notify_active_agent_work_changed()
+
+        executor_future.add_done_callback(_release_inflight)
+        # Shield is essential: cancelling an HTTP/SSE coroutine cannot stop the
+        # already-running thread. Cancelling the asyncio Future would fire its
+        # done callback early and falsely publish idle while agent work continues.
+        return await asyncio.shield(executor_future)
 
     # ------------------------------------------------------------------
     # /v1/runs — structured event streaming
@@ -4834,6 +4872,7 @@ class APIServerAdapter(BasePlatformAdapter):
         request_profile = _api_request_profile.get()
 
         async def _run_and_close():
+            executor_future = None
             try:
                 self._set_run_status(run_id, "running")
                 if run_id in self._stopping_run_ids:
@@ -4936,7 +4975,8 @@ class APIServerAdapter(BasePlatformAdapter):
                         }
                         return r, u
 
-                result, usage = await asyncio.get_running_loop().run_in_executor(None, _run_sync)
+                executor_future = asyncio.get_running_loop().run_in_executor(None, _run_sync)
+                result, usage = await asyncio.shield(executor_future)
                 if run_id in self._stopping_run_ids:
                     _put_event_if_active({
                         "event": "run.cancelled",
@@ -4982,6 +5022,11 @@ class APIServerAdapter(BasePlatformAdapter):
                         last_event="run.completed",
                     )
             except asyncio.CancelledError:
+                if executor_future is not None and not executor_future.done():
+                    # The task entry below is about to disappear, but shielded
+                    # executor work is still running and cannot be force-cancelled.
+                    # Transfer its count before finally removes the task.
+                    self._track_detached_executor_run(executor_future)
                 self._set_run_status(
                     run_id,
                     "cancelled",
@@ -5034,10 +5079,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._active_run_tasks.pop(run_id, None)
                 self._run_approval_sessions.pop(run_id, None)
                 self._stopping_run_ids.discard(run_id)
+                self._notify_active_agent_work_changed()
 
         self._activate_admitted_request()
         task = asyncio.create_task(_run_and_close())
         self._active_run_tasks[run_id] = task
+        self._notify_active_agent_work_changed()
         try:
             self._background_tasks.add(task)
         except TypeError:

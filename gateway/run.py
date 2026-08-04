@@ -22263,9 +22263,11 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # historical in-process 60s ticker; an external provider (e.g. chronos)
     # may arm a schedule and return. Pass the event loop so cron delivery can
     # use live adapters (E2EE support).
+    from cron.scheduler import set_active_work_change_callback
     from cron.scheduler_provider import InProcessCronScheduler, resolve_cron_scheduler
     cron_stop = threading.Event()
     cron_provider = resolve_cron_scheduler()
+    set_active_work_change_callback(runner._persist_active_agents)
     cron_start_kwargs = {"adapters": runner.adapters, "loop": asyncio.get_running_loop()}
     # External cron providers own their remote scheduling contract. Only the
     # in-process ticker polls local due jobs, so only it receives the local
@@ -22331,11 +22333,16 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         cron_provider.stop()
     except Exception as e:
         logger.debug("Cron provider stop() error: %s", e)
-    if not await _await_thread_exit(cron_thread, timeout=_CRON_SHUTDOWN_DRAIN_TIMEOUT):
+    cron_exited = await _await_thread_exit(
+        cron_thread, timeout=_CRON_SHUTDOWN_DRAIN_TIMEOUT
+    )
+    if not cron_exited:
         logger.warning(
             "Cron ticker did not exit within %.0fs of shutdown — an in-flight "
             "delivery may have been dropped.", _CRON_SHUTDOWN_DRAIN_TIMEOUT,
         )
+    else:
+        set_active_work_change_callback(None)
     await _await_thread_exit(
         housekeeping_thread, timeout=_HOUSEKEEPING_SHUTDOWN_DRAIN_TIMEOUT
     )

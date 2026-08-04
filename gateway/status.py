@@ -46,6 +46,7 @@ _WINDOWS_LOCK_OFFSET = 1024 * 1024
 _GATEWAY_RUNNING_PID_CACHE_TTL_SECONDS = 1.0
 _gateway_running_pid_cache_lock = threading.Lock()
 _gateway_running_pid_cache: dict[tuple[str, bool, bool], tuple[float, tuple[Any, ...], Optional[int]]] = {}
+_runtime_status_write_lock = threading.RLock()
 
 logger = logging.getLogger(__name__)
 
@@ -886,6 +887,33 @@ def write_runtime_status(
     served_profiles: Any = _UNSET,
 ) -> None:
     """Persist gateway runtime health information for diagnostics/status."""
+    with _runtime_status_write_lock:
+        _write_runtime_status_unlocked(
+            gateway_state=gateway_state,
+            exit_reason=exit_reason,
+            restart_requested=restart_requested,
+            active_agents=active_agents,
+            platform=platform,
+            platform_state=platform_state,
+            error_code=error_code,
+            error_message=error_message,
+            served_profiles=served_profiles,
+        )
+
+
+def _write_runtime_status_unlocked(
+    *,
+    gateway_state: Any = _UNSET,
+    exit_reason: Any = _UNSET,
+    restart_requested: Any = _UNSET,
+    active_agents: Any = _UNSET,
+    platform: Any = _UNSET,
+    platform_state: Any = _UNSET,
+    error_code: Any = _UNSET,
+    error_message: Any = _UNSET,
+    served_profiles: Any = _UNSET,
+) -> None:
+    """Read-merge-write transaction; caller holds the process-local lock."""
     path = _get_runtime_status_path()
     payload = _read_json_file(path) or _build_runtime_status_record()
     current_record = _build_pid_record()
