@@ -38,17 +38,29 @@ import subprocess
 import sys
 from typing import NamedTuple, Optional
 
-from hermes_cli.content_gate import flag_recovery_pr_mismatch
+from hermes_cli.content_gate import _RECOVERY_SIGNAL_RE, flag_recovery_pr_mismatch
 
 # Additional recovery-PR signals beyond the description text itself —
 # branch name and PR title patterns. A recovery PR is often titled/branched
 # distinctively even when the body text doesn't use the word "recovery"
 # verbatim (e.g. `recover/checkout-fix` or "Salvage stranded worktree
-# changes"). These are OR'd with the description-text signal already
-# implemented in ``flag_recovery_pr_mismatch`` so detection doesn't depend
-# solely on body wording.
+# changes"). These are OR'd with the description-text signal so detection
+# doesn't depend solely on body wording.
 _RECOVERY_BRANCH_RE = re.compile(r"^(recover|recovery|salvage)/", re.IGNORECASE)
 _RECOVERY_TITLE_RE = re.compile(r"\b(recovery|stranded|salvage)\b", re.IGNORECASE)
+
+# The description signal deliberately does NOT reuse ``_RECOVERY_TITLE_RE``.
+# That regex bare-word-matches "recovery"/"stranded"/"salvage" anywhere,
+# which false-positives on domain vocabulary that has nothing to do with
+# git-worktree recovery -- e.g. "alarm recovery-sent codes" (PR #318) or
+# "lease recovery lifecycle" (PR #321), both false-blocked on 2026-08-03
+# and needing a body reword + close/reopen to merge. PR titles are short,
+# deliberate summaries where a bare "recovery"/"stranded"/"salvage" is a
+# reasonably strong signal on its own, but PR *descriptions* are prose and
+# need a structural marker -- ``_RECOVERY_SIGNAL_RE`` (shared with
+# ``content_gate.flag_recovery_pr_mismatch``) requires an actual
+# recovery-PR/stranded-worktree phrase, not just the bare word.
+_RECOVERY_DESCRIPTION_RE = _RECOVERY_SIGNAL_RE
 
 # Self-referential exemption: a PR that touches the gate's own implementation
 # (this file, or content_gate.py's flag_recovery_pr_mismatch it wraps) will
@@ -85,15 +97,21 @@ def is_recovery_pr(*, branch_name: str = "", pr_title: str = "", pr_description:
 
     Checks, in order: branch name pattern (``recover/*`` / ``recovery/*`` /
     ``salvage/*``), recovery/stranded/salvage language in the title, and
-    recovery/stranded-worktree language in the description (the same
-    pattern :func:`hermes_cli.content_gate.flag_recovery_pr_mismatch`
-    matches internally). Any one hit is sufficient.
+    a structural recovery-PR/stranded-worktree phrase in the description
+    (``_RECOVERY_DESCRIPTION_RE`` -- the same pattern
+    :func:`hermes_cli.content_gate.flag_recovery_pr_mismatch` matches
+    internally). Any one hit is sufficient.
+
+    The description check intentionally requires a structural phrase
+    ("recovery PR", "stranded worktree", "recovered branch") rather than
+    the bare word "recovery" -- domain vocabulary (alarm recovery, lease
+    recovery, etc.) uses "recovery" without being a recovery PR.
     """
     if branch_name and _RECOVERY_BRANCH_RE.search(branch_name.strip()):
         return True
     if pr_title and _RECOVERY_TITLE_RE.search(pr_title):
         return True
-    if pr_description and _RECOVERY_TITLE_RE.search(pr_description):
+    if pr_description and _RECOVERY_DESCRIPTION_RE.search(pr_description):
         return True
     return False
 
@@ -134,7 +152,7 @@ def check_recovery_pr(
     # synthesize a minimal description prefix so the mismatch heuristic
     # still runs against the real description content.
     effective_description = pr_description
-    if not _RECOVERY_TITLE_RE.search(pr_description or ""):
+    if not _RECOVERY_DESCRIPTION_RE.search(pr_description or ""):
         effective_description = f"Recovery PR. {pr_description or ''}"
 
     mismatch = flag_recovery_pr_mismatch(effective_description, diff_stat_text)

@@ -26,6 +26,15 @@ Run on a short interval (see the paired launchd plist, 15 minutes) so a
 stale exhausted mark clears within about an hour of the account actually
 recovering, comfortably inside the drill's one-hour acceptance bound.
 
+Thin wrapper (ClickUp 86e2mb8p0, PR 2/4): the codex-specific classification
+here (``probe_entry`` / ``_default_http_get``) and this script's own state
+file / CLI flags / Slack-alert semantics are all unchanged so the already-
+deployed launchd job needs no migration. ``run_probe()`` now delegates its
+entry loop, cost guards (10 min/entry, 12/provider/hr), and control-host
+network arbitration to ``provider_probe.py``'s generalized engine — see that
+module for the multi-provider adapter table (anthropic, openrouter, generic)
+this script's codex-only logic was generalized into.
+
 Usage:
   codex_quota_probe.py                  # probe + clear, human summary, exit 0
   codex_quota_probe.py --json           # emit JSON result
@@ -41,12 +50,34 @@ Exit codes: 0 = ran to completion (regardless of whether anything cleared),
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import subprocess
 import sys
 import time
+from pathlib import Path
 from typing import Any, Callable, Dict, List, NamedTuple, Optional
+
+
+def _load_sibling_module(name: str, filename: str):
+    """Load a same-directory module by file path, WITHOUT touching
+    ``sys.path`` or ``sys.modules``. The generalized probe engine lives
+    alongside this script both in the repo and in its manifest-governed
+    deploy destination (``~/.hermes/scripts`` — see
+    ``machine-setup/mini-scripts/fleet_outcome_manifest.json``), but a plain
+    ``import provider_probe`` would need this directory on ``sys.path``,
+    which — mutated at module scope — leaks into every other file a test
+    runner collects in the same process (this directory's ``tests/`` suite
+    has exactly that history of cross-file pollution)."""
+    spec = importlib.util.spec_from_file_location(name, Path(__file__).resolve().parent / filename)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+provider_probe = _load_sibling_module("codex_quota_probe_provider_probe", "provider_probe.py")
 
 STATE_PATH = os.path.expanduser("~/.hermes/state/codex-quota-probe.json")
 HERMES_BIN = os.path.expanduser("~/.local/bin/hermes")
@@ -64,6 +95,11 @@ class ProbeResult(NamedTuple):
     usable: bool
     status_code: Optional[int]
     detail: str
+    # Shape-compatible with provider_probe.ProbeResult (defaults to None so
+    # every existing 3-positional-arg construction/comparison in this
+    # module's tests is unaffected) — provider_probe.run_probe's generalized
+    # loop reads this field on whatever ProbeResult an adapter returns.
+    usage_percent: Optional[float] = None
 
 
 def _now() -> float:
@@ -157,46 +193,24 @@ def run_probe(
 ) -> Dict[str, Any]:
     """Probe and (unless dry_run) clear every frozen-exhausted entry for
     ``provider``. Returns a JSON-safe diagnostics dict; never retains
-    credential material."""
-    now = _now() if now is None else now
-    from agent.credential_pool import load_pool
+    credential material.
 
-    pool = load_pool(provider)
-    frozen = pool.frozen_exhausted_entries(now=now)
-
-    cleared: List[Dict[str, Any]] = []
-    still_exhausted: List[Dict[str, Any]] = []
-    for entry in frozen:
-        result = probe_entry(entry, http_get=http_get, timeout=timeout)
-        reset_at = getattr(entry, "last_error_reset_at", None)
-        if result.usable:
-            did_clear = dry_run or pool.clear_stale_exhaustion(entry.id)
-            cleared.append({
-                "provider": provider,
-                "id": entry.id,
-                "stale_reset_at": reset_at,
-                "probed_at": now,
-                "probe_detail": result.detail,
-                "dry_run": dry_run,
-                "persisted": did_clear and not dry_run,
-            })
-        else:
-            still_exhausted.append({
-                "provider": provider,
-                "id": entry.id,
-                "reset_at": reset_at,
-                "probed_at": now,
-                "probe_status_code": result.status_code,
-                "probe_detail": result.detail,
-            })
-
-    return {
-        "provider": provider,
-        "checked_at": now,
-        "frozen_count": len(frozen),
-        "cleared": cleared,
-        "still_exhausted": still_exhausted,
-    }
+    Thin delegation to ``provider_probe.run_probe()``'s generalized engine
+    (cost guards + control-host network arbitration + record_probe_verdict),
+    passing THIS module's own ``probe_entry`` as the adapter override so the
+    codex-specific /models classification (and any test monkeypatch of it or
+    of ``_default_http_get``) still governs what actually executes — the
+    generalized engine only owns the loop, not the per-entry codex
+    classification.
+    """
+    return provider_probe.run_probe(
+        provider,
+        now=now,
+        http_get=http_get,
+        timeout=timeout,
+        dry_run=dry_run,
+        adapter=probe_entry,
+    )
 
 
 def _load_state() -> Dict[str, Any]:

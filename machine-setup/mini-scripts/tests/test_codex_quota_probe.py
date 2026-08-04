@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Contract tests for codex_quota_probe.py (ClickUp 86e2kxk50)."""
+"""Contract tests for codex_quota_probe.py (ClickUp 86e2kxk50).
+
+Generalized for 86e2mb8p0 (PR 2/4): the script now delegates its entry loop
+to provider_probe.py's generalized engine, loaded as a sibling module via
+``importlib`` (not a plain ``import provider_probe`` — that would need this
+directory on ``sys.path``, which mutated at module scope leaks into every
+other file a test runner collects in the same process)."""
 from __future__ import annotations
 
 import importlib.util

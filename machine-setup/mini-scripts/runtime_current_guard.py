@@ -17,7 +17,7 @@ from governed_interpreter import SELECTOR_CONTRACT, select_governed_interpreter
 FLEET_DIGEST_JOB_ID = "f23a03e9d1b2"
 _TRUST_MANIFEST = Path(__file__).resolve().with_name("digest_trusted_scripts.json")
 _READ_ONLY_PROGRAMS = {"cat", "ls", "stat", "readlink", "pwd", "printf", "echo", "wc", "du", "df", "uname", "date"}
-_CUTTER_SHA256 = "955b208c162a0d7e923fcc1b9f2e9c53501640b6b0084a9aa91946dc99353b0e"
+_CUTTER_SHA256 = "3876981a873ba1ffc1bd8ee86cb2a73acb165e26cf9d9e2eade1cfb8e17792fb"
 _RELEASE_NAME = re.compile(r"^v[0-9][0-9A-Za-z.!+_-]*-[0-9a-f]{12,64}$")
 
 

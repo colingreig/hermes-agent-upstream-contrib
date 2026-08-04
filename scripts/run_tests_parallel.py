@@ -52,7 +52,18 @@ from typing import Dict, List, Tuple
 
 
 # Default test discovery roots.
-_DEFAULT_ROOTS = ["tests"]
+#
+# machine-setup/mini-scripts/tests/test_reconcile_pr_pipeline.py is pinned
+# explicitly (not the whole mini-scripts/tests/ directory): that directory
+# has ~50 files that have never run in CI and may assume a mini-like
+# environment, so bulk-adding it is a separate, higher-risk change. This one
+# file is self-contained, fast (~4s, 39 tests), and its manifest-vs-patch
+# hash-parity assertions had gone stale silently for lack of CI coverage
+# (see task 86e2m60c7) -- pin it so that class of drift is caught again.
+_DEFAULT_ROOTS = [
+    "tests",
+    "machine-setup/mini-scripts/tests/test_reconcile_pr_pipeline.py",
+]
 
 # Directories to skip during discovery — these suites require real
 # external services (a model gateway, a docker daemon with a prebuilt
