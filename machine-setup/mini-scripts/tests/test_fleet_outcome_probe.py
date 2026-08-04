@@ -1946,7 +1946,19 @@ def test_kanban_sweep_stderr_shares_canonical_semantic_evidence_log():
 
     stdout_path = plist["StandardOutPath"]
     assert plist["StandardErrorPath"] == stdout_path
-    assert Path(stdout_path).expanduser() == Path(contract["outcome"]["path"]).expanduser()
+    # The plist is a real launchd config deployed to one fixed machine (the
+    # mini, home /Users/colingreig) — it hardcodes that absolute path rather
+    # than "~". Resolve the contract's "~"-relative path against that same
+    # fixed, known deployment home instead of `Path.expanduser()`, which
+    # resolves against whatever $HOME the test happens to run under (e.g.
+    # /home/runner in CI) and would otherwise make this assertion pass or
+    # fail based on the test runner's environment rather than the actual
+    # deployed configuration.
+    deployment_home = "/Users/colingreig"
+    contract_path = contract["outcome"]["path"]
+    if contract_path.startswith("~"):
+        contract_path = deployment_home + contract_path[1:]
+    assert Path(stdout_path) == Path(contract_path)
     assert any(
         pattern.startswith("^Traceback")
         for pattern in contract["outcome"]["failure_patterns"]
