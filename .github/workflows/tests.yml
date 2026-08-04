@@ -144,6 +144,53 @@ jobs:
           path: slice-${{ matrix.slice.index }}-test_durations.json
           retention-days: 1
 
+  # machine-setup/mini-scripts/tests/ runs here as ONE unsliced pytest
+  # invocation, deliberately outside the sharded `test` job above (which
+  # runs every file in its own subprocess via scripts/run_tests.sh — no
+  # shared interpreter, no cross-file state). Several of these tests load
+  # implementation modules by file path (they aren't a real package) and
+  # stash stand-in stub modules directly into sys.modules under a real
+  # module's name; a stub left behind by one file can silently leak into
+  # another file's test if they ever share a process. That class of
+  # cross-file ordering bug can hide behind sharding indefinitely (each
+  # file isolated in its own subprocess never reproduces it) — this job
+  # exists so it can't (ClickUp 86e2md9cw). Do not slice/shard this job.
+  mini-scripts-unsliced:
+    name: "mini-scripts tests (unsliced)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+
+      - name: Set up Python 3.11
+        run: uv python install 3.11
+
+      - name: Install dependencies
+        uses: ./.github/actions/retry
+        with:
+          command: uv sync --locked --python 3.11 --extra all --extra dev
+
+      - name: Minimize uv cache
+        run: uv cache prune --ci
+
+      - name: Run mini-scripts tests as a single unsliced process
+        run: |
+          source .venv/bin/activate
+          python -m pytest machine-setup/mini-scripts/tests/ -q
+        env:
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
+
   # Merge per-slice duration data into a single cache, so future runs
   # (including PRs) get balanced slicing.
   save-durations:
