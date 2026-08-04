@@ -2,13 +2,15 @@
 """Manifest-verified installer for the hermes-self-report deploy bundle.
 
 This script is the SOLE writer of the hermes-self-report and lifecycle
-continuity artifacts declared in that manifest, into
+continuity artifacts declared in that manifest, plus the deployed manifest
+contract itself, into
 ``~/.hermes/scripts/`` (and ``~/.hermes/skills/hermes-self-report/SKILL.md``).
 It reads ``self_report_manifest.json`` (the declared bundle), verifies every
 source's sha256 against the manifest, snapshots each existing destination, then
-atomically installs and re-verifies the deployed bytes. It NEVER rsyncs the
-scripts dir and NEVER touches any file that is not a manifest destination — in
-particular ``queue_snapshot.json`` and the release venv, which must co-exist
+atomically installs the governed files and manifest and re-verifies the
+deployed bytes. It NEVER rsyncs the scripts dir and NEVER touches any file that
+is not a manifest destination or the manifest contract itself — in particular
+``queue_snapshot.json`` and the release venv, which must co-exist
 alongside the bundle (the installer only warns if required co-exist files are
 missing). ``claim_store.py``, ``closeout_actor.py`` and
 ``manual_platform_handoff.py`` are manifest-governed because they are
@@ -247,6 +249,27 @@ def install(
         brain_path=brain_path,
         include_skill=include_skill,
     )
+    # The runtime coverage contract classifies the bundle manifest alongside
+    # its governed destinations.  Install the exact manifest used to verify
+    # this transaction so a clean Mini does not lack the contract that
+    # describes its deployed bytes.  This cannot be a self-referential entry
+    # in manifest["files"], so its expected hash is derived from the already
+    # loaded manifest file itself.
+    manifest_dest = home / ".hermes" / "scripts" / "self_report_manifest.json"
+    _check_dest_in_bounds(
+        manifest_dest,
+        "~/.hermes/scripts/self_report_manifest.json",
+        home / ALLOWED_DEST_SUBPATH,
+    )
+    plan.append(
+        {
+            "src": manifest_path,
+            "dest": manifest_dest,
+            "expected_sha256": _sha256(manifest_path),
+            "role": "deployed bundle contract",
+            "deploy_mode": "manifest",
+        }
+    )
     warnings = check_coexist(manifest, home)
 
     if dry_run:
@@ -271,7 +294,10 @@ def install(
             pre_existed = dest.exists()
             snapshot: Path | None = None
             if pre_existed:
-                snapshot = snapshot_dir / dest.name
+                snapshot_name = (
+                    f"deployed-{dest.name}" if dest == manifest_dest else dest.name
+                )
+                snapshot = snapshot_dir / snapshot_name
                 shutil.copy2(dest, snapshot)
                 shutil.copy2(dest, dest.with_name(dest.name + f".bak-self-report-install-{stamp}"))
 

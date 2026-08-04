@@ -58,6 +58,7 @@ def test_real_manifest_installs_only_declared_files_with_verified_receipt(tmp_pa
     for name, entry in declared.items():
         deployed = scripts / name
         assert hashlib.sha256(deployed.read_bytes()).hexdigest() == entry["sha256"]
+    assert (scripts / "spend_manifest.json").read_bytes() == MANIFEST_PATH.read_bytes()
     for name, data in protected.items():
         assert (scripts / name).read_bytes() == data
 
@@ -65,7 +66,7 @@ def test_real_manifest_installs_only_declared_files_with_verified_receipt(tmp_pa
     assert len(receipts) == 1
     receipt = json.loads(receipts[0].read_text(encoding="utf-8"))
     assert receipt["result"] == "success"
-    assert len(receipt["files"]) == 4
+    assert len(receipt["files"]) == 5
     assert {item["status"] for item in receipt["files"]} == {"installed"}
 
 
