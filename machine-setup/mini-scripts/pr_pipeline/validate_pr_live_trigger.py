@@ -38,20 +38,29 @@ by a per-tick validation cap.
 from __future__ import annotations
 
 import argparse
+import bisect
+import fcntl
 import json
 import os
 import subprocess
 import sys
+import tempfile
+from contextlib import contextmanager, nullcontext
+from pathlib import Path
 
 if __package__:
     from . import autonomous_merge
+    from . import identity
     from . import pr_pipeline_improvements
     from . import validate_pr
+    from . import validator_repo_guard
     from . import validator_verdict
 else:  # pragma: no cover - flat deployment fallback, mirrors validate_pr.py
     import autonomous_merge
+    import identity
     import pr_pipeline_improvements
     import validate_pr
+    import validator_repo_guard
     import validator_verdict
 
 FINALIZE_TOKEN_ENV = "HERMES_VALIDATOR_FINALIZE_TOKEN"
@@ -59,6 +68,7 @@ MAX_VALIDATIONS_ENV = "HERMES_VALIDATOR_TRIGGER_MAX"
 DEFAULT_MAX_VALIDATIONS = 3
 PR_LIST_LIMIT = 30
 GH_TIMEOUT = 60
+STATE_PATH = Path.home() / ".hermes/state/validator-live-trigger.json"
 # Mirrors autonomous_merge._merge_readiness — a held PR is not a candidate.
 HOLD_LABELS = {"hold-for-colin", "do-not-merge", "do-not-auto-merge", "hold"}
 
@@ -82,6 +92,136 @@ def max_validations() -> int:
     except ValueError:
         return DEFAULT_MAX_VALIDATIONS
     return value if value > 0 else DEFAULT_MAX_VALIDATIONS
+
+
+def _candidate_key(candidate) -> tuple[str, int, str]:
+    """Stable identity used for deterministic ordering and the durable cursor."""
+    return candidate["repo"], candidate["pr"], candidate["head"]
+
+
+def _load_cursor() -> tuple[str, int, str] | None:
+    """Load the last reservation, refusing malformed/unreadable state."""
+    try:
+        with STATE_PATH.open(encoding="utf-8") as state_file:
+            state = json.load(state_file)
+    except FileNotFoundError:
+        return None
+    except Exception as exc:
+        raise RuntimeError(f"round-robin state unreadable: {exc}") from exc
+
+    key = state.get("last_reserved_candidate") if isinstance(state, dict) else None
+    if not (
+        isinstance(key, list)
+        and len(key) == 3
+        and isinstance(key[0], str)
+        and isinstance(key[1], int)
+        and not isinstance(key[1], bool)
+        and isinstance(key[2], str)
+    ):
+        raise RuntimeError("round-robin state malformed")
+    try:
+        canonical_repo = identity.canonicalize_repo(key[0])
+    except identity.IdentityError:
+        raise RuntimeError("round-robin state malformed") from None
+    if (
+        key[0] != canonical_repo
+        or key[1] <= 0
+        or len(key[2]) != 40
+        or any(character not in "0123456789abcdefABCDEF" for character in key[2])
+    ):
+        raise RuntimeError("round-robin state malformed")
+    return key[0], key[1], key[2]
+
+
+def _reserve_candidate(key: tuple[str, int, str]) -> None:
+    """Atomically persist a reservation before its validation can begin."""
+    path = STATE_PATH
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as state_file:
+                json.dump({"last_reserved_candidate": list(key)}, state_file,
+                          sort_keys=True)
+                state_file.write("\n")
+                state_file.flush()
+                os.fsync(state_file.fileno())
+            os.chmod(temporary, 0o600)
+            os.replace(temporary, path)
+            directory_fd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except BaseException:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+            raise
+    except Exception as exc:
+        raise RuntimeError(f"round-robin reservation failed: {exc}") from exc
+
+
+def _round_robin_candidates(candidates, cursor):
+    """Return candidates in stable order, beginning strictly after cursor."""
+    ordered = sorted(candidates, key=_candidate_key)
+    if not ordered or cursor is None:
+        return ordered
+    keys = [_candidate_key(candidate) for candidate in ordered]
+    start = bisect.bisect_right(keys, cursor)
+    return ordered[start:] + ordered[:start]
+
+
+@contextmanager
+def _validation_run_lock():
+    """Serialize live selection and validation across trigger processes."""
+    lock_path = STATE_PATH.with_name(f"{STATE_PATH.name}.run.lock")
+    lock_file = None
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_file = lock_path.open("a", encoding="utf-8")
+        os.chmod(lock_path, 0o600)
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+    except Exception as exc:
+        if lock_file is not None:
+            lock_file.close()
+        raise RuntimeError(f"validation run lock failed: {exc}") from exc
+
+    try:
+        yield
+    finally:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        finally:
+            lock_file.close()
+
+
+def _select_and_reserve_candidates(candidates, limit):
+    """Select and reserve one batch as a cross-process atomic transaction.
+
+    This shorter lock remains distinct from the live-run lock because direct
+    callers also need atomic reservations. Normal live runs acquire the run lock
+    first and this selection lock second, then release them in reverse order.
+    """
+    lock_path = STATE_PATH.with_name(f"{STATE_PATH.name}.lock")
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("a", encoding="utf-8") as lock_file:
+            os.chmod(lock_path, 0o600)
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                cursor = _load_cursor()
+                selected = _round_robin_candidates(candidates, cursor)[:limit]
+                if selected:
+                    _reserve_candidate(_candidate_key(selected[-1]))
+                return selected
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(f"round-robin transaction failed: {exc}") from exc
 
 
 def _list_open_prs(repo):
@@ -133,16 +273,89 @@ def candidate_skip_reason(info) -> str:
 
 
 def scan_candidates(allowlist):
-    """Enumerate validation candidates across the allowlist.
+    """Enumerate validation candidates across canonical allowlisted repositories.
 
     Returns (candidates, skipped, errors). A candidate is a dict with
-    repo/pr/head/task_id. Repo-alias spellings of the same repository are
-    deduped by (pr_number, head_sha) — the lexicographically first spelling
-    wins, so one PR never gets validated under two ledger subjects.
+    repo/pr/head/task_id. Every valid allowlist spelling is resolved before any
+    PR lookup and replaced by its canonical owner/name. Canonical repositories
+    must form a bijection between immutable node_id and normalized owner/name;
+    aliases resolving to the same pair are scanned once, while either-direction
+    identity conflicts fail closed before PR discovery. Equal PR/head pairs in
+    repositories with distinct canonical identities remain independent.
+    Repositories without a complete, consistent canonical identity fail closed
+    before their PRs are scanned.
     """
     candidates, skipped, errors = [], [], []
+    canonical_names_by_node = {}
+    canonical_nodes_by_name = {}
+
+    # Resolve the complete allowlist first. Keeping identity discovery separate
+    # from PR discovery prevents an alias from leaking into any downstream API,
+    # ledger, candidate, cursor, validation, or summary subject.
+    for allowlisted_repo in sorted(allowlist):
+        try:
+            canonical = validator_repo_guard.canonical_identity(allowlisted_repo)
+        except Exception as exc:
+            errors.append(
+                f"{allowlisted_repo}: canonical repository identity resolution failed: {exc!r}"
+            )
+            continue
+        node_id = canonical.get("node_id") if isinstance(canonical, dict) else None
+        full_name = canonical.get("full_name") if isinstance(canonical, dict) else None
+        if not isinstance(full_name, str):
+            errors.append(
+                f"{allowlisted_repo}: canonical repository identity is unresolved or malformed"
+            )
+            continue
+        try:
+            canonical_full_name = identity.canonicalize_repo(full_name)
+        except identity.IdentityError:
+            errors.append(
+                f"{allowlisted_repo}: canonical repository identity is unresolved or malformed"
+            )
+            continue
+        if (
+            not isinstance(node_id, str)
+            or not node_id.strip()
+            or node_id != node_id.strip()
+        ):
+            errors.append(
+                f"{allowlisted_repo}: canonical repository identity is unresolved or malformed"
+            )
+            continue
+        canonical_names_by_node.setdefault(node_id, set()).add(canonical_full_name)
+        canonical_nodes_by_name.setdefault(canonical_full_name, set()).add(node_id)
+
+    conflicting_nodes = {
+        node_id for node_id, full_names in canonical_names_by_node.items()
+        if len(full_names) != 1
+    }
+    conflicting_names = {
+        full_name for full_name, node_ids in canonical_nodes_by_name.items()
+        if len(node_ids) != 1
+    }
+    for node_id in sorted(conflicting_nodes):
+        errors.append(
+            f"canonical repository identity {node_id!r} has conflicting owner/name values: "
+            f"{', '.join(sorted(canonical_names_by_node[node_id]))}"
+        )
+    for full_name in sorted(conflicting_names):
+        errors.append(
+            f"canonical repository identity {full_name!r} has conflicting node_id values: "
+            f"{', '.join(sorted(canonical_nodes_by_name[full_name]))}"
+        )
+
+    canonical_repositories = []
+    for node_id, full_names in canonical_names_by_node.items():
+        if node_id in conflicting_nodes:
+            continue
+        full_name = next(iter(full_names))
+        if full_name in conflicting_names:
+            continue
+        canonical_repositories.append((full_name, node_id))
+
     seen_heads = set()
-    for repo in sorted(allowlist):
+    for repo, repository_key in sorted(canonical_repositories):
         prs, err = _list_open_prs(repo)
         if err:
             errors.append(f"{repo}: {err}")
@@ -159,9 +372,10 @@ def scan_candidates(allowlist):
             if not head:
                 errors.append(f"{repo}#{number}: no head SHA")
                 continue
-            if (number, head) in seen_heads:
-                continue  # alias spelling of an already-scanned repository
-            seen_heads.add((number, head))
+            dedupe_key = (repository_key, number, head)
+            if dedupe_key in seen_heads:
+                continue
+            seen_heads.add(dedupe_key)
             reason = candidate_skip_reason(info)
             if reason:
                 skipped.append({"repo": repo, "pr": number, "reason": reason})
@@ -215,45 +429,62 @@ def run(dry_run: bool = False, cap: int | None = None):
         _log("allowlist is empty — nothing to validate")
         return 0, summary
 
-    candidates, skipped, errors = scan_candidates(allowlist)
-    summary["candidates"] = candidates
-    summary["skipped"] = skipped
-    summary["errors"].extend(errors)
-    for item in skipped:
-        _log(f"skip {item['repo']}#{item['pr']}: {item['reason']}")
-    for err in errors:
-        _log_err(f"scan error (non-fatal): {err}")
-
     limit = cap if isinstance(cap, int) and cap > 0 else max_validations()
-    to_validate = candidates[:limit]
-    if len(candidates) > limit:
-        _log(f"{len(candidates)} candidate(s); validating first {limit} "
-             f"(cap, remainder next tick)")
+    try:
+        # Dry runs remain strictly observational: nullcontext neither creates
+        # nor acquires the adjacent live-run lock. Live runs acquire the full-run
+        # lock before scanning so selection never consumes a snapshot captured
+        # while a prior run was still validating.
+        run_lock = nullcontext() if dry_run else _validation_run_lock()
+        with run_lock:
+            candidates, skipped, errors = scan_candidates(allowlist)
+            summary["candidates"] = candidates
+            summary["skipped"] = skipped
+            summary["errors"].extend(errors)
+            for item in skipped:
+                _log(f"skip {item['repo']}#{item['pr']}: {item['reason']}")
+            for err in errors:
+                _log_err(f"scan error (non-fatal): {err}")
 
-    for item in to_validate:
-        repo, pr, task_id = item["repo"], item["pr"], item["task_id"]
-        if dry_run:
-            _log(f"DRY_RUN would validate {repo}#{pr} head={item['head'][:8]} "
-                 f"task={task_id or '-'}")
-            continue
-        _log(f"validating {repo}#{pr} head={item['head'][:8]} task={task_id or '-'}")
-        try:
-            rc, result = validate_pr.validate(
-                repo, pr, task=task_id, shadow=False, allow_panel=True,
-                expected_repo=repo)
-        except Exception as exc:
-            _log_err(f"{repo}#{pr} validation crashed (non-fatal): {exc!r}")
-            summary["errors"].append(f"{repo}#{pr}: {exc!r}")
-            continue
-        outcome = {
-            "repo": repo, "pr": pr, "rc": rc,
-            "verdict": result.get("verdict"),
-            "tier": result.get("tier"),
-            "shadow": result.get("shadow"),
-        }
-        summary["validated"].append(outcome)
-        _log(f"{repo}#{pr} -> {outcome['verdict']} tier={outcome['tier']} "
-             f"shadow={outcome['shadow']} rc={rc}")
+            if dry_run:
+                # A dry run observes the current cursor but must not create either
+                # reservation state or either adjacent lock file.
+                cursor = _load_cursor()
+                to_validate = _round_robin_candidates(candidates, cursor)[:limit]
+            else:
+                to_validate = _select_and_reserve_candidates(candidates, limit)
+            if len(candidates) > limit:
+                _log(f"{len(candidates)} candidate(s); validating round-robin "
+                     f"selected {limit} (cap, remainder next tick)")
+
+            for item in to_validate:
+                repo, pr, task_id = item["repo"], item["pr"], item["task_id"]
+                if dry_run:
+                    _log(f"DRY_RUN would validate {repo}#{pr} head={item['head'][:8]} "
+                         f"task={task_id or '-'}")
+                    continue
+                _log(f"validating {repo}#{pr} head={item['head'][:8]} task={task_id or '-'}")
+                try:
+                    rc, result = validate_pr.validate(
+                        repo, pr, task=task_id, shadow=False, allow_panel=True,
+                        expected_repo=repo)
+                except Exception as exc:
+                    _log_err(f"{repo}#{pr} validation crashed (non-fatal): {exc!r}")
+                    summary["errors"].append(f"{repo}#{pr}: {exc!r}")
+                    continue
+                outcome = {
+                    "repo": repo, "pr": pr, "rc": rc,
+                    "verdict": result.get("verdict"),
+                    "tier": result.get("tier"),
+                    "shadow": result.get("shadow"),
+                }
+                summary["validated"].append(outcome)
+                _log(f"{repo}#{pr} -> {outcome['verdict']} tier={outcome['tier']} "
+                     f"shadow={outcome['shadow']} rc={rc}")
+    except RuntimeError as exc:
+        _log_err(str(exc))
+        summary["errors"].append(str(exc))
+        return 1, summary
 
     return 0, summary
 
