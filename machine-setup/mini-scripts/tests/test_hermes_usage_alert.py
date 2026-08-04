@@ -36,6 +36,10 @@ def _prepare(module, tmp_path, *, status="error"):
     module.STATE_PATH = str(tmp_path / "state.json")
     module.RECEIPT_PATH = str(tmp_path / "receipt.json")
     module.JOBS_PATH = str(tmp_path / "jobs.json")
+    # Isolate from whatever the real dev/mini auth.json happens to contain —
+    # a nonexistent fixture path makes _scan_pool_events() a clean no-op
+    # (degraded_secrets_monitor.check_credential_pool() reports "missing").
+    module.AUTH_PATH = str(tmp_path / "auth.json")
     module.LOGS = []
     Path(module.JOBS_PATH).write_text(
         json.dumps(
