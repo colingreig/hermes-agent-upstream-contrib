@@ -1005,6 +1005,33 @@ else
   fail "install_governed_fleet_config failed when invoking its installer directly"
 fi
 
+# Fleet-outcome sources may resolve from the repository root rather than the
+# mini-scripts bundle. Exercise the real install function and pin the complete
+# load-bearing argument pair: --repo-root must equal this release directory.
+FLEET_OUTCOMES_RELEASE="$RELEASES_DIR/v1.1.6-fleet-outcomes-repo-root"
+FLEET_OUTCOMES_RECONCILER="$FLEET_OUTCOMES_RELEASE/$VENDORED_FLEET_OUTCOMES_RECONCILER_REL"
+FLEET_OUTCOMES_MANIFEST="$FLEET_OUTCOMES_RELEASE/$VENDORED_FLEET_OUTCOMES_MANIFEST_REL"
+FLEET_OUTCOMES_CALLS="$TEST_ROOT/fleet-outcomes-reconciler-calls"
+mkdir -p "$(dirname "$FLEET_OUTCOMES_RECONCILER")" "$FLEET_OUTCOMES_RELEASE/venv/bin"
+printf '# placeholder fleet-outcomes reconciler\n' > "$FLEET_OUTCOMES_RECONCILER"
+printf '{}\n' > "$FLEET_OUTCOMES_MANIFEST"
+cat > "$FLEET_OUTCOMES_RELEASE/venv/bin/python" <<SH
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$FLEET_OUTCOMES_CALLS"
+SH
+chmod 0755 "$FLEET_OUTCOMES_RELEASE/venv/bin/python"
+if (
+  guarded_or_direct() { "$@"; }
+  install_governed_fleet_outcomes "$FLEET_OUTCOMES_RELEASE"
+); then
+  :
+else
+  fail "install_governed_fleet_outcomes failed for a valid release bundle"
+fi
+grep -Fqx "$FLEET_OUTCOMES_RECONCILER install --source-root $(dirname "$FLEET_OUTCOMES_RECONCILER") --repo-root $FLEET_OUTCOMES_RELEASE --manifest $FLEET_OUTCOMES_MANIFEST --home $HOME --hermes-home $HERMES_HOME --reload" \
+  "$FLEET_OUTCOMES_CALLS" \
+  || fail "fleet-outcome install did not pass --repo-root equal to the release directory"
+
 # A later cut starts with an unarmed in-process marker. If reconciliation fails
 # during validation/before snapshot creation, it must not consume the previous
 # successful generation's rollback pointer.

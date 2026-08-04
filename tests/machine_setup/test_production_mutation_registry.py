@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -182,6 +183,18 @@ def test_each_actor_has_a_complete_resource_and_recovery_model():
         pointers = actors[actor_id]["operational_pointers"]
         assert set(pointers) == {"activation", "rollback", "verification"}
         assert pointers["verification"]["entry_point"].endswith("verify_governed_paths.py")
+
+
+def test_fleet_outcomes_standalone_activation_supplies_the_repository_root():
+    """The manifest contains repo-root sources, so the documented direct
+    activation must not fall back to the mini-scripts bundle directory.
+    """
+    actor = _actors_by_id(_registry())["fleet-outcomes-reconciler"]
+    activation = actor["operational_pointers"]["activation"]
+    argv = shlex.split(activation["command"])
+
+    assert activation["entry_point"] in argv
+    assert argv[argv.index("--repo-root") + 1] == "<repo-root>"
 
 
 def test_unknown_path_guard_and_generated_human_index_are_current():
