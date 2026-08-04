@@ -8,6 +8,7 @@ turns once the gateway starts draining.
 """
 
 import asyncio
+import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -17,6 +18,7 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.api_server import APIServerAdapter
+from gateway.status import read_runtime_status, write_runtime_status
 from tests.gateway.restart_test_helpers import make_restart_runner
 
 
@@ -144,6 +146,81 @@ class TestAPIServerAdapterWorkCount:
 
         assert adapter.active_agent_work_count() == 1
 
+    @pytest.mark.asyncio
+    async def test_cancelled_http_coroutine_stays_active_until_executor_exits(self):
+        adapter = APIServerAdapter(PlatformConfig(enabled=True))
+        worker_started = threading.Event()
+        release_worker = threading.Event()
+        agent = MagicMock()
+
+        def blocked_run(**_kwargs):
+            worker_started.set()
+            release_worker.wait(2)
+            return {"final_response": "done"}
+
+        agent.run_conversation.side_effect = blocked_run
+        agent.session_prompt_tokens = 0
+        agent.session_completion_tokens = 0
+        agent.session_total_tokens = 0
+
+        with patch.object(adapter, "_create_agent", return_value=agent):
+            task = asyncio.create_task(
+                adapter._run_agent(user_message="hello", conversation_history=[])
+            )
+            assert await asyncio.to_thread(worker_started.wait, 2)
+            assert adapter.active_agent_work_count() == 1
+
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+            assert adapter.active_agent_work_count() == 1
+            release_worker.set()
+            for _ in range(100):
+                if adapter.active_agent_work_count() == 0:
+                    break
+                await asyncio.sleep(0.01)
+
+        assert adapter.active_agent_work_count() == 0
+
+    @pytest.mark.asyncio
+    async def test_cancelled_structured_run_transfers_count_to_executor(self):
+        adapter = APIServerAdapter(PlatformConfig(enabled=True))
+        app = _make_admission_app(adapter)
+        worker_started = threading.Event()
+        release_worker = threading.Event()
+        agent = MagicMock()
+
+        def blocked_run(**_kwargs):
+            worker_started.set()
+            release_worker.wait(2)
+            return {"final_response": "done"}
+
+        agent.run_conversation.side_effect = blocked_run
+        agent.session_prompt_tokens = 0
+        agent.session_completion_tokens = 0
+        agent.session_total_tokens = 0
+
+        with patch.object(adapter, "_create_agent", return_value=agent):
+            async with TestClient(TestServer(app)) as client:
+                response = await client.post("/v1/runs", json={"input": "hello"})
+                assert response.status == 202
+                assert await asyncio.to_thread(worker_started.wait, 2)
+                run_task = next(iter(adapter._active_run_tasks.values()))
+                run_task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await run_task
+
+                assert adapter._active_run_tasks == {}
+                assert adapter.active_agent_work_count() == 1
+                release_worker.set()
+                for _ in range(100):
+                    if adapter.active_agent_work_count() == 0:
+                        break
+                    await asyncio.sleep(0.01)
+
+        assert adapter.active_agent_work_count() == 0
+
 
 class TestDrainWaitsForApiWork:
     @pytest.mark.asyncio
@@ -161,6 +238,8 @@ class TestDrainWaitsForApiWork:
         runner, _adapter = make_restart_runner()
         api = APIServerAdapter(PlatformConfig(enabled=True))
         runner.adapters = {Platform.API_SERVER: api}
+        api.gateway_runner = runner
+        write_runtime_status(gateway_state="running", active_agents=0)
         app = _make_admission_app(api)
         original_create_task = asyncio.create_task
         task_started = asyncio.Event()
@@ -191,6 +270,9 @@ class TestDrainWaitsForApiWork:
 
                 assert api._active_run_agents == {}
                 assert runner._active_api_run_count() == 1
+                runtime = read_runtime_status()
+                assert runtime is not None
+                assert runtime["active_agents"] == 1
                 drain_task = original_create_task(runner._drain_active_agents(2.0))
                 await asyncio.sleep(0.1)
                 assert not drain_task.done()
@@ -199,6 +281,9 @@ class TestDrainWaitsForApiWork:
                 _snapshot, timed_out = await drain_task
 
         assert timed_out is False
+        runtime = read_runtime_status()
+        assert runtime is not None
+        assert runtime["active_agents"] == 0
 
     @pytest.mark.asyncio
     async def test_drain_times_out_if_api_run_outlives_the_window(self):
@@ -235,6 +320,55 @@ class TestDrainWaitsForApiWork:
 
 
 class TestDrainAdmission:
+    @pytest.mark.asyncio
+    async def test_real_request_boundaries_persist_gateway_active_work(self):
+        adapter = APIServerAdapter(PlatformConfig(enabled=True))
+        runner, _adapter = make_restart_runner()
+        runner.adapters = {Platform.API_SERVER: adapter}
+        adapter.gateway_runner = runner
+        write_runtime_status(gateway_state="running", active_agents=0)
+        app = _make_admission_app(adapter)
+        body_read_started = asyncio.Event()
+        allow_body_read = asyncio.Event()
+
+        async def delayed_read_json(_request):
+            body_read_started.set()
+            await allow_body_read.wait()
+            return {"message": "hello"}, None
+
+        with patch.object(
+            adapter,
+            "_get_existing_session_or_404",
+            return_value=({}, None),
+        ), patch.object(
+            adapter,
+            "_read_json_body",
+            side_effect=delayed_read_json,
+        ), patch.object(
+            adapter,
+            "_run_agent",
+            new=AsyncMock(return_value=({"final_response": "done"}, {})),
+        ):
+            async with TestClient(TestServer(app)) as client:
+                request_task = asyncio.create_task(
+                    client.post("/api/sessions/missing/chat", json={})
+                )
+                await body_read_started.wait()
+
+                runtime = read_runtime_status()
+                assert runtime is not None
+                assert runtime["gateway_state"] == "running"
+                assert runtime["active_agents"] == 1
+
+                allow_body_read.set()
+                response = await request_task
+                assert response.status == 200
+
+        runtime = read_runtime_status()
+        assert runtime is not None
+        assert runtime["gateway_state"] == "running"
+        assert runtime["active_agents"] == 0
+
     @pytest.mark.asyncio
     async def test_drain_refuses_every_agent_start_endpoint(self):
         adapter = APIServerAdapter(PlatformConfig(enabled=True))
