@@ -237,6 +237,7 @@
     },
     {
       "source": "scripts/clickup_poll_gate.py",
+      "source_root": "repo",
       "destination_root": "scripts",
       "destination": "clickup_poll_gate.py",
       "mode": "0644",

@@ -673,13 +673,17 @@ than having their schedules advanced.
   Deployment is governed by the content-addressed
   `fleet_outcome_manifest.json` and transactional
   `reconcile_fleet_outcomes.py`. The normal Mini release cut invokes it
-  automatically. For an explicit verification or repair from an exact release:
+  automatically and passes the release root explicitly so manifest entries
+  with `source_root: "repo"` (including the single canonical
+  `scripts/clickup_poll_gate.py`) resolve from the release checkout. For an
+  explicit verification or repair from an exact release:
 
   ```bash
   ~/.hermes/runtime-current/venv/bin/python \
     ~/.hermes/runtime-current/machine-setup/mini-scripts/reconcile_fleet_outcomes.py \
     verify \
     --source-root ~/.hermes/runtime-current/machine-setup/mini-scripts \
+    --repo-root ~/.hermes/runtime-current \
     --manifest ~/.hermes/runtime-current/machine-setup/mini-scripts/fleet_outcome_manifest.json \
     --reload
   ```
