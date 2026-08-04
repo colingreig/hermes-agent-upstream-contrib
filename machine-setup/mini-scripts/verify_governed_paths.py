@@ -300,12 +300,33 @@ class GovernedPathsVerifier:
         current = self.hermes / "runtime-current"
         if not current.is_symlink():
             raise VerificationError(f"runtime-current is missing or not a symlink: {current}")
+        # Check the RAW link text, not only the resolved path (ClickUp
+        # 86e2kt3yr). The 2026-08-02 corruption was a bare-name relative link
+        # (`v0.18.2-<sha>`), which resolves against ~/.hermes rather than
+        # releases/ and therefore dangled. A relative link that *does* resolve
+        # (e.g. `releases/v0.18.2-<sha>`) is equally out of contract: the
+        # release receipt records an absolute runtime_target, and every
+        # consumer builds paths by string-joining onto this pointer.
+        raw_target = Path(os.readlink(current))
+        if not raw_target.is_absolute():
+            raise VerificationError(
+                f"runtime-current is a relative symlink (must be absolute): {current} -> {raw_target}"
+            )
         try:
             target = current.resolve(strict=True)
         except OSError as exc:
             raise VerificationError(f"runtime-current target is missing: {current}") from exc
         if not target.is_dir() or target.parent != releases.resolve():
             raise VerificationError(f"runtime-current escapes releases: {target}")
+        # Reject traversal/dot components on the raw text. Deliberately NOT a
+        # string comparison against the resolved path: this verifier runs
+        # inside every release cut, and a home under a symlinked prefix
+        # (macOS /var -> /private/var) would then fail a healthy pointer and
+        # roll the cut back.
+        if any(part in {".", ".."} for part in raw_target.parts):
+            raise VerificationError(
+                f"runtime-current is not canonical: {current} -> {raw_target}"
+            )
 
         previous = releases / ".previous"
         _plain_file(previous, "release previous pointer")

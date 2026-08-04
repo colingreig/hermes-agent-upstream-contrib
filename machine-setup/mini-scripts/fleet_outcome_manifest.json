@@ -37,7 +37,7 @@
       "destination_root": "scripts",
       "destination": "verify_governed_paths.py",
       "mode": "0755",
-      "sha256": "ecce5c417b83e33bdfeb781ae0fbcaa8644e2137885542e5a66193943284a7e5"
+      "sha256": "066ec23fe90d62f85b011382bc9cb203ece3b23d0fb8a83f54af70992d00d27a"
     },
     {
       "source": "verify_governed_paths_launcher.py",
@@ -58,7 +58,7 @@
       "destination_root": "scripts",
       "destination": "runtime_current_guard.py",
       "mode": "0755",
-      "sha256": "831fabb26eb71ebb8fb6adfaed0a8b60335d4650113169758cc9a391439403ae"
+      "sha256": "9be2d3675a365878b35e90420e25c1ce4de7e8648d8bc416a585a154587a264a"
     },
     {
       "source": "digest_trusted_scripts.json",
@@ -86,7 +86,7 @@
       "destination_root": "scripts",
       "destination": "fleet_outcome_contracts.json",
       "mode": "0644",
-      "sha256": "048feb93addbbc6e37061b28f4eac6067ab36f0527e1f7fb648d5369cb56f568"
+      "sha256": "8f5a0a08f55e62f43478db2d756c4211193c7fddc0370e2cee2556b7b5f294a2"
     },
     {
       "source": "mini_local_registry.json",

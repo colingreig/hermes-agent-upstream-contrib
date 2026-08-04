@@ -1078,7 +1078,10 @@ def test_release_poll_contract_requires_fresh_heartbeat(tmp_path):
     }
 
     # Log is fresh but missing the heartbeat marker entirely (unexpected
-    # content): alarm rather than silently pass.
+    # content): alarm rather than silently pass. The heartbeat doubles as this
+    # contract's run-start marker (ClickUp 86e2kt3yr), so its absence is
+    # reported as a missing run boundary -- equally distinguishable, and one
+    # code instead of two for the same underlying condition.
     os.utime(heartbeat, (NOW.timestamp(), NOW.timestamp()))
     heartbeat.write_text("some unrelated line\n", encoding="utf-8")
     os.utime(heartbeat, (NOW.timestamp(), NOW.timestamp()))
@@ -1089,10 +1092,7 @@ def test_release_poll_contract_requires_fresh_heartbeat(tmp_path):
         home=tmp_path,
         now=NOW,
     )
-    assert {item["code"] for item in findings} == {
-        "success_marker_missing",
-        "required_marker_missing",
-    }
+    assert {item["code"] for item in findings} == {"run_boundary_missing"}
 
     # Structurally absent (unloaded): the launchd-registration check itself
     # must alarm, independent of any log content.
@@ -1107,6 +1107,65 @@ def test_release_poll_contract_requires_fresh_heartbeat(tmp_path):
     assert {(item["id"], item["code"]) for item in launch_findings} == {
         (label, "agent_not_loaded")
     }
+
+
+def test_release_poll_corrupt_pointer_alarms_distinguishably_and_clears(tmp_path):
+    """ClickUp 86e2kt3yr: a corrupt runtime-current pointer must alarm as
+    itself, and the alarm must be satisfiable.
+
+    The poller fails closed on a corrupt pointer with a stable, greppable
+    prefix. Two things have to hold together:
+
+    * the corrupt line must produce a ``failure_marker``, not the generic
+      liveness silence a broken poller would otherwise look like; and
+    * once the pointer is repaired, the very next poll must clear it. The log
+      is append-only and the contract keeps a 4000-line tail, so without a run
+      boundary a single one-minute incident would hold this alarm red for
+      weeks -- the unsatisfiable-alarm failure mode. The heartbeat, printed
+      unconditionally as the first line of every invocation, is therefore the
+      run-start marker, which scopes evaluation to the latest poll.
+    """
+    module = _load_module()
+    label = "com.colingreig.hermes.release-poll"
+    outcome = _canonical_contract(launch_label=label)["outcome"]
+    assert outcome["run_start_pattern"] == "^mini-release-poll: heartbeat "
+
+    healthy = "mini-release-poll: heartbeat ts=2026-08-03T12:00:00Z pid=123\n"
+    corrupt = (
+        "mini-release-poll: heartbeat ts=2026-08-03T12:15:00Z pid=124\n"
+        "mini-release-poll: runtime-current pointer corrupt: "
+        "relative symlink (must be absolute): -> v0.18.2-aae777c146da\n"
+    )
+
+    log = _fresh_artifact(tmp_path, healthy + corrupt)
+    checked_outcome = {**outcome, "path": str(log)}
+    findings = module._check_artifact(
+        surface="launchd",
+        identifier=label,
+        outcome=checked_outcome,
+        home=tmp_path,
+        now=NOW,
+    )
+    assert {(item["id"], item["code"]) for item in findings} == {
+        (label, "failure_marker")
+    }
+
+    # Pointer repaired: the next poll appends a clean run and the alarm clears
+    # even though the corrupt line is still in the tail.
+    log.write_text(healthy + corrupt + healthy, encoding="utf-8")
+    import os
+
+    os.utime(log, (NOW.timestamp(), NOW.timestamp()))
+    assert (
+        module._check_artifact(
+            surface="launchd",
+            identifier=label,
+            outcome=checked_outcome,
+            home=tmp_path,
+            now=NOW,
+        )
+        == []
+    )
 
 
 def test_kanban_sweep_contract_requires_complete_clean_summary(tmp_path):
