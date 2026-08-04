@@ -136,7 +136,7 @@ than observed.
 | G3 | **No supported repair.** `--rollback` also dereferences the pointer, so the one obvious recovery command was unusable in exactly the situation it was needed. The 08-02 repair was itself an unregistered `ln`. | fixed |
 | G4 | `verify_governed_paths.py` validated the *resolved* path only. A relative link that happens to resolve (`releases/v0.18.2-x`) passed, despite the receipt contract recording an absolute `runtime_target`. | fixed |
 | G5 | `repoint_symlink`'s post-swap check compared **target equality only**; a link whose text matched but whose form was relative would have been accepted. | fixed |
-| G6 | `tests/scripts/test_mini_release_cut_safety.sh` — the cutter's only safety suite — was **not collected by pytest and not run by any workflow**. It could rot silently while CI stayed green. | fixed |
+| G6 | `tests/scripts/test_mini_release_cut_safety.sh` — the cutter's only safety suite — was **not collected by pytest and not run by any workflow**. It could rot silently while CI stayed green. | partly fixed — now collected, but macOS-only (see below) |
 | G7 | Gateway **shell hooks fail open** when their interpreter is unreachable: `merge_guard.py` and `git_commit_identity_guard.py` degraded to warnings and tool calls proceeded ungated. | follow-up |
 | G8 | `PRODUCTION_WRITERS.md`'s unknown-path guard is documentation, not runtime admission control (its own follow-ups `86e2kmucr`/`86e2kmuct` are still open), so an out-of-band write is unpreventable by design today. | follow-up (already tracked) |
 
@@ -199,7 +199,19 @@ than observed.
 - `tests/machine_setup/test_verify_governed_paths.py` — 3 new cases (bare-name relative,
   resolvable relative, non-canonical absolute).
 - `tests/scripts/test_mini_release_cut_safety_suite.py` — collects the bash suite under
-  pytest so CI actually runs it (G6).
+  pytest so it is finally on a gate (G6). It skips on non-Darwin: the suite
+  exercises BSD-only cutter primitives, above all `mv -fh` in `repoint_symlink`
+  (GNU coreutils rejects `-h`; its equivalent is `-T`). `-h` is load-bearing —
+  without it BSD `mv` moves the staged link *into* the current release
+  directory and the pointer is never swapped — so making the primitive
+  portable to satisfy an Ubuntu runner would put that exact regression one bad
+  platform detection away. The suite therefore runs on every macOS developer
+  machine and on the mini, and reports as skipped on the Linux CI runner. Same
+  gate for the two `--repair-pointer` tests that reach `repoint_symlink`; the
+  read-only `--verify-pointer` tests and the whole poller-guard suite are
+  cross-platform and do run in CI. **Residual gap: CI has no macOS job, so the
+  bash suite still has no automated enforcement — closing that needs either a
+  macOS runner or a portable swap primitive, and is a deliberate follow-up.**
 
 ---
 

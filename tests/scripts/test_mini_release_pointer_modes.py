@@ -18,6 +18,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -26,6 +27,19 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 CUT = REPO_ROOT / "scripts" / "mini-release-cut.sh"
 
 pytestmark = pytest.mark.skipif(shutil.which("bash") is None, reason="bash is required")
+
+# The probe modes are portable, but any test that reaches ``repoint_symlink``
+# is not: the swap is ``mv -fh``, a BSD-only flag with no GNU spelling
+# (GNU's equivalent is ``-T``). That is deliberate, load-bearing macOS code --
+# without ``-h``, BSD ``mv`` treats an existing symlink-to-directory
+# destination as "move INTO that directory" and the pointer is never swapped,
+# which is the bug the flag was added to fix. The mini is macOS, so the flag
+# stays and these tests are macOS-only rather than the primitive being made
+# portable for the benefit of an Ubuntu CI runner.
+requires_bsd_mv = pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="repoint_symlink uses BSD `mv -fh`; the release cutter is macOS-only",
+)
 
 
 def _fixture(tmp_path: Path) -> tuple[Path, Path]:
@@ -84,6 +98,7 @@ def test_verify_pointer_is_read_only_on_a_corrupt_pointer(tmp_path):
     assert os.readlink(pointer) == release.name
 
 
+@requires_bsd_mv
 def test_repair_pointer_restores_the_receipt_verified_target(tmp_path):
     home, release = _fixture(tmp_path)
     pointer = home / "runtime-current"
@@ -107,6 +122,7 @@ def test_repair_pointer_is_idempotent(tmp_path):
     assert "already healthy" in result.stdout
 
 
+@requires_bsd_mv
 def test_repair_pointer_releases_its_lock(tmp_path):
     home, release = _fixture(tmp_path)
     (home / "runtime-current").symlink_to(release.name)
