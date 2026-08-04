@@ -369,11 +369,14 @@ def test_repository_manifest_is_content_addressed() -> None:
         cron_updates = {
             update["name"]: update for update in reconciler.manifest["cron_updates"]
         }
-        assert cron_updates["verify-governed-paths"] == {
-            "id": "a6e2d5b00123",
-            "name": "verify-governed-paths",
-            "fields": {"script": "verify_governed_paths.sh"},
-        }
+        # verify-governed-paths (a6e2d5b00123) is intentionally NOT pinned
+        # here: fleet-config/jobs.json already ships that job with
+        # "script": "verify_governed_paths.sh", so a cron_updates entry for
+        # it is redundant and, worse, deadlocks the first cut of any release
+        # that both adds a new cron job and reconciles it in the same
+        # release (reconcile_fleet_outcomes.py can only patch an EXISTING
+        # job) — see the 592f589e90 (#324) first-cut bootstrap deadlock.
+        assert "verify-governed-paths" not in cron_updates
         assert cron_updates["ci-health-watch"] == {
             "id": "e835c614cfb2",
             "name": "ci-health-watch",

@@ -58,7 +58,7 @@
       "destination_root": "scripts",
       "destination": "runtime_current_guard.py",
       "mode": "0755",
-      "sha256": "1706f421d4068f9fcb2ef62ced4bc1281bd3087b981d9d4549aee7e8992aa843"
+      "sha256": "831fabb26eb71ebb8fb6adfaed0a8b60335d4650113169758cc9a391439403ae"
     },
     {
       "source": "digest_trusted_scripts.json",
@@ -216,13 +216,6 @@
     }
   ],
   "cron_updates": [
-    {
-      "id": "a6e2d5b00123",
-      "name": "verify-governed-paths",
-      "fields": {
-        "script": "verify_governed_paths.sh"
-      }
-    },
     {
       "id": "e835c614cfb2",
       "name": "ci-health-watch",

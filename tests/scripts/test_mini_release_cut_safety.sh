@@ -1506,6 +1506,30 @@ dry_drain_clear_line="$(grep -nF 'clear external gateway drain' "$DRY_ROOT/outpu
   || fail "dry cut planned runtime switch before external drain"
 [ "$dry_launchd_line" -lt "$dry_drain_clear_line" ] \
   || fail "dry cut planned drain cleanup before new launchd registration"
+# Regression guard for the 592f589e90 (#324) first-cut bootstrap deadlock:
+# install_governed_fleet_outcomes reconciles cron_updates against an
+# ALREADY-EXISTING job in jobs.json (reconcile_fleet_outcomes.py can only
+# patch a job, never create one). A release that both adds a cron job in
+# fleet-config/jobs.json and pins that same job in
+# fleet_outcome_manifest.json's cron_updates deadlocks on its first cut
+# unless install_governed_fleet_config runs first. Assert that ordering
+# both in the source text and in the planned dry-run execution order.
+fleet_config_install_source_line="$(grep -n 'if ! install_governed_fleet_config "\$NEW_DIR"; then' "$SCRIPT" \
+  | head -n1 | cut -d: -f1 || true)"
+fleet_outcomes_install_source_line="$(grep -n 'if ! install_governed_fleet_outcomes "\$NEW_DIR"; then' "$SCRIPT" \
+  | head -n1 | cut -d: -f1 || true)"
+[ -n "$fleet_config_install_source_line" ] && [ -n "$fleet_outcomes_install_source_line" ] \
+  || fail "could not locate install_governed_fleet_config/install_governed_fleet_outcomes call sites"
+[ "$fleet_config_install_source_line" -lt "$fleet_outcomes_install_source_line" ] \
+  || fail "install_governed_fleet_outcomes call site precedes install_governed_fleet_config in source (first-cut deadlock regression, see #324)"
+dry_fleet_config_line="$(grep -nF 'install_fleet_config.py --manifest' "$DRY_ROOT/output" \
+  | head -n1 | cut -d: -f1 || true)"
+dry_fleet_outcomes_line="$(grep -nF 'reconcile_fleet_outcomes.py install --source-root' "$DRY_ROOT/output" \
+  | head -n1 | cut -d: -f1 || true)"
+[ -n "$dry_fleet_config_line" ] && [ -n "$dry_fleet_outcomes_line" ] \
+  || fail "dry cut did not plan fleet-config install or fleet-outcome reconciliation"
+[ "$dry_fleet_config_line" -lt "$dry_fleet_outcomes_line" ] \
+  || fail "dry cut planned fleet-outcome cron reconciliation before fleet-config job creation (first-cut deadlock regression, see #324)"
 grep -Fq "ls-tree $DRY_TARGET_SHA -- $VENDORED_REFRESH_REL" "$DRY_GIT_LOG" \
   || fail "dry cut did not validate refresh metadata from the target tree"
 grep -Fq "ls-tree $DRY_TARGET_SHA -- $VENDORED_LAUNCHD_RECONCILER_REL" "$DRY_GIT_LOG" \

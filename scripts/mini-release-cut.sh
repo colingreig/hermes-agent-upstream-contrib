@@ -2959,15 +2959,15 @@ if ! reconcile_governed_pr_pipeline "$NEW_DIR" "$SHA"; then
   die "cut aborted and rolled back to previous release"
 fi
 heartbeat_production_write_lease
-if ! install_governed_fleet_outcomes "$NEW_DIR"; then
-  warn "governed fleet-outcome reconciliation failed — rolling back"
-  guarded_rollback_to_previous "governed fleet-outcome reconciliation failed"
-  die "cut aborted and rolled back to previous release"
-fi
-heartbeat_production_write_lease
 if ! install_governed_fleet_config "$NEW_DIR"; then
   warn "governed fleet-config install failed — rolling back"
   guarded_rollback_to_previous "governed fleet-config install failed"
+  die "cut aborted and rolled back to previous release"
+fi
+heartbeat_production_write_lease
+if ! install_governed_fleet_outcomes "$NEW_DIR"; then
+  warn "governed fleet-outcome reconciliation failed — rolling back"
+  guarded_rollback_to_previous "governed fleet-outcome reconciliation failed"
   die "cut aborted and rolled back to previous release"
 fi
 heartbeat_production_write_lease
