@@ -487,6 +487,16 @@
       "timestamp_pattern": "ts=(?P<ts>\\S+)"
     },
     {
+      "id": "release-cut-drain-deferral",
+      "kind": "repeated_release_drift",
+      "path": "~/.hermes/logs/mini-release-poll.log",
+      "pattern": "release cut deferred: gateway did not quiesce",
+      "threshold": 6,
+      "tail_bytes": 262144,
+      "window_minutes": 240,
+      "timestamp_pattern": "ts=(?P<ts>\\S+)"
+    },
+    {
       "id": "governed-path-integrity",
       "kind": "governed_manifest",
       "path": "~/.hermes/scripts/fleet_outcome_manifest.json"
