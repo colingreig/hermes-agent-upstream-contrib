@@ -1152,6 +1152,214 @@ def test_auth_list_prefers_explicit_reset_time(monkeypatch, capsys):
     assert "7d 0h left" in out
 
 
+def test_auth_list_shows_taxonomy_fields(monkeypatch, capsys):
+    """86e2mb8pb: `hermes auth list` renders the provider-failure taxonomy
+    (86e2mb8nv last_failure_kind, 86e2mb8p0 probe verdict, usage headroom)
+    when a pool entry carries it."""
+    from hermes_cli.auth_commands import auth_list_command
+
+    class _Entry:
+        id = "cred-1"
+        label = "primary"
+        auth_type = "api_key"
+        source = "manual"
+        last_status = None
+        last_error_code = None
+        last_status_at = None
+        last_failure_kind = "usage_cap"
+        last_probe_verdict = "still_unusable"
+        usage_percent = 92
+
+    class _Pool:
+        def entries(self):
+            return [_Entry()]
+
+        def peek(self):
+            return None
+
+    monkeypatch.setattr("hermes_cli.auth_commands.load_pool", lambda provider: _Pool())
+
+    class _Args:
+        provider = "openrouter"
+
+    auth_list_command(_Args())
+
+    out = capsys.readouterr().out
+    assert "kind=usage_cap" in out
+    assert "probe=still_unusable" in out
+    assert "headroom=8%" in out
+
+
+def test_auth_list_omits_taxonomy_suffix_when_absent(monkeypatch, capsys):
+    """A pool entry written before 86e2mb8nv (or one that's simply never
+    failed) carries no taxonomy fields — the suffix must not appear."""
+    from hermes_cli.auth_commands import auth_list_command
+
+    class _Entry:
+        id = "cred-1"
+        label = "primary"
+        auth_type = "api_key"
+        source = "manual"
+        last_status = None
+        last_error_code = None
+        last_status_at = None
+
+    class _Pool:
+        def entries(self):
+            return [_Entry()]
+
+        def peek(self):
+            return None
+
+    monkeypatch.setattr("hermes_cli.auth_commands.load_pool", lambda provider: _Pool())
+
+    class _Args:
+        provider = "openrouter"
+
+    auth_list_command(_Args())
+
+    out = capsys.readouterr().out
+    assert "kind=" not in out
+    assert "probe=" not in out
+    assert "headroom=" not in out
+
+
+def test_auth_codex_list_shows_taxonomy_fields(tmp_path, monkeypatch, capsys):
+    """86e2mb8pb: `hermes auth codex list` renders the same taxonomy fields
+    for the account-slot rendering path (separate from auth_list_command's
+    generic pool rendering)."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    entry = {
+        "id": "codex-1",
+        "label": "codex@example.com",
+        "auth_type": "oauth",
+        "priority": 0,
+        "source": "device_code",
+        "access_token": _jwt_with_email("codex@example.com"),
+        "refresh_token": "refresh-token",
+        "base_url": "https://chatgpt.com/backend-api/codex",
+        "last_refresh": "2026-06-15T10:00:00Z",
+        "last_failure_kind": "rate_limit_session",
+        "last_probe_verdict": "usable",
+        "usage_percent": 40,
+    }
+    _write_auth_store(tmp_path, {
+        "version": 1,
+        "active_provider": "openai-codex",
+        "providers": {},
+        "credential_pool": {"openai-codex": [entry]},
+    })
+
+    from types import SimpleNamespace
+
+    from hermes_cli.auth_commands import auth_codex_list_command
+
+    auth_codex_list_command(SimpleNamespace())
+
+    out = capsys.readouterr().out
+    assert "kind=rate_limit_session" in out
+    assert "probe=usable" in out
+    assert "headroom=60%" in out
+
+
+def test_auth_status_command_renders_pool_taxonomy_when_logged_in(tmp_path, monkeypatch, capsys):
+    """86e2mb8pb: `hermes auth status` renders pool taxonomy fields via
+    agent.credential_pool.failure_summary(), independent of whatever
+    get_auth_status() reports for the OAuth/API-key status itself."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    entry = {
+        "id": "cred-1",
+        "label": "primary",
+        "auth_type": "oauth",
+        "priority": 0,
+        "source": "manual:device_code",
+        "access_token": "tok",
+        "last_failure_kind": "auth_permanent",
+        "last_probe_verdict": "confirmed_provider_side",
+        "usage_percent": 80,
+    }
+    _write_auth_store(tmp_path, {
+        "version": 1,
+        "providers": {},
+        "credential_pool": {"openai-codex": [entry]},
+    })
+
+    from types import SimpleNamespace
+
+    from hermes_cli.auth_commands import auth_status_command
+
+    monkeypatch.setattr(
+        "hermes_cli.auth_commands.auth_mod.get_auth_status",
+        lambda provider: {"logged_in": True, "auth_type": "oauth"},
+    )
+
+    auth_status_command(SimpleNamespace(provider="openai-codex"))
+
+    out = capsys.readouterr().out
+    assert "openai-codex: logged in" in out
+    assert "taxonomy:" in out
+    assert "kind=auth_permanent" in out
+    assert "probe=confirmed_provider_side" in out
+    assert "headroom=20%" in out
+
+
+def test_auth_status_command_renders_pool_taxonomy_when_logged_out(tmp_path, monkeypatch, capsys):
+    """A dead/quarantined pool entry's last_failure_kind is often exactly
+    why a provider shows logged out — must render there too, not just on
+    the logged-in path."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    entry = {
+        "id": "cred-1",
+        "label": "primary",
+        "auth_type": "api_key",
+        "priority": 0,
+        "source": "manual",
+        "access_token": "tok",
+        "last_status": "dead",
+        "last_failure_kind": "auth_permanent",
+    }
+    _write_auth_store(tmp_path, {
+        "version": 1,
+        "providers": {},
+        "credential_pool": {"gemini": [entry]},
+    })
+
+    from types import SimpleNamespace
+
+    from hermes_cli.auth_commands import auth_status_command
+
+    monkeypatch.setattr(
+        "hermes_cli.auth_commands.auth_mod.get_auth_status",
+        lambda provider: {"logged_in": False},
+    )
+
+    auth_status_command(SimpleNamespace(provider="gemini"))
+
+    out = capsys.readouterr().out
+    assert "gemini: logged out" in out
+    assert "taxonomy:" in out
+    assert "kind=auth_permanent" in out
+
+
+def test_auth_status_command_omits_taxonomy_section_when_no_pool_entries(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(tmp_path, {"version": 1, "providers": {}})
+
+    from types import SimpleNamespace
+
+    from hermes_cli.auth_commands import auth_status_command
+
+    monkeypatch.setattr(
+        "hermes_cli.auth_commands.auth_mod.get_auth_status",
+        lambda provider: {"logged_in": False},
+    )
+
+    auth_status_command(SimpleNamespace(provider="some-unconfigured-provider"))
+
+    out = capsys.readouterr().out
+    assert "taxonomy:" not in out
+
+
 def test_auth_remove_env_seeded_clears_env_var(tmp_path, monkeypatch):
     """Removing an env-seeded credential should also clear the env var from .env
     so the entry doesn't get re-seeded on the next load_pool() call."""
