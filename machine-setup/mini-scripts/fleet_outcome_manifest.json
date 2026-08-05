@@ -100,7 +100,7 @@
       "destination_root": "scripts",
       "destination": "mini_local_registry.json",
       "mode": "0644",
-      "sha256": "1f3fd77705bc707528510fa4a8d1be313ea902c3a85f71b5af6bedb3c9cf44da"
+      "sha256": "7b956eaa5ddd9b4067d14410d6994c24ac670606ca887649359035b0dd180687"
     },
     {
       "source": "hermes_usage_alert.py",
