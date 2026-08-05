@@ -100,7 +100,7 @@
       "destination_root": "scripts",
       "destination": "mini_local_registry.json",
       "mode": "0644",
-      "sha256": "1f3fd77705bc707528510fa4a8d1be313ea902c3a85f71b5af6bedb3c9cf44da"
+      "sha256": "7b956eaa5ddd9b4067d14410d6994c24ac670606ca887649359035b0dd180687"
     },
     {
       "source": "hermes_usage_alert.py",
@@ -237,10 +237,11 @@
     },
     {
       "source": "scripts/clickup_poll_gate.py",
+      "source_root": "repo",
       "destination_root": "scripts",
       "destination": "clickup_poll_gate.py",
       "mode": "0644",
-      "sha256": "59708d963a8e701eb2e35538099092cd1a979ec33da2de0102336b4b54f95cdf"
+      "sha256": "71f04d309f0546f61af7ead99800b031afe6a82c998d13b3a2e55e96efa1566c"
     }
   ],
   "cron_updates": [

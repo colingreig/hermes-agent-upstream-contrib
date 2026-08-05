@@ -3,6 +3,7 @@
 import json
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -1614,6 +1615,61 @@ class TestActiveAgentsTurnBoundaryWrite:
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         status.write_runtime_status(gateway_state="running", active_agents=-5)
         assert status.read_runtime_status()["active_agents"] == 0
+
+    def test_late_writer_recomputes_active_agents_inside_status_lock(
+        self, tmp_path, monkeypatch
+    ):
+        """A delayed cron callback must not overwrite newer API work with 0."""
+        from tests.gateway.restart_test_helpers import make_restart_runner
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        status.write_runtime_status(gateway_state="running", active_agents=0)
+        runner, _adapter = make_restart_runner()
+        active_work = [0]
+        runner._active_work_count = lambda: active_work[0]
+
+        class NewestWriterFirstLock:
+            """Serialize the newer write before the already-started stale one."""
+
+            def __init__(self):
+                self.stale_waiting = threading.Event()
+                self.new_finished = threading.Event()
+
+            def __enter__(self):
+                if threading.current_thread().name == "stale-status-writer":
+                    self.stale_waiting.set()
+                    if not self.new_finished.wait(2):
+                        raise TimeoutError("new status writer did not finish")
+                return self
+
+            def __exit__(self, _exc_type, _exc, _tb):
+                if threading.current_thread().name == "new-status-writer":
+                    self.new_finished.set()
+
+        ordered_lock = NewestWriterFirstLock()
+        monkeypatch.setattr(status, "_runtime_status_write_lock", ordered_lock)
+
+        stale = threading.Thread(
+            target=runner._persist_active_agents, name="stale-status-writer"
+        )
+        stale.start()
+        assert ordered_lock.stale_waiting.wait(2)
+
+        active_work[0] = 1
+        newer = threading.Thread(
+            target=runner._persist_active_agents, name="new-status-writer"
+        )
+        newer.start()
+        newer.join(2)
+        stale.join(2)
+
+        assert not newer.is_alive()
+        assert not stale.is_alive()
+        runtime = status.read_runtime_status()
+        assert runtime is not None
+        assert runtime["active_agents"] == 1
+
+
 class TestGatewayBusyDerivation:
     """Pure contract for derive_gateway_busy / derive_gateway_drainable — the
     single shared definition both /api/status and /health/detailed consume."""

@@ -125,6 +125,9 @@ def test_happy_path_installs_and_verifies(bundle):
         assert deployed.is_file()
         entry = next(f for f in bundle["manifest"]["files"] if f["src_rel"] == name)
         assert _sha(deployed.read_bytes()) == entry["sha256"]
+    assert (scripts / "self_report_manifest.json").read_bytes() == bundle[
+        "manifest_path"
+    ].read_bytes()
     receipt = _receipt(bundle["home"])
     assert receipt["result"] == "success"
     assert receipt["coexist_warnings"] == []
@@ -158,6 +161,7 @@ def test_snapshot_and_receipt_written(bundle):
     snap = installs[0]
     assert (snap / "install-receipt.json").is_file()
     assert (snap / "self_report_manifest.json").is_file()
+    assert not (snap / "deployed-self_report_manifest.json").exists()
     assert (snap / "hermes_report_build.py").read_text() == "# OLD deployed bytes\n"
     baks = list(scripts.glob("hermes_report_build.py.bak-self-report-install-*"))
     assert len(baks) == 1
@@ -224,6 +228,7 @@ def test_dry_run_writes_nothing(bundle):
     rc = _install(bundle, dry_run=True)
     assert rc == 0
     assert not (bundle["home"] / ".hermes" / "scripts" / "hermes_report_build.py").exists()
+    assert not (bundle["home"] / ".hermes" / "scripts" / "self_report_manifest.json").exists()
     assert not (bundle["home"] / ".hermes" / "logs").exists()
 
 

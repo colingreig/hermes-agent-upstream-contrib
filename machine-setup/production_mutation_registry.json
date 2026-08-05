@@ -206,7 +206,7 @@
       "operational_pointers": {
         "activation": {
           "entry_point": "machine-setup/mini-scripts/reconcile_fleet_outcomes.py",
-          "command": "python3 reconcile_fleet_outcomes.py install --home <home> --reload"
+          "command": "python3 machine-setup/mini-scripts/reconcile_fleet_outcomes.py install --repo-root <repo-root> --home <home> --reload"
         },
         "rollback": {
           "entry_point": "machine-setup/mini-scripts/reconcile_fleet_outcomes.py",

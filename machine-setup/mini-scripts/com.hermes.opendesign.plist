@@ -1,54 +1,27 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!--
-  Open Design headless daemon (gui/501 LaunchAgent, loopback only).
-
-  Deploy: scp this file to ~/Library/LaunchAgents/com.hermes.opendesign.plist,
-  then bootout -> poll -> bootstrap (see OPENDESIGN.md).
-
-  The daemon entry is the standalone daemon CLI:
-      /Users/colingreig/opendesign/apps/daemon/bin/od.mjs
-  invoked as `od daemon start --headless` (imports ../dist/cli.js). This is
-  the entry that actually serves a fixed-port HTTP API (OD_PORT default
-  7456, OD_BIND_HOST default 127.0.0.1) matching odx's expectations.
-
-  NOTE: apps/packaged/dist/headless.mjs (built via `pnpm tools-pack mac
-  build --to app`) is a DIFFERENT thing -- a full desktop-app launcher that
-  spawns its API daemon as a sidecar on a hardcoded ephemeral port
-  (DAEMON_PORT=0) and never prints or exposes it on a fixed port. It cannot
-  be used here; verified by inspecting apps/packaged/src/sidecars.ts and by
-  a live test (it started, but nothing listened on any fixed port).
-
-  launchd cannot read a file into EnvironmentVariables, so ProgramArguments
-  runs a short bash preamble that reads the 0600 token file, exports
-  OD_API_TOKEN, picks a Node binary, and execs the daemon. The token is never
-  echoed and never appears in argv.
-
-  Logs land in ~/Library/Logs/opendesign/; create that directory before
-  bootstrapping or launchd fails to open the log paths.
--->
 <plist version="1.0">
 <dict>
-  <key>Label</key>
-  <string>com.hermes.opendesign</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>/bin/bash</string>
-    <string>-c</string>
-    <string>set -euo pipefail
+	<key>Label</key>
+	<string>com.hermes.opendesign</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>-c</string>
+		<string>set -euo pipefail
 TOKEN_FILE="$HOME/.hermes/secrets/od_api_token"
 if [ ! -f "$TOKEN_FILE" ]; then
-  echo "opendesign: missing token file $TOKEN_FILE" >&amp;2
+  echo "opendesign: missing token file $TOKEN_FILE" &gt;&amp;2
   exit 78
 fi
 PERMS=$(/usr/bin/stat -f '%Lp' "$TOKEN_FILE")
 if [ "$PERMS" != "600" ]; then
-  echo "opendesign: $TOKEN_FILE must be mode 0600 (found 0$PERMS)" >&amp;2
+  echo "opendesign: $TOKEN_FILE must be mode 0600 (found 0$PERMS)" &gt;&amp;2
   exit 78
 fi
 OD_API_TOKEN=$(/usr/bin/head -n 1 "$TOKEN_FILE" | /usr/bin/tr -d '\r\n')
 if [ -z "$OD_API_TOKEN" ]; then
-  echo "opendesign: $TOKEN_FILE is empty" >&amp;2
+  echo "opendesign: $TOKEN_FILE is empty" &gt;&amp;2
   exit 78
 fi
 export OD_API_TOKEN
@@ -60,56 +33,49 @@ for candidate in "$HOME/opt/node24/bin/node" /opt/homebrew/bin/node /usr/local/b
   fi
 done
 if [ -z "$NODE_BIN" ]; then
-  echo "opendesign: no node runtime found" >&amp;2
+  echo "opendesign: no node runtime found" &gt;&amp;2
   exit 78
 fi
 OD_ENTRY="/Users/colingreig/opendesign/apps/daemon/bin/od.mjs"
 if [ ! -f "$OD_ENTRY" ]; then
-  echo "opendesign: daemon entry $OD_ENTRY not found" >&amp;2
+  echo "opendesign: daemon entry $OD_ENTRY not found" &gt;&amp;2
   exit 78
 fi
 /bin/mkdir -p "$OD_DATA_DIR"
 echo "opendesign: starting $NODE_BIN $OD_ENTRY daemon start --headless"
 exec "$NODE_BIN" "$OD_ENTRY" daemon start --headless
 </string>
-  </array>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>HOME</key>
-    <string>/Users/colingreig</string>
-    <key>PATH</key>
-    <string>/Users/colingreig/opt/node24/bin:/Users/colingreig/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
-    <!-- Loopback only. Do not set OD_BIND_HOST or OD_PORT: defaults are
-         127.0.0.1:7456, which is what we want. Setting OD_BIND_HOST to
-         0.0.0.0 would expose the whole API to the LAN. -->
-    <key>OD_DATA_DIR</key>
-    <string>/Users/colingreig/.hermes/opendesign/data</string>
-    <key>NODE_ENV</key>
-    <string>production</string>
-    <key>OD_WEB_PROD</key>
-    <string>1</string>
-    <!-- Headless-only knob from upstream issue #221; leave unset unless the
-         packaged web sidecar refuses to boot in server mode, then try:
-         <key>OD_WEB_OUTPUT_MODE</key><string>export</string> -->
-    <!-- Tailscale Serve fronts the loopback daemon at this tailnet-only
-         HTTPS URL; browser requests to /api/* arrive with this Origin and
-         must be allow-listed here (see apps/daemon/src/origin-validation.ts). -->
-    <key>OD_ALLOWED_ORIGINS</key>
-    <string>https://mac-mini-h.tail51ec1b.ts.net</string>
-  </dict>
-  <key>LimitLoadToSessionType</key>
-  <string>Aqua</string>
-  <key>RunAtLoad</key>
-  <true/>
-  <key>KeepAlive</key>
-  <true/>
-  <key>ThrottleInterval</key>
-  <integer>15</integer>
-  <key>ProcessType</key>
-  <string>Background</string>
-  <key>StandardOutPath</key>
-  <string>/Users/colingreig/Library/Logs/opendesign/opendesign.log</string>
-  <key>StandardErrorPath</key>
-  <string>/Users/colingreig/Library/Logs/opendesign/opendesign.error.log</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>HOME</key>
+		<string>/Users/colingreig</string>
+		<key>PATH</key>
+		<string>/Users/colingreig/.hermes/bin:/Users/colingreig/opt/node24/bin:/Users/colingreig/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+		<key>VELA_BIN</key>
+		<string>/Users/colingreig/.hermes/bin/vela</string>
+		<key>OD_DATA_DIR</key>
+		<string>/Users/colingreig/.hermes/opendesign/data</string>
+		<key>NODE_ENV</key>
+		<string>production</string>
+		<key>OD_WEB_PROD</key>
+		<string>1</string>
+		<key>OD_ALLOWED_ORIGINS</key>
+		<string>https://mac-mini-h.tail51ec1b.ts.net</string>
+	</dict>
+	<key>LimitLoadToSessionType</key>
+	<string>Aqua</string>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ThrottleInterval</key>
+	<integer>15</integer>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>StandardOutPath</key>
+	<string>/Users/colingreig/Library/Logs/opendesign/opendesign.log</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/colingreig/Library/Logs/opendesign/opendesign.error.log</string>
 </dict>
 </plist>

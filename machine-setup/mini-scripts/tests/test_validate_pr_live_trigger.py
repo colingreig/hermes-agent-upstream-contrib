@@ -23,6 +23,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -814,6 +815,193 @@ class RunTriggerTests(unittest.TestCase):
             self.assertEqual(vplt.max_validations(), vplt.DEFAULT_MAX_VALIDATIONS)
         with mock.patch.dict(os.environ, _env(HERMES_VALIDATOR_TRIGGER_MAX="bogus")):
             self.assertEqual(vplt.max_validations(), vplt.DEFAULT_MAX_VALIDATIONS)
+
+
+class IdentityFailureCooldownTests(unittest.TestCase):
+    """Task: starvation fix (2026-08-04) — the excel.tv/no-branch-protection
+    footgun where 3 permanently-unvalidatable PRs held all 3 slots forever."""
+
+    def test_recent_failures_are_deprioritized_below_never_attempted(self):
+        candidates = [
+            {"repo": "acme/a", "pr": 1, "head": "1" * 40, "task_id": ""},
+            {"repo": "acme/b", "pr": 2, "head": "2" * 40, "task_id": ""},
+            {"repo": "acme/c", "pr": 3, "head": "3" * 40, "task_id": ""},
+        ]
+        failures = {
+            "acme/a#1": {"head": "1" * 40, "last_failure_ts": 100.0, "failure_count": 1},
+            "acme/b#2": {"head": "2" * 40, "last_failure_ts": 50.0, "failure_count": 1},
+        }
+        ordered = vplt._order_candidates(candidates, failures)
+        # never-attempted (c) first; within the failed group, oldest failure
+        # (b, ts=50) sorts before the more recent one (a, ts=100).
+        self.assertEqual([c["pr"] for c in ordered], [3, 2, 1])
+
+    def test_ordering_is_stable_within_each_group(self):
+        candidates = [
+            {"repo": "acme/a", "pr": 1, "head": "1"},
+            {"repo": "acme/b", "pr": 2, "head": "2"},
+            {"repo": "acme/c", "pr": 3, "head": "3"},
+            {"repo": "acme/d", "pr": 4, "head": "4"},
+        ]
+        failures = {
+            "acme/a#1": {"head": "1", "last_failure_ts": 10.0},
+            "acme/c#3": {"head": "3", "last_failure_ts": 10.0},
+        }
+        ordered = vplt._order_candidates(candidates, failures)
+        # never-attempted group (b, d) first preserving original relative
+        # order, then the failed group (a, c) — equal ts, stable sort keeps
+        # a before c since that was their original relative order.
+        self.assertEqual([c["pr"] for c in ordered], [2, 4, 1, 3])
+
+    def test_no_failures_returns_original_order_unchanged(self):
+        candidates = [{"repo": "a", "pr": 1, "head": "x"}, {"repo": "b", "pr": 2, "head": "y"}]
+        self.assertEqual(vplt._order_candidates(candidates, {}), candidates)
+
+    def test_head_change_clears_prior_failure_record(self):
+        candidates = [{"repo": "acme/widget", "pr": 7, "head": "new" * 10, "task_id": ""}]
+        failures = {"acme/widget#7": {"head": "old" * 10, "last_failure_ts": time.time(),
+                                       "failure_count": 2}}
+        changed = vplt._reconcile_stale_heads(candidates, failures)
+        self.assertTrue(changed)
+        self.assertNotIn("acme/widget#7", failures)
+
+    def test_same_head_is_not_reconciled_away(self):
+        candidates = [{"repo": "acme/widget", "pr": 7, "head": "f" * 40, "task_id": ""}]
+        failures = {"acme/widget#7": {"head": "f" * 40, "last_failure_ts": time.time(),
+                                       "failure_count": 2}}
+        changed = vplt._reconcile_stale_heads(candidates, failures)
+        self.assertFalse(changed)
+        self.assertIn("acme/widget#7", failures)
+
+    def test_corrupt_cooldown_file_yields_empty_dict_and_does_not_raise(self):
+        with tempfile.TemporaryDirectory() as d:
+            cooldown_path = Path(d) / "cooldown.json"
+            cooldown_path.write_text("{not valid json")
+            failures = vplt._load_identity_failures(cooldown_path)
+        self.assertEqual(failures, {})
+
+    def test_missing_cooldown_file_yields_empty_dict(self):
+        with tempfile.TemporaryDirectory() as d:
+            missing = Path(d) / "does-not-exist.json"
+            self.assertEqual(vplt._load_identity_failures(missing), {})
+
+    def test_prune_drops_ttl_expired_and_closed_prs(self):
+        old_ts = time.time() - (31 * 86400)
+        data = {
+            "acme/a#1": {"head": "x", "last_failure_ts": old_ts},
+            "acme/b#2": {"head": "y", "last_failure_ts": time.time()},
+            "acme/c#3": {"head": "z", "last_failure_ts": time.time()},
+        }
+        pruned = vplt._prune_identity_failures(data, open_keys={"acme/b#2"})
+        self.assertEqual(set(pruned), {"acme/b#2"})
+
+    def test_run_picks_never_attempted_over_recent_identity_failure(self):
+        stale_candidate = {"repo": "acme/broken", "pr": 1, "head": "a" * 40, "task_id": ""}
+        fresh_candidate = {"repo": "acme/ok", "pr": 2, "head": "b" * 40, "task_id": ""}
+        with tempfile.TemporaryDirectory() as d:
+            cooldown_path = Path(d) / "cooldown.json"
+            cooldown_path.write_text(json.dumps({
+                "acme/broken#1": {"head": "a" * 40, "last_failure_ts": time.time(),
+                                  "failure_count": 3},
+            }))
+            with (
+                mock.patch.dict(os.environ, _env(HERMES_VALIDATOR_FINALIZE_TOKEN="tok")),
+                mock.patch.object(vplt.autonomous_merge, "_load_allowlist",
+                                  return_value={"acme/broken", "acme/ok"}),
+                mock.patch.object(vplt, "scan_candidates",
+                                  return_value=([stale_candidate, fresh_candidate], [], [])),
+                mock.patch.object(vplt, "_identity_failures_path", return_value=cooldown_path),
+                mock.patch.object(vplt.validate_pr, "validate",
+                                  return_value=(0, {"verdict": "PASS", "tier": "low",
+                                                    "shadow": False})) as validate,
+            ):
+                rc, summary = vplt.run(cap=1)
+            self.assertEqual(rc, 0)
+            validate.assert_called_once_with(
+                "acme/ok", 2, task="", shadow=False, allow_panel=True,
+                expected_repo="acme/ok")
+
+    def test_fenced_busy_result_is_not_recorded_as_identity_failure(self):
+        candidate = {"repo": "acme/widget", "pr": 7, "head": "f" * 40, "task_id": ""}
+        with tempfile.TemporaryDirectory() as d:
+            cooldown_path = Path(d) / "cooldown.json"
+            with (
+                mock.patch.dict(os.environ, _env(HERMES_VALIDATOR_FINALIZE_TOKEN="tok")),
+                mock.patch.object(vplt.autonomous_merge, "_load_allowlist",
+                                  return_value={"acme/widget"}),
+                mock.patch.object(vplt, "scan_candidates",
+                                  return_value=([candidate], [], [])),
+                mock.patch.object(vplt, "_identity_failures_path", return_value=cooldown_path),
+                mock.patch.object(vplt.validate_pr, "validate",
+                                  return_value=(2, {"verdict": "BLOCK", "fenced": True})),
+            ):
+                rc, summary = vplt.run()
+            self.assertEqual(rc, 0)
+            self.assertFalse(cooldown_path.exists())
+
+    def test_identity_failure_rc2_not_fenced_is_recorded(self):
+        candidate = {"repo": "acme/widget", "pr": 7, "head": "f" * 40, "task_id": ""}
+        with tempfile.TemporaryDirectory() as d:
+            cooldown_path = Path(d) / "cooldown.json"
+            with (
+                mock.patch.dict(os.environ, _env(HERMES_VALIDATOR_FINALIZE_TOKEN="tok")),
+                mock.patch.object(vplt.autonomous_merge, "_load_allowlist",
+                                  return_value={"acme/widget"}),
+                mock.patch.object(vplt, "scan_candidates",
+                                  return_value=([candidate], [], [])),
+                mock.patch.object(vplt, "_identity_failures_path", return_value=cooldown_path),
+                mock.patch.object(vplt.validate_pr, "validate",
+                                  return_value=(2, {"verdict": "BLOCK", "fenced": False,
+                                                    "reason": "no branch protection"})),
+            ):
+                rc, summary = vplt.run()
+            self.assertEqual(rc, 0)
+            data = json.loads(cooldown_path.read_text())
+            self.assertIn("acme/widget#7", data)
+            self.assertEqual(data["acme/widget#7"]["head"], "f" * 40)
+
+    def test_success_clears_prior_failure_record(self):
+        candidate = {"repo": "acme/widget", "pr": 7, "head": "f" * 40, "task_id": ""}
+        with tempfile.TemporaryDirectory() as d:
+            cooldown_path = Path(d) / "cooldown.json"
+            cooldown_path.write_text(json.dumps({
+                "acme/widget#7": {"head": "f" * 40, "last_failure_ts": time.time(),
+                                  "failure_count": 2},
+            }))
+            with (
+                mock.patch.dict(os.environ, _env(HERMES_VALIDATOR_FINALIZE_TOKEN="tok")),
+                mock.patch.object(vplt.autonomous_merge, "_load_allowlist",
+                                  return_value={"acme/widget"}),
+                mock.patch.object(vplt, "scan_candidates",
+                                  return_value=([candidate], [], [])),
+                mock.patch.object(vplt, "_identity_failures_path", return_value=cooldown_path),
+                mock.patch.object(vplt.validate_pr, "validate",
+                                  return_value=(0, {"verdict": "PASS", "tier": "low",
+                                                    "shadow": False})),
+            ):
+                rc, summary = vplt.run()
+            data = json.loads(cooldown_path.read_text())
+            self.assertNotIn("acme/widget#7", data)
+
+    def test_run_survives_corrupt_cooldown_file(self):
+        candidate = {"repo": "acme/widget", "pr": 7, "head": "f" * 40, "task_id": ""}
+        with tempfile.TemporaryDirectory() as d:
+            cooldown_path = Path(d) / "cooldown.json"
+            cooldown_path.write_text("{not valid json")
+            with (
+                mock.patch.dict(os.environ, _env(HERMES_VALIDATOR_FINALIZE_TOKEN="tok")),
+                mock.patch.object(vplt.autonomous_merge, "_load_allowlist",
+                                  return_value={"acme/widget"}),
+                mock.patch.object(vplt, "scan_candidates",
+                                  return_value=([candidate], [], [])),
+                mock.patch.object(vplt, "_identity_failures_path", return_value=cooldown_path),
+                mock.patch.object(vplt.validate_pr, "validate",
+                                  return_value=(0, {"verdict": "PASS", "tier": "low",
+                                                    "shadow": False})) as validate,
+            ):
+                rc, summary = vplt.run()
+            self.assertEqual(rc, 0)
+            validate.assert_called_once()
 
 
 class EndToEndLedgerTests(unittest.TestCase):

@@ -29,31 +29,40 @@ if __package__:
 else:
     import validator_common as vc
 
-# Each rule: (label, tier, path_regex_or_None, content_regex_or_None).
+# Each rule: (label, tier, path_regex_or_None, content_regex_or_None,
+# prose_suppressible). prose_suppressible (default False) opts a rule's
+# CONTENT arm into being skipped on doc/prose paths (see _is_doc_path below).
+# It is True ONLY for the auth/session rule — see the comment on
+# _DOC_PATH_RE for why every other rule must stay fully live in doc files.
 # A rule matches a file if its path regex matches the path AND/OR its content
 # regex matches any added line. (None means "don't constrain on this axis".)
 HIGH_RULES = [
     ("auth/session endpoint", "high",
      re.compile(r"(^|/)(api|auth|middleware|login|session)[^/]*\.(t|j)sx?$|/api/", re.I),
      re.compile(r"\b(cookie|set-cookie|authorization|isSignedIn|requireAuth|"
-                r"getSession|jwt|bearer)\b", re.I)),
+                r"getSession|jwt|bearer)\b", re.I),
+     True),
     ("secrets/env", "high",
      re.compile(r"(^|/)\.env|(^|/)(secrets?|credentials?)\b|wrangler\.(toml|jsonc?)$", re.I),
      re.compile(r"\b(api[_-]?key|client[_-]?secret|access[_-]?token|private[_-]?key|"
-                r"password)\b", re.I)),
+                r"password)\b", re.I),
+     False),
     ("workflow-dispatch / protected-main write", "high",
      None,
      re.compile(r"\b(repository_dispatch|workflow_dispatch|createWorkflowDispatch|"
-                r"/dispatches\b|gh\s+workflow\s+run|protected.?main)\b", re.I)),
+                r"/dispatches\b|gh\s+workflow\s+run|protected.?main)\b", re.I),
+     False),
     ("CI / deploy config", "high",
      re.compile(r"\.github/workflows/.*\.ya?ml$|(^|/)(vercel|wrangler)\.|"
                 r"Dockerfile$|fly\.toml$", re.I),
      re.compile(r"\b(wrangler\s+deploy|vercel\s+(deploy|--prod)|gh\s+pr\s+merge|"
-                r"deploy[-_]?(admin|worker|prod))\b", re.I)),
+                r"deploy[-_]?(admin|worker|prod))\b", re.I),
+     False),
     ("DB migration / RLS", "high",
      re.compile(r"(^|/)(migrations?|supabase)/.*\.(sql|ts)$|\.sql$", re.I),
      re.compile(r"\b(create\s+table|alter\s+table|drop\s+table|create\s+policy|"
-                r"row\s+level\s+security|grant\s+)\b", re.I)),
+                r"row\s+level\s+security|grant\s+)\b", re.I),
+     False),
     # Money-movement / spend-gating logic: budgets, payments, orders, billing.
     # Added 2026-06-20 after PR #37 (PressWhizz budget gating, "skip premature
     # client_budget_exceeded auto-resolve") classified MEDIUM and drew a single
@@ -66,23 +75,50 @@ HIGH_RULES = [
      re.compile(r"\b(client_budget_exceeded|budgetExceeded\w*|budget_exceeded\w*|"
                 r"sendOrder|markOrderPaid|mark_order_paid|order_paid|"
                 r"amount_due|amount_cents|price_cents|spend_cap|payout|refund|"
-                r"invoice|charge_amount|stripe)\b", re.I)),
+                r"invoice|charge_amount|stripe)\b", re.I),
+     False),
 ]
 
 MEDIUM_RULES = [
     ("application source", "medium",
-     re.compile(r"\.(t|j)sx?$|\.(py|go|rb|rs|java|mjs|cjs)$", re.I), None),
+     re.compile(r"\.(t|j)sx?$|\.(py|go|rb|rs|java|mjs|cjs)$", re.I), None, False),
     ("config", "medium",
-     re.compile(r"\.(json|ya?ml|toml|ini|conf)$|package(-lock)?\.json$", re.I), None),
+     re.compile(r"\.(json|ya?ml|toml|ini|conf)$|package(-lock)?\.json$", re.I), None, False),
 ]
 
 # Low = everything else (markdown, .mdoc content, images, copy, translations).
 
+# Documentation/prose files: ONLY the auth/session rule's CONTENT regex arm
+# is suppressed here (via prose_suppressible=True on that one rule) — English
+# prose legitimately quotes shell/HTTP snippets ("Authorization: Bearer ...")
+# in handoff docs and curl examples without containing real executable auth
+# code. PR #287 (a pure-markdown handoff doc, the only real false positive
+# found across PRs #333-#353) classified HIGH solely because it quoted an
+# `Authorization` header in a curl example. Prose does NOT legitimately
+# contain live credentials or deploy triggers, so every other rule's content
+# arm — secrets/env, workflow-dispatch, CI/deploy config, DB migration/RLS,
+# money/spend — must keep firing on doc paths; a real key pasted into a .md
+# file is still a real key. The extension match is intentionally narrow
+# (prose file types only, anchored to the end of the path) — see FIX 1 below
+# for why a directory-name clause (e.g. "docs/") is unsafe here: it would
+# suppress non-prose files (scripts, configs) that merely live under a
+# docs/ directory. The PATH regex arm of every rule is unaffected regardless
+# of prose_suppressible — a rule that matches on path (e.g. a real .env
+# file, a real .sql migration) still fires normally in any directory.
+_DOC_PATH_RE = re.compile(r"\.(md|mdx|markdown|rst)$", re.I)
+
+
+def _is_doc_path(path: str) -> bool:
+    return bool(_DOC_PATH_RE.search(path or ""))
+
 
 def _rule_hits(rule, fd):
-    _, _, path_re, content_re = rule
-    path_ok = path_re.search(fd.get("path", "")) if path_re else False
-    content_ok = content_re.search(fd.added_text) if content_re else False
+    _, _, path_re, content_re, prose_suppressible = rule
+    path = fd.get("path", "")
+    path_ok = path_re.search(path) if path_re else False
+    content_ok = bool(content_re.search(fd.added_text)) if content_re else False
+    if content_ok and prose_suppressible and _is_doc_path(path):
+        content_ok = False
     # If both axes are specified, a hit on EITHER counts (path OR content) —
     # an auth endpoint by name, or auth-shaped content anywhere.
     if path_re and content_re:

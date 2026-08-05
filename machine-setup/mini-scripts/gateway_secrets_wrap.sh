@@ -54,13 +54,17 @@ set +a
 # 1Password's "Hermes Flags" item pre-sets HERMES_AUTONOMOUS_MERGE (master),
 # _MEDIUM, and _HIGH to "1" regardless of which tier has actually graduated.
 # The master flag enables BOTH low and medium tier per
-# merge_guard._tier_autonomy_enabled(), so leaving it resolved would silently
-# turn on medium-tier autonomous merge even though medium hasn't graduated yet
-# (ClickUp 86e2h2q7z, still pending). Neutralize the flags this preset
-# shouldn't govern; HERMES_AUTONOMOUS_MERGE_LOW is deliberately left resolved
-# since low tier is the intentionally-live one.
+# merge_guard._tier_autonomy_enabled(), so leaving it resolved would bypass
+# per-tier control. Neutralize the flags this preset shouldn't govern;
+# HERMES_AUTONOMOUS_MERGE_LOW is deliberately left resolved since low tier is
+# the intentionally-live one.
+#
+# 2026-08-04: MEDIUM tier activated (owner-authorized) — leaving
+# HERMES_AUTONOMOUS_MERGE_MEDIUM resolved from the 1Password preset. The
+# master switch and HIGH remain unset deliberately: master would silently
+# enable both tiers at once (bypassing per-tier control), and HIGH is not
+# authorized.
 unset HERMES_AUTONOMOUS_MERGE
-unset HERMES_AUTONOMOUS_MERGE_MEDIUM
 unset HERMES_AUTONOMOUS_MERGE_HIGH
 
 GH_TOKEN="$("$RUNTIME_PYTHON" "$TOKEN_MINTER" 2>>"$LOG")"
