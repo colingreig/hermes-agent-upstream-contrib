@@ -57,7 +57,8 @@ def check_gh_available():
     if shutil.which("gh") is None:
         raise FatalError("`gh` CLI not found on PATH. Install/authenticate GitHub CLI first.")
     try:
-        result = subprocess.run(["gh", "auth", "status"], capture_output=True, text=True, timeout=30)
+        result = subprocess.run(["gh", "auth", "status"], capture_output=True, text=True, timeout=30,
+                                 stdin=subprocess.DEVNULL)
     except Exception as e:
         raise FatalError(f"Failed to run `gh auth status`: {e}")
     if result.returncode != 0:
