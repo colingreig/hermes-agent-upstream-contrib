@@ -103,6 +103,107 @@ Types: `feat`, `fix`, `refactor`, `docs`, `test`, `ci`, `chore`, `perf`
 
 ## 3. Pushing and Creating a PR
 
+### Mandatory task-level reuse check
+
+When the work comes from ClickUp, branch-level idempotency is not enough: an
+executor retry normally has a new cycle branch, so `gh pr create` can succeed
+again for the same task. Before creating a branch **or** opening a PR, build an
+**exhaustive, tri-state** inventory of every open PR. Use the REST pagination
+path (a fixed `gh pr list` limit silently truncates larger repos):
+
+```bash
+TASK_ID="${CLICKUP_TASK_ID:?set the ClickUp task id}"
+ACTIVE_BOT_PREFIXES="${ACTIVE_BOT_PREFIXES:-agent/,hermes/}"
+OWNER_REPO="${OWNER_REPO:?set owner/repo}"
+
+if ! gh api --paginate --slurp \
+  "repos/$OWNER_REPO/pulls?state=open&per_page=100" > /tmp/open-pr-pages.json; then
+  echo "open-PR inventory UNKNOWN; refusing PR creation" >&2
+  exit 1
+fi
+
+python3 - "$TASK_ID" "$ACTIVE_BOT_PREFIXES" /tmp/open-pr-pages.json <<'PY'
+import json, re, sys
+
+target = sys.argv[1].lower()
+prefixes = tuple(p for p in sys.argv[2].split(",") if p)
+marker = re.compile(r"<!--\s*clickup-task-id:\s*(86e[0-9a-z]{5,8})\s*-->", re.I)
+fallback = re.compile(r"\b(86e[0-9a-z]{5,8})\b", re.I)
+
+def identity(*texts):
+    # Canonical markers have precedence. Only when none exist may free-text
+    # ids in branch/title/body establish identity.
+    marked = {m.lower() for text in texts for m in marker.findall(str(text or ""))}
+    if len(marked) == 1:
+        return "unique", marked.pop()
+    if len(marked) > 1:
+        return "ambiguous", None
+    ids = {m.lower() for text in texts for m in fallback.findall(str(text or ""))}
+    if len(ids) == 1:
+        return "unique", ids.pop()
+    return ("ambiguous" if ids else "absent"), None
+
+try:
+    pages = json.load(open(sys.argv[3], encoding="utf-8"))
+    if not isinstance(pages, list) or any(not isinstance(page, list) for page in pages):
+        raise ValueError("malformed pagination shape")
+    matches = []
+    for page in pages:
+        for pr in page:
+            if not isinstance(pr, dict) or not isinstance(pr.get("number"), int):
+                raise ValueError("malformed PR row")
+            head = pr.get("head")
+            user = pr.get("user")
+            if not isinstance(head, dict) or not isinstance(head.get("ref"), str):
+                raise ValueError("malformed PR head")
+            if not isinstance(user, dict) or not isinstance(user.get("login"), str):
+                raise ValueError("malformed PR author")
+            status, task_id = identity(head["ref"], pr.get("title"), pr.get("body"))
+            login = user["login"].lower()
+            is_bot = login in {
+                "app/hermes-dev-assistant",
+                "hermes-dev-assistant",
+                "hermes-dev-assistant[bot]",
+            }
+            if is_bot and head["ref"].startswith(prefixes) and status != "unique":
+                raise ValueError(
+                    f"{status} task identity on active bot branch {head['ref']}"
+                )
+            if status == "unique" and task_id == target:
+                matches.append((pr["number"], head["ref"]))
+except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+    print(f"open-PR inventory UNKNOWN ({exc}); refusing PR creation", file=sys.stderr)
+    raise SystemExit(2)
+
+for number, branch in matches:
+    print(f"reuse open PR #{number} on {branch}")
+raise SystemExit(0 if matches else 3)  # 0=found, 3=authoritatively absent, 2=unknown
+PY
+case $? in
+  0) echo "reuse the PR(s) printed above; do not create another"; exit 0 ;;
+  3) echo "task authoritatively absent from exhaustive open-PR inventory" ;;
+  *) echo "inventory UNKNOWN; refusing PR creation" >&2; exit 1 ;;
+esac
+```
+
+The identity rule is deliberate: one canonical
+`<!-- clickup-task-id: 86e... -->` marker wins even if unrelated prose contains
+another task id; multiple canonical markers are ambiguous. Only when no marker
+exists may a unique free-text id across head ref, title, and body identify the
+task.
+
+- If a match exists, **reuse that PR and head branch**: put follow-up commits on
+  its branch and do not call `gh pr create` again.
+- If replacement is genuinely required, explicitly close the prior PR first and
+  record why; never leave two open bot PRs for one task.
+- Do not delete the superseded branch or invent a second cleanup path. Branch
+  and worktree retirement stays with the existing worktree sweep after it proves
+  the content is landed or human-approved for retirement.
+- Treat inventory as `found | absent | unknown`. API failure, malformed JSON or
+  rows, ambiguous identity, or an unidentified Hermes-bot PR under any active
+  prefix means **unknown**: fail closed and call no PR-creation API. Only an
+  exhaustive, well-formed inventory may return authoritatively absent.
+
 ### Push the Branch (same either way)
 
 ```bash
