@@ -89,7 +89,7 @@ def gh_api(args, call_log, verbose=False, input_data=None):
 # --------------------------------------------------------------------------
 
 def load_labels():
-    with open(LABELS_PATH, "r") as f:
+    with open(LABELS_PATH, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
@@ -257,7 +257,7 @@ def main(argv=None):
     def flush_receipt():
         receipt["gh_api_calls_made"] = len(call_log)
         os.makedirs(os.path.dirname(os.path.abspath(receipt_path)), exist_ok=True)
-        with open(receipt_path, "w") as f:
+        with open(receipt_path, "w", encoding="utf-8") as f:
             json.dump(receipt, f, indent=2, default=str)
         eprint(f"\nReceipt written: {receipt_path}")
 

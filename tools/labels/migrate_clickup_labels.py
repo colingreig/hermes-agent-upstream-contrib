@@ -266,9 +266,9 @@ class ClickUpClient:
 # --------------------------------------------------------------------------
 
 def load_registry():
-    with open(LABELS_PATH, "r") as f:
+    with open(LABELS_PATH, "r", encoding="utf-8") as f:
         labels = json.load(f)
-    with open(MAP_PATH, "r") as f:
+    with open(MAP_PATH, "r", encoding="utf-8") as f:
         tag_map = json.load(f)
     return labels, tag_map
 
@@ -764,7 +764,7 @@ def main(argv=None):
         receipt["api_calls_made"] = client.api_calls_made
         receipt["errors"] = errors
         os.makedirs(os.path.dirname(os.path.abspath(receipt_path)), exist_ok=True)
-        with open(receipt_path, "w") as f:
+        with open(receipt_path, "w", encoding="utf-8") as f:
             json.dump(receipt, f, indent=2, default=str)
         eprint(f"\nReceipt written: {receipt_path}")
 
