@@ -158,3 +158,8 @@ apps/desktop/demo/
 # PR body is the archive. See the hermes-agent-dev skill's
 # pr-infographic-workflow reference (storage rule + lapse #8 / #COMMIT-1).
 infographic/
+
+# Label-taxonomy migration run receipts — generated per-run by
+# migrate_clickup_labels.py / sync_github_labels.py, never an artifact of the
+# repo. See tools/labels/README.md.
+tools/labels/receipts/
