@@ -10,9 +10,9 @@ Full mapping: `tools/labels/clickup-tag-map.json`. Read-only pull — no writes 
 | rename | 53 |
 | merge | 65 |
 | explode | 10 |
-| delete | 56 |
+| delete | 60 |
 | keep_unmapped | 378 |
-| needs_decision | 4 |
+| needs_decision | 0 |
 | **total** | **566** |
 
 Total tags classified (566) matches total tags fetched (566) — Delivery 508, Operations 170, Growth 12, CRM 4, deduplicated to 566 distinct names across the union.
@@ -30,14 +30,16 @@ Applying the mapping (deletes removed, renames/merges/explodes collapsed onto th
 
 Operations shrinks the most (170 → 77) — it was carrying most of the epoch/id one-off automation artifacts (`attempt-cap-exceeded-*`, `blocked-operator-*`, `superseded-by-*`) and phase/rebuild codenames, all deleted, plus several bare taxonomy-shaped tags (`tier:1`, `blocked`, `agent-avoid`, etc.) that collapse via rename/merge. Delivery shrinks modestly (508 → 409) since the bulk of it is legitimate client/project/marketing vocabulary quarantined as `keep_unmapped`, not touched.
 
-## needs_decision (4 tags — genuinely ambiguous)
+## needs_decision (0 tags — resolved)
 
-| tag | best guess |
+Operator decision 2026-08-05: kill all 4. The following 4 tags, previously `needs_decision`, are now `delete`:
+
+| tag | resolution |
 |---|---|
-| `aoe` | Unclear internal acronym/subsystem name (Delivery+Operations). Guess: an internal automation subsystem — recommend `area:infra` if confirmed, otherwise `keep_unmapped`. |
-| `aoe-dispatch` | Same unresolved `aoe` acronym, Delivery-only, paired with "dispatch" (a content/task dispatch action). Guess: `area:infra` merge target once `aoe` is resolved, otherwise `keep_unmapped`. |
-| `investigation-only` | Operations-only scope-limiter ("no code changes, investigate only"). Guess: not a lifecycle state — recommend `keep_unmapped` as a legitimate scope marker rather than forcing it into `flow:`. |
-| `repo:ignite-marketplace` | Operations-only repo-scope tag, single occurrence. Guess: `keep_unmapped` (legitimate repo-scope quarantine, analogous to a client name), unless it's actually a stale one-off from a retired integration, in which case `delete`. |
+| `aoe` | `delete` — operator decision 2026-08-05: kill |
+| `aoe-dispatch` | `delete` — operator decision 2026-08-05: kill |
+| `investigation-only` | `delete` — operator decision 2026-08-05: kill |
+| `repo:ignite-marketplace` | `delete` — operator decision 2026-08-05: kill |
 
 ## Judgment-call notes (non-obvious defaults applied)
 

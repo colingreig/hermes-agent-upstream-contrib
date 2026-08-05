@@ -366,18 +366,18 @@
         "90171361707",
         "90171361718"
       ],
-      "disposition": "needs_decision",
+      "disposition": "delete",
       "to": [],
-      "rationale": "unclear internal acronym/subsystem name, appears in Delivery+Operations; can't confidently classify"
+      "rationale": "operator decision 2026-08-05: kill"
     },
     {
       "tag": "aoe-dispatch",
       "spaces": [
         "90171361707"
       ],
-      "disposition": "needs_decision",
+      "disposition": "delete",
       "to": [],
-      "rationale": "related to ambiguous 'aoe' acronym; can't confidently classify"
+      "rationale": "operator decision 2026-08-05: kill"
     },
     {
       "tag": "apollo",
@@ -2272,9 +2272,9 @@
       "spaces": [
         "90171361718"
       ],
-      "disposition": "needs_decision",
+      "disposition": "delete",
       "to": [],
-      "rationale": "scope-limiter (no code changes), unclear whether it's a flow state or an area tag"
+      "rationale": "operator decision 2026-08-05: kill"
     },
     {
       "tag": "isr",
@@ -3923,9 +3923,9 @@
       "spaces": [
         "90171361718"
       ],
-      "disposition": "needs_decision",
+      "disposition": "delete",
       "to": [],
-      "rationale": "Operations-only repo-scope tag; unclear if legitimate quarantine or one-off cleanup target"
+      "rationale": "operator decision 2026-08-05: kill"
     },
     {
       "tag": "reporting",
