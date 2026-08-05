@@ -1,7 +1,7 @@
 {
-  "version": 1,
+  "version": 2,
   "generated_from": "live ClickUp tag inventory, 4 spaces (Delivery, Operations, Growth, CRM), pulled 2026-08-04",
-  "notes": "keep_unmapped is applied to any legitimate non-junk tag lacking a clean taxonomy fit, not strictly limited to the Delivery space (broadened from the literal rule text since several substantive Operations/Growth/CRM tags share this profile). area: is treated as an open namespace and extended pragmatically (e.g. area:billing, area:pr-pipeline usage) where a tag clearly names a fleet subsystem.",
+  "notes": "keep_unmapped is applied to any legitimate non-junk tag lacking a clean taxonomy fit, not strictly limited to the Delivery space (broadened from the literal rule text since several substantive Operations/Growth/CRM tags share this profile). v2 (2026-08-05): re-targeted every mapping that pointed at a label cut in the 35->18 label consolidation (see tools/labels/labels.json rules.retired). area: remains open but its bar is now higher -- data/reporting/seo/ux tags with no surviving-area fit were left keep_unmapped (all live in the Delivery/client-facing space) rather than deleted.",
   "spaces": {
     "90171361707": "Delivery",
     "90171361718": "Operations",
@@ -281,11 +281,9 @@
         "90171361707",
         "90171361718"
       ],
-      "disposition": "rename",
-      "to": [
-        "flow:needs-validation"
-      ],
-      "rationale": "awaiting review == awaiting validation"
+      "disposition": "delete",
+      "to": [],
+      "rationale": "v2 consolidation: flow:needs-validation removed -- the board's own 'In Review' status already expresses this; there is no label for awaiting-review."
     },
     {
       "tag": "agentos",
@@ -393,11 +391,9 @@
         "90171361707",
         "90171361718"
       ],
-      "disposition": "merge",
-      "to": [
-        "flow:needs-validation"
-      ],
-      "rationale": "queued awaiting approval, i.e. awaiting validation"
+      "disposition": "delete",
+      "to": [],
+      "rationale": "v2 consolidation: flow:needs-validation removed -- board status already expresses it."
     },
     {
       "tag": "architecture",
@@ -464,10 +460,9 @@
       "spaces": [
         "90171361707"
       ],
-      "disposition": "rename",
-      "to": [
-        "src:audit"
-      ]
+      "disposition": "delete",
+      "to": [],
+      "rationale": "v2 consolidation: src: namespace removed entirely -- provenance is already recorded by the task creator/issue author, a label is redundant."
     },
     {
       "tag": "audit-0620",
@@ -931,10 +926,9 @@
         "90171361707",
         "90171361718"
       ],
-      "disposition": "merge",
-      "to": [
-        "area:seo"
-      ]
+      "disposition": "keep_unmapped",
+      "to": [],
+      "rationale": "v2 consolidation: area:seo removed, no surviving area value fits, tag lives in the Delivery space so kept rather than deleted."
     },
     {
       "tag": "claude",
@@ -1167,11 +1161,9 @@
         "90171361707",
         "90171361718"
       ],
-      "disposition": "merge",
-      "to": [
-        "flow:needs-prep"
-      ],
-      "rationale": "content not yet ready for QA; needs further prep first"
+      "disposition": "delete",
+      "to": [],
+      "rationale": "v2 consolidation: flow:needs-prep removed, the absence of flow:prepped already conveys this."
     },
     {
       "tag": "content-quality",
@@ -1327,10 +1319,9 @@
         "90171361707",
         "90171361718"
       ],
-      "disposition": "rename",
-      "to": [
-        "area:data"
-      ]
+      "disposition": "keep_unmapped",
+      "to": [],
+      "rationale": "v2 consolidation: area:data removed, no surviving area value fits, tag lives in the Delivery space so kept rather than deleted."
     },
     {
       "tag": "data-quality",
@@ -1338,10 +1329,9 @@
         "90171361707",
         "90171361718"
       ],
-      "disposition": "merge",
-      "to": [
-        "area:data"
-      ]
+      "disposition": "keep_unmapped",
+      "to": [],
+      "rationale": "v2 consolidation: area:data removed, no surviving area value fits, tag lives in the Delivery space so kept rather than deleted."
     },
     {
       "tag": "database",
@@ -1358,11 +1348,9 @@
         "90171361707",
         "90171361718"
       ],
-      "disposition": "merge",
-      "to": [
-        "area:seo"
-      ],
-      "rationale": "SEO data vendor/tool integration"
+      "disposition": "keep_unmapped",
+      "to": [],
+      "rationale": "SEO data vendor/tool integration -- v2 consolidation: area:seo removed, no surviving area value fits, tag lives in the Delivery space so kept rather than deleted."
     },
     {
       "tag": "dead-image-monitor",
@@ -1394,10 +1382,9 @@
         "90171361707",
         "90171361718"
       ],
-      "disposition": "merge",
-      "to": [
-        "area:data"
-      ]
+      "disposition": "keep_unmapped",
+      "to": [],
+      "rationale": "v2 consolidation: area:data removed, no surviving area value fits, tag lives in the Delivery space so kept rather than deleted."
     },
     {
       "tag": "deferred",
@@ -1438,8 +1425,9 @@
       ],
       "disposition": "rename",
       "to": [
-        "lane:design"
-      ]
+        "lane:content"
+      ],
+      "rationale": "v2 consolidation: lane:design folded into lane:content."
     },
     {
       "tag": "design-handoff",
@@ -1579,20 +1567,18 @@
       "spaces": [
         "90171361707"
       ],
-      "disposition": "rename",
-      "to": [
-        "flow:duplicate"
-      ]
+      "disposition": "delete",
+      "to": [],
+      "rationale": "v2 consolidation: flow:duplicate removed -- duplication is a closure reason, it belongs in the close action/comment, not a label."
     },
     {
       "tag": "duplicate-close-pending",
       "spaces": [
         "90171361707"
       ],
-      "disposition": "merge",
-      "to": [
-        "flow:duplicate"
-      ]
+      "disposition": "delete",
+      "to": [],
+      "rationale": "v2 consolidation: flow:duplicate removed -- duplication is a closure reason, it belongs in the close action/comment, not a label."
     },
     {
       "tag": "duplicate-of-86e2610g8",
@@ -1713,10 +1699,9 @@
         "90171361707",
         "90171361718"
       ],
-      "disposition": "merge",
-      "to": [
-        "area:data"
-      ]
+      "disposition": "keep_unmapped",
+      "to": [],
+      "rationale": "v2 consolidation: area:data removed, no surviving area value fits, tag lives in the Delivery space so kept rather than deleted."
     },
     {
       "tag": "exception-queue",
@@ -1900,9 +1885,9 @@
       ],
       "disposition": "merge",
       "to": [
-        "area:billing"
+        "area:cost"
       ],
-      "rationale": "CI cost-tracking tag; billing is the closer single-label fit than infra"
+      "rationale": "CI cost-tracking tag -- v2 consolidation: area:billing renamed to area:cost."
     },
     {
       "tag": "github-actions",
@@ -1970,10 +1955,9 @@
         "90171361707",
         "90171361718"
       ],
-      "disposition": "rename",
-      "to": [
-        "src:hermes"
-      ]
+      "disposition": "delete",
+      "to": [],
+      "rationale": "v2 consolidation: src: namespace removed entirely -- provenance is already recorded by the task creator/issue author, a label is redundant."
     },
     {
       "tag": "hermes-infra",
@@ -2018,8 +2002,9 @@
       ],
       "disposition": "merge",
       "to": [
-        "area:pr-pipeline"
-      ]
+        "area:infra"
+      ],
+      "rationale": "v2 consolidation: area:pr-pipeline folded into area:infra."
     },
     {
       "tag": "high",
@@ -2058,10 +2043,9 @@
       "spaces": [
         "90171361707"
       ],
-      "disposition": "rename",
-      "to": [
-        "src:human"
-      ]
+      "disposition": "delete",
+      "to": [],
+      "rationale": "v2 consolidation: src: namespace removed entirely -- provenance is already recorded by the task creator/issue author, a label is redundant."
     },
     {
       "tag": "humanizer",
@@ -2160,11 +2144,9 @@
       "spaces": [
         "90171361718"
       ],
-      "disposition": "merge",
-      "to": [
-        "flow:needs-validation"
-      ],
-      "rationale": "ClickUp 'In Review' status mirrored as a tag; awaiting validation"
+      "disposition": "delete",
+      "to": [],
+      "rationale": "ClickUp 'In Review' status mirrored as a tag -- v2 consolidation: flow:needs-validation removed, this is exactly the board status already."
     },
     {
       "tag": "incident",
@@ -2202,10 +2184,9 @@
         "90171361707",
         "90171361718"
       ],
-      "disposition": "merge",
-      "to": [
-        "area:data"
-      ]
+      "disposition": "keep_unmapped",
+      "to": [],
+      "rationale": "v2 consolidation: area:data removed, no surviving area value fits, tag lives in the Delivery space so kept rather than deleted."
     },
     {
       "tag": "inngest",
@@ -2407,8 +2388,9 @@
       ],
       "disposition": "rename",
       "to": [
-        "lane:design"
-      ]
+        "lane:content"
+      ],
+      "rationale": "v2 consolidation: lane:design folded into lane:content."
     },
     {
       "tag": "lane:hybrid",
@@ -2463,10 +2445,9 @@
         "90171361707",
         "90171361718"
       ],
-      "disposition": "merge",
-      "to": [
-        "area:seo"
-      ]
+      "disposition": "keep_unmapped",
+      "to": [],
+      "rationale": "v2 consolidation: area:seo removed, no surviving area value fits, tag lives in the Delivery space so kept rather than deleted."
     },
     {
       "tag": "link-ops",
@@ -2474,10 +2455,9 @@
         "90171361707",
         "90171361718"
       ],
-      "disposition": "merge",
-      "to": [
-        "area:seo"
-      ]
+      "disposition": "keep_unmapped",
+      "to": [],
+      "rationale": "v2 consolidation: area:seo removed, no surviving area value fits, tag lives in the Delivery space so kept rather than deleted."
     },
     {
       "tag": "linkedin",
@@ -2509,10 +2489,9 @@
         "90171361707",
         "90171361718"
       ],
-      "disposition": "merge",
-      "to": [
-        "area:seo"
-      ]
+      "disposition": "keep_unmapped",
+      "to": [],
+      "rationale": "v2 consolidation: area:seo removed, no surviving area value fits, tag lives in the Delivery space so kept rather than deleted."
     },
     {
       "tag": "local",
@@ -2821,8 +2800,9 @@
       ],
       "disposition": "rename",
       "to": [
-        "model:human"
-      ]
+        "flow:needs-human"
+      ],
+      "rationale": "v2 consolidation: model:human folded into flow:needs-human -- same signal expressed twice."
     },
     {
       "tag": "model:opus",
@@ -2975,11 +2955,9 @@
         "90171361707",
         "90171361718"
       ],
-      "disposition": "merge",
-      "to": [
-        "flow:needs-prep"
-      ],
-      "rationale": "investigation precedes grooming; closest flow value"
+      "disposition": "delete",
+      "to": [],
+      "rationale": "investigation precedes grooming -- v2 consolidation: flow:needs-prep removed, the absence of flow:prepped already conveys this."
     },
     {
       "tag": "needs-operator",
@@ -2997,10 +2975,9 @@
         "90171361707",
         "90171361718"
       ],
-      "disposition": "rename",
-      "to": [
-        "flow:needs-prep"
-      ]
+      "disposition": "delete",
+      "to": [],
+      "rationale": "v2 consolidation: flow:needs-prep removed, the absence of flow:prepped already conveys this."
     },
     {
       "tag": "needs-validation",
@@ -3010,10 +2987,9 @@
         "90171361707",
         "90171361718"
       ],
-      "disposition": "rename",
-      "to": [
-        "flow:needs-validation"
-      ]
+      "disposition": "delete",
+      "to": [],
+      "rationale": "v2 consolidation: flow:needs-validation removed, board status already expresses it."
     },
     {
       "tag": "net-new",
@@ -3358,8 +3334,9 @@
       ],
       "disposition": "merge",
       "to": [
-        "area:billing"
-      ]
+        "area:cost"
+      ],
+      "rationale": "v2 consolidation: area:billing renamed to area:cost."
     },
     {
       "tag": "pbn",
@@ -3367,10 +3344,9 @@
         "90171361707",
         "90171361718"
       ],
-      "disposition": "merge",
-      "to": [
-        "area:seo"
-      ]
+      "disposition": "keep_unmapped",
+      "to": [],
+      "rationale": "v2 consolidation: area:seo removed, no surviving area value fits, tag lives in the Delivery space so kept rather than deleted."
     },
     {
       "tag": "pbn-index",
@@ -3378,10 +3354,9 @@
         "90171361707",
         "90171361718"
       ],
-      "disposition": "merge",
-      "to": [
-        "area:seo"
-      ]
+      "disposition": "keep_unmapped",
+      "to": [],
+      "rationale": "v2 consolidation: area:seo removed, no surviving area value fits, tag lives in the Delivery space so kept rather than deleted."
     },
     {
       "tag": "pending",
@@ -3611,8 +3586,9 @@
       ],
       "disposition": "merge",
       "to": [
-        "area:pr-pipeline"
-      ]
+        "area:infra"
+      ],
+      "rationale": "v2 consolidation: area:pr-pipeline folded into area:infra."
     },
     {
       "tag": "pr-pipeline",
@@ -3621,8 +3597,9 @@
       ],
       "disposition": "rename",
       "to": [
-        "area:pr-pipeline"
-      ]
+        "area:infra"
+      ],
+      "rationale": "v2 consolidation: area:pr-pipeline folded into area:infra."
     },
     {
       "tag": "prep-blocked",
@@ -3632,8 +3609,9 @@
       ],
       "disposition": "rename",
       "to": [
-        "flow:prep-blocked"
-      ]
+        "flow:blocked"
+      ],
+      "rationale": "v2 consolidation: flow:prep-blocked folded into flow:blocked -- one blocked signal, not two."
     },
     {
       "tag": "prepped",
@@ -3933,10 +3911,9 @@
         "90171361707",
         "90171361718"
       ],
-      "disposition": "rename",
-      "to": [
-        "area:reporting"
-      ]
+      "disposition": "keep_unmapped",
+      "to": [],
+      "rationale": "v2 consolidation: area:reporting removed, no surviving area value fits, tag lives in the Delivery space so kept rather than deleted."
     },
     {
       "tag": "reports",
@@ -3959,11 +3936,9 @@
       "spaces": [
         "90171361718"
       ],
-      "disposition": "merge",
-      "to": [
-        "flow:needs-prep"
-      ],
-      "rationale": "rescoped work needs re-grooming before it can be prepped again"
+      "disposition": "delete",
+      "to": [],
+      "rationale": "rescoped work needs re-grooming before it can be prepped again -- v2 consolidation: flow:needs-prep removed, the absence of flow:prepped already conveys this."
     },
     {
       "tag": "research",
@@ -3995,11 +3970,9 @@
         "90171361707",
         "90171361718"
       ],
-      "disposition": "merge",
-      "to": [
-        "flow:needs-validation"
-      ],
-      "rationale": "generic review marker; awaiting validation"
+      "disposition": "delete",
+      "to": [],
+      "rationale": "generic review marker -- v2 consolidation: flow:needs-validation removed, board status already expresses it."
     },
     {
       "tag": "review-ux",
@@ -4007,10 +3980,9 @@
         "90171361707",
         "90171361718"
       ],
-      "disposition": "merge",
-      "to": [
-        "area:ux"
-      ]
+      "disposition": "keep_unmapped",
+      "to": [],
+      "rationale": "v2 consolidation: area:ux removed, no surviving area value fits, tag lives in the Delivery space so kept rather than deleted."
     },
     {
       "tag": "rm",
@@ -4167,11 +4139,9 @@
       "spaces": [
         "90171361707"
       ],
-      "disposition": "merge",
-      "to": [
-        "flow:needs-validation"
-      ],
-      "rationale": "ready to be sent for approval, i.e. awaiting validation"
+      "disposition": "delete",
+      "to": [],
+      "rationale": "ready to be sent for approval -- v2 consolidation: flow:needs-validation removed, board status already expresses it."
     },
     {
       "tag": "sentry",
@@ -4190,10 +4160,9 @@
         "90171361707",
         "90171361718"
       ],
-      "disposition": "rename",
-      "to": [
-        "area:seo"
-      ]
+      "disposition": "keep_unmapped",
+      "to": [],
+      "rationale": "v2 consolidation: area:seo removed, no surviving area value fits, tag lives in the Delivery space so kept rather than deleted."
     },
     {
       "tag": "seo-agent",
@@ -4201,10 +4170,9 @@
         "90171361707",
         "90171361718"
       ],
-      "disposition": "merge",
-      "to": [
-        "area:seo"
-      ]
+      "disposition": "keep_unmapped",
+      "to": [],
+      "rationale": "v2 consolidation: area:seo removed, no surviving area value fits, tag lives in the Delivery space so kept rather than deleted."
     },
     {
       "tag": "seo-audit",
@@ -4228,11 +4196,9 @@
         "90171361693",
         "90171361707"
       ],
-      "disposition": "merge",
-      "to": [
-        "area:seo"
-      ],
-      "rationale": "SEO research work item; folds into the seo area"
+      "disposition": "keep_unmapped",
+      "to": [],
+      "rationale": "SEO research work item -- v2 consolidation: area:seo removed, no surviving area value fits, tag lives in the Delivery space so kept rather than deleted."
     },
     {
       "tag": "serp-optimization",
@@ -4396,10 +4362,9 @@
         "90171361707",
         "90171361718"
       ],
-      "disposition": "rename",
-      "to": [
-        "flow:superseded"
-      ]
+      "disposition": "delete",
+      "to": [],
+      "rationale": "v2 consolidation: flow:superseded removed -- supersession is a closure reason, it belongs in the close action/comment, not a label."
     },
     {
       "tag": "superseded-by-86e2610g8",
@@ -4433,10 +4398,9 @@
       "spaces": [
         "90171361707"
       ],
-      "disposition": "merge",
-      "to": [
-        "flow:superseded"
-      ]
+      "disposition": "delete",
+      "to": [],
+      "rationale": "v2 consolidation: flow:superseded removed -- supersession is a closure reason, it belongs in the close action/comment, not a label."
     },
     {
       "tag": "svc-content",
@@ -4612,10 +4576,9 @@
       "to": [
         "risk:medium",
         "lane:code",
-        "model:sonnet",
-        "flow:needs-prep"
+        "model:sonnet"
       ],
-      "rationale": "space-joined compound literal"
+      "rationale": "space-joined compound literal -- v2 consolidation: flow:needs-prep component dropped, absence of flow:prepped already conveys it."
     },
     {
       "tag": "tier:2 lane:code model:sonnet prep-blocked needs-human",
@@ -4627,10 +4590,10 @@
         "risk:medium",
         "lane:code",
         "model:sonnet",
-        "flow:prep-blocked",
+        "flow:blocked",
         "flow:needs-human"
       ],
-      "rationale": "space-joined compound literal"
+      "rationale": "space-joined compound literal -- v2 consolidation: flow:prep-blocked folded into flow:blocked."
     },
     {
       "tag": "tier:3",
@@ -4652,9 +4615,9 @@
       "to": [
         "risk:high",
         "flow:needs-human",
-        "flow:prep-blocked"
+        "flow:blocked"
       ],
-      "rationale": "space-joined compound literal"
+      "rationale": "space-joined compound literal -- v2 consolidation: flow:prep-blocked folded into flow:blocked."
     },
     {
       "tag": "tigunia",
@@ -4730,11 +4693,9 @@
         "90171361707",
         "90171361718"
       ],
-      "disposition": "merge",
-      "to": [
-        "src:human"
-      ],
-      "rationale": "a human confirmed the triage decision"
+      "disposition": "delete",
+      "to": [],
+      "rationale": "a human confirmed the triage decision -- v2 consolidation: src: namespace removed entirely."
     },
     {
       "tag": "triaged",
@@ -4793,10 +4754,9 @@
         "90171361707",
         "90171361718"
       ],
-      "disposition": "merge",
-      "to": [
-        "area:ux"
-      ]
+      "disposition": "keep_unmapped",
+      "to": [],
+      "rationale": "v2 consolidation: area:ux removed, no surviving area value fits, tag lives in the Delivery space so kept rather than deleted."
     },
     {
       "tag": "ui-v2",
@@ -4865,9 +4825,9 @@
       ],
       "disposition": "merge",
       "to": [
-        "area:validator"
+        "area:infra"
       ],
-      "rationale": "generic validation-system topic tag, not a lifecycle state; folds into area:validator"
+      "rationale": "generic validation-system topic tag -- v2 consolidation: area:validator folded into area:infra."
     },
     {
       "tag": "validation-blocked",
@@ -4899,8 +4859,9 @@
       ],
       "disposition": "rename",
       "to": [
-        "area:validator"
-      ]
+        "area:infra"
+      ],
+      "rationale": "v2 consolidation: area:validator folded into area:infra."
     },
     {
       "tag": "vendor",
