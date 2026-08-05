@@ -357,28 +357,98 @@ class FleetOutcomeReconcilerTests(unittest.TestCase):
 
 def test_repository_manifest_is_content_addressed() -> None:
     source_root = SCRIPT.parent
+    repo_root = source_root.parent.parent
     with tempfile.TemporaryDirectory() as temporary:
         home = Path(temporary)
         reconciler = module.Reconciler(
             source_root=source_root,
             manifest_path=source_root / "fleet_outcome_manifest.json",
             home=home,
+            repo_root=repo_root,
         )
         reconciler.validate_sources()
         assert reconciler.manifest["files"]
         cron_updates = {
             update["name"]: update for update in reconciler.manifest["cron_updates"]
         }
-        assert cron_updates["verify-governed-paths"] == {
-            "id": "a6e2d5b00123",
-            "name": "verify-governed-paths",
-            "fields": {"script": "verify_governed_paths.sh"},
-        }
+        # verify-governed-paths (a6e2d5b00123) is intentionally NOT pinned
+        # here: fleet-config/jobs.json already ships that job with
+        # "script": "verify_governed_paths.sh", so a cron_updates entry for
+        # it is redundant and, worse, deadlocks the first cut of any release
+        # that both adds a new cron job and reconciles it in the same
+        # release (reconcile_fleet_outcomes.py can only patch an EXISTING
+        # job) — see the 592f589e90 (#324) first-cut bootstrap deadlock.
+        assert "verify-governed-paths" not in cron_updates
         assert cron_updates["ci-health-watch"] == {
             "id": "e835c614cfb2",
             "name": "ci-health-watch",
             "fields": {"script": "ci-health-watch-cron.py"},
         }
+
+
+def test_clickup_poll_gate_is_fleet_outcome_governed_from_its_single_canonical_source() -> None:
+    """The active cutter now passes --repo-root, so the temporary bootstrap
+    duplicate from PR #351 must be gone and deployments must resolve the
+    canonical repo-root script directly.
+    """
+    source_root = SCRIPT.parent
+    repo_root = source_root.parent.parent
+    manifest = json.loads(
+        (source_root / "fleet_outcome_manifest.json").read_text(encoding="utf-8")
+    )
+    entry = next(
+        (
+            f
+            for f in manifest["files"]
+            if f.get("destination") == "clickup_poll_gate.py"
+        ),
+        None,
+    )
+    assert entry is not None, "clickup_poll_gate.py has no fleet_outcome_manifest entry"
+    assert entry["destination_root"] == "scripts"
+    assert entry["source"] == "scripts/clickup_poll_gate.py"
+    assert entry.get("source_root") == "repo"
+
+    canonical_source = repo_root / "scripts" / "clickup_poll_gate.py"
+    assert canonical_source.is_file()
+    assert not (source_root / "scripts" / "clickup_poll_gate.py").exists(), (
+        "clickup_poll_gate.py must have only one canonical source"
+    )
+    actual = hashlib.sha256(canonical_source.read_bytes()).hexdigest()
+    assert entry["sha256"] == actual, (
+        "fleet_outcome_manifest.json clickup_poll_gate.py sha256 is stale — "
+        "the exact silent-never-deploys gap this entry exists to close"
+    )
+
+    with tempfile.TemporaryDirectory() as temporary:
+        home = Path(temporary)
+        reconciler = module.Reconciler(
+            source_root=source_root,
+            manifest_path=source_root / "fleet_outcome_manifest.json",
+            home=home,
+            repo_root=repo_root,
+        )
+        reconciler.validate_sources()
+        targets = reconciler.target_map()
+        target = reconciler.scripts_dir / "clickup_poll_gate.py"
+        assert target in targets
+        resolved_source, mode = targets[target]
+        assert resolved_source == canonical_source
+        assert mode == 0o644
+
+
+def test_clickup_poll_gate_is_no_longer_an_inert_mini_local_declaration() -> None:
+    """The old mini_local_registry.json entry declared clickup_poll_gate.py
+    as 'no repo source yet' — now that it is fleet-outcome governed, that
+    declaration must be gone or the deployment-coverage probe would treat
+    the live file as simultaneously mini-local AND bundle-governed.
+    """
+    source_root = SCRIPT.parent
+    registry = json.loads(
+        (source_root / "mini_local_registry.json").read_text(encoding="utf-8")
+    )
+    mini_local_paths = {entry["path"] for entry in registry["mini_local"]}
+    assert "scripts/clickup_poll_gate.py" not in mini_local_paths
 
 
 if __name__ == "__main__":

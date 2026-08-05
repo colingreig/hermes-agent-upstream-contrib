@@ -103,10 +103,6 @@
    "dest": "scripts/research_outcome_metrics.py"
   },
   {
-   "src_rel": "sentinel_run.sh",
-   "dest": "scripts/sentinel_run.sh"
-  },
-  {
    "src_rel": "skill_pull_guard.py",
    "dest": "scripts/skill_pull_guard.py"
   },
@@ -171,53 +167,7 @@
    "dest": "launch_agents/com.hermes.opendesign.plist"
   }
  ],
- "pinned_exceptions": {
-  "scripts/db_publish_task.py": {
-   "sha256": "64cb440902a83ffd74c6dc6baff465805b811b7e85c3c3b304bba4fdebb7a5af",
-   "reason": "live copy drifted from the repo source before this registry existed; accepted as-is pending reconciliation",
-   "reconcile_task": "86e2m63ua"
-  },
-  "scripts/install_self_report.py": {
-   "sha256": "c99fac35088cb532c46acc2918e387842d45e8a366b533fe6051a76c221f8a99",
-   "reason": "live copy drifted from the repo source before this registry existed; accepted as-is pending reconciliation",
-   "reconcile_task": "86e2m63ua"
-  },
-  "scripts/research_stage_monitor.py": {
-   "sha256": "87c90dd734e8f90f782695d0c5e983e3e38a2eb8e83aa03aade13ff78cb03558",
-   "reason": "live copy drifted from the repo source before this registry existed; accepted as-is pending reconciliation",
-   "reconcile_task": "86e2m63ua"
-  },
-  "scripts/verify-writer-chain.py": {
-   "sha256": "f26ab519392252df1c74fb49b1e1c0e07726b99c44bc7a59df20ff2241c008fa",
-   "reason": "live copy drifted from the repo source before this registry existed; accepted as-is pending reconciliation",
-   "reconcile_task": "86e2m63ua"
-  },
-  "scripts/tests/test_op_sdk_consumers.sh": {
-   "sha256": "43db4a2c106ecd35470e1365b632735ebf0832b556c24a6fd463bb41898b60df",
-   "reason": "live copy drifted from the repo source before this registry existed; accepted as-is pending reconciliation",
-   "reconcile_task": "86e2m63ua"
-  },
-  "scripts/tests/test_op_sdk_resolve.py": {
-   "sha256": "84b01188cbde2f1fc9dc838f232e040abfad4638fc7f2874c8d791637c647440",
-   "reason": "live copy drifted from the repo source before this registry existed; accepted as-is pending reconciliation",
-   "reconcile_task": "86e2m63ua"
-  },
-  "scripts/tests/test_sentinel_run.sh": {
-   "sha256": "13dba7f0b5a73bfa6b31894d28882c74543564a06781e8cc351b0bd1758ae211",
-   "reason": "live copy drifted from the repo source before this registry existed; accepted as-is pending reconciliation",
-   "reconcile_task": "86e2m63ua"
-  },
-  "launch_agents/com.hermes.opendesign.plist": {
-   "sha256": "c7f5ca68b3e55203d5ab5a5b2fd46571712b3bc1a4647f660b658c5cd40aa86b",
-   "reason": "live plist drifted from repo copy before this registry existed; accepted pending reconciliation",
-   "reconcile_task": "86e2m63ua"
-  },
-  "scripts/opencode_exec.py": {
-   "sha256": "fb5b81cffb1f51b3cebf1a54a8e2d2bd500ec01f5aaf888d378f38a51d71fa16",
-   "reason": "live spend-bundle copy predates the current spend_manifest sha; accepted pending install_spend.py rerun",
-   "reconcile_task": "86e2m63ua"
-  }
- },
+ "pinned_exceptions": {},
  "mini_local": [
   {
    "path": "scripts/.gitignore",
@@ -283,11 +233,6 @@
   },
   {
    "path": "scripts/clickup_groomer.py",
-   "category": "clickup-ops",
-   "reason": "mini-only ClickUp ops chokepoint script; no repo source yet (see hermes-cron-executes-from-scripts-dir-not-release); vendor into machine-setup/mini-scripts before changing"
-  },
-  {
-   "path": "scripts/clickup_poll_gate.py",
    "category": "clickup-ops",
    "reason": "mini-only ClickUp ops chokepoint script; no repo source yet (see hermes-cron-executes-from-scripts-dir-not-release); vendor into machine-setup/mini-scripts before changing"
   },
@@ -395,11 +340,6 @@
    "path": "scripts/hermes_self_report_run.py",
    "category": "monitor",
    "reason": "mini-local self-report runner shim outside the governed self-report bundle"
-  },
-  {
-   "path": "scripts/hermes_validate_size_monitor.py",
-   "category": "monitor",
-   "reason": "mini-local monitor/ops script; no repo source"
   },
   {
    "path": "scripts/ignite-board-sync.sh",
@@ -566,11 +506,6 @@
    "path": "scripts/stalled_task_reconciler.py",
    "category": "clickup-ops",
    "reason": "mini-only ClickUp ops chokepoint script; no repo source yet (see hermes-cron-executes-from-scripts-dir-not-release); vendor into machine-setup/mini-scripts before changing"
-  },
-  {
-   "path": "scripts/supabase_rls_guard.py",
-   "category": "monitor",
-   "reason": "mini-local monitor/ops script; no repo source"
   },
   {
    "path": "scripts/sync_ignite_skills_to_hermes.sh",

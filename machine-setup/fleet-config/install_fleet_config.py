@@ -632,6 +632,7 @@ def _print_jobs_plan(item: dict, *, helper_item: dict, home: Path) -> None:
         print(f"  (no existing jobs.json; installing {len(bundled_jobs)} jobs)")
         return
     merged, counts = merge_jobs_json(live_payload, bundled_payload)
+    _assert_required_environment_variables_roundtrip(merged["jobs"], bundled_jobs)
     live_jobs = live_payload.get("jobs", [])
     live_names = {j.get("name") for j in live_jobs if isinstance(j, dict)}
     bundled_names = {j.get("name") for j in bundled_jobs if isinstance(j, dict)}
@@ -716,6 +717,49 @@ def merge_jobs_json(
     result = dict(bundled)
     result["jobs"] = merged_jobs
     return result, counts
+
+
+def _assert_required_environment_variables_roundtrip(
+    merged_jobs: list[dict[str, Any]], bundled_jobs: list[dict[str, Any]]
+) -> None:
+    """Fail closed if a curated ``required_environment_variables`` shape does
+    not survive the merge byte-for-byte, including any per-entry ``optional``
+    flag.
+
+    ``cron/scheduler.py::_normalize_environment_variable_declarations``
+    treats a bare string name and a ``{"name": ..., "optional": true}``
+    mapping differently: a flattened optional entry silently becomes
+    REQUIRED and hard-fails the job with ``CronRequiredEnvironmentError``
+    instead of degrading gracefully when the credential is absent. Both
+    ``merge_jobs_json`` and the ``jobs_json`` write step already carry the
+    bundled (curated) value through untouched for every non-runtime field,
+    so this assertion should never trip in normal operation — it exists as
+    a fail-closed tripwire against a future regression in that merge path
+    (found live 2026-08-03: fleet-health-digest / f23a03e9d1b2 drifted to a
+    flattened plain-string list on the Mini, dropping IGNITE_SKILLS_ROOT's
+    declared optionality and hard-failing the job).
+    """
+    bundled_by_id = {
+        str(job["id"]): job
+        for job in bundled_jobs
+        if isinstance(job, dict) and job.get("id")
+    }
+    for job in merged_jobs:
+        if not isinstance(job, dict) or not job.get("id"):
+            continue
+        bundled_job = bundled_by_id.get(str(job["id"]))
+        if bundled_job is None:
+            continue
+        expected = bundled_job.get("required_environment_variables")
+        actual = job.get("required_environment_variables")
+        if actual != expected:
+            raise InstallError(
+                "required_environment_variables did not round-trip the merge "
+                f"for job {job.get('name') or job['id']!r}: curated bundle "
+                f"declares {expected!r}, merged output has {actual!r} — "
+                "refusing to install a job that would silently change which "
+                "environment variables are optional vs required"
+            )
 
 
 def _load_jobs_payload(
@@ -2186,6 +2230,7 @@ def install(
             except json.JSONDecodeError as exc:
                 raise InstallError(f"live jobs.json is not valid JSON: {exc}") from exc
         merged, merge_counts = merge_jobs_json(live_document, parsed)
+        _assert_required_environment_variables_roundtrip(merged["jobs"], parsed.get("jobs", []))
         if manifest.get("fleet_contract") == FLEET_JOBS_CONTRACT:
             _validate_direct_clickup_jobs(merged)
         with _protected_mutation(lease_box, home=home):

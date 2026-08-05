@@ -20,6 +20,44 @@ PYTHON="$HERMES_HOME/runtime-current/venv/bin/python"
 CONTROL="$HERMES_HOME/runtime-current/scripts/mini-release-poll-control.py"
 CERTIFIER="$HERMES_HOME/runtime-current/scripts/certify_prod_live_patches.py"
 
+# runtime-current pointer probe (ClickUp 86e2kt3yr). Every path below — and
+# every cron job on this box — dereferences $HERMES_HOME/runtime-current. On
+# 2026-08-02 that pointer was left as a bare-name relative symlink by an
+# out-of-band write and nothing noticed for minutes: the checks below would
+# have reported only "release cutter missing", which reads as a broken release
+# rather than a broken pointer. The poller is the fleet's most frequent
+# toucher of this path (~15 min), so it is also the cheapest place to get
+# detection cadence without a new LaunchAgent. The reason string is emitted on
+# stdout with a stable, greppable prefix so a fleet-outcome contract can alarm
+# on it distinguishably.
+POINTER="$HERMES_HOME/runtime-current"
+pointer_defect() {
+  if [ ! -L "$POINTER" ]; then
+    [ -e "$POINTER" ] && { printf 'not a symlink'; return 0; }
+    printf 'missing'
+    return 0
+  fi
+  POINTER_RAW="$(readlink "$POINTER")" || { printf 'unreadable'; return 0; }
+  case "$POINTER_RAW" in
+    /*) ;;
+    *) printf 'relative symlink (must be absolute): -> %s' "$POINTER_RAW"; return 0 ;;
+  esac
+  case "$POINTER_RAW" in
+    "$HERMES_HOME/releases/"*/*) printf 'target is not a direct child of releases/: -> %s' "$POINTER_RAW"; return 0 ;;
+    "$HERMES_HOME/releases/"?*) ;;
+    *) printf 'target escapes releases/: -> %s' "$POINTER_RAW"; return 0 ;;
+  esac
+  [ -d "$POINTER_RAW" ] || { printf 'dangling target: -> %s' "$POINTER_RAW"; return 0; }
+  [ -x "$POINTER_RAW/venv/bin/python" ] || { printf 'no usable runtime Python: -> %s' "$POINTER_RAW"; return 0; }
+  return 1
+}
+if POINTER_DEFECT="$(pointer_defect)"; then
+  printf 'mini-release-poll: runtime-current pointer corrupt: %s\n' "$POINTER_DEFECT"
+  printf 'mini-release-poll: runtime-current pointer corrupt: %s\n' "$POINTER_DEFECT" >&2
+  printf 'mini-release-poll: repair with: mini-release-cut.sh --repair-pointer\n' >&2
+  exit 1
+fi
+
 if [ ! -x "$CUT" ]; then
   printf 'mini-release-poll: release cutter missing or not executable: %s\n' "$CUT" >&2
   exit 1
@@ -77,7 +115,22 @@ git -C "$HERMES_HOME/runtime-current" cat-file blob "$LOCAL_AUTHORITY_REF" > "$R
   --receipt-id "$RECEIPT_ID" \
   --head-sha "$CERTIFIED_SHA" >/dev/null
 
+# Exit 75 (EX_TEMPFAIL, mini-release-cut.sh's RELEASE_DEFER_EXIT) means the cut
+# was DEFERRED because the fleet was still working: nothing switched, the drain
+# marker was removed, and poll-control was deliberately left unfrozen so this
+# very wrapper retries on its next 15-minute invocation (ClickUp 86e2md9ck).
+# Reporting that as a poller failure would be misleading, so it is surfaced as
+# its own log line and a clean exit. Repeated deferrals are counted and alarmed
+# by the release-cut-drain-deferral fleet-outcome contract, which reads the
+# cutter's own "release cut deferred:" line out of this same log — so a fleet
+# that can never quiesce pages rather than quietly never deploying.
+CUT_STATUS=0
 "$CUT" --ref prod-live-patches \
   --certified-sha "$CERTIFIED_SHA" \
   --promotion-receipt-id "$RECEIPT_ID" \
-  --if-advanced --prune
+  --if-advanced --prune || CUT_STATUS=$?
+if [ "$CUT_STATUS" -eq 75 ]; then
+  printf 'mini-release-poll: cut deferred by a busy fleet; authorization intact, retrying next cycle\n'
+  exit 0
+fi
+exit "$CUT_STATUS"

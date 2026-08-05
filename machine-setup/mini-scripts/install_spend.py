@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """Manifest-verified installer for the hermes-spend-guard deploy bundle.
 
-This script is the SOLE writer of the four spend-control artifacts
+This script is the SOLE writer of the four spend-control artifacts and their
+deployed manifest contract
 (``spend_opencode.py``, ``opencode_exec.py``, ``spend_guard.py``,
 ``spend_meter.py``) into ``~/.hermes/scripts/``. It reads
 ``spend_manifest.json`` (the declared bundle), verifies every source's sha256
 against the manifest, snapshots each existing destination, then atomically
-installs and re-verifies the deployed bytes. It NEVER rsyncs the scripts dir
-and NEVER touches any file that is not a manifest destination — in particular
+installs the governed files and manifest and re-verifies the deployed bytes.
+It NEVER rsyncs the scripts dir and NEVER touches any file that is not a
+manifest destination or the manifest contract itself — in particular
 ``claim_store.py`` and ``hermes_report_build.py``, which must co-exist
 alongside the bundle (the installer only warns if the required co-exist files
 are missing).
@@ -110,6 +112,11 @@ def _check_dest_in_bounds(dest: Path, dest_abs: str, allowed_root: Path) -> None
        symlinked intermediate directory can't redirect the write outside
        ``allowed_root`` either.
     """
+    if allowed_root.is_symlink():
+        raise InstallError(
+            f"allowed destination root {allowed_root} is a symlink — refusing"
+        )
+
     if ".." in dest.parts:
         raise InstallError(
             f"manifest destination {dest_abs!r} contains a '..' path "
@@ -125,18 +132,18 @@ def _check_dest_in_bounds(dest: Path, dest_abs: str, allowed_root: Path) -> None
             f"which is outside {allowed_root} — refusing"
         ) from exc
 
-    resolved_root = allowed_root.resolve()
-    ancestor = normalized
-    while not ancestor.exists() and ancestor.parent != ancestor:
-        ancestor = ancestor.parent
-    resolved_ancestor = ancestor.resolve()
+    # ``strict=False`` resolves every existing symlink while preserving a
+    # not-yet-created suffix. This allows a first install into a clean home
+    # (where ``.hermes`` does not exist yet) without weakening the symlink
+    # escape check for homes or intermediate directories that do exist.
+    resolved_root = allowed_root.resolve(strict=False)
+    resolved_destination = normalized.resolve(strict=False)
     try:
-        resolved_ancestor.relative_to(resolved_root)
+        resolved_destination.relative_to(resolved_root)
     except ValueError as exc:
         raise InstallError(
-            f"manifest destination {dest_abs!r} resolves (via ancestor "
-            f"{ancestor}) to {resolved_ancestor} which is outside "
-            f"{resolved_root} — refusing"
+            f"manifest destination {dest_abs!r} resolves to "
+            f"{resolved_destination} which is outside {resolved_root} — refusing"
         ) from exc
 
 
@@ -241,6 +248,24 @@ def install(
         home=home,
         mirror_root=mirror_root,
     )
+    # Deploy the exact contract used for this transaction alongside its
+    # governed scripts.  The manifest cannot hash itself in its own files
+    # array, so treat it as an installer-owned transaction item.
+    manifest_dest = home / ".hermes" / "scripts" / "spend_manifest.json"
+    _check_dest_in_bounds(
+        manifest_dest,
+        "~/.hermes/scripts/spend_manifest.json",
+        home / ALLOWED_DEST_SUBPATH,
+    )
+    plan.append(
+        {
+            "src": manifest_path,
+            "dest": manifest_dest,
+            "expected_sha256": _sha256(manifest_path),
+            "role": "deployed bundle contract",
+            "deploy_mode": "manifest",
+        }
+    )
     warnings = check_coexist(manifest, home)
 
     if dry_run:
@@ -265,7 +290,10 @@ def install(
             pre_existed = dest.exists()
             snapshot: Path | None = None
             if pre_existed:
-                snapshot = snapshot_dir / dest.name
+                snapshot_name = (
+                    f"deployed-{dest.name}" if dest == manifest_dest else dest.name
+                )
+                snapshot = snapshot_dir / snapshot_name
                 shutil.copy2(dest, snapshot)
                 shutil.copy2(dest, dest.with_name(dest.name + f".bak-spend-install-{stamp}"))
 

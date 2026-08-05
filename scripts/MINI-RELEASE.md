@@ -134,14 +134,22 @@ which is not on a non-interactive ssh PATH — the script extends PATH itself.
   --certified-sha <same-certified-full-sha> \
   --promotion-receipt-id <promotion-receipt-sha256> \
   --prune
+
+# Probe the runtime-current pointer (read-only: no lock, no lease, no mutation):
+~/.hermes/runtime-current/scripts/mini-release-cut.sh --verify-pointer
+
+# Repair a corrupt pointer from the receipt-verified target. Run the cutter out
+# of a release directory directly, because a corrupt pointer is exactly what
+# makes ~/.hermes/runtime-current/... unreachable:
+bash ~/.hermes/releases/<latest>/scripts/mini-release-cut.sh --repair-pointer
 ```
 
 `--ref` defaults to `prod-live-patches`.
 Every real cut and preflight requires both `--certified-sha` and
 `--promotion-receipt-id`. The resolved target must equal the full certified SHA
 exactly, and the immutable promotion receipt must authorize that same target;
-ancestry is not accepted as certification. Dry-runs and explicit rollback are
-the only exceptions. `MINI_RELEASE_VERIFY_TIMEOUT` accepts only a plain decimal
+ancestry is not accepted as certification. Dry-runs, explicit rollback, and the
+two pointer modes are the only exceptions. `MINI_RELEASE_VERIFY_TIMEOUT` accepts only a plain decimal
 integer from 1 through 900; `MINI_RELEASE_KEEP_EXTRA` accepts only 0 through 20.
 Signs, whitespace, leading-zero/octal forms, shell syntax, and larger values
 fail before release-state work.
@@ -488,6 +496,33 @@ Poll-control changes are content-addressed, persist under `releases/`, and
 require an explicit actor and reason. Missing, corrupt, locked, or
 unsafe-permission control state prevents polling. A failed managed cut records
 a frozen receipt, or remains fail-closed if the control itself is unavailable.
+
+**Deferral is not failure (ClickUp 86e2md9ck).** Before switching the runtime
+the cutter arms the gateway's reversible external drain and waits
+`MINI_RELEASE_DRAIN_TIMEOUT` (default 300s) for `gateway_state=draining` +
+`active_agents=0`. A normal cron agent run is 25-45 minutes, so that window
+routinely expires simply because the fleet is working. When it does — and only
+when the drain marker came back off cleanly and nothing was switched — the
+cutter logs `release cut deferred: gateway did not quiesce ...`, exits **75**
+(`EX_TEMPFAIL`), and deliberately leaves poll-control **unfrozen**: the next
+15-minute poll retries unattended against the same certified SHA and promotion
+receipt, re-running every fetch, promotion-authority, advancement, build, and
+verify gate from scratch. `mini-release-poll.sh` maps that 75 to its own
+`cut deferred by a busy fleet` line and a clean exit.
+
+Everything else keeps the original fail-closed behaviour: a drain that could
+not be *armed*, a marker that could not be *cleared*, and every build/verify
+failure still freeze poll-control for operator reconciliation. Because an
+unattended retry is silent by design, the `release-cut-drain-deferral`
+fleet-outcome contract counts deferral lines in
+`~/.hermes/logs/mini-release-poll.log` and alarms at 6 inside 240 minutes, so a
+fleet that can *never* quiesce pages instead of quietly never deploying.
+
+The drain window is intentionally NOT widened to cover a whole agent run: the
+marker refuses new fleet work for as long as it is armed, so a 45-minute
+blocking wait inside a 15-minute cron would park the fleet in drain
+permanently. Short window plus cheap automatic retry is the contract.
+
 Any deployment that explicitly adopts this contingency must first prove its
 promotion branch contains the active runtime commit; the locked preflight
 accepts only an equal or strict-descendant target and rejects all unverifiable
@@ -617,6 +652,47 @@ authority.
     that already-supplied target SHA, which binds its mutation snapshots,
     activation receipt, and any fence-loss evidence to the target rather than
     the old active HEAD. Explicit rollback instead binds the current active SHA.
+14. `runtime-current` must be a symlink whose **raw link text** is an absolute,
+    canonical (no `.`/`..` component) path to a direct child of `releases/` that
+    resolves to a directory holding an executable `venv/bin/python`. A relative
+    link is rejected even when it resolves — the release receipt records an
+    absolute `runtime_target` and every consumer string-joins onto the pointer.
+    This is asserted before the first dereference of `runtime-current` in every
+    mutating mode (so a corrupt pointer can never reach `.previous` or a
+    receipt), re-asserted by `repoint_symlink` after its own swap, checked on
+    every poll, and checked by `verify_governed_paths.py`.
+
+## Pointer integrity (`--verify-pointer` / `--repair-pointer`)
+
+```bash
+~/.hermes/runtime-current/scripts/mini-release-cut.sh --verify-pointer
+bash ~/.hermes/releases/<latest>/scripts/mini-release-cut.sh --repair-pointer
+```
+
+`--verify-pointer` is a read-only probe: exit 0 prints the resolved release,
+exit 1 prints one line naming the defect. It takes no lock, acquires no lease,
+and mutates nothing.
+
+`--repair-pointer` repoints `runtime-current` at the `runtime_target` recorded
+in `releases/.mini-release-last-receipt.json`, and only after that receipt
+byte-matches its immutable content-addressed `.mini-release-receipt-<sha256>`
+twin and names an existing direct child of `releases/`. The operator never
+chooses the target. It is the **one** mode that takes the cut lock without a
+production-write lease — the lease bootstraps from the active clone, which a
+corrupt pointer makes unreachable — so it never evicts a stale owner and
+refuses outright if a cutter holds the lock. It uses the *system* `python3`,
+since the release venv is reached through the very pointer being repaired, and
+it is idempotent (a healthy pointer exits 0 having changed nothing). It does
+not restart services; running processes hold their pre-repair image.
+
+Never `ln -s` the pointer by hand: a bare name resolves against `~/.hermes`,
+not `releases/`, which is exactly how the 2026-08-02 corruption happened
+(`reports/audit-runtime-current-symlink-corruption-2026-08-03.md`).
+
+The release poller checks the pointer before anything else and fails closed
+with the stable prefix `mini-release-poll: runtime-current pointer corrupt: `,
+registered as a `failure_patterns` entry on the `release-poll` fleet-outcome
+contract so the condition alarms as itself rather than as generic silence.
 
 ## Rollback
 

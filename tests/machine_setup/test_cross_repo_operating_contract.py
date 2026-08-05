@@ -36,7 +36,7 @@ def test_contract_doc_names_schedule_authority_and_one_owner_rules():
     text = CONTRACT_PATH.read_text(encoding="utf-8")
     assert "one owner per shared resource" in text.casefold()
     assert "6e25865a22a4" in text
-    assert "*/45 * * * *" in text
+    assert "*/15 * * * *" in text
     assert "6139465f559f" in text
     assert "deploy-poller.sh" in text
     assert "Conductor workspace" in text
@@ -50,7 +50,7 @@ def test_resource_manifest_matches_schema_and_registry_resource():
     assert manifest["registry_resource_id"] == "purelymail-poller-deploy"
     assert manifest["partner_repository"] == "ignite-email-infra"
     assert manifest["cron_schedule_authority"]["hermes_cron_job_id"] == "6e25865a22a4"
-    assert manifest["cron_schedule_authority"]["live_schedule_expr"] == "*/45 * * * *"
+    assert manifest["cron_schedule_authority"]["live_schedule_expr"] == "*/15 * * * *"
 
     registry = json.loads(REGISTRY_PATH.read_text(encoding="utf-8"))
     resource_ids = {row["id"] for row in registry["resources"]}

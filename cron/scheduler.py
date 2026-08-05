@@ -34,7 +34,7 @@ except ImportError:
     except ImportError:
         msvcrt = None
 from pathlib import Path
-from typing import Any, Iterable, List, NamedTuple, Optional
+from typing import Any, Callable, Iterable, List, NamedTuple, Optional
 
 # Add parent directory to path for imports BEFORE repo-level imports.
 # Without this, standalone invocations (e.g. after `hermes update` reloads
@@ -793,6 +793,8 @@ _parallel_pool: Optional[concurrent.futures.ThreadPoolExecutor] = None
 _parallel_pool_max_workers: Optional[int] = None
 _running_job_ids: set = set()
 _running_lock = threading.Lock()
+_active_work_change_callback: Optional[Callable[[], None]] = None
+_active_work_callback_lock = threading.Lock()
 
 # Job IDs the gateway shutdown path force-killed the tool subprocess of
 # while still in ``_running_job_ids`` (see ``mark_running_jobs_interrupted``
@@ -821,6 +823,25 @@ def get_running_job_ids() -> "frozenset[str]":
     """
     with _running_lock:
         return frozenset(_running_job_ids)
+
+
+def set_active_work_change_callback(callback: Optional[Callable[[], None]]) -> None:
+    """Bind the optional gateway observer for cron in-flight boundaries."""
+    global _active_work_change_callback
+    with _active_work_callback_lock:
+        _active_work_change_callback = callback
+
+
+def _notify_active_work_changed() -> None:
+    """Notify outside ``_running_lock``; the observer reads the running set."""
+    with _active_work_callback_lock:
+        callback = _active_work_change_callback
+    if callback is None:
+        return
+    try:
+        callback()
+    except Exception:
+        logger.debug("Cron active-work status callback failed", exc_info=True)
 
 
 def mark_running_jobs_interrupted(reason: str) -> list:
@@ -5827,10 +5848,27 @@ def tick(
                     logger.info("Job '%s' already running — skipping", job.get("name", job_id))
                     return None
                 _running_job_ids.add(job_id)
+            _notify_active_work_changed()
             # Record the owned, leased attempt before executor dispatch. A
             # restart can only terminalize a modern row after its lease expiry
             # and exact owner death prove the worker cannot still report.
-            execution = create_execution(job_id, source="builtin")
+            try:
+                execution = create_execution(job_id, source="builtin")
+            except Exception as execution_err:
+                # The in-flight claim is acquired before the durable ledger row
+                # so shutdown can see the whole dispatch boundary. If ledger
+                # creation fails, release that claim just like submit failure;
+                # otherwise this job remains permanently "running" and wedges
+                # both future ticks and gateway shutdown drain.
+                with _running_lock:
+                    _running_job_ids.discard(job_id)
+                _notify_active_work_changed()
+                logger.error(
+                    "Job '%s' not dispatched: execution ledger creation failed: %s",
+                    job.get("name", job_id),
+                    execution_err,
+                )
+                return None
             dispatched_job = dict(
                 job,
                 execution_id=execution["id"],
@@ -5844,12 +5882,14 @@ def tick(
                 finally:
                     with _running_lock:
                         _running_job_ids.discard(j["id"])
+                    _notify_active_work_changed()
 
             try:
                 return pool.submit(_run_and_release)
             except Exception as submit_err:
                 with _running_lock:
                     _running_job_ids.discard(job_id)
+                _notify_active_work_changed()
                 finish_execution(
                     execution["id"],
                     owner_token=execution["owner_token"],

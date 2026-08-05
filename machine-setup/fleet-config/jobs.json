@@ -749,7 +749,7 @@
       "skills": [],
       "skill_scope": "ops",
       "max_turns": 40,
-      "required_environment_variables": null,
+      "required_environment_variables": [],
       "context_from": null,
       "enabled_toolsets": null,
       "repeat": {
@@ -776,10 +776,10 @@
       "name": "Purelymail notify-me poller",
       "schedule": {
         "kind": "cron",
-        "expr": "*/45 * * * *",
-        "display": "*/45 * * * *"
+        "expr": "*/15 * * * *",
+        "display": "*/15 * * * *"
       },
-      "schedule_display": "*/45 * * * *",
+      "schedule_display": "*/15 * * * *",
       "enabled": true,
       "state": "scheduled",
       "no_agent": true,

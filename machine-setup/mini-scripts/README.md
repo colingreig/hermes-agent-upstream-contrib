@@ -673,13 +673,17 @@ than having their schedules advanced.
   Deployment is governed by the content-addressed
   `fleet_outcome_manifest.json` and transactional
   `reconcile_fleet_outcomes.py`. The normal Mini release cut invokes it
-  automatically. For an explicit verification or repair from an exact release:
+  automatically and passes the release root explicitly so manifest entries
+  with `source_root: "repo"` (including the single canonical
+  `scripts/clickup_poll_gate.py`) resolve from the release checkout. For an
+  explicit verification or repair from an exact release:
 
   ```bash
   ~/.hermes/runtime-current/venv/bin/python \
     ~/.hermes/runtime-current/machine-setup/mini-scripts/reconcile_fleet_outcomes.py \
     verify \
     --source-root ~/.hermes/runtime-current/machine-setup/mini-scripts \
+    --repo-root ~/.hermes/runtime-current \
     --manifest ~/.hermes/runtime-current/machine-setup/mini-scripts/fleet_outcome_manifest.json \
     --reload
   ```
@@ -988,6 +992,9 @@ the **sole writer** of these files. It:
 
 - verifies every source's sha256 against the manifest and **fails closed** on
   drift (never installs unverified bytes);
+- deploys the exact `self_report_manifest.json` used for the transaction to
+  `~/.hermes/scripts/`, so the runtime coverage contract is present alongside
+  the files it governs;
 - snapshots each existing destination into
   `~/.hermes/logs/self-report-installs/<UTC-ts>/` (plus a
   `<dest>.bak-self-report-install-<ts>` sibling) before writing;
@@ -1071,6 +1078,7 @@ This bundle closes that gap the same way `self_report_manifest.json` +
 exactly: sha-pinned, fails closed on any source hash drift, snapshots each
 existing destination into `~/.hermes/logs/spend-guard-installs/<UTC-ts>/`
 (plus a `<dest>.bak-spend-install-<ts>` sibling) before writing, installs
+the four files plus the exact `spend_manifest.json` transaction contract
 atomically and re-verifies the deployed bytes (restoring the snapshot on any
 mismatch), writes a durable `install-receipt.json`, and refuses any
 destination outside `~/.hermes/` or named `claim_store.py` /
@@ -1094,20 +1102,20 @@ declared files by name and touches nothing else. Because release/reconcile
 passes are known to clobber hand edits, this manifest + installer must be the
 ONLY writer of these four files going forward.
 
-`scripts/mini-release-cut.sh`'s post-cut receipt now scans every file that
-changed in the cut release under `machine-setup/mini-scripts/` and warns by
-name if any changed file is not covered by `self_report_manifest.json`,
-`spend_manifest.json`, `disk_lifecycle_manifest.json`, `github_app_manifest.json`,
-`fleet_outcome_manifest.json`, `pr_pipeline/manifest.json`, or the three files it
-vendors directly (`clickup_workspace_refresh.py`,
-`reconcile_launchd_environment.py`, `reconcile_marketplace_skills.py`) —
-so an uncovered change is flagged instead of silently rolling up into
-"governed script deployment verified." Neither `install_self_report.py`,
-`install_spend.py`, `install_disk_lifecycle.py`, nor `install_github_app.py`
-is invoked automatically
+`scripts/mini-release-cut.sh` now scans every file changed in the target release
+under `machine-setup/mini-scripts/` **before the build or runtime switch**. It
+rejects the cut if a changed runtime file is not covered by
+`self_report_manifest.json`, `spend_manifest.json`,
+`disk_lifecycle_manifest.json`, `github_app_manifest.json`,
+`fleet_outcome_manifest.json`, `pr_pipeline/manifest.json`, or one of the
+explicit cutter-owned deployment paths. An ungoverned change therefore cannot
+ship with a warning and remain inert on the mini.
+Neither `install_self_report.py`, `install_spend.py`,
+`install_disk_lifecycle.py`, nor `install_github_app.py` is invoked automatically
 by the cut itself (they require an explicit, deliberate run — see each
-installer's usage above); the drift check only makes the receipt honest about
-what did and did not deploy.
+installer's usage above). The pre-switch admission gate proves every changed
+runtime asset has a declared deployment owner; the fleet-outcome coverage check
+then detects missing or drifted live bytes after deployment.
 
 ## GitHub App auth (GH-Cost Phase 1, ClickUp 86e2k42qu)
 

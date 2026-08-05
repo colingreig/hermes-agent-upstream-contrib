@@ -60,7 +60,7 @@ import urllib.error
 import urllib.parse
 import re
 import urllib.request
-from datetime import date
+from datetime import date, datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import clickup_sync
@@ -286,14 +286,133 @@ def _token():
 _CLICKUP_RETRYABLE_STATUSES = frozenset({429, 500, 502, 503, 504})
 _CLICKUP_RETRY_MAX_ATTEMPTS = 4  # 1 initial try + 3 retries
 _CLICKUP_RETRY_BASE_DELAY_S = 1.0
-_CLICKUP_RETRY_MAX_DELAY_S = 20.0
+_CLICKUP_RETRY_MAX_DELAY_S = 8.0
+_CLICKUP_REQUEST_TIMEOUT_S = 20
+# The cron wrapper hard-kills the whole process at 120s. Stop ClickUp retry
+# work after 90s so terminal call telemetry can be appended and the queue gate
+# still has 30s for recovery/classification/mutations and a clean exit.
+_CLICKUP_PROCESS_DEADLINE_S = 120.0
+_CLICKUP_DEADLINE_RESERVE_S = 30.0
+_CLICKUP_RETRY_DEADLINE_S = _CLICKUP_PROCESS_DEADLINE_S - _CLICKUP_DEADLINE_RESERVE_S
+
+
+def _metrics_env_int(name, default, *, minimum=0):
+    try:
+        return max(minimum, int(os.environ.get(name, str(default))))
+    except (TypeError, ValueError):
+        return default
+
+
+_CLICKUP_METRICS_PATH = os.path.expanduser(
+    os.environ.get(
+        "HERMES_CLICKUP_CALL_METRICS_PATH",
+        "~/.hermes/state/clickup-client-calls.jsonl",
+    )
+)
+_CLICKUP_METRICS_MAX_BYTES = _metrics_env_int(
+    "HERMES_CLICKUP_CALL_METRICS_MAX_BYTES", 10 * 1024 * 1024, minimum=1
+)
+_CLICKUP_METRICS_RETAIN_FILES = _metrics_env_int(
+    "HERMES_CLICKUP_CALL_METRICS_RETAIN_FILES", 5
+)
+
+
+def _clickup_failure_class(exc):
+    if isinstance(exc, urllib.error.HTTPError):
+        return f"http_{exc.code}"
+    if isinstance(exc, (TimeoutError, urllib.error.URLError)):
+        return "timeout_or_network"
+    if isinstance(exc, (ConnectionError, OSError)):
+        return "network"
+    return type(exc).__name__.lower()
+
+
+def _rotate_clickup_metrics():
+    """Rotate the local event stream before append, retaining a bounded set."""
+    retain = max(0, _CLICKUP_METRICS_RETAIN_FILES)
+    if retain == 0:
+        try:
+            os.unlink(_CLICKUP_METRICS_PATH)
+        except FileNotFoundError:
+            pass
+        return
+    oldest = f"{_CLICKUP_METRICS_PATH}.{retain}"
+    try:
+        os.unlink(oldest)
+    except FileNotFoundError:
+        pass
+    for generation in range(retain - 1, 0, -1):
+        source = f"{_CLICKUP_METRICS_PATH}.{generation}"
+        if os.path.exists(source):
+            os.replace(source, f"{_CLICKUP_METRICS_PATH}.{generation + 1}")
+    os.replace(_CLICKUP_METRICS_PATH, f"{_CLICKUP_METRICS_PATH}.1")
+
+
+def _record_clickup_call_event(*, outcome, attempts, failure_class, elapsed_ms):
+    """Append one bounded, fail-open record per logical ClickUp call."""
+    event = {
+        "schema": "clickup-client-call/v1",
+        "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "client": "clickup_poll_gate",
+        "outcome": outcome,
+        "attempts": attempts,
+        "failure_class": failure_class,
+        "elapsed_ms": round(elapsed_ms, 3),
+    }
+    line = json.dumps(event, sort_keys=True) + "\n"
+    try:
+        metrics_dir = os.path.dirname(_CLICKUP_METRICS_PATH)
+        if metrics_dir:
+            os.makedirs(metrics_dir, exist_ok=True)
+        if (
+            os.path.exists(_CLICKUP_METRICS_PATH)
+            and os.path.getsize(_CLICKUP_METRICS_PATH) + len(line.encode("utf-8"))
+            > max(1, _CLICKUP_METRICS_MAX_BYTES)
+        ):
+            _rotate_clickup_metrics()
+        with open(_CLICKUP_METRICS_PATH, "a", encoding="utf-8") as metrics_file:
+            metrics_file.write(line)
+    except OSError as exc:
+        print(f"[gate] ClickUp metrics append failed (fail-open): {exc!r}", file=sys.stderr)
+
+
+# The queue scan's principal ClickUp reads do not use urllib: clickup_sync
+# shells out to curl and catches each list failure before falling back to its
+# stale cache. Wrap that exact imported call boundary so those failures remain
+# observable even though load_team_task_index() returns usable cached data.
+_CLICKUP_SYNC_CURL = clickup_sync._curl
+
+
+def _observed_clickup_sync_curl(path, *, timeout=45):
+    started = time.monotonic()
+    try:
+        result = _CLICKUP_SYNC_CURL(path, timeout=timeout)
+    except Exception as exc:
+        _record_clickup_call_event(
+            outcome="failure",
+            attempts=1,
+            failure_class=_clickup_failure_class(exc),
+            elapsed_ms=(time.monotonic() - started) * 1000,
+        )
+        raise
+    _record_clickup_call_event(
+        outcome="success",
+        attempts=1,
+        failure_class=None,
+        elapsed_ms=(time.monotonic() - started) * 1000,
+    )
+    return result
+
+
+clickup_sync._curl = _observed_clickup_sync_curl
 
 
 def _clickup_retry_delay(attempt, retry_after_header=None):
-    """Seconds to sleep before retry `attempt` (0-indexed). Honors a
-    Retry-After header (seconds form) when ClickUp sends one; otherwise
-    exponential backoff with +/-25% jitter to avoid thundering-herd retries
-    across the fleet's other cron ticks."""
+    """Seconds to sleep before retry ``attempt`` (0-indexed).
+
+    Honors Retry-After seconds when ClickUp sends one; otherwise uses
+    exponential backoff with jitter.
+    """
     if retry_after_header:
         try:
             return min(float(retry_after_header), _CLICKUP_RETRY_MAX_DELAY_S)
@@ -303,27 +422,72 @@ def _clickup_retry_delay(attempt, retry_after_header=None):
     return base * (1 + random.random() * 0.25)
 
 
-def _urlopen_with_retry(req, *, timeout=30, max_attempts=_CLICKUP_RETRY_MAX_ATTEMPTS):
+def _urlopen_with_retry(
+    req,
+    *,
+    timeout=_CLICKUP_REQUEST_TIMEOUT_S,
+    max_attempts=_CLICKUP_RETRY_MAX_ATTEMPTS,
+):
     """`urllib.request.urlopen(req, timeout=timeout)` with retry/backoff on
     ClickUp rate-limit (429) / transient (5xx) responses and on connection
     errors. Re-raises the final error once attempts are exhausted or the
     error is non-retryable (e.g. 401/404), so callers' existing exception
     handling is unchanged."""
     last_exc = None
+    started = time.monotonic()
+    retry_deadline = _SCRIPT_START + _CLICKUP_RETRY_DEADLINE_S
     for attempt in range(max_attempts):
+        # Cap each request to the process-wide retry window. In particular, a
+        # call reached late after queue sync cannot start a fresh 20s request
+        # that consumes the time reserved for telemetry and later gate work.
+        remaining = retry_deadline - time.time()
+        attempt_timeout = min(timeout, max(0.001, remaining))
         try:
-            return urllib.request.urlopen(req, timeout=timeout)
+            response = urllib.request.urlopen(req, timeout=attempt_timeout)
+            _record_clickup_call_event(
+                outcome="recovered" if attempt else "success",
+                attempts=attempt + 1,
+                failure_class=_clickup_failure_class(last_exc) if last_exc else None,
+                elapsed_ms=(time.monotonic() - started) * 1000,
+            )
+            return response
         except urllib.error.HTTPError as exc:
             last_exc = exc
             if exc.code not in _CLICKUP_RETRYABLE_STATUSES or attempt == max_attempts - 1:
+                _record_clickup_call_event(
+                    outcome="failure",
+                    attempts=attempt + 1,
+                    failure_class=_clickup_failure_class(exc),
+                    elapsed_ms=(time.monotonic() - started) * 1000,
+                )
                 raise
             retry_after = exc.headers.get("Retry-After") if exc.headers else None
             delay = _clickup_retry_delay(attempt, retry_after)
         except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as exc:
             last_exc = exc
             if attempt == max_attempts - 1:
+                _record_clickup_call_event(
+                    outcome="failure",
+                    attempts=attempt + 1,
+                    failure_class=_clickup_failure_class(exc),
+                    elapsed_ms=(time.monotonic() - started) * 1000,
+                )
                 raise
             delay = _clickup_retry_delay(attempt)
+        remaining = retry_deadline - time.time()
+        if remaining <= delay:
+            _record_clickup_call_event(
+                outcome="failure",
+                attempts=attempt + 1,
+                failure_class=_clickup_failure_class(last_exc),
+                elapsed_ms=(time.monotonic() - started) * 1000,
+            )
+            print(
+                f"[gate] ClickUp retry deadline reached after attempt {attempt + 1}; "
+                f"preserving {_CLICKUP_DEADLINE_RESERVE_S:.0f}s for telemetry/later work",
+                file=sys.stderr,
+            )
+            raise last_exc
         print(
             f"[gate] ClickUp call failed (attempt {attempt + 1}/{max_attempts}): "
             f"{last_exc!r}; retrying in {delay:.1f}s",
@@ -335,7 +499,7 @@ def _urlopen_with_retry(req, *, timeout=30, max_attempts=_CLICKUP_RETRY_MAX_ATTE
 
 def _get(url):
     req = urllib.request.Request(url, headers={"Authorization": _token()})
-    with _urlopen_with_retry(req, timeout=30) as resp:
+    with _urlopen_with_retry(req, timeout=_CLICKUP_REQUEST_TIMEOUT_S) as resp:
         return json.loads(resp.read().decode("utf-8", "replace"))
 
 
@@ -788,7 +952,7 @@ def _delete_tag(task_id, tag):
             method="DELETE",
             headers={"Authorization": _token()},
         )
-        with _urlopen_with_retry(req, timeout=30) as resp:
+        with _urlopen_with_retry(req, timeout=_CLICKUP_REQUEST_TIMEOUT_S) as resp:
             print(f"[gate] DELETE /tag/{tag} on {task_id}: rc={resp.status}")
     except Exception as e:
         # 404 = tag was never on the task (already clean). Anything else is
@@ -833,7 +997,7 @@ def _stamp_worked_by_hermes(task_id):
                 "Content-Type": "application/json",
             },
         )
-        with _urlopen_with_retry(req, timeout=30) as resp:
+        with _urlopen_with_retry(req, timeout=_CLICKUP_REQUEST_TIMEOUT_S) as resp:
             print(f"[gate] POST /field/Worked-By on {task_id}: rc={resp.status}")
     except Exception as e:
         # Best-effort: a failed stamp must never block the wake it rides

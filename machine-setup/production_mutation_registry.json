@@ -165,7 +165,7 @@
       "current_lock_or_transaction_boundary": {
         "kind": "directory lease and atomic release pointer swap",
         "path_or_identity": "~/.hermes/releases/.mini-release-cut.lock",
-        "behavior": "Builds and validates a fresh release before atomically repointing runtime-current; serializes cuts, rollback, and prune."
+        "behavior": "Builds and validates a fresh release before atomically repointing runtime-current; serializes cuts, rollback, prune, and --repair-pointer. --repair-pointer is the one mode that takes this lock WITHOUT a production-write lease (the lease bootstraps from the active clone, which a corrupt runtime-current makes unreachable); it never evicts a stale owner, refuses outright if a cutter holds the lock, and can only repoint at the runtime_target of a receipt that byte-matches its content-addressed twin."
       },
       "rollback_surface": {
         "surface": "~/.hermes/releases/.previous and .mini-release-last-receipt.json",
@@ -206,7 +206,7 @@
       "operational_pointers": {
         "activation": {
           "entry_point": "machine-setup/mini-scripts/reconcile_fleet_outcomes.py",
-          "command": "python3 reconcile_fleet_outcomes.py install --home <home> --reload"
+          "command": "python3 machine-setup/mini-scripts/reconcile_fleet_outcomes.py install --repo-root <repo-root> --home <home> --reload"
         },
         "rollback": {
           "entry_point": "machine-setup/mini-scripts/reconcile_fleet_outcomes.py",
@@ -637,7 +637,7 @@
         "surface": "~/.hermes/deploy/purelymail-poller/ previous deployed artifact and cron output",
         "procedure": "Restore the prior verified poller release through ignite-email-infra deploy rollback; do not hand-edit live poller bytes under ~/.hermes/scripts/."
       },
-      "notes": "Fleet jobs.json registers the Hermes cron schedule (*/45 * * * *); script bytes and deploy contract remain owned by ignite-email-infra."
+      "notes": "Fleet jobs.json registers the Hermes cron schedule (*/15 * * * *); script bytes and deploy contract remain owned by ignite-email-infra."
     },
     {
       "id": "ignite-email-infra-poller-deploy",

@@ -42,6 +42,8 @@ import json
 import os
 import subprocess
 import sys
+import time
+from pathlib import Path
 
 if __package__:
     from . import autonomous_merge
@@ -61,6 +63,136 @@ PR_LIST_LIMIT = 30
 GH_TIMEOUT = 60
 # Mirrors autonomous_merge._merge_readiness — a held PR is not a candidate.
 HOLD_LABELS = {"hold-for-colin", "do-not-merge", "do-not-auto-merge", "hold"}
+
+# --- identity-failure cooldown (task: starvation fix, 2026-08-04) ----------
+#
+# WHY: candidates[:limit] always slices a deterministic prefix. A PR whose
+# repo has no branch protection can NEVER validate — resolve_shadow_identity()
+# raises VerdictStoreError every tick — so if such a PR sorts first it holds a
+# slot forever and starves every other candidate. This section tracks
+# per-candidate identity-resolution failures (NOT CI/content BLOCKs, which
+# already produce a terminal verdict and drop out of scan_candidates on their
+# own) and demotes repeat offenders to the back of the queue. Ordering and
+# bookkeeping only — it never touches resolve_shadow_identity() or any trust
+# check, and a failed/unreadable cooldown file always falls back to the
+# original candidate order (fail-soft, never raises).
+IDENTITY_FAILURES_FILENAME = ".validator_identity_failures.json"
+IDENTITY_FAILURE_TTL_DAYS = 30
+
+
+def _identity_failures_path() -> Path:
+    """Directory mirrors validator_verdict.STORE_PATH (the TrustStore) so the
+    cooldown bookkeeping file always lives beside the ledger it protects —
+    reuses that existing HERMES_HOME resolution rather than hardcoding one."""
+    return Path(validator_verdict.STORE_PATH).parent / IDENTITY_FAILURES_FILENAME
+
+
+def _candidate_key(repo: str, pr: int) -> str:
+    return f"{repo}#{pr}"
+
+
+def _load_identity_failures(path=None) -> dict:
+    """Fail-soft: any missing/corrupt/unreadable file yields {} — the caller
+    then falls back to the original candidate ordering. Never raises."""
+    p = Path(path) if path is not None else _identity_failures_path()
+    try:
+        raw = p.read_text()
+    except FileNotFoundError:
+        return {}
+    except OSError as exc:
+        _log_err(f"identity-failure cooldown unreadable, ignoring (non-fatal): {exc!r}")
+        return {}
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, ValueError) as exc:
+        _log_err(f"identity-failure cooldown corrupt, ignoring (non-fatal): {exc!r}")
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {
+        key: rec for key, rec in data.items()
+        if isinstance(key, str) and isinstance(rec, dict)
+    }
+
+
+def _prune_identity_failures(data: dict, open_keys=None) -> dict:
+    """Cap growth: drop TTL-expired entries and (when known) entries for PRs
+    that are no longer open."""
+    cutoff = time.time() - (IDENTITY_FAILURE_TTL_DAYS * 86400)
+    pruned = {}
+    for key, rec in data.items():
+        if not isinstance(rec, dict):
+            continue
+        ts = rec.get("last_failure_ts")
+        if not isinstance(ts, (int, float)) or ts < cutoff:
+            continue
+        if open_keys is not None and key not in open_keys:
+            continue
+        pruned[key] = rec
+    return pruned
+
+
+def _save_identity_failures(data: dict, path=None, open_keys=None) -> None:
+    """Fail-soft: a write failure is logged and swallowed, never raised —
+    losing cooldown bookkeeping must never block validation."""
+    p = Path(path) if path is not None else _identity_failures_path()
+    try:
+        pruned = _prune_identity_failures(data, open_keys=open_keys)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_name(f"{p.name}.tmp{os.getpid()}")
+        tmp.write_text(json.dumps(pruned, indent=2, sort_keys=True))
+        tmp.replace(p)
+    except Exception as exc:  # pragma: no cover - defensive, must never break the trigger
+        _log_err(f"failed to persist identity-failure cooldown (non-fatal): {exc!r}")
+
+
+def _reconcile_stale_heads(candidates: list, failures: dict) -> bool:
+    """Clear a failure record whose stored head no longer matches the
+    candidate's current head — a new push deserves a fresh attempt. Returns
+    True iff the in-memory failures dict changed."""
+    changed = False
+    for item in candidates:
+        key = _candidate_key(item["repo"], item["pr"])
+        rec = failures.get(key)
+        if isinstance(rec, dict) and rec.get("head") != item.get("head"):
+            del failures[key]
+            changed = True
+    return changed
+
+
+def _order_candidates(candidates: list, failures: dict) -> list:
+    """Stable-sort so never-attempted candidates come first, then
+    identity-failed candidates ordered by last_failure_ts ascending (longest
+    since failure next). Relative order within each group is preserved
+    (Python's sort is stable) — this only reorders, never filters."""
+    if not failures:
+        return list(candidates)
+
+    def sort_key(item):
+        rec = failures.get(_candidate_key(item["repo"], item["pr"]))
+        if not isinstance(rec, dict):
+            return (0, 0.0)
+        ts = rec.get("last_failure_ts")
+        if not isinstance(ts, (int, float)):
+            return (0, 0.0)
+        return (1, ts)
+
+    return sorted(candidates, key=sort_key)
+
+
+def _record_identity_failure(failures: dict, repo: str, pr: int, head: str) -> None:
+    key = _candidate_key(repo, pr)
+    existing = failures.get(key)
+    count = 1
+    if isinstance(existing, dict) and existing.get("head") == head:
+        prior = existing.get("failure_count")
+        if isinstance(prior, int) and prior > 0:
+            count = prior + 1
+    failures[key] = {"head": head, "last_failure_ts": time.time(), "failure_count": count}
+
+
+def _clear_identity_failure(failures: dict, repo: str, pr: int) -> bool:
+    return failures.pop(_candidate_key(repo, pr), None) is not None
 
 
 def _log(msg: str) -> None:
@@ -216,13 +348,26 @@ def run(dry_run: bool = False, cap: int | None = None):
         return 0, summary
 
     candidates, skipped, errors = scan_candidates(allowlist)
-    summary["candidates"] = candidates
     summary["skipped"] = skipped
     summary["errors"].extend(errors)
     for item in skipped:
         _log(f"skip {item['repo']}#{item['pr']}: {item['reason']}")
     for err in errors:
         _log_err(f"scan error (non-fatal): {err}")
+
+    # Identity-failure cooldown ordering (fail-soft: any problem here falls
+    # back to scan_candidates()'s original order and never raises).
+    failures, failures_dirty = {}, False
+    try:
+        failures = _load_identity_failures()
+        failures_dirty = _reconcile_stale_heads(candidates, failures)
+        candidates = _order_candidates(candidates, failures)
+    except Exception as exc:  # pragma: no cover - defensive, must never block validation
+        _log_err(f"identity-failure cooldown ordering failed, using scan order "
+                 f"(non-fatal): {exc!r}")
+        failures, failures_dirty = {}, False
+
+    summary["candidates"] = candidates
 
     limit = cap if isinstance(cap, int) and cap > 0 else max_validations()
     to_validate = candidates[:limit]
@@ -254,6 +399,24 @@ def run(dry_run: bool = False, cap: int | None = None):
         summary["validated"].append(outcome)
         _log(f"{repo}#{pr} -> {outcome['verdict']} tier={outcome['tier']} "
              f"shadow={outcome['shadow']} rc={rc}")
+
+        # Identity-failure bookkeeping (ordering-only; never affects rc/verdict).
+        # rc==2 with fenced=True is VerdictBusyError — a transient lease
+        # conflict, not an identity failure — and must not be recorded.
+        try:
+            if rc == 2 and not result.get("fenced"):
+                _record_identity_failure(failures, repo, pr, item["head"])
+                failures_dirty = True
+            elif rc in (0, 1):
+                if _clear_identity_failure(failures, repo, pr):
+                    failures_dirty = True
+        except Exception as exc:  # pragma: no cover - defensive
+            _log_err(f"identity-failure cooldown bookkeeping failed (non-fatal): {exc!r}")
+
+    if failures_dirty and not dry_run:
+        open_keys = {_candidate_key(c["repo"], c["pr"]) for c in candidates}
+        open_keys |= {_candidate_key(s["repo"], s["pr"]) for s in skipped}
+        _save_identity_failures(failures, open_keys=open_keys)
 
     return 0, summary
 

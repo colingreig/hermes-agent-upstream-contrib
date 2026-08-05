@@ -217,6 +217,24 @@ def _source_root_default(home: Path) -> Path:
     return SCRIPT_ROOT
 
 
+def _repo_root_default(home: Path) -> Path:
+    """Root for fleet-outcome entries declaring "source_root": "repo".
+
+    Deliberately independent of any --source-root override: a handful of
+    tests point source_root at an isolated copy of just the mini-scripts
+    subtree to exercise edge cases on entries that stay bundle-relative,
+    but a repo-relative entry's single canonical source (e.g. scripts/
+    clickup_poll_gate.py) never moves with that override — it is always
+    either the real checkout (SCRIPT_ROOT's parent tree) or, when deployed,
+    the active release directory (which contains scripts/ alongside
+    machine-setup/, same as source_root's own deployed case above).
+    """
+    deployed_scripts = home / ".hermes" / "scripts"
+    if SCRIPT_ROOT == deployed_scripts:
+        return home / ".hermes" / "runtime-current"
+    return REPO_ROOT
+
+
 def _semantic_overlay_matches(live: Any, overlay: Any, path: str = "") -> None:
     """Check only overlay-owned semantic values, preserving all other config."""
     if isinstance(overlay, dict):
@@ -275,12 +293,14 @@ class GovernedPathsVerifier:
         home: Path,
         source_root: Path | None = None,
         fleet_root: Path | None = None,
+        repo_root: Path | None = None,
         fixture_safe: bool = False,
     ) -> None:
         self.home = home.expanduser().resolve()
         self.hermes = self.home / ".hermes"
         self.source_root = (source_root or _source_root_default(self.home)).resolve()
         self.fleet_root = (fleet_root or _fleet_config_default(self.home, self.source_root)).resolve()
+        self.repo_root = (repo_root or _repo_root_default(self.home)).resolve()
         self.fixture_safe = fixture_safe
 
     def verify(self) -> list[Finding]:
@@ -300,12 +320,33 @@ class GovernedPathsVerifier:
         current = self.hermes / "runtime-current"
         if not current.is_symlink():
             raise VerificationError(f"runtime-current is missing or not a symlink: {current}")
+        # Check the RAW link text, not only the resolved path (ClickUp
+        # 86e2kt3yr). The 2026-08-02 corruption was a bare-name relative link
+        # (`v0.18.2-<sha>`), which resolves against ~/.hermes rather than
+        # releases/ and therefore dangled. A relative link that *does* resolve
+        # (e.g. `releases/v0.18.2-<sha>`) is equally out of contract: the
+        # release receipt records an absolute runtime_target, and every
+        # consumer builds paths by string-joining onto this pointer.
+        raw_target = Path(os.readlink(current))
+        if not raw_target.is_absolute():
+            raise VerificationError(
+                f"runtime-current is a relative symlink (must be absolute): {current} -> {raw_target}"
+            )
         try:
             target = current.resolve(strict=True)
         except OSError as exc:
             raise VerificationError(f"runtime-current target is missing: {current}") from exc
         if not target.is_dir() or target.parent != releases.resolve():
             raise VerificationError(f"runtime-current escapes releases: {target}")
+        # Reject traversal/dot components on the raw text. Deliberately NOT a
+        # string comparison against the resolved path: this verifier runs
+        # inside every release cut, and a home under a symlinked prefix
+        # (macOS /var -> /private/var) would then fail a healthy pointer and
+        # roll the cut back.
+        if any(part in {".", ".."} for part in raw_target.parts):
+            raise VerificationError(
+                f"runtime-current is not canonical: {current} -> {raw_target}"
+            )
 
         previous = releases / ".previous"
         _plain_file(previous, "release previous pointer")
@@ -353,8 +394,17 @@ class GovernedPathsVerifier:
         for index, entry in enumerate(manifest["files"]):
             if not isinstance(entry, dict):
                 raise VerificationError(f"fleet outcome manifest files[{index}] is invalid")
+            entry_source_root = entry.get("source_root", "bundle")
+            if entry_source_root == "bundle":
+                source_base = self.source_root
+            elif entry_source_root == "repo":
+                source_base = self.repo_root
+            else:
+                raise VerificationError(
+                    f"fleet outcome files[{index}].source_root is not governed: {entry_source_root!r}"
+                )
             source = _safe_join(
-                self.source_root,
+                source_base,
                 _plain_relative(entry.get("source"), f"fleet outcome files[{index}].source"),
                 f"fleet outcome source files[{index}]",
             )
@@ -501,6 +551,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--source-root", type=Path, help="governed mini-scripts source root")
     parser.add_argument("--fleet-root", type=Path, help="fleet bundle root; defaults to the active release when deployed")
     parser.add_argument(
+        "--repo-root",
+        type=Path,
+        help="repo checkout root for source_root=repo manifest entries; defaults to the active release when deployed",
+    )
+    parser.add_argument(
         "--fixture-safe",
         action="store_true",
         help="declare an isolated fixture run; never consult launchd, git, or external state",
@@ -521,6 +576,7 @@ def main(argv: list[str] | None = None) -> int:
         home=args.home,
         source_root=args.source_root,
         fleet_root=args.fleet_root,
+        repo_root=args.repo_root,
         fixture_safe=args.fixture_safe,
     )
     receipt = args.receipt or args.home / ".hermes" / "state" / "governed-paths-verification.json"

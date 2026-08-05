@@ -94,6 +94,8 @@ IF_ADVANCED=0
 LAUNCHD_ENV_CHANGED=0
 MARKETPLACE_SKILLS_CHANGED=0
 PREFLIGHT=0
+VERIFY_POINTER=0
+REPAIR_POINTER=0
 CERTIFIED_SHA=""
 PROMOTION_RECEIPT_ID=""
 PR_PIPELINE_CHANGED=0
@@ -104,7 +106,23 @@ FLEET_OUTCOMES_CHANGED=0
 usage() {
   cat <<'EOF'
 Usage: mini-release-cut.sh [--ref <branch-or-sha>] [--certified-sha <full-sha>] [--promotion-receipt-id <sha256>] [--if-advanced] [--preflight] [--rollback] [--prune] [--dry-run] [--offline]
+       mini-release-cut.sh --verify-pointer | --repair-pointer
 
+  --verify-pointer
+                Read-only probe of the runtime-current pointer. Exits 0 and
+                prints the resolved release when the pointer is a symlink
+                holding an ABSOLUTE path to a canonical direct child of
+                releases/ that resolves to a directory with a usable
+                venv/bin/python. Exits 1 with a one-line reason otherwise.
+                Takes no lock, acquires no lease, and mutates nothing.
+  --repair-pointer
+                Repoint runtime-current at the release recorded in
+                ~/.hermes/releases/.mini-release-last-receipt.json, after
+                verifying that receipt byte-matches its content-addressed
+                twin. Serialized by the normal cut lock. Use only when
+                --verify-pointer reports a corrupt pointer; a corrupt pointer
+                makes the normal cut/rollback paths (which need the release
+                venv) unusable.
   --ref <ref>   Branch or sha to cut (default: prod-live-patches).
   --certified-sha <sha>
                 Bind the cut/preflight to one exact certified source commit.
@@ -134,6 +152,14 @@ Usage: mini-release-cut.sh [--ref <branch-or-sha>] [--certified-sha <full-sha>] 
                 gap rather than silently shipping a corrupt release. Prefer
                 the default network clone; use this only when origin is
                 genuinely unreachable.
+
+Exit codes:
+  0   success (cut, no-op, preflight, or rollback)
+  75  DEFERRED — the gateway did not quiesce inside the drain window because
+      the fleet was still working. Nothing was switched, the drain marker was
+      removed, and poll-control was NOT frozen: the next poll retries with the
+      same certified SHA and promotion receipt. Not an error.
+  1   failure (fail-closed; a managed poll cut also freezes poll-control)
 EOF
 }
 
@@ -151,6 +177,8 @@ while [ $# -gt 0 ]; do
     --offline)  OFFLINE=1; shift ;;
     --if-advanced) IF_ADVANCED=1; shift ;;
     --preflight) PREFLIGHT=1; IF_ADVANCED=1; shift ;;
+    --verify-pointer) VERIFY_POINTER=1; shift ;;
+    --repair-pointer) REPAIR_POINTER=1; shift ;;
     -h|--help)  usage; exit 0 ;;
     *) echo "ERROR: unknown argument: ${1:-}" >&2; usage >&2; exit 2 ;;
   esac
@@ -682,8 +710,8 @@ install_governed_fleet_outcomes() {
   if [ "$DRY_RUN" -eq 1 ]; then
     dry_run_target_regular_file_metadata "$VENDORED_FLEET_OUTCOMES_RECONCILER_REL" || return 1
     dry_run_target_regular_file_metadata "$VENDORED_FLEET_OUTCOMES_MANIFEST_REL" || return 1
-    printf '\033[35m[DRY-RUN]\033[0m %s %s install --source-root %s --manifest %s --home %s --hermes-home %s --reload\n' \
-      "$release_dir/venv/bin/python" "$reconciler" "$source_root" "$manifest" \
+    printf '\033[35m[DRY-RUN]\033[0m %s %s install --source-root %s --repo-root %s --manifest %s --home %s --hermes-home %s --reload\n' \
+      "$release_dir/venv/bin/python" "$reconciler" "$source_root" "$release_dir" "$manifest" \
       "$HOME" "$HERMES_HOME"
     return 0
   fi
@@ -692,7 +720,7 @@ install_governed_fleet_outcomes() {
   [ -f "$manifest" ] && [ ! -L "$manifest" ] \
     || { warn "fleet-outcome manifest missing or symlinked: $manifest"; return 1; }
   if ! guarded_or_direct "$release_dir/venv/bin/python" "$reconciler" install \
-    --source-root "$source_root" --manifest "$manifest" \
+    --source-root "$source_root" --repo-root "$release_dir" --manifest "$manifest" \
     --home "$HOME" --hermes-home "$HERMES_HOME" --reload; then
     return 1
   fi
@@ -973,6 +1001,224 @@ http_ok() {
 }
 
 # ---------------------------------------------------------------------------
+# runtime-current pointer health (read-only).
+#
+# Forensics (2026-08-02, ClickUp 86e2kt3yr): runtime-current was found as a
+# BARE-NAME relative symlink (`v0.18.2-aae777c146da`, no directory prefix).
+# A relative symlink resolves against the LINK's directory ($HERMES_HOME), not
+# releases/, so the pointer was dangling: every process that dereferenced
+# $HERMES_HOME/runtime-current/venv/bin/python got ENOENT for ~3 minutes, which
+# silently degraded the gateway's pre-tool-call shell hooks (merge_guard.py,
+# git_commit_identity_guard.py) to warnings while a cron agent ran.
+#
+# This helper is the single definition of "the pointer is healthy". It is
+# deliberately read-only and dependency-free (no git, no release venv, no
+# production-write lease) so it still works when the pointer is the broken
+# thing. It checks the RAW link text, not just the resolved path: a relative
+# link that happens to resolve (e.g. `releases/v0.18.2-xxxx`) is still a
+# defect, because the receipt contract records an absolute runtime_target.
+#
+# Prints a one-line reason to stdout and returns non-zero when unhealthy.
+# ---------------------------------------------------------------------------
+_current_link_check() {
+  local require_runtime="${1:-1}" link="${2:-$CURRENT_LINK}"
+  local raw releases_canon parent_canon base target
+  if [ ! -L "$link" ]; then
+    if [ -e "$link" ]; then
+      printf 'runtime-current is not a symlink: %s\n' "$link"
+    else
+      printf 'runtime-current is missing: %s\n' "$link"
+    fi
+    return 1
+  fi
+  raw="$(readlink "$link")" || {
+    printf 'runtime-current could not be read: %s\n' "$link"
+    return 1
+  }
+  case "$raw" in
+    /*) ;;
+    *)
+      printf 'runtime-current is a relative symlink (must be absolute): %s -> %s\n' "$link" "$raw"
+      return 1
+      ;;
+  esac
+  releases_canon="$(canonical_existing_dir "$RELEASES_DIR")" || {
+    printf 'releases dir does not exist: %s\n' "$RELEASES_DIR"
+    return 1
+  }
+  base="$(basename -- "$raw")"
+  case "$base" in
+    ''|.|..)
+      printf 'runtime-current target has no release component: %s -> %s\n' "$link" "$raw"
+      return 1
+      ;;
+  esac
+  parent_canon="$(canonical_existing_dir "$(dirname -- "$raw")")" || {
+    printf 'runtime-current target parent does not exist: %s -> %s\n' "$link" "$raw"
+    return 1
+  }
+  [ "$parent_canon" = "$releases_canon" ] || {
+    printf 'runtime-current escapes releases dir: %s -> %s (parent resolved: %s)\n' \
+      "$link" "$raw" "$parent_canon"
+    return 1
+  }
+  # Reject traversal (`releases/../releases/x`) and dot components. The parent
+  # check above already pins the link into releases/, but it canonicalizes, so
+  # on its own it would accept a path that walks out of releases/ and back in.
+  # Scanning the raw text keeps that closed without assuming a particular
+  # spelling of $HOME: the mini's home can legitimately sit under a symlinked
+  # prefix (macOS /var -> /private/var), so a literal string comparison
+  # against $RELEASES_DIR would reject healthy pointers. Repeated slashes are
+  # deliberately tolerated — they are cosmetic and enable no escape.
+  case "$raw" in
+    */../*|*/..|*/./*|*/.)
+      printf 'runtime-current target is not canonical: %s -> %s\n' "$link" "$raw"
+      return 1
+      ;;
+  esac
+  target="$raw"
+  [ -d "$target" ] || {
+    printf 'runtime-current target is dangling or not a directory: %s -> %s\n' "$link" "$raw"
+    return 1
+  }
+  if [ "$require_runtime" = 1 ]; then
+    [ -x "$target/venv/bin/python" ] || {
+      printf 'runtime-current target has no usable runtime Python: %s/venv/bin/python\n' "$target"
+      return 1
+    }
+  fi
+  printf '%s\n' "$target"
+  return 0
+}
+
+# Full operational health: structure + a usable runtime interpreter. This is
+# the contract every consumer of $HERMES_HOME/runtime-current actually depends
+# on, so it is what --verify-pointer and the poller assert.
+current_link_health() { _current_link_check 1 "${1:-$CURRENT_LINK}"; }
+
+# Structural health only: symlink, absolute, canonical direct child of
+# releases/, resolves to a directory. Used by the swap primitive itself, which
+# must stay usable for a rollback to a generation whose venv is being repaired.
+current_link_structure_ok() { _current_link_check 0 "${1:-$CURRENT_LINK}"; }
+
+# Fail-closed wrapper. A corrupt pointer must never be silently propagated into
+# PREV_TARGET/.previous or into a receipt, so every mutating mode calls this
+# before it touches release state.
+assert_current_link_healthy() {
+  local detail
+  if detail="$(current_link_health)"; then
+    return 0
+  fi
+  die "runtime-current pointer is CORRUPT: $detail
+     repair: $HERMES_HOME/runtime-current/scripts/mini-release-cut.sh --repair-pointer
+     (or, if the pointer is unusable: bash <checkout>/scripts/mini-release-cut.sh --repair-pointer)"
+}
+
+# Read the receipt-verified runtime target without trusting runtime-current.
+# The last receipt is content-addressed: it must byte-match its immutable
+# .mini-release-receipt-<sha256>.json twin, which is what makes it a safe
+# repair source. Uses the SYSTEM python3 on purpose — the release venv is
+# reached through the very pointer being repaired.
+receipt_verified_runtime_target() {
+  local py
+  py="$(command -v python3 || true)"
+  [ -n "$py" ] || { printf 'system python3 not found\n' >&2; return 1; }
+  RELEASES_DIR="$RELEASES_DIR" LAST_RECEIPT_FILE="$LAST_RECEIPT_FILE" "$py" - <<'PY'
+import hashlib
+import json
+import os
+import sys
+
+releases = os.environ["RELEASES_DIR"]
+last = os.environ["LAST_RECEIPT_FILE"]
+
+
+def fail(msg):
+    print(msg, file=sys.stderr)
+    raise SystemExit(1)
+
+
+try:
+    raw = open(last, "rb").read()
+except OSError as exc:
+    fail(f"last release receipt unreadable: {exc}")
+
+digest = hashlib.sha256(raw).hexdigest()
+immutable = os.path.join(releases, f".mini-release-receipt-{digest}.json")
+if os.path.islink(immutable) or not os.path.isfile(immutable):
+    fail("last release receipt has no content-addressed twin")
+if open(immutable, "rb").read() != raw:
+    fail("last release receipt differs from its content-addressed receipt")
+
+try:
+    payload = json.loads(raw.decode("utf-8"))
+except ValueError as exc:
+    fail(f"last release receipt is not valid JSON: {exc}")
+if payload.get("schema_version") != 2:
+    fail("last release receipt has an unsupported schema_version")
+if payload.get("event") not in {"noop", "rejected", "advanced", "cut", "rollback"}:
+    fail("last release receipt has an invalid event")
+
+target = payload.get("runtime_target")
+if not isinstance(target, str) or not target.startswith("/"):
+    fail("last release receipt runtime_target is not an absolute path")
+if os.path.dirname(target) != os.path.realpath(releases):
+    fail("last release receipt runtime_target is not a direct child of releases/")
+if not os.path.isdir(target):
+    fail("last release receipt runtime_target does not exist on disk")
+print(target)
+PY
+}
+
+# Lease-free mutex for --repair-pointer. Uses the same lock path and the same
+# exclusive os.link(2) primitive as acquire_cut_lock, so a live cutter and a
+# repair can never both own it; unlike acquire_cut_lock it does not require a
+# production-write lease, which cannot be bootstrapped while the pointer that
+# reaches the runtime clone is broken. It also never recovers a "stale" owner:
+# a repair must not evict a cutter, it must refuse.
+POINTER_REPAIR_LOCK_HELD=0
+acquire_pointer_repair_lock() {
+  assert_release_target "$CUT_LOCK_DIR"
+  python3 -c '
+import json, os, sys, tempfile, time
+path = sys.argv[1]
+payload = json.dumps(
+    {
+        "schema_version": 1,
+        "pointer_repair": True,
+        "pid": os.getpid(),
+        "acquired_at": time.time(),
+    },
+    sort_keys=True,
+    separators=(",", ":"),
+).encode("utf-8")
+parent = os.path.dirname(path)
+fd, staged = tempfile.mkstemp(prefix=".mini-release-pointer-repair.", dir=parent)
+try:
+    os.fchmod(fd, 0o600)
+    os.write(fd, payload)
+    os.fsync(fd)
+finally:
+    os.close(fd)
+try:
+    os.link(staged, path)
+except FileExistsError:
+    raise SystemExit(17)
+finally:
+    os.unlink(staged)
+' "$CUT_LOCK_DIR" \
+    || die "release-cut lock is held ($CUT_LOCK_DIR); refusing pointer repair while a cut may be in flight"
+  POINTER_REPAIR_LOCK_HELD=1
+}
+
+# shellcheck disable=SC2329 # registered as an EXIT trap by the repair mode.
+release_pointer_repair_lock() {
+  [ "$POINTER_REPAIR_LOCK_HELD" -eq 1 ] || return 0
+  POINTER_REPAIR_LOCK_HELD=0
+  rm -f "$CUT_LOCK_DIR" || warn "could not release pointer-repair lock: $CUT_LOCK_DIR"
+}
+
+# ---------------------------------------------------------------------------
 # Symlink repoint (atomic) — one of the two permitted out-of-releases writes.
 # ---------------------------------------------------------------------------
 repoint_symlink() {
@@ -1001,6 +1247,13 @@ repoint_symlink() {
   # invariant that was silently violated before the -h fix above).
   [ "$(readlink "$CURRENT_LINK")" = "$target" ] \
     || die "repoint_symlink: swap did not take effect (runtime-current still -> $(readlink "$CURRENT_LINK" 2>/dev/null))"
+  # Re-assert the full pointer contract, not just target equality: the link
+  # must be absolute, a canonical direct child of releases/, and resolve to a
+  # real directory. Equality alone would accept a relative link whose text
+  # happened to match, which is the exact 2026-08-02 corruption shape.
+  local structure
+  structure="$(current_link_structure_ok)" \
+    || die "repoint_symlink: post-swap pointer is not healthy: $structure"
   ok "runtime-current → $target"
 }
 
@@ -1694,6 +1947,27 @@ DRAIN_REQUEST_FILE="$HERMES_HOME/.drain_request.json"
 GATEWAY_STATE_FILE="$HERMES_HOME/gateway_state.json"
 RELEASE_DRAIN_ARMED=0
 
+# A drain window that expires because the fleet is still working is NOT a
+# release failure (ClickUp 86e2md9ck).  Nothing has been switched, the
+# certified SHA and promotion receipt are unchanged, and the correct response
+# is to try again on the next 15-minute poll — not to freeze poll-control and
+# demand an operator re-certification.  A normal cron agent run is 25-45
+# minutes, so a 5-minute drain window loses to a busy fleet routinely; before
+# this exit code existed that structurally locked a busy fleet out of its own
+# deploy path.
+#
+# The window itself is deliberately NOT widened to cover a whole agent run:
+# the drain marker refuses new fleet work for as long as it is armed, so a
+# 45-minute blocking wait inside a 15-minute cron would keep the fleet parked
+# in drain permanently.  Short window + cheap automatic retry is the shape.
+#
+# 75 is EX_TEMPFAIL.  It is reserved for exactly one condition: the drain
+# window expired with the marker successfully removed and no operational
+# mutation performed.  Every other nonzero result keeps the original
+# fail-closed freeze.
+RELEASE_DEFER_EXIT=75
+RELEASE_DEFERRED=0
+
 request_release_drain() {
   local runtime_python="$CURRENT_LINK/venv/bin/python"
   if [ "$DRY_RUN" -eq 1 ]; then
@@ -1788,7 +2062,10 @@ wait_for_release_drain() {
     sleep 1
   done
   warn "gateway did not drain within ${DRAIN_TIMEOUT}s; refusing runtime switch/reload"
-  return 1
+  # Distinct from 1: the gateway is healthy and simply still busy.  The caller
+  # turns this into a deferral (see RELEASE_DEFER_EXIT).  Failure to ARM the
+  # drain, by contrast, still returns 1 and stays a hard failure.
+  return "$RELEASE_DEFER_EXIT"
 }
 
 begin_release_drain() {
@@ -2154,17 +2431,17 @@ prune_releases() {
 }
 
 # ---------------------------------------------------------------------------
-# Ungoverned mini-scripts drift check.
+# Ungoverned mini-scripts release-admission check.
 #
 # Five bundles (self_report_manifest.json + install_self_report.py,
 # spend_manifest.json + install_spend.py,
 # disk_lifecycle_manifest.json + install_disk_lifecycle.py,
 # github_app_manifest.json + install_github_app.py, and
 # fleet_outcome_manifest.json + reconcile_fleet_outcomes.py) declare which
-# machine-setup/mini-scripts/ files are sha-pinned and governed; a fifth
-# (pr_pipeline/manifest.json) owns its whole subtree the same way. Every
-# other file under machine-setup/mini-scripts/ is a manual-copy asset (see
-# the README). The fleet-outcome reconciler runs automatically as part of this
+# machine-setup/mini-scripts/ files are sha-pinned and governed; a sixth
+# (pr_pipeline/manifest.json) owns its whole subtree the same way. Remaining
+# live Mini files must be explicitly classified by mini_local_registry.json.
+# The fleet-outcome reconciler runs automatically as part of this
 # cut. The self-report and spend installers remain explicit invocations, so a
 # file inside either of those bundles can still go undeployed if nobody re-ran
 # its installer.
@@ -2202,6 +2479,53 @@ for entry in manifest.get('files', []):
 " "$root"
 }
 
+# Print registry classifications as ``E<TAB>repo-path`` for exact paths or
+# ``G<TAB>repo-pattern`` for mini-local globs. Registry destinations are live
+# keys (scripts/... or launch_agents/...), so translate them back to their
+# release-tree source shape before comparing them with git diff output.
+classified_mini_scripts_paths() {
+  local root="${1:-machine-setup/mini-scripts}"
+  git_current show "${SHA}:${root}/mini_local_registry.json" 2>/dev/null | python3 -c "
+import json, sys
+
+root = sys.argv[1]
+try:
+    registry = json.load(sys.stdin)
+except Exception:
+    sys.exit(2)
+
+for entry in registry.get('direct_deploy', []):
+    if isinstance(entry, dict) and isinstance(entry.get('src_rel'), str):
+        print('E\\t' + root + '/' + entry['src_rel'])
+
+for entry in registry.get('mini_local', []):
+    if not isinstance(entry, dict) or not isinstance(entry.get('path'), str):
+        continue
+    live = entry['path']
+    if live.startswith('scripts/'):
+        release_path = root + '/' + live[len('scripts/'):]
+    elif live.startswith('launch_agents/'):
+        release_path = root + '/launchd/' + live[len('launch_agents/'):]
+    else:
+        continue
+    print(('G' if entry.get('glob') else 'E') + '\\t' + release_path)
+" "$root"
+}
+
+mini_registry_classifies_path() {
+  local candidate="${1:-}" classifications="${2:-}" kind pattern
+  while IFS=$'\t' read -r kind pattern; do
+    [ -n "$pattern" ] || continue
+    if [ "$kind" = "E" ] && [ "$candidate" = "$pattern" ]; then
+      return 0
+    fi
+    if [ "$kind" = "G" ] && [[ "$candidate" == $pattern ]]; then
+      return 0
+    fi
+  done <<<"$classifications"
+  return 1
+}
+
 # List (repo-relative paths, one per line) every machine-setup/mini-scripts/
 # file that changed between $ACTIVE_SHA and $SHA but is not accounted for by
 # self_report_manifest.json, spend_manifest.json,
@@ -2211,8 +2535,11 @@ for entry in manifest.get('files', []):
 # is ever deployed to the mini.
 find_uncovered_mini_scripts_changes() {
   local root="machine-setup/mini-scripts"
-  local changed covered f
-  changed="$(git_current diff --name-only "$ACTIVE_SHA" "$SHA" -- "$root" 2>/dev/null || true)"
+  local changed covered classified f
+  if ! changed="$(git_current diff --name-only "$ACTIVE_SHA" "$SHA" -- "$root" 2>/dev/null)"; then
+    warn "release admission could not discover changed Mini runtime files"
+    return 1
+  fi
   [ -n "$changed" ] || return 0
 
   covered="$(
@@ -2223,6 +2550,14 @@ find_uncovered_mini_scripts_changes() {
       covered_mini_scripts_paths "$root/github_app_manifest.json" "$root"
       covered_mini_scripts_paths "$root/fleet_outcome_manifest.json" "$root"
       printf '%s\n' \
+        "$root/self_report_manifest.json" \
+        "$root/install_self_report.py" \
+        "$root/spend_manifest.json" \
+        "$root/install_spend.py" \
+        "$root/disk_lifecycle_manifest.json" \
+        "$root/install_disk_lifecycle.py" \
+        "$root/github_app_manifest.json" \
+        "$root/install_github_app.py" \
         "$VENDORED_REFRESH_REL" \
         "$VENDORED_LAUNCHD_RECONCILER_REL" \
         "$VENDORED_SKILLS_RECONCILER_REL" \
@@ -2231,16 +2566,41 @@ find_uncovered_mini_scripts_changes() {
         "$VENDORED_FLEET_OUTCOMES_MANIFEST_REL"
     } 2>/dev/null
   )"
+  if ! classified="$(classified_mini_scripts_paths "$root")"; then
+    warn "release admission could not read the target Mini classification registry"
+    return 1
+  fi
 
   while IFS= read -r f; do
     [ -n "$f" ] || continue
     case "$f" in
       "$root"/tests/*|"$root"/README.md|"$root"/pr_pipeline/*) continue ;;
     esac
-    if ! grep -Fxq -- "$f" <<<"$covered"; then
+    if ! grep -Fxq -- "$f" <<<"$covered" \
+       && ! mini_registry_classifies_path "$f" "$classified"; then
       printf '%s\n' "$f"
     fi
   done <<<"$changed"
+}
+
+# Fail release admission before build, runtime-current switch, or any live
+# Mini-file mutation. A warning-only receipt is too late: it leaves merged
+# runtime fixes inert until somebody notices the log. Keep this helper
+# side-effect free so preflight/dry-run exercise the identical classification.
+require_governed_mini_scripts_changes() {
+  local uncovered count file
+  if ! uncovered="$(find_uncovered_mini_scripts_changes)"; then
+    warn "release admission rejected: Mini runtime change discovery/classification failed"
+    return 1
+  fi
+  [ -z "$uncovered" ] && return 0
+
+  count="$(printf '%s\n' "$uncovered" | grep -c .)"
+  warn "release admission rejected: ${count} changed Mini runtime file(s) are outside every deploy manifest:"
+  while IFS= read -r file; do
+    [ -n "$file" ] && warn "  ungoverned change: $file"
+  done <<<"$uncovered"
+  return 1
 }
 
 freeze_managed_poll_after_failure() {
@@ -2439,6 +2799,61 @@ CUT_LOCK_DIR="$RELEASES_DIR/.mini-release-cut.lock"
 LAST_RECEIPT_FILE="$RELEASES_DIR/.mini-release-last-receipt.json"
 REFRESH_BACKUP_FILE="$RELEASES_DIR/.clickup_workspace_refresh.previous"
 
+# ===========================================================================
+# MODE: pointer probe / pointer repair (ClickUp 86e2kt3yr)
+#
+# Both run before certification-argument validation on purpose. A corrupt
+# runtime-current pointer makes the release venv unreachable, so the poller
+# cannot mint a certified sha and the operator has nothing to pass. These are
+# also the only two modes that must keep working when the pointer is broken.
+# ===========================================================================
+if [ "$VERIFY_POINTER" -eq 1 ] || [ "$REPAIR_POINTER" -eq 1 ]; then
+  [ "$VERIFY_POINTER" -eq 0 ] || [ "$REPAIR_POINTER" -eq 0 ] \
+    || die "--verify-pointer and --repair-pointer are mutually exclusive"
+  if [ "$DO_ROLLBACK" -eq 1 ] || [ "$DO_PRUNE" -eq 1 ] || [ "$PREFLIGHT" -eq 1 ] \
+     || [ "$OFFLINE" -eq 1 ] || [ "$DRY_RUN" -eq 1 ]; then
+    die "pointer modes cannot be combined with --rollback, --prune, --preflight, --offline, or --dry-run"
+  fi
+fi
+
+if [ "$VERIFY_POINTER" -eq 1 ]; then
+  POINTER_DETAIL=""
+  if POINTER_DETAIL="$(current_link_health)"; then
+    ok "runtime-current OK → $POINTER_DETAIL"
+    exit 0
+  fi
+  printf '\033[31m✗ runtime-current CORRUPT: %s\033[0m\n' "$POINTER_DETAIL" >&2
+  exit 1
+fi
+
+if [ "$REPAIR_POINTER" -eq 1 ]; then
+  # The production-write lease is bootstrapped from the ACTIVE runtime clone
+  # (git_current rev-parse), which a corrupt pointer makes unreachable — the
+  # lease is therefore structurally unobtainable in exactly the situation this
+  # mode exists for. Repair instead takes the SAME single-instance cut lock
+  # file with the same exclusive-link primitive, without a lease: it never
+  # holds it across a build, and it refuses outright if a real cutter already
+  # owns it. A healthy cut never exposes a corrupt pointer anyway (the swap
+  # stages under a separate .swap name and renames atomically), so a repair
+  # racing a live cutover is not a reachable state.
+  acquire_pointer_repair_lock
+  trap 'release_pointer_repair_lock' EXIT
+  if POINTER_DETAIL="$(current_link_health)"; then
+    ok "runtime-current already healthy → $POINTER_DETAIL (no repair needed)"
+    exit 0
+  fi
+  warn "runtime-current is corrupt: $POINTER_DETAIL"
+  RECEIPT_TARGET="$(receipt_verified_runtime_target)" \
+    || die "cannot repair: no receipt-verified runtime target available"
+  log "repairing runtime-current from receipt-verified target: $RECEIPT_TARGET"
+  repoint_symlink "$RECEIPT_TARGET"
+  POINTER_DETAIL="$(current_link_health)" \
+    || die "repair did not produce a healthy pointer: $POINTER_DETAIL"
+  ok "runtime-current repaired → $POINTER_DETAIL"
+  warn "services still run from their pre-repair image; restart them if the gateway or dashboard failed during the outage"
+  exit 0
+fi
+
 if [ "$PREFLIGHT" -eq 1 ] && {
   [ "$DRY_RUN" -eq 1 ] || [ "$DO_ROLLBACK" -eq 1 ] \
     || [ "$DO_PRUNE" -eq 1 ] || [ "$OFFLINE" -eq 1 ]
@@ -2463,6 +2878,12 @@ fi
 # fetch.  Fetch and promotion authority verification both materialize git and
 # receipt state, so they cannot precede the production-write fence.
 if [ "$DRY_RUN" -eq 0 ]; then
+  # Assert the pointer BEFORE the first dereference of $CURRENT_LINK. Without
+  # this, a corrupt pointer surfaced as "could not resolve active runtime
+  # commit for bootstrap lease" — a misleading message that names neither the
+  # real defect nor the repair. It also stops a corrupt pointer from being
+  # copied into PREV_TARGET/.previous or a receipt by a later stage.
+  assert_current_link_healthy
   SHA="$(git_current rev-parse --verify "HEAD^{commit}")" \
     || die "could not resolve active runtime commit for bootstrap lease"
   bootstrap_production_write_lease
@@ -2493,6 +2914,10 @@ cleanup_on_exit() {
       RELEASE_DRAIN_ARMED=0
     elif ! production_write_mutation_allowed || ! clear_release_drain; then
       warn "FATAL: release drain cleanup could not be completed"
+      # A marker that cannot be removed parks the whole fleet in drain. That is
+      # a real safety event, so revoke any deferral claim and fall back to the
+      # fail-closed freeze below.
+      RELEASE_DEFERRED=0
       status=70
     fi
   fi
@@ -2513,7 +2938,14 @@ cleanup_on_exit() {
       warn "cleanup: refusing to remove partial release without current production write fence"
     fi
   fi
-  if [ "$status" -ne 0 ]; then
+  if [ "$status" -ne 0 ] && [ "$RELEASE_DEFERRED" -eq 1 ]; then
+    # Deferral, not failure: the runtime was never switched, the drain marker
+    # is off, and the certified SHA + promotion receipt are untouched. Leave
+    # poll-control unfrozen so the next poll retries unattended. RELEASE_DEFERRED
+    # is only ever set on the drain-timeout path, and is revoked above if the
+    # marker could not be cleared.
+    warn "poll freeze skipped: release deferred, not failed; authorization left intact for automatic retry"
+  elif [ "$status" -ne 0 ]; then
     # Fetch/preflight failures happen before lease acquisition.  A trap must
     # leave poll-control state alone in that case (or after fence loss).
     if [ "$LEASE_CUT_READY" -ne 1 ]; then
@@ -2609,6 +3041,8 @@ fi
 # fetch and immutable commit resolution. This closes the check-then-cut race.
 ACTIVE_SHA="$(git_current rev-parse --verify "HEAD^{commit}")" \
   || die "could not resolve active runtime commit"
+require_governed_mini_scripts_changes \
+  || die "target release contains ungoverned Mini runtime changes; add manifest coverage or explicitly classify the file as mini-local"
 if [ "$IF_ADVANCED" -eq 1 ]; then
   ADVANCEMENT="$(classify_ref_advancement "$ACTIVE_SHA" "$SHA")"
   ACTIVE_TARGET="$(readlink "$CURRENT_LINK")"
@@ -2902,8 +3336,31 @@ heartbeat_production_write_lease
 # Quiesce the live gateway before the first pre-switch operational mutation.
 # Timeout clears the marker and aborts before .previous, runtime-current, or
 # any launchd registration is changed.
-if ! begin_release_drain; then
+#
+# Two distinct outcomes (ClickUp 86e2md9ck):
+#   * the drain could not be ARMED, or the marker could not be REMOVED after a
+#     timeout — a genuine operational failure; die() and let the EXIT trap
+#     freeze poll-control for operator reconciliation, exactly as before;
+#   * the drain was armed, the fleet stayed busy, and the marker came back off
+#     cleanly — nothing was switched and nothing was left armed, so this is a
+#     DEFERRAL.  Exit RELEASE_DEFER_EXIT with poll-control untouched so the
+#     next 15-minute poll retries unattended against the same certified SHA
+#     and promotion receipt.  Certification is never weakened here: the retry
+#     re-runs every fetch, promotion-authority, advancement, build, and verify
+#     gate from scratch.
+DRAIN_STATUS=0
+begin_release_drain || DRAIN_STATUS=$?
+if [ "$DRAIN_STATUS" -ne 0 ]; then
   clear_release_drain || warn "release drain remained armed after timeout"
+  if [ "$DRAIN_STATUS" -eq "$RELEASE_DEFER_EXIT" ] && [ "$RELEASE_DRAIN_ARMED" -eq 0 ]; then
+    RELEASE_DEFERRED=1
+    # Single, greppable, fleet-outcome-countable evidence line.  The
+    # release-cut-drain-deferral contract in fleet_outcome_contracts.json
+    # alarms once these repeat inside its window, so a fleet that can NEVER
+    # quiesce pages instead of silently never deploying.
+    warn "release cut deferred: gateway did not quiesce within ${DRAIN_TIMEOUT}s; poll authorization preserved, retrying next poll"
+    exit "$RELEASE_DEFER_EXIT"
+  fi
   die "cut aborted before runtime switch: gateway did not quiesce"
 fi
 heartbeat_production_write_lease
@@ -2959,15 +3416,15 @@ if ! reconcile_governed_pr_pipeline "$NEW_DIR" "$SHA"; then
   die "cut aborted and rolled back to previous release"
 fi
 heartbeat_production_write_lease
-if ! install_governed_fleet_outcomes "$NEW_DIR"; then
-  warn "governed fleet-outcome reconciliation failed — rolling back"
-  guarded_rollback_to_previous "governed fleet-outcome reconciliation failed"
-  die "cut aborted and rolled back to previous release"
-fi
-heartbeat_production_write_lease
 if ! install_governed_fleet_config "$NEW_DIR"; then
   warn "governed fleet-config install failed — rolling back"
   guarded_rollback_to_previous "governed fleet-config install failed"
+  die "cut aborted and rolled back to previous release"
+fi
+heartbeat_production_write_lease
+if ! install_governed_fleet_outcomes "$NEW_DIR"; then
+  warn "governed fleet-outcome reconciliation failed — rolling back"
+  guarded_rollback_to_previous "governed fleet-outcome reconciliation failed"
   die "cut aborted and rolled back to previous release"
 fi
 heartbeat_production_write_lease
@@ -3013,21 +3470,7 @@ else
     die "cut aborted and rolled back to previous release"
   fi
 fi
-# Honest receipt: don't claim "governed script deployment verified" while a
-# machine-setup/mini-scripts/ file changed in this release outside every
-# declared deploy manifest (self_report_manifest.json, spend_manifest.json,
-# pr_pipeline/manifest.json, or the three files vendored above). This is a
-# report-only check — it never blocks or rolls back the cut.
-UNCOVERED_MINI_SCRIPTS="$(find_uncovered_mini_scripts_changes)"
 RECEIPT_DETAIL="release cut, exact-source PR-pipeline reconciliation, and governed script deployment verified"
-if [ -n "$UNCOVERED_MINI_SCRIPTS" ]; then
-  UNCOVERED_COUNT="$(printf '%s\n' "$UNCOVERED_MINI_SCRIPTS" | grep -c .)"
-  warn "release changed machine-setup/mini-scripts/ file(s) outside every deploy manifest — NOT deployed to the mini by this cut:"
-  while IFS= read -r UNCOVERED_FILE; do
-    [ -n "$UNCOVERED_FILE" ] && warn "  ungoverned change: $UNCOVERED_FILE"
-  done <<<"$UNCOVERED_MINI_SCRIPTS"
-  RECEIPT_DETAIL="release cut complete; WARNING: ${UNCOVERED_COUNT} machine-setup/mini-scripts/ file(s) changed outside every deploy manifest (see cut log for names)"
-fi
 
 RECEIPT_EVENT="cut"
 [ "$IF_ADVANCED" -eq 1 ] && RECEIPT_EVENT="advanced"
@@ -3036,9 +3479,6 @@ record_cut_receipt_or_rollback "$RECEIPT_EVENT" "$ACTIVE_SHA" "$SHA" "$NEW_DIR" 
   "$RECEIPT_DETAIL"
 
 ok "release cut complete: runtime-current → $NEW_DIR (v${VERSION}-${SHORT_SHA})"
-if [ -n "$UNCOVERED_MINI_SCRIPTS" ]; then
-  warn "release cut complete WITH WARNINGS: ${UNCOVERED_COUNT} ungoverned mini-scripts change(s) — see above"
-fi
 
 # --- Optional prune (explicit only) ----------------------------------------
 if [ "$DO_PRUNE" -eq 1 ]; then

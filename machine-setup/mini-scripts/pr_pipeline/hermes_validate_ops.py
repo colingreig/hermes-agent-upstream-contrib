@@ -311,13 +311,25 @@ def cmd_set_status(a):
     return 1
 
 
-def cmd_add_tag(a):
+def add_tag(task_id: str, tag: str) -> bool:
+    """Add ``tag`` to ``task_id`` through the packaged ClickUp write path.
+
+    Pollers import this helper instead of spawning a version-pinned Python
+    executable and a retired flat entrypoint.  ClickUp tag writes are
+    idempotent, so callers can safely retry after an uncertain read.
+    """
     if DRY_RUN:
-        print(f"[DRY_RUN] would POST tag '{a.tag}' to task {a.task_id}")
-        return 0
-    name = urllib.parse.quote(a.tag)
-    st, _ = _req("POST", f"/task/{a.task_id}/tag/{name}")
-    if st and 200 <= st < 300:
+        print(f"[DRY_RUN] would POST tag '{tag}' to task {task_id}")
+        return True
+    name = urllib.parse.quote(tag)
+    st, _ = _req("POST", f"/task/{task_id}/tag/{name}")
+    return bool(st and 200 <= st < 300)
+
+
+def cmd_add_tag(a):
+    if add_tag(a.task_id, a.tag):
+        if DRY_RUN:
+            return 0
         print(f"tag '{a.tag}' added")
         return 0
     return 1

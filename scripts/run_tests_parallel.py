@@ -63,6 +63,7 @@ from typing import Dict, List, Tuple
 _DEFAULT_ROOTS = [
     "tests",
     "machine-setup/mini-scripts/tests/test_reconcile_pr_pipeline.py",
+    "machine-setup/fleet-config/tests",
 ]
 
 # Directories to skip during discovery — these suites require real

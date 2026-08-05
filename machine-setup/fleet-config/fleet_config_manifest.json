@@ -85,7 +85,7 @@
     {
       "src_rel": "jobs.json",
       "dest_abs": "~/.hermes/cron/jobs.json",
-      "sha256": "11cb707cf2813da065ba1702673c31fbfaaf811f88ef47880a87414708ee1ad9",
+      "sha256": "1a508887347feb7d72bd1a35c003b1005d3db8b17679e1050f682771e92078e4",
       "role": "curated 18-job cron set (five LLM jobs plus thirteen no-agent jobs, including the deterministic fleet-health-digest, Purelymail poller, and five-minute governed-path verifier); direct ClickUp executor prompts; hermes-pr-validate re-enabled 2026-07-31 and pinned to IGNITE_SKILLS_ROOT; merges bundled definitions while preserving scheduler runtime for unchanged job ids; validator-live-trigger added 2026-08-03 (86e2m44np) as the deterministic fenced validate_pr.py producer with job-scoped HERMES_VALIDATOR_FINALIZE_TOKEN",
       "deploy_mode": "jobs_json"
     },
@@ -103,7 +103,7 @@
     },
     {
       "src_rel": "install_fleet_config.py",
-      "sha256": "4a1df4dd5b68b705ed97640d31aad29e34db112c6e6a8e1ed232aa914e4cbceb",
+      "sha256": "7a84627eb802024e33301955f35e73350daa5f4bd5ba7769940a4b28fd982b65",
       "role": "source-only pin for the governed fleet installer, including private legacy root config-backup remediation and exact-mode rollback",
       "deploy_mode": "installer_source"
     }

@@ -11,7 +11,8 @@ Covers the cron/scheduler.py primitives directly:
     result AFTER its tool was already killed out from under it
 """
 
-from unittest.mock import patch
+import threading
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -26,7 +27,11 @@ def _reset_scheduler_state(monkeypatch):
 
     sched._running_job_ids.clear()
     sched._interrupted_job_ids.clear()
+    if hasattr(sched, "set_active_work_change_callback"):
+        sched.set_active_work_change_callback(None)
     yield
+    if hasattr(sched, "set_active_work_change_callback"):
+        sched.set_active_work_change_callback(None)
     sched._running_job_ids.clear()
     sched._interrupted_job_ids.clear()
 
@@ -58,6 +63,89 @@ class TestGetRunningJobIds:
         sched._running_job_ids.add("job-2")
 
         assert snapshot == frozenset({"job-1"})
+
+
+class TestActiveWorkBoundaryNotification:
+    def test_execution_ledger_failure_releases_active_work_claim(self, monkeypatch):
+        import cron.scheduler as sched
+
+        job = {
+            "id": "ledger-failure",
+            "name": "ledger-failure",
+            "prompt": "test",
+            "schedule": "every 5m",
+            "enabled": True,
+        }
+        observed = []
+        sched.set_active_work_change_callback(
+            lambda: observed.append(len(sched.get_running_job_ids()))
+        )
+        monkeypatch.setattr(sched, "get_due_jobs", lambda: [job])
+        monkeypatch.setattr(sched, "advance_next_run", lambda *_args: None)
+        monkeypatch.setattr(sched, "load_config", lambda: {"cron": {"max_parallel_jobs": 1}})
+        monkeypatch.setattr(
+            sched, "create_execution", MagicMock(side_effect=OSError("ledger unavailable"))
+        )
+
+        assert sched.tick(verbose=False, sync=False) == 0
+        assert sched.get_running_job_ids() == frozenset()
+        assert observed == [1, 0]
+
+    def test_real_tick_persists_cron_start_and_end(self, monkeypatch):
+        import cron.scheduler as sched
+        from gateway.status import read_runtime_status, write_runtime_status
+        from tests.gateway.restart_test_helpers import make_restart_runner
+
+        runner, _adapter = make_restart_runner()
+        runner.adapters = {}
+        write_runtime_status(gateway_state="running", active_agents=0)
+        sched.set_active_work_change_callback(runner._persist_active_agents)
+
+        job = {
+            "id": "persisted-cron-work",
+            "name": "persisted-cron-work",
+            "prompt": "test",
+            "schedule": "every 5m",
+            "enabled": True,
+        }
+        worker_started = threading.Event()
+        release_worker = threading.Event()
+
+        def blocked_run(_job, **_kwargs):
+            worker_started.set()
+            release_worker.wait(2)
+            return True
+
+        monkeypatch.setattr(sched, "get_due_jobs", lambda: [job])
+        monkeypatch.setattr(sched, "advance_next_run", lambda *_args: None)
+        monkeypatch.setattr(sched, "load_config", lambda: {"cron": {"max_parallel_jobs": 1}})
+        monkeypatch.setattr(sched, "run_one_job", blocked_run)
+        monkeypatch.setattr(sched, "create_execution", MagicMock(return_value={
+            "id": "execution-1", "owner_token": "owner-1"
+        }))
+
+        try:
+            assert sched.tick(verbose=False, sync=False) == 1
+            assert worker_started.wait(2)
+            runtime = read_runtime_status()
+            assert runtime is not None
+            assert runtime["gateway_state"] == "running"
+            assert runtime["active_agents"] == 1
+
+            release_worker.set()
+            for _ in range(100):
+                if not sched.get_running_job_ids():
+                    break
+                threading.Event().wait(0.01)
+
+            assert sched.get_running_job_ids() == frozenset()
+            runtime = read_runtime_status()
+            assert runtime is not None
+            assert runtime["gateway_state"] == "running"
+            assert runtime["active_agents"] == 0
+        finally:
+            release_worker.set()
+            sched._shutdown_parallel_pool()
 
 
 class TestMarkRunningJobsInterrupted:

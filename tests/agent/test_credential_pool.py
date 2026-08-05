@@ -3775,6 +3775,48 @@ def test_record_probe_verdict_unknown_entry_returns_false(tmp_path, monkeypatch)
     assert record_probe_verdict("provider-never-configured", "cred-1", "confirmed_dead") is False
 
 
+def test_record_resolution_failure_updates_entries(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_single_entry_pool(tmp_path, "anthropic", entry_id="cred-unresolved")
+
+    from agent.credential_pool import record_resolution_failure, STATUS_UNRESOLVED
+
+    updated = record_resolution_failure("anthropic", "no token resolved; env_visibility={}")
+    assert updated == 1
+
+    auth_payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    persisted = auth_payload["credential_pool"]["anthropic"][0]
+    assert persisted["last_status"] == STATUS_UNRESOLVED
+    assert persisted["last_status_at"] is not None
+    assert "no token resolved" in persisted["last_error_reason"]
+
+
+def test_record_resolution_failure_never_marks_exhausted_or_dead(tmp_path, monkeypatch):
+    """STATUS_UNRESOLVED must stay outside the EXHAUSTED/DEAD gate — a bare
+    resolution miss (no request was ever sent) must never block rotation the
+    way a real upstream 401/429 failure does."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_single_entry_pool(tmp_path, "anthropic", entry_id="cred-unresolved")
+
+    from agent.credential_pool import load_pool, record_resolution_failure
+
+    record_resolution_failure("anthropic", "no token resolved")
+
+    pool = load_pool("anthropic")
+    assert pool.has_available()
+    assert pool.select() is not None
+
+
+def test_record_resolution_failure_no_entries_returns_zero(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+
+    from agent.credential_pool import record_resolution_failure
+
+    assert record_resolution_failure("anthropic", "no token resolved") == 0
+    assert record_resolution_failure("", "no token resolved") == 0
+    assert record_resolution_failure("anthropic", "") == 0
+
+
 def test_failure_summary_single_provider(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     _write_single_entry_pool(tmp_path, "openai-codex", entry_id="cred-summary")

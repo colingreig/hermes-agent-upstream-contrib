@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import json
 import subprocess
+import time
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
 import agent.ops_alerts as ops_alerts
@@ -50,6 +52,27 @@ class TestAlertOnceDedup:
             # Must never propagate — alerting must not break the caller.
             fired = ops_alerts.alert_once("vision:gemini", "vision is dead")
         assert fired is True
+
+    def test_concurrent_calls_send_exactly_once(self, monkeypatch):
+        class _SlowContainsSet(set):
+            def __contains__(self, item):
+                present = super().__contains__(item)
+                time.sleep(0.02)
+                return present
+
+        monkeypatch.setattr(ops_alerts, "_ALERTED_SIGNATURES", _SlowContainsSet())
+        with patch.object(ops_alerts, "_send_slack") as mock_send:
+            with ThreadPoolExecutor(max_workers=12) as pool:
+                fired = list(
+                    pool.map(
+                        lambda _: ops_alerts.alert_once("provider:shared", "provider failed"),
+                        range(12),
+                    )
+                )
+
+        assert fired.count(True) == 1
+        assert fired.count(False) == 11
+        mock_send.assert_called_once()
 
 
 class TestSendSlackShape:

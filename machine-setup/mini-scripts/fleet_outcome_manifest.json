@@ -9,7 +9,7 @@
       "destination_root": "scripts",
       "destination": "reconcile_fleet_outcomes.py",
       "mode": "0755",
-      "sha256": "4e7a83e415c3724f127e784af24aacc40a28a58cd63056c544eccc05548623b8"
+      "sha256": "f7214a24aee54f70e1d6299d082fd765e719b0fe3d7d2134caea7c6972c7341a"
     },
     {
       "source": "ci-health-watch-cron.py",
@@ -23,7 +23,7 @@
       "destination_root": "scripts",
       "destination": "fleet_outcome_probe.py",
       "mode": "0755",
-      "sha256": "93c44bad22c911a3aa464945954b1de01754311de54b93c36152819122266f7b"
+      "sha256": "b96ed493b32f5760fae7b5d9660250e3a63ede194e7098f6ffafd872d7430c08"
     },
     {
       "source": "fleet_incident_report.py",
@@ -37,7 +37,7 @@
       "destination_root": "scripts",
       "destination": "verify_governed_paths.py",
       "mode": "0755",
-      "sha256": "ecce5c417b83e33bdfeb781ae0fbcaa8644e2137885542e5a66193943284a7e5"
+      "sha256": "3768b1fc86841d092ec617e2ae12d13694febafe77c1e2e6f9a3f6ee1b107603"
     },
     {
       "source": "verify_governed_paths_launcher.py",
@@ -58,7 +58,14 @@
       "destination_root": "scripts",
       "destination": "runtime_current_guard.py",
       "mode": "0755",
-      "sha256": "1706f421d4068f9fcb2ef62ced4bc1281bd3087b981d9d4549aee7e8992aa843"
+      "sha256": "71a1cef5c64df1e6f82d2ee020b86013df92fc228b2a5382cb4c5dad26758430"
+    },
+    {
+      "source": "governed_path_trust.json",
+      "destination_root": "scripts",
+      "destination": "governed_path_trust.json",
+      "mode": "0644",
+      "sha256": "8cbd8ecb1d7c3b69df897536dc3cba6f182c0327d837d313604325fda55905f8"
     },
     {
       "source": "digest_trusted_scripts.json",
@@ -86,28 +93,28 @@
       "destination_root": "scripts",
       "destination": "fleet_outcome_contracts.json",
       "mode": "0644",
-      "sha256": "048feb93addbbc6e37061b28f4eac6067ab36f0527e1f7fb648d5369cb56f568"
+      "sha256": "cd7a50a0358b4adfd64571f303f2c634e9175f2313ca0a0e9628ce1b97804746"
     },
     {
       "source": "mini_local_registry.json",
       "destination_root": "scripts",
       "destination": "mini_local_registry.json",
       "mode": "0644",
-      "sha256": "da9b739aa8cb806e2eabfb0b4ab652a26e1b4cefbdddf2a90edf4596eee54e6c"
+      "sha256": "7b956eaa5ddd9b4067d14410d6994c24ac670606ca887649359035b0dd180687"
     },
     {
       "source": "hermes_usage_alert.py",
       "destination_root": "scripts",
       "destination": "hermes_usage_alert.py",
       "mode": "0755",
-      "sha256": "396972cd6890db6ebaae1be47c2227f80dc7b617798bc1c2676d0ff073192b9f"
+      "sha256": "6540e0f430a8104157ae49da3201e60c6d7dd8a902704121cf01ab1b99c8d31a"
     },
     {
       "source": "degraded_secrets_monitor.py",
       "destination_root": "scripts",
       "destination": "degraded_secrets_monitor.py",
       "mode": "0755",
-      "sha256": "38b001098b9bb8aa532a28ab0815a170e0773b54df1bcc08e41a67715f8e8954"
+      "sha256": "71f785db1cb24ce0dbf4652521087bf951cf9beecb21ddf8ee9685b6b02c44ab"
     },
     {
       "source": "mcp_serve_reaper.py",
@@ -142,7 +149,7 @@
       "destination_root": "scripts",
       "destination": "silent_delivery_monitor.py",
       "mode": "0755",
-      "sha256": "0f0e958a9a0bfa425dad4c01cefd54cec9e65139a5471abab079be6ac013c519"
+      "sha256": "872e2edff10cadee692d29075aa2fa21a12a71e742e169735b42e953bc4e808e"
     },
     {
       "source": "launchd/com.colingreig.hermes.fleet-outcome-probe.plist",
@@ -213,16 +220,31 @@
       "destination": "supabase_rls_guard.py",
       "mode": "0755",
       "sha256": "fee1c085fc0ba16795f4f65421d26f4d54bc0199afeebf628f7cbaaba1782ae2"
+    },
+    {
+      "source": "sentinel_run.sh",
+      "destination_root": "scripts",
+      "destination": "sentinel_run.sh",
+      "mode": "0755",
+      "sha256": "762a4431f3289bd57ba38b050e64ffe2c313719d0e64bec205d457abf4cc2500"
+    },
+    {
+      "source": "closeout_actor.py",
+      "destination_root": "scripts",
+      "destination": "closeout_actor.py",
+      "mode": "0644",
+      "sha256": "abcdb6d7e9b6c5dae03618693bdac8f12ce9272ca6f0802e1aad4763656f6dbd"
+    },
+    {
+      "source": "scripts/clickup_poll_gate.py",
+      "source_root": "repo",
+      "destination_root": "scripts",
+      "destination": "clickup_poll_gate.py",
+      "mode": "0644",
+      "sha256": "71f04d309f0546f61af7ead99800b031afe6a82c998d13b3a2e55e96efa1566c"
     }
   ],
   "cron_updates": [
-    {
-      "id": "a6e2d5b00123",
-      "name": "verify-governed-paths",
-      "fields": {
-        "script": "verify_governed_paths.sh"
-      }
-    },
     {
       "id": "e835c614cfb2",
       "name": "ci-health-watch",

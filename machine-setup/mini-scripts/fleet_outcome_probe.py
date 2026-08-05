@@ -46,6 +46,8 @@ from pathlib import Path
 from typing import Any, Callable
 from xml.parsers.expat import ExpatError
 
+from agent.failure_taxonomy import FAILURE_KIND_AUTH_PERMANENT, FAILURE_KIND_USAGE_CAP
+
 
 HOME = Path.home()
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -83,6 +85,13 @@ NOTABLE_ALARM_ACTIONS = frozenset(
 MONITORED_LABEL_RE = re.compile(
     r"^(?:ai\.hermes\.|com\.hermes\.|com\.ignite\.|com\.colingreig\.(?:hermes|ignite|pull_anthropic))"
 )
+# ``last_status`` values that mean an entry is terminal (never self-heals via
+# TTL) — matches degraded_secrets_monitor.py's TERMINAL_POOL_STATUSES, kept
+# as a local constant rather than an import since it's a legacy pool-status
+# vocabulary, not a failure_taxonomy kind.
+TERMINAL_POOL_STATUSES = frozenset({"dead", "invalid", "error"})
+DEFAULT_CREDENTIAL_TAXONOMY_DEAD_STALE_HOURS = 6
+DEFAULT_CREDENTIAL_TAXONOMY_PROBE_STALE_HOURS = 24
 
 
 class ProbeError(RuntimeError):
@@ -103,6 +112,21 @@ def _parse_time(value: object) -> datetime | None:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
+
+
+def _entry_age_seconds(value: object, now_ts: float) -> float | None:
+    """Seconds since a credential-pool timestamp field, tolerating both the
+    raw epoch float ``agent.credential_pool`` persists (``time.time()``) and
+    an ISO8601 string, should a future writer ever emit one."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return max(0.0, now_ts - float(value))
+    if isinstance(value, str) and value.strip():
+        parsed = _parse_time(value)
+        if parsed is not None:
+            return max(0.0, now_ts - parsed.timestamp())
+    return None
 
 
 def _atomic_json(path: Path, value: dict[str, Any]) -> None:
@@ -435,7 +459,16 @@ def _check_text_evidence(
                         f"{path} has no declared outcome record",
                     )
                 ]
-            text = records[-1]
+            # 86e2mg7j3: evaluate success/failure markers against EVERY
+            # matching record still inside the tail window, not just the
+            # physically-last one. A monitor can print multiple distinct
+            # per-tick status lines in one run (e.g. degraded_secrets_monitor
+            # prints one line per degraded credential, or a placeholder
+            # warning followed by a routine "credential pool degraded" line)
+            # -- checking only the last line lets an earlier, still-current
+            # malfunction marker from the SAME tick go undetected purely
+            # because something else printed after it.
+            text = "\n".join(records)
     if outcome.get("response_only"):
         marker = "## Response"
         failed_evidence = _canonical_failed_cron_evidence(text)
@@ -1093,6 +1126,93 @@ def _coverage_aggregate(
     return _finding("operational", identifier, code, f"{len(ordered)} file(s): {shown}")
 
 
+def _coverage_bundle_classification(
+    registry: dict[str, Any], *, mirror_root: Path, identifier: str
+) -> tuple[dict[str, Any], list[dict[str, str]]]:
+    """Load the complete bundle-governed deployment classification."""
+    governed: dict[str, str | None] = {}
+    pr_root_patterns: list[str] = []
+    pr_root_exclusions: set[str] = set()
+    pr_package_prefixes: list[str] = []
+    findings: list[dict[str, str]] = []
+    for bundle in registry.get("bundles", []):
+        if not isinstance(bundle, dict):
+            continue
+        manifest_rel = str(bundle.get("manifest_rel") or "")
+        manifest_path = mirror_root / manifest_rel
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            findings.append(
+                _finding("operational", identifier, "coverage_manifest_unreadable", f"{manifest_path}: {exc}")
+            )
+            continue
+        # Bundle manifests are deployed alongside their governed files.
+        governed.setdefault(f"scripts/{manifest_rel}", None)
+        schema = bundle.get("schema")
+        if schema == "dest_map":
+            for entry in manifest.get("files", []):
+                if isinstance(entry, dict):
+                    key = _coverage_dest_key(entry.get("dest_abs"))
+                    if key:
+                        governed[key] = entry.get("sha256")
+        elif schema == "fleet_outcome":
+            for entry in manifest.get("files", []):
+                if not isinstance(entry, dict):
+                    continue
+                root = entry.get("destination_root")
+                prefix = "scripts" if root == "scripts" else "launch_agents" if root == "launch_agents" else None
+                if prefix and isinstance(entry.get("destination"), str):
+                    governed[f"{prefix}/{entry['destination']}"] = entry.get("sha256")
+        elif schema == "pr_pipeline":
+            for field in ("source_root_entrypoints", "legacy_flat_entrypoints"):
+                for name in manifest.get(field, []):
+                    if isinstance(name, str):
+                        governed[f"scripts/{name}"] = None
+            for name in manifest.get("expected_local_patches", {}):
+                governed[f"scripts/{name}"] = None
+            pr_root_patterns.extend(
+                pattern for pattern in manifest.get("managed_root_patterns", []) if isinstance(pattern, str)
+            )
+            pr_root_exclusions.update(
+                name for name in manifest.get("unmanaged_root_exclusions", []) if isinstance(name, str)
+            )
+            package_destination = manifest.get("package_destination")
+            if isinstance(package_destination, str) and package_destination:
+                pr_package_prefixes.append(f"scripts/{package_destination}/")
+        else:
+            findings.append(
+                _finding("operational", identifier, "coverage_registry_invalid", f"unsupported bundle schema {schema!r}")
+            )
+    return (
+        {
+            "exact": governed,
+            "pr_root_patterns": tuple(pr_root_patterns),
+            "pr_root_exclusions": frozenset(pr_root_exclusions),
+            "pr_package_prefixes": tuple(pr_package_prefixes),
+        },
+        findings,
+    )
+
+
+def _coverage_key_is_bundle_governed(key: str, classification: dict[str, Any]) -> bool:
+    """Apply the exact, package-prefix, and root-pattern rules used by the live probe."""
+    import fnmatch
+
+    if key in classification["exact"]:
+        return True
+    if any(key.startswith(prefix) for prefix in classification["pr_package_prefixes"]):
+        return True
+    if not key.startswith("scripts/"):
+        return False
+    rel = key.split("/", 1)[1]
+    return (
+        "/" not in rel
+        and rel not in classification["pr_root_exclusions"]
+        and any(fnmatch.fnmatch(rel, pattern) for pattern in classification["pr_root_patterns"])
+    )
+
+
 def _check_deployment_coverage(
     contract: dict[str, Any], *, home: Path
 ) -> tuple[list[dict[str, str]], list[dict[str, Any]]]:
@@ -1137,62 +1257,11 @@ def _check_deployment_coverage(
         str(contract.get("launch_agents_dir") or "~/Library/LaunchAgents"), home=home
     )
 
-    governed: dict[str, str | None] = {}
-    pr_root_patterns: list[str] = []
-    pr_root_exclusions: set[str] = set()
-    pr_package_prefixes: list[str] = []
-    for bundle in registry.get("bundles", []):
-        if not isinstance(bundle, dict):
-            continue
-        manifest_rel = str(bundle.get("manifest_rel") or "")
-        manifest_path = mirror_root / manifest_rel
-        try:
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            findings.append(
-                _finding("operational", identifier, "coverage_manifest_unreadable", f"{manifest_path}: {exc}")
-            )
-            continue
-        # The bundle manifest itself is deployed alongside its files (e.g.
-        # self_report_manifest.json, fleet_outcome_manifest.json land in
-        # ~/.hermes/scripts); a listed bundle's manifest is accounted for by
-        # construction, so its live copy is never "undeclared".
-        governed.setdefault(f"scripts/{manifest_rel}", None)
-        schema = bundle.get("schema")
-        if schema == "dest_map":
-            for entry in manifest.get("files", []):
-                if isinstance(entry, dict):
-                    key = _coverage_dest_key(entry.get("dest_abs"))
-                    if key:
-                        governed[key] = entry.get("sha256")
-        elif schema == "fleet_outcome":
-            for entry in manifest.get("files", []):
-                if not isinstance(entry, dict):
-                    continue
-                root = entry.get("destination_root")
-                prefix = "scripts" if root == "scripts" else "launch_agents" if root == "launch_agents" else None
-                if prefix and isinstance(entry.get("destination"), str):
-                    governed[f"{prefix}/{entry['destination']}"] = entry.get("sha256")
-        elif schema == "pr_pipeline":
-            for field in ("source_root_entrypoints", "legacy_flat_entrypoints"):
-                for name in manifest.get(field, []):
-                    if isinstance(name, str):
-                        governed[f"scripts/{name}"] = None
-            for name in manifest.get("expected_local_patches", {}):
-                governed[f"scripts/{name}"] = None
-            pr_root_patterns.extend(
-                pattern for pattern in manifest.get("managed_root_patterns", []) if isinstance(pattern, str)
-            )
-            pr_root_exclusions.update(
-                name for name in manifest.get("unmanaged_root_exclusions", []) if isinstance(name, str)
-            )
-            package_destination = manifest.get("package_destination")
-            if isinstance(package_destination, str) and package_destination:
-                pr_package_prefixes.append(f"scripts/{package_destination}/")
-        else:
-            findings.append(
-                _finding("operational", identifier, "coverage_registry_invalid", f"unsupported bundle schema {schema!r}")
-            )
+    classification, classification_findings = _coverage_bundle_classification(
+        registry, mirror_root=mirror_root, identifier=identifier
+    )
+    findings.extend(classification_findings)
+    governed: dict[str, str | None] = classification["exact"]
 
     direct = {
         str(entry.get("dest")): str(entry.get("src_rel"))
@@ -1214,6 +1283,7 @@ def _check_deployment_coverage(
     state_matches = _coverage_state_matcher(registry.get("state", {}) or {})
 
     live: dict[str, Path] = {}
+    symlink_entries: list[str] = []
     for base, prefix in ((scripts_dir, "scripts"), (agents_dir, "launch_agents")):
         if not base.is_dir():
             findings.append(
@@ -1221,9 +1291,16 @@ def _check_deployment_coverage(
             )
             continue
         for path in base.rglob("*"):
-            if path.is_symlink() or not path.is_file():
+            key = f"{prefix}/{path.relative_to(base).as_posix()}"
+            if path.is_symlink():
+                # A symlink can redirect an apparently governed filename to
+                # arbitrary bytes, and a directory symlink can hide an entire
+                # subtree from rglob. Never omit either from coverage evidence.
+                symlink_entries.append(key)
                 continue
-            live[f"{prefix}/{path.relative_to(base).as_posix()}"] = path
+            if not path.is_file():
+                continue
+            live[key] = path
 
     def _pin_accepts(key: str, actual_sha: str) -> bool:
         pin = pins.get(key)
@@ -1250,15 +1327,7 @@ def _check_deployment_coverage(
                 elif actual != expected:
                     pinned_accepted.append(key)
             continue
-        if any(key.startswith(prefix) for prefix in pr_package_prefixes):
-            continue
-        rel = key.split("/", 1)[1]
-        if (
-            key.startswith("scripts/")
-            and "/" not in rel
-            and rel not in pr_root_exclusions
-            and any(fnmatch.fnmatch(rel, pattern) for pattern in pr_root_patterns)
-        ):
+        if _coverage_key_is_bundle_governed(key, classification):
             continue
         if key in direct:
             source = mirror_root / direct[key]
@@ -1301,6 +1370,8 @@ def _check_deployment_coverage(
 
     if undeclared:
         findings.append(_coverage_aggregate(identifier, "undeclared_file", undeclared))
+    if symlink_entries:
+        findings.append(_coverage_aggregate(identifier, "symlink_entry", symlink_entries))
     if bundle_drift:
         findings.append(_coverage_aggregate(identifier, "bundle_sha_drift", bundle_drift))
     if direct_drift:
@@ -1316,6 +1387,7 @@ def _check_deployment_coverage(
             "surface": "operational",
             "id": identifier,
             "live_files": len(live),
+            "symlink_entries": len(symlink_entries),
             "governed": len(governed),
             "direct_declared": len(direct),
             "mini_local_declared": len(local_exact) + len(local_globs),
@@ -1323,6 +1395,96 @@ def _check_deployment_coverage(
             "pending_release": sorted(pending_release),
         }
     ]
+    return findings, evidence
+
+
+def _check_credential_taxonomy(
+    contract: dict[str, Any], *, home: Path, now: datetime
+) -> tuple[list[dict[str, str]], list[dict[str, Any]]]:
+    """Alarm on credential-pool taxonomy (86e2mb8nv/86e2mb8p0/86e2mb8p5)
+    states that never self-heal, without duplicating the alerting those
+    prior PRs already ship. See ``fleet_outcome_contracts.json``'s
+    ``credential-taxonomy-health`` entry's ``note`` field for the full
+    intentional-suppression rationale (deliberately not repeated here —
+    the decided convention for this contract is documentation lives next
+    to the check in JSON, not in a code comment).
+    """
+    findings: list[dict[str, str]] = []
+    evidence: list[dict[str, Any]] = []
+    identifier = str(contract.get("id") or "credential-taxonomy")
+    path = _expand_path(str(contract.get("path") or "~/.hermes/auth.json"), home=home)
+    payload = _load_optional_json(path)
+    pool = payload.get("credential_pool")
+    if not isinstance(pool, dict):
+        evidence.append({"surface": "operational", "id": identifier, "path": str(path), "providers": 0})
+        return findings, evidence
+
+    expected_providers = sorted({str(p) for p in (contract.get("expected_providers") or [])})
+    dead_stale_seconds = (
+        float(contract.get("dead_stale_hours", DEFAULT_CREDENTIAL_TAXONOMY_DEAD_STALE_HOURS)) * 3600.0
+    )
+    probe_stale_seconds = (
+        float(contract.get("probe_stale_hours", DEFAULT_CREDENTIAL_TAXONOMY_PROBE_STALE_HOURS)) * 3600.0
+    )
+    now_ts = now.timestamp()
+
+    for provider in expected_providers:
+        entries = pool.get(provider)
+        if not isinstance(entries, list) or not entries:
+            findings.append(_finding(
+                "operational", identifier, "unconfigured_expected_provider",
+                f"provider {provider!r} has zero configured credentials but is declared expected_providers",
+            ))
+
+    stuck_dead: list[str] = []
+    stale_probe: list[str] = []
+    for raw_provider, raw_entries in pool.items():
+        if not isinstance(raw_entries, list):
+            continue
+        provider = str(raw_provider)
+        for entry in raw_entries:
+            if not isinstance(entry, dict):
+                continue
+            entry_id = str(entry.get("id") or "unknown")
+            status = str(entry.get("last_status") or "").strip().lower()
+            failure_kind = str(entry.get("last_failure_kind") or "").strip().lower()
+
+            if status in TERMINAL_POOL_STATUSES or failure_kind == FAILURE_KIND_AUTH_PERMANENT:
+                age = _entry_age_seconds(entry.get("last_status_at"), now_ts)
+                if age is not None and age >= dead_stale_seconds:
+                    stuck_dead.append(f"{provider}:{entry_id}")
+
+            # A plain usage_cap credential is EXPECTED to still be exhausted
+            # between probes (it self-clears at its own reset_at and already
+            # has dedicated alerting — see the contract's ``note``) so it is
+            # excluded here even when it carries a stale probe receipt.
+            if status == "exhausted" and failure_kind != FAILURE_KIND_USAGE_CAP:
+                probe_age = _entry_age_seconds(entry.get("last_probe_verdict_at"), now_ts)
+                if probe_age is not None and probe_age >= probe_stale_seconds:
+                    stale_probe.append(f"{provider}:{entry_id}")
+
+    if stuck_dead:
+        findings.append(_finding(
+            "operational", identifier, "credential_stuck_dead",
+            f"{len(stuck_dead)} credential(s) terminal/quarantined ≥{dead_stale_seconds / 3600:.0f}h: "
+            f"{', '.join(sorted(stuck_dead))}",
+        ))
+    if stale_probe:
+        findings.append(_finding(
+            "operational", identifier, "stale_probe_receipt",
+            f"{len(stale_probe)} credential(s) probed ≥{probe_stale_seconds / 3600:.0f}h ago and still "
+            f"exhausted: {', '.join(sorted(stale_probe))}",
+        ))
+
+    evidence.append({
+        "surface": "operational",
+        "id": identifier,
+        "path": str(path),
+        "providers": len(pool),
+        "expected_providers": expected_providers,
+        "stuck_dead_count": len(stuck_dead),
+        "stale_probe_count": len(stale_probe),
+    })
     return findings, evidence
 
 
@@ -1336,7 +1498,74 @@ def _check_operational_contracts(
         identifier = str(contract.get("id") or "unknown")
         kind = contract.get("kind")
         path = _expand_path(str(contract.get("path") or ""), home=home)
-        if kind in {"sqlite_health", "admission_health"}:
+        if kind == "session_db_health":
+            if not path.is_file():
+                findings.append(_finding("operational", identifier, "database_missing", f"missing {path}"))
+                continue
+            named_root = path.parent / "profiles"
+            databases = [path, *sorted(named_root.glob(f"*/{path.name}"))]
+            profile_limit = int(contract.get("profile_max_size_bytes", contract.get("max_size_bytes", 0)))
+            root_limit = int(contract.get("root_max_size_bytes", profile_limit))
+            profiles: list[dict[str, Any]] = []
+            for database in databases:
+                profile_bytes = sum(
+                    candidate.stat().st_size if candidate.is_file() else 0
+                    for candidate in (
+                        database,
+                        database.with_name(database.name + "-wal"),
+                        database.with_name(database.name + "-shm"),
+                    )
+                )
+                try:
+                    conn = sqlite3.connect(f"file:{database}?mode=ro", uri=True, timeout=0.05)
+                    try:
+                        check = conn.execute("PRAGMA quick_check").fetchone()
+                        if check is None or check[0] != "ok":
+                            findings.append(
+                                _finding(
+                                    "operational",
+                                    identifier,
+                                    "database_quick_check_failed",
+                                    f"{database}: {check[0] if check else 'no result'}",
+                                )
+                            )
+                    finally:
+                        conn.close()
+                except sqlite3.Error as exc:
+                    message = str(exc).lower()
+                    code = "database_busy" if "locked" in message or "busy" in message else "database_unreadable"
+                    findings.append(_finding("operational", identifier, code, f"{database}: {exc}"))
+                if profile_limit and profile_bytes > profile_limit:
+                    findings.append(
+                        _finding(
+                            "operational",
+                            identifier,
+                            "profile_database_size",
+                            f"{database} plus WAL/SHM is {profile_bytes} bytes (profile limit {profile_limit})",
+                        )
+                    )
+                profiles.append({"path": str(database), "profile_bytes": profile_bytes})
+            root_bytes = sum(item["profile_bytes"] for item in profiles)
+            if root_limit and root_bytes > root_limit:
+                findings.append(
+                    _finding(
+                        "operational",
+                        identifier,
+                        "root_database_size",
+                        f"aggregate session databases plus WAL/SHM are {root_bytes} bytes (root limit {root_limit})",
+                    )
+                )
+            evidence.append(
+                {
+                    "surface": "operational",
+                    "id": identifier,
+                    "path": str(path),
+                    "profile_bytes": profiles[0]["profile_bytes"],
+                    "root_bytes": root_bytes,
+                    "profiles": profiles,
+                }
+            )
+        elif kind in {"sqlite_health", "admission_health"}:
             if not path.is_file():
                 findings.append(_finding("operational", identifier, "database_missing", f"missing {path}"))
                 continue
@@ -1472,6 +1701,10 @@ def _check_operational_contracts(
             coverage_findings, coverage_evidence = _check_deployment_coverage(contract, home=home)
             findings.extend(coverage_findings)
             evidence.extend(coverage_evidence)
+        elif kind == "credential_taxonomy":
+            taxonomy_findings, taxonomy_evidence = _check_credential_taxonomy(contract, home=home, now=now)
+            findings.extend(taxonomy_findings)
+            evidence.extend(taxonomy_evidence)
         else:
             raise ProbeError(f"operational check {identifier} has unsupported kind {kind!r}")
     return findings, evidence

@@ -1078,7 +1078,10 @@ def test_release_poll_contract_requires_fresh_heartbeat(tmp_path):
     }
 
     # Log is fresh but missing the heartbeat marker entirely (unexpected
-    # content): alarm rather than silently pass.
+    # content): alarm rather than silently pass. The heartbeat doubles as this
+    # contract's run-start marker (ClickUp 86e2kt3yr), so its absence is
+    # reported as a missing run boundary -- equally distinguishable, and one
+    # code instead of two for the same underlying condition.
     os.utime(heartbeat, (NOW.timestamp(), NOW.timestamp()))
     heartbeat.write_text("some unrelated line\n", encoding="utf-8")
     os.utime(heartbeat, (NOW.timestamp(), NOW.timestamp()))
@@ -1089,10 +1092,7 @@ def test_release_poll_contract_requires_fresh_heartbeat(tmp_path):
         home=tmp_path,
         now=NOW,
     )
-    assert {item["code"] for item in findings} == {
-        "success_marker_missing",
-        "required_marker_missing",
-    }
+    assert {item["code"] for item in findings} == {"run_boundary_missing"}
 
     # Structurally absent (unloaded): the launchd-registration check itself
     # must alarm, independent of any log content.
@@ -1107,6 +1107,65 @@ def test_release_poll_contract_requires_fresh_heartbeat(tmp_path):
     assert {(item["id"], item["code"]) for item in launch_findings} == {
         (label, "agent_not_loaded")
     }
+
+
+def test_release_poll_corrupt_pointer_alarms_distinguishably_and_clears(tmp_path):
+    """ClickUp 86e2kt3yr: a corrupt runtime-current pointer must alarm as
+    itself, and the alarm must be satisfiable.
+
+    The poller fails closed on a corrupt pointer with a stable, greppable
+    prefix. Two things have to hold together:
+
+    * the corrupt line must produce a ``failure_marker``, not the generic
+      liveness silence a broken poller would otherwise look like; and
+    * once the pointer is repaired, the very next poll must clear it. The log
+      is append-only and the contract keeps a 4000-line tail, so without a run
+      boundary a single one-minute incident would hold this alarm red for
+      weeks -- the unsatisfiable-alarm failure mode. The heartbeat, printed
+      unconditionally as the first line of every invocation, is therefore the
+      run-start marker, which scopes evaluation to the latest poll.
+    """
+    module = _load_module()
+    label = "com.colingreig.hermes.release-poll"
+    outcome = _canonical_contract(launch_label=label)["outcome"]
+    assert outcome["run_start_pattern"] == "^mini-release-poll: heartbeat "
+
+    healthy = "mini-release-poll: heartbeat ts=2026-08-03T12:00:00Z pid=123\n"
+    corrupt = (
+        "mini-release-poll: heartbeat ts=2026-08-03T12:15:00Z pid=124\n"
+        "mini-release-poll: runtime-current pointer corrupt: "
+        "relative symlink (must be absolute): -> v0.18.2-aae777c146da\n"
+    )
+
+    log = _fresh_artifact(tmp_path, healthy + corrupt)
+    checked_outcome = {**outcome, "path": str(log)}
+    findings = module._check_artifact(
+        surface="launchd",
+        identifier=label,
+        outcome=checked_outcome,
+        home=tmp_path,
+        now=NOW,
+    )
+    assert {(item["id"], item["code"]) for item in findings} == {
+        (label, "failure_marker")
+    }
+
+    # Pointer repaired: the next poll appends a clean run and the alarm clears
+    # even though the corrupt line is still in the tail.
+    log.write_text(healthy + corrupt + healthy, encoding="utf-8")
+    import os
+
+    os.utime(log, (NOW.timestamp(), NOW.timestamp()))
+    assert (
+        module._check_artifact(
+            surface="launchd",
+            identifier=label,
+            outcome=checked_outcome,
+            home=tmp_path,
+            now=NOW,
+        )
+        == []
+    )
 
 
 def test_kanban_sweep_contract_requires_complete_clean_summary(tmp_path):
@@ -1887,7 +1946,19 @@ def test_kanban_sweep_stderr_shares_canonical_semantic_evidence_log():
 
     stdout_path = plist["StandardOutPath"]
     assert plist["StandardErrorPath"] == stdout_path
-    assert Path(stdout_path).expanduser() == Path(contract["outcome"]["path"]).expanduser()
+    # The plist is a real launchd config deployed to one fixed machine (the
+    # mini, home /Users/colingreig) — it hardcodes that absolute path rather
+    # than "~". Resolve the contract's "~"-relative path against that same
+    # fixed, known deployment home instead of `Path.expanduser()`, which
+    # resolves against whatever $HOME the test happens to run under (e.g.
+    # /home/runner in CI) and would otherwise make this assertion pass or
+    # fail based on the test runner's environment rather than the actual
+    # deployed configuration.
+    deployment_home = "/Users/colingreig"
+    contract_path = contract["outcome"]["path"]
+    if contract_path.startswith("~"):
+        contract_path = deployment_home + contract_path[1:]
+    assert Path(stdout_path) == Path(contract_path)
     assert any(
         pattern.startswith("^Traceback")
         for pattern in contract["outcome"]["failure_patterns"]
@@ -1942,6 +2013,68 @@ def test_sqlite_health_reports_corruption_instead_of_crashing(tmp_path):
         now=NOW,
     )
     assert [item["code"] for item in findings] == ["database_unreadable"]
+
+
+def test_session_db_health_profile_budget_counts_wal_and_shm(tmp_path):
+    module = _load_module()
+    database = tmp_path / "state.db"
+    with sqlite3.connect(database) as conn:
+        conn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY)")
+    database_bytes = database.stat().st_size
+    Path(f"{database}-wal").write_bytes(b"w" * 101)
+    Path(f"{database}-shm").write_bytes(b"s" * 37)
+    profile_bytes = database_bytes + 138
+
+    findings, evidence = module._check_operational_contracts(
+        [{
+            "id": "session-db",
+            "kind": "session_db_health",
+            "path": str(database),
+            "profile_max_size_bytes": profile_bytes - 1,
+            "root_max_size_bytes": profile_bytes + 1000,
+        }],
+        home=tmp_path,
+        now=NOW,
+    )
+
+    assert [item["code"] for item in findings] == ["profile_database_size"]
+    assert str(profile_bytes) in findings[0]["detail"]
+    assert evidence[0]["profile_bytes"] == profile_bytes
+    assert evidence[0]["root_bytes"] == profile_bytes
+
+
+def test_session_db_health_root_budget_aggregates_named_profiles(tmp_path):
+    module = _load_module()
+    database = tmp_path / "state.db"
+    named = tmp_path / "profiles" / "coder" / "state.db"
+    named.parent.mkdir(parents=True)
+    for path in (database, named):
+        with sqlite3.connect(path) as conn:
+            conn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY)")
+    Path(f"{named}-shm").write_bytes(b"s" * 41)
+    default_bytes = database.stat().st_size
+    named_bytes = named.stat().st_size + 41
+    root_bytes = default_bytes + named_bytes
+
+    findings, evidence = module._check_operational_contracts(
+        [{
+            "id": "session-db",
+            "kind": "session_db_health",
+            "path": str(database),
+            "profile_max_size_bytes": max(default_bytes, named_bytes) + 1,
+            "root_max_size_bytes": root_bytes - 1,
+        }],
+        home=tmp_path,
+        now=NOW,
+    )
+
+    assert [item["code"] for item in findings] == ["root_database_size"]
+    assert str(root_bytes) in findings[0]["detail"]
+    assert evidence[0]["root_bytes"] == root_bytes
+    assert {item["path"] for item in evidence[0]["profiles"]} == {
+        str(database),
+        str(named),
+    }
 
 
 def _canonical_operational_contract(op_id):
@@ -2129,6 +2262,126 @@ def test_degraded_secrets_monitor_success_marker_survives_trailing_diagnostics(t
         now=NOW,
     )
     assert findings == []
+
+
+def test_degraded_secrets_monitor_deduped_ongoing_degradation_produces_zero_findings(tmp_path):
+    """86e2mg7j3: degraded_secrets_monitor.py only prints an 'alerted' line
+    once per DISTINCT breach signature (see its own dedup) — for the rest of
+    a long-running, already-known, already-paged incident every subsequent
+    tick just reprints the routine 'credential pool degraded: ...' line, so
+    the 'alerted'/'healthy'/'recovered' markers age out of a 5-line tail
+    almost immediately. Treating the routine line as a probe-level failure
+    made this LaunchAgent contract permanently red for as long as the
+    (already independently alerted) degradation persisted. This is the
+    deduped-degraded log shape: five ticks, no 'alerted' anywhere, must
+    produce zero findings."""
+    module = _load_module()
+    label = "com.colingreig.hermes.degraded-secrets-monitor"
+    outcome = _canonical_contract(launch_label=label)["outcome"]
+
+    deduped_tail = "".join(
+        "[degraded-secrets-monitor] credential pool degraded: "
+        "provider=anthropic id=backup status=missing_credential\n"
+        for _ in range(5)
+    )
+    artifact = _fresh_artifact(tmp_path, deduped_tail)
+    checked_outcome = {**outcome, "path": str(artifact)}
+
+    findings = module._check_artifact(
+        surface="launchd",
+        identifier=label,
+        outcome=checked_outcome,
+        home=tmp_path,
+        now=NOW,
+    )
+    assert findings == []
+
+
+def test_degraded_secrets_monitor_fresh_alerted_degradation_still_produces_zero_findings(tmp_path):
+    """Regression guard: a freshly-degraded tick that alerts successfully
+    (the FIRST tick of an incident) must keep behaving as it always has —
+    the probe defers entirely to degraded_secrets_monitor.py's own
+    successful Slack+ClickUp escalation and does not double-page."""
+    module = _load_module()
+    label = "com.colingreig.hermes.degraded-secrets-monitor"
+    outcome = _canonical_contract(launch_label=label)["outcome"]
+
+    fresh_tail = (
+        "[degraded-secrets-monitor] credential pool degraded: "
+        "provider=anthropic id=backup status=missing_credential\n"
+        "[degraded-secrets-monitor] alerted (slack=True clickup=True)\n"
+    )
+    artifact = _fresh_artifact(tmp_path, fresh_tail)
+    checked_outcome = {**outcome, "path": str(artifact)}
+
+    findings = module._check_artifact(
+        surface="launchd",
+        identifier=label,
+        outcome=checked_outcome,
+        home=tmp_path,
+        now=NOW,
+    )
+    assert findings == []
+
+
+def test_degraded_secrets_monitor_real_malfunction_still_surfaces_even_when_not_last_line(tmp_path):
+    """86e2mg7j3: a genuine agent malfunction (here, an unresolved secret
+    placeholder) that happened earlier in the tail window than a LATER,
+    routine 'credential pool degraded' line must still surface as a
+    failure_marker — the fix that stops routine degraded-status noise from
+    permanently reddening this contract must not also blind it to a real
+    malfunction just because something else printed after it."""
+    module = _load_module()
+    label = "com.colingreig.hermes.degraded-secrets-monitor"
+    outcome = _canonical_contract(launch_label=label)["outcome"]
+
+    mixed_tail = (
+        "[degraded-secrets-monitor] unresolved placeholder: "
+        "server=some-mcp var=SOME_API_KEY\n"
+        "[degraded-secrets-monitor] credential pool degraded: "
+        "provider=anthropic id=backup status=missing_credential\n"
+    )
+    artifact = _fresh_artifact(tmp_path, mixed_tail)
+    checked_outcome = {**outcome, "path": str(artifact)}
+
+    findings = module._check_artifact(
+        surface="launchd",
+        identifier=label,
+        outcome=checked_outcome,
+        home=tmp_path,
+        now=NOW,
+    )
+    assert [item["code"] for item in findings] == ["failure_marker"]
+
+
+def test_degraded_secrets_monitor_alert_delivery_failure_still_surfaces_as_failure(tmp_path):
+    """86e2mg7j3 acceptance: 'fresh degradation still ... surfaces as real
+    failure when appropriate' — specifically, when degraded_secrets_monitor's
+    OWN alerting pipeline fails to deliver, that is a genuine malfunction of
+    the agent itself (not just a known, already-paged world-state) and must
+    still trip failure_marker even though a routine 'credential pool
+    degraded' line (now a success marker) appears earlier in the window."""
+    module = _load_module()
+    label = "com.colingreig.hermes.degraded-secrets-monitor"
+    outcome = _canonical_contract(launch_label=label)["outcome"]
+
+    delivery_failure_tail = (
+        "[degraded-secrets-monitor] credential pool degraded: "
+        "provider=anthropic id=backup status=missing_credential\n"
+        "[degraded-secrets-monitor] alert delivery incomplete "
+        "(slack=False clickup=True); dedupe state NOT advanced\n"
+    )
+    artifact = _fresh_artifact(tmp_path, delivery_failure_tail)
+    checked_outcome = {**outcome, "path": str(artifact)}
+
+    findings = module._check_artifact(
+        surface="launchd",
+        identifier=label,
+        outcome=checked_outcome,
+        home=tmp_path,
+        now=NOW,
+    )
+    assert [item["code"] for item in findings] == ["failure_marker"]
 
 
 def _run_main(

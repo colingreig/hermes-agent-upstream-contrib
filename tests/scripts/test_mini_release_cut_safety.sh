@@ -1005,6 +1005,33 @@ else
   fail "install_governed_fleet_config failed when invoking its installer directly"
 fi
 
+# Fleet-outcome sources may resolve from the repository root rather than the
+# mini-scripts bundle. Exercise the real install function and pin the complete
+# load-bearing argument pair: --repo-root must equal this release directory.
+FLEET_OUTCOMES_RELEASE="$RELEASES_DIR/v1.1.6-fleet-outcomes-repo-root"
+FLEET_OUTCOMES_RECONCILER="$FLEET_OUTCOMES_RELEASE/$VENDORED_FLEET_OUTCOMES_RECONCILER_REL"
+FLEET_OUTCOMES_MANIFEST="$FLEET_OUTCOMES_RELEASE/$VENDORED_FLEET_OUTCOMES_MANIFEST_REL"
+FLEET_OUTCOMES_CALLS="$TEST_ROOT/fleet-outcomes-reconciler-calls"
+mkdir -p "$(dirname "$FLEET_OUTCOMES_RECONCILER")" "$FLEET_OUTCOMES_RELEASE/venv/bin"
+printf '# placeholder fleet-outcomes reconciler\n' > "$FLEET_OUTCOMES_RECONCILER"
+printf '{}\n' > "$FLEET_OUTCOMES_MANIFEST"
+cat > "$FLEET_OUTCOMES_RELEASE/venv/bin/python" <<SH
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$FLEET_OUTCOMES_CALLS"
+SH
+chmod 0755 "$FLEET_OUTCOMES_RELEASE/venv/bin/python"
+if (
+  guarded_or_direct() { "$@"; }
+  install_governed_fleet_outcomes "$FLEET_OUTCOMES_RELEASE"
+); then
+  :
+else
+  fail "install_governed_fleet_outcomes failed for a valid release bundle"
+fi
+grep -Fqx "$FLEET_OUTCOMES_RECONCILER install --source-root $(dirname "$FLEET_OUTCOMES_RECONCILER") --repo-root $FLEET_OUTCOMES_RELEASE --manifest $FLEET_OUTCOMES_MANIFEST --home $HOME --hermes-home $HERMES_HOME --reload" \
+  "$FLEET_OUTCOMES_CALLS" \
+  || fail "fleet-outcome install did not pass --repo-root equal to the release directory"
+
 # A later cut starts with an unarmed in-process marker. If reconciliation fails
 # during validation/before snapshot creation, it must not consume the previous
 # successful generation's rollback pointer.
@@ -1424,6 +1451,11 @@ case "${1:-}" in
       *) exit 1 ;;
     esac
     ;;
+  diff)
+    # The synthetic target has no Mini runtime changes. Change discovery must
+    # still execute successfully now that release admission fails closed.
+    exit 0
+    ;;
   show|cat-file)
     printf 'unexpected target blob read during dry run\n' >&2
     exit 97
@@ -1506,6 +1538,30 @@ dry_drain_clear_line="$(grep -nF 'clear external gateway drain' "$DRY_ROOT/outpu
   || fail "dry cut planned runtime switch before external drain"
 [ "$dry_launchd_line" -lt "$dry_drain_clear_line" ] \
   || fail "dry cut planned drain cleanup before new launchd registration"
+# Regression guard for the 592f589e90 (#324) first-cut bootstrap deadlock:
+# install_governed_fleet_outcomes reconciles cron_updates against an
+# ALREADY-EXISTING job in jobs.json (reconcile_fleet_outcomes.py can only
+# patch a job, never create one). A release that both adds a cron job in
+# fleet-config/jobs.json and pins that same job in
+# fleet_outcome_manifest.json's cron_updates deadlocks on its first cut
+# unless install_governed_fleet_config runs first. Assert that ordering
+# both in the source text and in the planned dry-run execution order.
+fleet_config_install_source_line="$(grep -n 'if ! install_governed_fleet_config "\$NEW_DIR"; then' "$SCRIPT" \
+  | head -n1 | cut -d: -f1 || true)"
+fleet_outcomes_install_source_line="$(grep -n 'if ! install_governed_fleet_outcomes "\$NEW_DIR"; then' "$SCRIPT" \
+  | head -n1 | cut -d: -f1 || true)"
+[ -n "$fleet_config_install_source_line" ] && [ -n "$fleet_outcomes_install_source_line" ] \
+  || fail "could not locate install_governed_fleet_config/install_governed_fleet_outcomes call sites"
+[ "$fleet_config_install_source_line" -lt "$fleet_outcomes_install_source_line" ] \
+  || fail "install_governed_fleet_outcomes call site precedes install_governed_fleet_config in source (first-cut deadlock regression, see #324)"
+dry_fleet_config_line="$(grep -nF 'install_fleet_config.py --manifest' "$DRY_ROOT/output" \
+  | head -n1 | cut -d: -f1 || true)"
+dry_fleet_outcomes_line="$(grep -nF 'reconcile_fleet_outcomes.py install --source-root' "$DRY_ROOT/output" \
+  | head -n1 | cut -d: -f1 || true)"
+[ -n "$dry_fleet_config_line" ] && [ -n "$dry_fleet_outcomes_line" ] \
+  || fail "dry cut did not plan fleet-config install or fleet-outcome reconciliation"
+[ "$dry_fleet_config_line" -lt "$dry_fleet_outcomes_line" ] \
+  || fail "dry cut planned fleet-outcome cron reconciliation before fleet-config job creation (first-cut deadlock regression, see #324)"
 grep -Fq "ls-tree $DRY_TARGET_SHA -- $VENDORED_REFRESH_REL" "$DRY_GIT_LOG" \
   || fail "dry cut did not validate refresh metadata from the target tree"
 grep -Fq "ls-tree $DRY_TARGET_SHA -- $VENDORED_LAUNCHD_RECONCILER_REL" "$DRY_GIT_LOG" \
@@ -1746,5 +1802,305 @@ fi
   || fail "fence-loss EXIT cleanup mutated poll-control state"
 [ ! -e "$FENCE_EXIT_ROOT/freeze-should-not-run" ] \
   || fail "fence-loss EXIT cleanup attempted poll freeze"
+
+# ---------------------------------------------------------------------------
+# runtime-current pointer health (ClickUp 86e2kt3yr).
+#
+# The 2026-08-02 incident left runtime-current as a BARE-NAME relative symlink
+# (`v0.18.2-<sha>`), which resolves against $HERMES_HOME instead of releases/
+# and therefore dangled. These checks pin every corruption shape the pointer
+# contract must reject, and prove the healthy case still passes.
+# ---------------------------------------------------------------------------
+POINTER_ROOT="$TEST_ROOT/pointer"
+POINTER_HOME="$POINTER_ROOT/.hermes"
+POINTER_RELEASES="$POINTER_HOME/releases"
+POINTER_ACTIVE="$POINTER_RELEASES/v9.9.9-abcdef123456"
+mkdir -p "$POINTER_ACTIVE/venv/bin"
+printf '#!/bin/sh\nexit 0\n' > "$POINTER_ACTIVE/venv/bin/python"
+chmod 0755 "$POINTER_ACTIVE/venv/bin/python"
+POINTER_HOME="$(cd -P "$POINTER_HOME" && pwd -P)"
+POINTER_RELEASES="$POINTER_HOME/releases"
+POINTER_ACTIVE="$POINTER_RELEASES/v9.9.9-abcdef123456"
+POINTER_LINK="$POINTER_HOME/runtime-current"
+
+pointer_health() (
+  HERMES_HOME="$POINTER_HOME"
+  RELEASES_DIR="$POINTER_RELEASES"
+  CURRENT_LINK="$POINTER_LINK"
+  current_link_health
+)
+pointer_structure() (
+  HERMES_HOME="$POINTER_HOME"
+  RELEASES_DIR="$POINTER_RELEASES"
+  CURRENT_LINK="$POINTER_LINK"
+  current_link_structure_ok
+)
+
+# Missing pointer.
+rm -f "$POINTER_LINK"
+POINTER_OUT="$(pointer_health || true)"
+case "$POINTER_OUT" in
+  *"runtime-current is missing"*) ;;
+  *) fail "missing pointer was not reported as missing: $POINTER_OUT" ;;
+esac
+if pointer_health >/dev/null 2>&1; then fail "missing pointer reported healthy"; fi
+
+# A regular directory in place of the pointer is not a symlink.
+mkdir -p "$POINTER_LINK"
+POINTER_OUT="$(pointer_health || true)"
+case "$POINTER_OUT" in
+  *"runtime-current is not a symlink"*) ;;
+  *) fail "non-symlink pointer was not detected: $POINTER_OUT" ;;
+esac
+rmdir "$POINTER_LINK"
+
+# THE INCIDENT SHAPE: bare-name relative link. It must be rejected on the raw
+# link text, before any resolution, and must never be reported healthy.
+ln -sfn "v9.9.9-abcdef123456" "$POINTER_LINK"
+POINTER_OUT="$(pointer_health || true)"
+case "$POINTER_OUT" in
+  *"relative symlink"*) ;;
+  *) fail "bare-name relative pointer was not rejected: $POINTER_OUT" ;;
+esac
+if pointer_health >/dev/null 2>&1; then fail "bare-name relative pointer reported healthy"; fi
+if pointer_structure >/dev/null 2>&1; then fail "bare-name relative pointer passed the structural check"; fi
+
+# A relative link that DOES resolve is still out of contract: the receipt
+# records an absolute runtime_target and consumers string-join onto it.
+ln -sfn "releases/v9.9.9-abcdef123456" "$POINTER_LINK"
+POINTER_OUT="$(pointer_health || true)"
+case "$POINTER_OUT" in
+  *"relative symlink"*) ;;
+  *) fail "resolvable relative pointer was not rejected: $POINTER_OUT" ;;
+esac
+
+# Absolute but non-canonical (traversal through releases/..) is rejected.
+ln -sfn "$POINTER_RELEASES/../releases/v9.9.9-abcdef123456" "$POINTER_LINK"
+POINTER_OUT="$(pointer_health || true)"
+case "$POINTER_OUT" in
+  *"not canonical"*) ;;
+  *) fail "non-canonical absolute pointer was not rejected: $POINTER_OUT" ;;
+esac
+
+# Absolute link that escapes releases/ entirely.
+mkdir -p "$POINTER_ROOT/outside"
+ln -sfn "$POINTER_ROOT/outside" "$POINTER_LINK"
+POINTER_OUT="$(pointer_health || true)"
+case "$POINTER_OUT" in
+  *"escapes releases dir"*) ;;
+  *) fail "escaping pointer was not rejected: $POINTER_OUT" ;;
+esac
+
+# Absolute, canonical, but dangling.
+ln -sfn "$POINTER_RELEASES/v0.0.0-deadbeefcafe" "$POINTER_LINK"
+POINTER_OUT="$(pointer_health || true)"
+case "$POINTER_OUT" in
+  *"dangling"*) ;;
+  *) fail "dangling pointer was not rejected: $POINTER_OUT" ;;
+esac
+
+# Structurally valid but the release has no usable runtime interpreter. The
+# full health contract rejects it; the structural contract (used by the swap
+# primitive itself) accepts it.
+POINTER_NOVENV="$POINTER_RELEASES/v9.9.9-000000000000"
+mkdir -p "$POINTER_NOVENV"
+ln -sfn "$POINTER_NOVENV" "$POINTER_LINK"
+POINTER_OUT="$(pointer_health || true)"
+case "$POINTER_OUT" in
+  *"no usable runtime Python"*) ;;
+  *) fail "pointer with no runtime Python was not rejected: $POINTER_OUT" ;;
+esac
+pointer_structure >/dev/null 2>&1 \
+  || fail "structural check rejected a release whose venv is absent"
+
+# Healthy pointer: reports the resolved target and exits 0.
+ln -sfn "$POINTER_ACTIVE" "$POINTER_LINK"
+POINTER_OUT="$(pointer_health)" || fail "healthy pointer was reported corrupt: $POINTER_OUT"
+[ "$POINTER_OUT" = "$POINTER_ACTIVE" ] \
+  || fail "healthy pointer did not report its resolved target: $POINTER_OUT"
+
+# assert_current_link_healthy must die (not warn) on a corrupt pointer, and
+# must name the repair path so an operator is not left guessing.
+ln -sfn "v9.9.9-abcdef123456" "$POINTER_LINK"
+ASSERT_OUT="$(
+  (
+    HERMES_HOME="$POINTER_HOME"
+    RELEASES_DIR="$POINTER_RELEASES"
+    CURRENT_LINK="$POINTER_LINK"
+    assert_current_link_healthy
+  ) 2>&1 || true
+)"
+case "$ASSERT_OUT" in
+  *"CORRUPT"*"--repair-pointer"*) ;;
+  *) fail "assert_current_link_healthy did not report a corrupt pointer with a repair hint: $ASSERT_OUT" ;;
+esac
+if (
+  HERMES_HOME="$POINTER_HOME"
+  RELEASES_DIR="$POINTER_RELEASES"
+  CURRENT_LINK="$POINTER_LINK"
+  assert_current_link_healthy
+) >/dev/null 2>&1; then
+  fail "assert_current_link_healthy accepted a corrupt pointer"
+fi
+
+# repoint_symlink must fail closed when its own swap leaves a pointer that
+# violates the contract. Simulate a faulty mv that writes a bare-name link
+# with the right basename: target equality alone would have accepted it.
+rm -f "$POINTER_LINK"
+if (
+  HERMES_HOME="$POINTER_HOME"
+  RELEASES_DIR="$POINTER_RELEASES"
+  CURRENT_LINK="$POINTER_LINK"
+  DRY_RUN=0
+  # shellcheck disable=SC2329 # invoked by repoint_symlink.
+  guarded_or_direct() {
+    if [ "${1:-}" = mv ]; then
+      rm -f "${!#}" "${@: -2:1}"
+      ln -sfn "v9.9.9-abcdef123456" "$CURRENT_LINK"
+      return 0
+    fi
+    "$@"
+  }
+  repoint_symlink "$POINTER_ACTIVE"
+) >/dev/null 2>&1; then
+  fail "repoint_symlink accepted a bare-name pointer after the swap"
+fi
+
+# The happy path still succeeds and leaves an absolute canonical pointer.
+rm -f "$POINTER_LINK"
+(
+  HERMES_HOME="$POINTER_HOME"
+  RELEASES_DIR="$POINTER_RELEASES"
+  CURRENT_LINK="$POINTER_LINK"
+  DRY_RUN=0
+  repoint_symlink "$POINTER_ACTIVE"
+) >/dev/null || fail "repoint_symlink failed on a healthy target"
+[ "$(readlink "$POINTER_LINK")" = "$POINTER_ACTIVE" ] \
+  || fail "repoint_symlink did not leave an absolute canonical pointer"
+
+# receipt_verified_runtime_target only trusts a receipt that byte-matches its
+# content-addressed twin, so a hand-edited pointer cannot become a repair
+# source.
+RECEIPT_ROOT="$TEST_ROOT/receipt-repair"
+RECEIPT_RELEASES="$RECEIPT_ROOT/releases"
+mkdir -p "$RECEIPT_RELEASES/v9.9.9-abcdef123456"
+RECEIPT_RELEASES="$(cd -P "$RECEIPT_RELEASES" && pwd -P)"
+RECEIPT_ACTIVE="$RECEIPT_RELEASES/v9.9.9-abcdef123456"
+RECEIPT_LAST="$RECEIPT_RELEASES/.mini-release-last-receipt.json"
+printf '{"event":"cut","runtime_target":"%s","schema_version":2}\n' "$RECEIPT_ACTIVE" > "$RECEIPT_LAST"
+RECEIPT_DIGEST="$(shasum -a 256 "$RECEIPT_LAST" | cut -d' ' -f1)"
+
+# No content-addressed twin yet -> refuse.
+if (
+  RELEASES_DIR="$RECEIPT_RELEASES"
+  LAST_RECEIPT_FILE="$RECEIPT_LAST"
+  receipt_verified_runtime_target
+) >/dev/null 2>&1; then
+  fail "receipt repair source accepted a receipt with no content-addressed twin"
+fi
+
+cp "$RECEIPT_LAST" "$RECEIPT_RELEASES/.mini-release-receipt-$RECEIPT_DIGEST.json"
+RECEIPT_OUT="$(
+  RELEASES_DIR="$RECEIPT_RELEASES"
+  LAST_RECEIPT_FILE="$RECEIPT_LAST"
+  receipt_verified_runtime_target
+)" || fail "receipt repair source rejected a valid content-addressed receipt"
+[ "$RECEIPT_OUT" = "$RECEIPT_ACTIVE" ] \
+  || fail "receipt repair source returned the wrong target: $RECEIPT_OUT"
+
+# A receipt naming a target outside releases/ must never be a repair source.
+printf '{"event":"cut","runtime_target":"%s","schema_version":2}\n' "$RECEIPT_ROOT" > "$RECEIPT_LAST"
+RECEIPT_DIGEST="$(shasum -a 256 "$RECEIPT_LAST" | cut -d' ' -f1)"
+cp "$RECEIPT_LAST" "$RECEIPT_RELEASES/.mini-release-receipt-$RECEIPT_DIGEST.json"
+if (
+  RELEASES_DIR="$RECEIPT_RELEASES"
+  LAST_RECEIPT_FILE="$RECEIPT_LAST"
+  receipt_verified_runtime_target
+) >/dev/null 2>&1; then
+  fail "receipt repair source accepted a target outside releases/"
+fi
+
+# Bundle control-plane files are governed too: changing a manifest or its
+# installer must not deadlock the release gate that is responsible for
+# deploying that bundle. An unrelated runtime source in the same target remains
+# uncovered.
+(
+  ACTIVE_SHA=active
+  SHA=target
+  git_current() {
+    case "${1:-}" in
+      diff)
+        printf '%s\n' \
+          machine-setup/mini-scripts/spend_manifest.json \
+          machine-setup/mini-scripts/install_spend.py \
+          machine-setup/mini-scripts/forgotten_runtime.py
+        ;;
+      show) printf '%s\n' '{"files":[]}' ;;
+      *) return 2 ;;
+    esac
+  }
+  [ "$(find_uncovered_mini_scripts_changes)" = \
+    'machine-setup/mini-scripts/forgotten_runtime.py' ]
+) || fail "bundle manifest/installer controls were not admitted precisely"
+
+# Release admission fails closed before build/switch when the target changes a
+# Mini runtime file that is outside every governed manifest.  The same gate is
+# a no-op for a fully covered target, so ordinary cuts remain admissible.
+if (
+  find_uncovered_mini_scripts_changes() {
+    printf '%s\n' 'machine-setup/mini-scripts/forgotten_runtime.py'
+  }
+  require_governed_mini_scripts_changes
+) >/dev/null 2>&1; then
+  fail "release admission accepted an ungoverned Mini runtime change"
+fi
+(
+  find_uncovered_mini_scripts_changes() { :; }
+  require_governed_mini_scripts_changes
+) || fail "release admission rejected a fully governed Mini runtime change set"
+
+# Change discovery is an admission input, not optional evidence. A failed diff
+# must reject the release instead of being converted into an empty change set.
+if (
+  ACTIVE_SHA=active
+  SHA=target
+  git_current() {
+    [ "${1:-}" != diff ] || return 41
+    return 2
+  }
+  require_governed_mini_scripts_changes
+) >/dev/null 2>&1; then
+  fail "release admission failed open when Mini change discovery failed"
+fi
+
+# Registry classifications are release-admission classifications too. Direct
+# sources and explicit mini-local destinations are admitted; an unrelated
+# changed runtime file remains uncovered.
+(
+  ACTIVE_SHA=active
+  SHA=target
+  git_current() {
+    case "${1:-}" in
+      diff)
+        printf '%s\n' \
+          machine-setup/mini-scripts/direct_tool.py \
+          machine-setup/mini-scripts/local_tool.py \
+          machine-setup/mini-scripts/launchd/com.example.local.plist \
+          machine-setup/mini-scripts/forgotten_runtime.py
+        ;;
+      show)
+        case "${2:-}" in
+          *:machine-setup/mini-scripts/mini_local_registry.json)
+            printf '%s\n' '{"direct_deploy":[{"src_rel":"direct_tool.py","dest":"scripts/direct_tool.py"}],"mini_local":[{"path":"scripts/local_tool.py"},{"path":"launch_agents/com.example.*","glob":true}]}'
+            ;;
+          *) printf '%s\n' '{"files":[]}' ;;
+        esac
+        ;;
+      *) return 2 ;;
+    esac
+  }
+  [ "$(find_uncovered_mini_scripts_changes)" = \
+    'machine-setup/mini-scripts/forgotten_runtime.py' ]
+) || fail "release admission ignored direct-deploy or mini-local registry classifications"
 
 printf 'mini-release-cut safety checks passed\n'

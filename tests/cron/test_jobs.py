@@ -18,6 +18,7 @@ from cron.jobs import (
     update_job,
     pause_job,
     resume_job,
+    trigger_job,
     remove_job,
     mark_job_run,
     advance_next_run,
@@ -492,8 +493,81 @@ class TestJobCRUD:
             "CLICKUP_API_TOKEN"
         ]
 
+    def test_required_environment_mixed_string_and_optional_dict_entries_survive(
+        self, tmp_cron_dir
+    ):
+        """A mix of plain-string (required) and optional-dict entries must
+        keep the optional dict's shape — only a non-optional dict collapses
+        to a bare name (86e2m2c1g)."""
+        job = create_job(
+            prompt="Digest",
+            schedule="every 1h",
+            required_environment_variables=[
+                "CLICKUP_API_TOKEN",
+                {"name": "SUPABASE_ACCESS_TOKEN", "optional": True},
+                {"name": "IGNITE_SKILLS_ROOT", "optional": True},
+            ],
+        )
+
+        expected = [
+            "CLICKUP_API_TOKEN",
+            {"name": "SUPABASE_ACCESS_TOKEN", "optional": True},
+            {"name": "IGNITE_SKILLS_ROOT", "optional": True},
+        ]
+        assert job["required_environment_variables"] == expected
+        assert get_job(job["id"])["required_environment_variables"] == expected
+
 
 class TestUpdateJob:
+    def test_update_job_round_trips_optional_environment_declaration(
+        self, tmp_cron_dir
+    ):
+        """Regression for 86e2m2c1g: fleet-health-digest declared
+        IGNITE_SKILLS_ROOT optional via curated fleet-config's dict shape.
+        update_job() (the write path behind pause/resume/trigger and the
+        agent cronjob tool) used to flatten every entry to a bare name,
+        silently dropping ``optional: true`` on any update — even one that
+        never touched required_environment_variables — and turning a
+        declared-optional variable into a hard requirement."""
+        job = create_job(prompt="Digest", schedule="every 1h")
+        job["required_environment_variables"] = [
+            {"name": "SUPABASE_ACCESS_TOKEN", "optional": True},
+            {"name": "IGNITE_SKILLS_ROOT", "optional": True},
+        ]
+        save_jobs([job])
+
+        expected = [
+            {"name": "SUPABASE_ACCESS_TOKEN", "optional": True},
+            {"name": "IGNITE_SKILLS_ROOT", "optional": True},
+        ]
+
+        # An update that doesn't even mention required_environment_variables
+        # still runs the full job dict through _apply_skill_fields.
+        updated = update_job(job["id"], {"name": "Digest v2"})
+        assert updated["required_environment_variables"] == expected
+        assert get_job(job["id"])["required_environment_variables"] == expected
+
+    def test_pause_resume_trigger_round_trip_optional_environment_declaration(
+        self, tmp_cron_dir
+    ):
+        job = create_job(prompt="Digest", schedule="every 1h")
+        job["required_environment_variables"] = [
+            {"name": "IGNITE_SKILLS_ROOT", "optional": True},
+        ]
+        save_jobs([job])
+        expected = [{"name": "IGNITE_SKILLS_ROOT", "optional": True}]
+
+        paused = pause_job(job["id"])
+        assert paused["required_environment_variables"] == expected
+
+        resumed = resume_job(job["id"])
+        assert resumed["required_environment_variables"] == expected
+
+        triggered = trigger_job(job["id"])
+        assert triggered["required_environment_variables"] == expected
+
+        assert get_job(job["id"])["required_environment_variables"] == expected
+
     def test_update_name(self, tmp_cron_dir):
         job = create_job(prompt="Check server status", schedule="every 1h", name="Old Name")
         assert job["name"] == "Old Name"

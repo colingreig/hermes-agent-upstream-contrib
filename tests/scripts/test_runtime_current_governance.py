@@ -19,6 +19,7 @@ SCRIPTS = REPO_ROOT / "machine-setup" / "mini-scripts"
 GUARD = SCRIPTS / "runtime_current_guard.py"
 VERIFIER = SCRIPTS / "verify_governed_paths.py"
 MANIFEST = SCRIPTS / "fleet_outcome_manifest.json"
+TRUST_MANIFEST = SCRIPTS / "governed_path_trust.json"
 JOBS = REPO_ROOT / "machine-setup" / "fleet-config" / "jobs.json"
 VERIFIER_LAUNCHER = SCRIPTS / "verify_governed_paths.sh"
 INTERPRETER_LAUNCHER = SCRIPTS / "verify_governed_paths_launcher.py"
@@ -137,6 +138,25 @@ def test_exact_hash_pinned_cutter_invocation_bootstraps_without_preexisting_leas
     assert result.stdout == ""
 
 
+def test_cutter_trust_hash_has_one_current_deployed_source_of_truth():
+    trust = json.loads(TRUST_MANIFEST.read_text(encoding="utf-8"))
+    cutter = REPO_ROOT / trust["trusted_cutter"]["source"]
+    assert trust["schema_version"] == 1
+    assert cutter == REPO_ROOT / "scripts" / "mini-release-cut.sh"
+    assert trust["trusted_cutter"]["sha256"] == hashlib.sha256(cutter.read_bytes()).hexdigest()
+
+    deployment = json.loads(MANIFEST.read_text(encoding="utf-8"))
+    entry = next(item for item in deployment["files"] if item["source"] == TRUST_MANIFEST.name)
+    assert entry["destination_root"] == "scripts"
+    assert entry["destination"] == TRUST_MANIFEST.name
+    assert entry["sha256"] == hashlib.sha256(TRUST_MANIFEST.read_bytes()).hexdigest()
+
+    for consumer in (GUARD, REPO_ROOT / "tools" / "governed_paths.py"):
+        source = consumer.read_text(encoding="utf-8")
+        assert "governed_path_trust.json" in source
+        assert "_CUTTER_SHA256 =" not in source
+
+
 def test_cutter_bootstrap_hook_rejects_compounds_wrappers_aliases_and_byte_drift(tmp_path):
     cutter, exact = _install_trusted_runtime_cutter(tmp_path)
     alias = tmp_path / "cutter-alias"
@@ -233,7 +253,12 @@ def test_bare_relative_runtime_pointer_has_distinct_persisted_failure(tmp_path):
     persisted = json.loads(receipt.read_text(encoding="utf-8"))
     assert persisted["status"] == "failed"
     assert persisted["failure_code"] == "runtime_current_broken"
-    assert "runtime-current target is missing" in persisted["failure_reason"]
+    # Before ClickUp 86e2kt3yr this shape was only caught downstream, as
+    # "runtime-current target is missing" -- true but misleading, because it
+    # reads as a pruned release rather than a malformed pointer. The verifier
+    # now inspects the raw link text first, so the persisted reason names the
+    # actual defect and the operator knows to repair the pointer, not re-cut.
+    assert "relative symlink" in persisted["failure_reason"]
 
 
 def test_guard_and_verifier_are_explicitly_hash_pinned_for_scripts_deployment():

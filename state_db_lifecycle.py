@@ -242,6 +242,12 @@ def _validate_retention_config(config: Mapping[str, Any]) -> dict[str, Any]:
                 "growth.expected_bytes_per_day exceeds root.max_bytes, so retention "
                 "can never hold the size budget"
             )
+        if horizon_bytes > config["profile"]["max_bytes"]:
+            raise LifecycleSafetyError(
+                "retention policy is unsatisfiable: profile.prune_after_days x "
+                "growth.expected_bytes_per_day exceeds profile.max_bytes, so a "
+                "profile holding the observed growth can never hold the size budget"
+            )
     return dict(config)
 
 
@@ -261,10 +267,9 @@ def _retention_scope(db_path: Path) -> tuple[Path, Path, bool]:
 
     Named profiles live in ``<root>/profiles/<name>/state.db``.  Root budgets
     must include the default profile *and every named profile*, while profile
-    budgets stay scoped to the active profile directory.  For the default
-    profile the two scopes coincide, so the (smaller) per-profile size budget
-    is not applied on top of the root budget -- otherwise the default profile
-    would silently inherit a stricter ceiling than the fleet-wide one.
+    budgets stay scoped to the active profile directory.  The default profile
+    is both a profile and part of the aggregate root scope, so both statuses
+    apply there; suppressing its profile status hides a genuine policy breach.
     """
     profile_home = db_path.parent
     if profile_home.parent.name == "profiles":
@@ -651,6 +656,8 @@ def _budget_forecast(
     root_max_bytes: int,
     prune_after_days: float,
     expected_bytes_per_day: Optional[float],
+    profile_bytes: Optional[int] = None,
+    profile_max_bytes: Optional[int] = None,
 ) -> dict[str, Any]:
     """Turn size + age budgets into a satisfiability statement.
 
@@ -665,15 +672,29 @@ def _budget_forecast(
         "growth_bytes_per_day": growth_bytes_per_day,
         "expected_bytes_per_day": expected_bytes_per_day,
         "policy_satisfiable": None,
+        "root_policy_satisfiable": None,
+        "profile_policy_satisfiable": None,
         "retention_horizon_bytes": None,
         "days_until_root_budget": None,
+        "days_until_profile_budget": None,
     }
     rate = growth_bytes_per_day if growth_bytes_per_day is not None else expected_bytes_per_day
     if rate is not None and rate > 0:
         forecast["retention_horizon_bytes"] = int(rate * prune_after_days)
-        forecast["policy_satisfiable"] = forecast["retention_horizon_bytes"] <= root_max_bytes
+        root_satisfiable = forecast["retention_horizon_bytes"] <= root_max_bytes
+        profile_satisfiable = (
+            None
+            if profile_max_bytes is None
+            else forecast["retention_horizon_bytes"] <= profile_max_bytes
+        )
+        forecast["root_policy_satisfiable"] = root_satisfiable
+        forecast["profile_policy_satisfiable"] = profile_satisfiable
+        forecast["policy_satisfiable"] = root_satisfiable and profile_satisfiable is not False
         headroom = root_max_bytes - root_bytes
         forecast["days_until_root_budget"] = round(headroom / rate, 2)
+        if profile_bytes is not None and profile_max_bytes is not None:
+            profile_headroom = profile_max_bytes - profile_bytes
+            forecast["days_until_profile_budget"] = round(profile_headroom / rate, 2)
     return forecast
 
 
@@ -881,11 +902,7 @@ def run_lifecycle(
             },
             "budget_status": {
                 "root_over_bytes": root_size_before > root["max_bytes"],
-                # The default profile and the root are the same scope, so the
-                # narrower per-profile ceiling only applies to named profiles.
-                "profile_over_bytes": bool(
-                    is_named_profile and profile_bytes_before > profile["max_bytes"]
-                ),
+                "profile_over_bytes": profile_bytes_before > profile["max_bytes"],
                 "wal_over_bytes": wal_bytes_before > checkpoint["max_bytes"],
             },
         }
@@ -1120,8 +1137,10 @@ def run_lifecycle(
             )
         plan["metrics"]["budget_forecast"] = _budget_forecast(
             root_bytes=plan["metrics"]["root_bytes"],
+            profile_bytes=plan["metrics"]["profile_bytes"],
             growth_bytes_per_day=plan["metrics"]["growth_bytes_per_day"],
             root_max_bytes=int(root["max_bytes"]),
+            profile_max_bytes=int(profile["max_bytes"]),
             prune_after_days=prune_days,
             expected_bytes_per_day=expected_bytes_per_day,
         )

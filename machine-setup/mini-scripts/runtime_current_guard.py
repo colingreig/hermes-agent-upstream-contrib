@@ -16,8 +16,8 @@ from governed_interpreter import SELECTOR_CONTRACT, select_governed_interpreter
 
 FLEET_DIGEST_JOB_ID = "f23a03e9d1b2"
 _TRUST_MANIFEST = Path(__file__).resolve().with_name("digest_trusted_scripts.json")
+_CUTTER_TRUST_MANIFEST = Path(__file__).resolve().with_name("governed_path_trust.json")
 _READ_ONLY_PROGRAMS = {"cat", "ls", "stat", "readlink", "pwd", "printf", "echo", "wc", "du", "df", "uname", "date"}
-_CUTTER_SHA256 = "0439b786f405c53cf8b03b454f2809afe2146e8c7d95ccb5cfffba9140df7f61"
 _RELEASE_NAME = re.compile(r"^v[0-9][0-9A-Za-z.!+_-]*-[0-9a-f]{12,64}$")
 
 
@@ -107,6 +107,30 @@ def _fleet_command_allowed(command: str, hermes: Path) -> bool:
     return isinstance(arguments, list) and words[2:] == arguments
 
 
+def _trusted_cutter_sha256() -> str | None:
+    """Load the cutter pin from the governed, atomically deployed manifest."""
+    try:
+        if _CUTTER_TRUST_MANIFEST.is_symlink() or not _CUTTER_TRUST_MANIFEST.is_file():
+            return None
+        manifest = json.loads(_CUTTER_TRUST_MANIFEST.read_text(encoding="utf-8"))
+        if not isinstance(manifest, dict):
+            return None
+        entry = manifest["trusted_cutter"]
+        if not isinstance(entry, dict):
+            return None
+        digest = entry["sha256"]
+    except (OSError, KeyError, TypeError, json.JSONDecodeError):
+        return None
+    if (
+        manifest.get("schema_version") != 1
+        or entry.get("source") != "scripts/mini-release-cut.sh"
+        or not isinstance(digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+    ):
+        return None
+    return digest
+
+
 def _trusted_cutter_bootstrap(command: str, hermes: Path) -> bool:
     if re.search(r"[;&|`$<>\n\r]", command):
         return False
@@ -145,12 +169,14 @@ def _trusted_cutter_bootstrap(command: str, hermes: Path) -> bool:
     try:
         actual = script.resolve(strict=True)
         relative = actual.relative_to((hermes / "releases").resolve(strict=True))
+        trusted_digest = _trusted_cutter_sha256()
         return (
             len(relative.parts) == 3
             and _RELEASE_NAME.fullmatch(relative.parts[0]) is not None
             and relative.parts[1:] == ("scripts", "mini-release-cut.sh")
             and not script.is_symlink()
-            and hashlib.sha256(actual.read_bytes()).hexdigest() == _CUTTER_SHA256
+            and trusted_digest is not None
+            and hashlib.sha256(actual.read_bytes()).hexdigest() == trusted_digest
         )
     except (OSError, ValueError):
         return False

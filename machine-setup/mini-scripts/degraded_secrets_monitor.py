@@ -22,6 +22,31 @@ any of:
       entries. Individual unavailable entries are reduced-redundancy diagnostics
       while another entry for the same provider remains usable.
 
+Credential-pool hits are classified into the shared failure taxonomy (ClickUp
+86e2mb8nv/86e2mb8p5, PR 1+3 of the adversarial provider-failure epic) rather
+than a raw pool status string:
+
+  unconfigured_provider — the provider key has zero configured entries (e.g. a
+      dead key left behind by a credential-hygiene sweep). Nothing routes to
+      it; never paged, surfaced only as a notice.
+  unconfigured_entry    — a bare placeholder slot (no field beyond ``id``)
+      nothing has ever configured. Never paged.
+  missing_credential    — a genuinely broken/absent credential: terminal pool
+      status (dead/invalid/error), an auth_permanent quarantine, or a
+      configured-but-unhydratable entry. Always paged.
+  exhausted_session      — a short-horizon, self-recovering throttle. Paged
+      when it reflects a REAL recorded failure (last_status=exhausted with a
+      session-scoped reset horizon); NEVER paged when it's merely an idle
+      credential whose token time-expired but is transparently refreshable on
+      next use (refresh_token/agent_key + an expiry, no failure ever
+      recorded) — see ClickUp 86e2mdfhx (nous re-paging every idle hour).
+  exhausted_cap          — a long-horizon usage cap (weekly/monthly/billing
+      period). Always paged.
+
+Sibling suppression (unchanged from PR 1): a hit only pages when it is the
+LAST usable entry for its provider — another usable sibling downgrades it to
+a `credential_pool_diagnostics` reduced-redundancy entry instead.
+
 Alerts via Slack DM to Colin (`hermes send --to slack:D0BA2PM9CFM`, with `@UN4CQ1EGG`
 mention) AND a ClickUp comment (same task-comment escalation convention as
 verify-hermes-patches.sh §7c: CLICKUP_API_TOKEN only, no destructive write).
@@ -51,6 +76,17 @@ import sys
 import urllib.request
 from datetime import datetime, timezone, timedelta
 
+# Single source of truth for the long-horizon split (86e2mb8nv PR 1) — this
+# mini-script is exactly the kind of vendoring call site failure_taxonomy's
+# own docstring anticipates. Hard-imported (not try/except-guarded) to match
+# the precedent already set by machine-setup/mini-scripts/provider_probe.py's
+# top-level `from agent.failure_taxonomy import ...`.
+from agent.failure_taxonomy import (
+    FAILURE_KIND_AUTH_PERMANENT,
+    FAILURE_KIND_USAGE_CAP,
+    USAGE_CAP_HORIZON_SECONDS,
+)
+
 LOG_PATH = os.path.expanduser("~/.hermes/logs/gateway.error.log")
 STATE_PATH = os.path.expanduser("~/.hermes/state/degraded-secrets-monitor.json")
 HERMES_BIN = os.path.expanduser("~/.local/bin/hermes")
@@ -58,6 +94,14 @@ TOKEN_FILE = os.path.expanduser("~/.config/op-runtime-token")
 TERMINAL_POOL_STATUSES = {"dead", "invalid", "error"}
 EXHAUSTED_TTL_401_SECONDS = 5 * 60
 EXHAUSTED_TTL_DEFAULT_SECONDS = 60 * 60
+
+# ── Degraded-secrets failure taxonomy (ClickUp 86e2mb8p5, PR 3/4) ──────────
+STATUS_UNCONFIGURED_PROVIDER = "unconfigured_provider"
+STATUS_UNCONFIGURED_ENTRY = "unconfigured_entry"
+STATUS_MISSING_CREDENTIAL = "missing_credential"
+STATUS_EXHAUSTED_SESSION = "exhausted_session"
+STATUS_EXHAUSTED_CAP = "exhausted_cap"
+STATUS_MALFORMED = "malformed"  # shape-validation failure, not a taxonomy class
 NOUS_INFERENCE_INVOKE_SCOPE = "inference:invoke"
 NOUS_INVOKE_JWT_MIN_TTL_SECONDS = 120
 ESCALATION_TASK_ID = os.environ.get("DEGRADED_SECRETS_ALERT_TASK_ID", "86e2610g8")
@@ -299,6 +343,72 @@ def _has_runtime_credential(provider, entry, now):
     return _has_borrowed_env_secret(entry)
 
 
+def _entry_is_configured(entry):
+    """True when the entry carries any field beyond a bare ``id`` — i.e.
+    something in this codebase's OAuth/env-seed/manual-entry paths actually
+    wrote a value into this slot, even a mistyped/legacy field name (e.g.
+    ``api_key`` instead of ``access_token``). False only for a genuinely
+    bare placeholder (``{}`` or ``{"id": ...}`` alone) nothing has ever
+    touched.
+
+    Deliberately NOT field-name-specific: an unrecognized field is still
+    "someone tried to configure this" and must page as missing_credential,
+    never silently downgrade to unconfigured_entry — misclassifying a real
+    misconfiguration as an inert placeholder would swallow exactly the
+    alert this monitor exists to raise (ClickUp 86e2mb8p5's stated
+    highest-risk boundary).
+    """
+    return any(key != "id" for key in entry.keys())
+
+
+def _is_refreshable_expiry(provider, entry):
+    """True when the runtime credential check failed ONLY because the
+    token is time-expired and a refresh path exists — the runtime
+    transparently refreshes it on next use, so this is not a real outage.
+
+    This is the fix for ClickUp 86e2mdfhx: an idle nous tier-3 fallback
+    with a 1h OAuth TTL, zero requests, and a live refresh_token looked
+    'missing' from disk (no runtime-usable JWT) but is healthy from the
+    runtime's point of view — it re-paged every hour it sat idle before
+    this carve-out existed. Must never fire for an entry with NO refresh
+    material: that's a genuine missing_credential, not idle-and-refreshable.
+    """
+    if provider == "nous":
+        has_refresh_material = bool(str(entry.get("refresh_token") or "").strip()) or bool(
+            str(entry.get("agent_key") or "").strip()
+        )
+        has_expiry = bool(entry.get("expires_at")) or bool(entry.get("agent_key_expires_at"))
+        return has_refresh_material and has_expiry
+    access_token = str(entry.get("access_token") or "").strip()
+    if access_token:
+        return False
+    refresh_token = str(entry.get("refresh_token") or "").strip()
+    has_expiry = bool(entry.get("expires_at")) or bool(entry.get("expires_at_ms"))
+    return bool(refresh_token) and has_expiry
+
+
+def _exhausted_taxonomy_class(entry, retry_at, now):
+    """Split a REAL recorded ``exhausted`` status into exhausted_session
+    (self-recovers soon) vs exhausted_cap (weekly/monthly/billing-period —
+    needs a human or a long wait). Prefers the persisted failure_kind from
+    agent.error_classifier's taxonomy (86e2mb8nv PR 1) when present; falls
+    back to the shared long-horizon heuristic for entries written before
+    that field existed. An auth_permanent quarantine needs repair, not a
+    wait, so it is reported as missing_credential instead — same
+    operational bucket as a terminal/dead credential.
+    """
+    failure_kind = str(entry.get("last_failure_kind") or "").strip().lower()
+    if failure_kind == FAILURE_KIND_USAGE_CAP:
+        return STATUS_EXHAUSTED_CAP
+    if failure_kind == FAILURE_KIND_AUTH_PERMANENT:
+        return STATUS_MISSING_CREDENTIAL
+    if failure_kind:
+        return STATUS_EXHAUSTED_SESSION
+    if retry_at is not None and (retry_at - now) >= timedelta(seconds=USAGE_CAP_HORIZON_SECONDS):
+        return STATUS_EXHAUSTED_CAP
+    return STATUS_EXHAUSTED_SESSION
+
+
 def classify_credential_pool(auth_payload, now):
     """Classify provider pools without retaining any credential material."""
     pool = auth_payload.get("credential_pool") if isinstance(auth_payload, dict) else None
@@ -308,18 +418,26 @@ def classify_credential_pool(auth_payload, now):
             "status": "absent",
             "hits": [],
             "credential_pool_diagnostics": [],
+            "credential_pool_notices": [],
         }
 
     if now.tzinfo is None:
         now = now.replace(tzinfo=timezone.utc)
     now = now.astimezone(timezone.utc)
     hits = []
+    notices = []
     diagnostics = []
     for raw_provider, raw_entries in sorted(pool.items(), key=lambda item: str(item[0])):
         provider = str(raw_provider)
         entries = raw_entries if isinstance(raw_entries, list) else [None]
         if not entries:
-            hits.append({"provider": provider, "id": "pool", "status": "empty"})
+            # Nothing routes to a provider with zero configured entries —
+            # never an operational emergency. See ClickUp 86e2mdfhx: the
+            # copilot/gemini stale-empty-key false page this fixes.
+            notices.append({
+                "provider": provider, "id": "pool",
+                "status": STATUS_UNCONFIGURED_PROVIDER, "retry_at": None,
+            })
             continue
 
         unavailable_slots = []
@@ -328,8 +446,9 @@ def classify_credential_pool(auth_payload, now):
             if not isinstance(entry, dict):
                 unavailable_slots.append({
                     "id": f"index:{index}",
-                    "status": "malformed",
+                    "status": STATUS_MALFORMED,
                     "retry_at": None,
+                    "non_paging": False,
                 })
                 continue
 
@@ -337,15 +456,26 @@ def classify_credential_pool(auth_payload, now):
             status = str(entry.get("last_status") or "").strip().lower()
             retry_at = None
             unavailable_status = None
+            non_paging = False
             if status in TERMINAL_POOL_STATUSES:
-                unavailable_status = status
+                unavailable_status = STATUS_MISSING_CREDENTIAL
             elif status == "exhausted":
                 retry_at = _exhausted_retry_at(entry)
                 if retry_at is not None and retry_at > now:
-                    unavailable_status = status
+                    # A REAL recorded failure — always pages (subject to the
+                    # usual sibling suppression below), regardless of which
+                    # taxonomy class it lands in.
+                    unavailable_status = _exhausted_taxonomy_class(entry, retry_at, now)
 
             if unavailable_status is None and not _has_runtime_credential(provider, entry, now):
-                unavailable_status = "missing_credential"
+                if _is_refreshable_expiry(provider, entry):
+                    unavailable_status = STATUS_EXHAUSTED_SESSION
+                    non_paging = True
+                elif _entry_is_configured(entry):
+                    unavailable_status = STATUS_MISSING_CREDENTIAL
+                else:
+                    unavailable_status = STATUS_UNCONFIGURED_ENTRY
+                    non_paging = True
 
             if unavailable_status is None:
                 usable_count += 1
@@ -354,41 +484,50 @@ def classify_credential_pool(auth_payload, now):
                     "id": slot_id,
                     "status": unavailable_status,
                     "retry_at": retry_at.isoformat() if retry_at is not None else None,
+                    "non_paging": non_paging,
                 })
 
         if usable_count == 0:
-            hits.extend(
-                {"provider": provider, "id": slot["id"], "status": slot["status"]}
-                for slot in unavailable_slots
-            )
+            for slot in unavailable_slots:
+                target = notices if slot["non_paging"] else hits
+                target.append({
+                    "provider": provider, "id": slot["id"], "status": slot["status"],
+                    "retry_at": slot["retry_at"],
+                })
         elif unavailable_slots:
             diagnostics.append({
                 "provider": provider,
                 "total_slot_count": len(entries),
                 "usable_count": usable_count,
                 "unavailable_count": len(unavailable_slots),
-                "unavailable_slots": unavailable_slots,
+                "unavailable_slots": [
+                    {"id": slot["id"], "status": slot["status"], "retry_at": slot["retry_at"]}
+                    for slot in unavailable_slots
+                ],
             })
 
     hits.sort(key=lambda hit: (hit["provider"], hit["id"], hit["status"]))
+    notices.sort(key=lambda hit: (hit["provider"], hit["id"], hit["status"]))
     return {
         "triggered": bool(hits),
         "status": "ok",
         "hits": hits,
         "credential_pool_diagnostics": diagnostics,
+        "credential_pool_notices": notices,
     }
 
 
 def check_credential_pool(auth_file, now=None):
     if not os.path.isfile(auth_file):
         return {"triggered": False, "status": "missing", "hits": [], "auth_file": auth_file,
-                "credential_pool_diagnostics": []}
+                "credential_pool_diagnostics": [], "credential_pool_notices": []}
     try:
         with open(auth_file, encoding="utf-8") as f:
             data = json.load(f)
     except Exception as exc:
         return {"triggered": False, "status": "malformed", "hits": [], "auth_file": auth_file,
-                "error": exc.__class__.__name__, "credential_pool_diagnostics": []}
+                "error": exc.__class__.__name__, "credential_pool_diagnostics": [],
+                "credential_pool_notices": []}
 
     result = classify_credential_pool(data, now or _now())
     result["auth_file"] = auth_file
@@ -518,19 +657,22 @@ def main():
     placeholder = check_unresolved_placeholder(lines)
     credential_pool = check_credential_pool(args.auth_file, now=now)
     credential_pool_diagnostics = credential_pool.get("credential_pool_diagnostics", [])
+    credential_pool_notices = credential_pool.get("credential_pool_notices", [])
     sig = _signature(fatal, parked_auth, placeholder, credential_pool)
     degraded = (fatal["triggered"] or parked_auth["triggered"] or placeholder["triggered"]
                 or credential_pool["triggered"])
 
     public_credential_pool = {
         key: value for key, value in credential_pool.items()
-        if key != "credential_pool_diagnostics"
+        if key not in ("credential_pool_diagnostics", "credential_pool_notices")
     }
     result = {"degraded": degraded, "fatal_loop": fatal, "parked_auth": parked_auth,
               "placeholder": placeholder, "credential_pool": public_credential_pool,
               "checked_at": now.isoformat()}
     if credential_pool_diagnostics:
         result["credential_pool_diagnostics"] = credential_pool_diagnostics
+    if credential_pool_notices:
+        result["credential_pool_notices"] = credential_pool_notices
 
     if args.json:
         print(json.dumps(result, indent=2))
@@ -561,6 +703,14 @@ def main():
                 f"usable={diagnostic['usable_count']}/{diagnostic['total_slot_count']} "
                 f"unavailable={slots}"
             )
+        # Notices are never paged (unconfigured_provider / unconfigured_entry
+        # / an idle-but-refreshable exhausted_session) but stay visible for
+        # operators — see ClickUp 86e2mdfhx.
+        for notice in credential_pool_notices:
+            print(
+                "[degraded-secrets-monitor] credential pool notice (not paged): "
+                f"provider={notice['provider']} id={notice['id']} status={notice['status']}"
+            )
 
     if args.alert:
         state = _load_state()
@@ -581,9 +731,14 @@ def main():
                     f"'{h['header']}' -> ${{{h['var']}}} never resolved. Set {h['var']} in "
                     f"1Password / ~/.hermes/.env and reconnect.")
             for h in credential_pool["hits"]:
+                next_step = (
+                    "Wait for the cap to reset or add/rotate a sibling credential."
+                    if h["status"] == STATUS_EXHAUSTED_CAP
+                    else "Repair or replace the stored credential."
+                )
                 msg_lines.append(
                     f"- Credential pool degraded: provider '{h['provider']}' entry "
-                    f"'{h['id']}' last_status={h['status']}. Repair or refresh the stored credential."
+                    f"'{h['id']}' status={h['status']}. {next_step}"
                 )
             msg = "\n".join(msg_lines)
             slack_msg = "\n".join([SLACK_MENTION, *msg_lines])

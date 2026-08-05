@@ -98,8 +98,17 @@ class Reconciler:
         hermes_home: Path | None = None,
         launch_agents_dir: Path | None = None,
         state_dir: Path | None = None,
+        repo_root: Path | None = None,
     ) -> None:
         self.source_root = source_root.resolve()
+        # Most governed files are vendored directly under source_root
+        # (machine-setup/mini-scripts). A few files (e.g. scripts/
+        # clickup_poll_gate.py) have their single canonical source at the
+        # repo root instead, so entries may opt in with
+        # "source_root": "repo" rather than duplicating the file into
+        # mini-scripts and risking silent fork drift. Defaults to
+        # source_root so existing bundle-relative entries are unaffected.
+        self.repo_root = repo_root.resolve() if repo_root is not None else self.source_root
         self.manifest_path = manifest_path.resolve()
         self.home = home.resolve()
         self.hermes_home = (
@@ -145,6 +154,14 @@ class Reconciler:
             raise ReconcileError(f"{field} must not be absolute or contain '..'")
         return path
 
+    def _source_base(self, entry: dict[str, Any], *, index: int) -> Path:
+        source_root_field = entry.get("source_root", "bundle")
+        if source_root_field == "bundle":
+            return self.source_root
+        if source_root_field == "repo":
+            return self.repo_root
+        raise ReconcileError(f"files[{index}].source_root is not governed")
+
     def target_map(self) -> dict[Path, tuple[Path, int]]:
         targets: dict[Path, tuple[Path, int]] = {
             self.scripts_dir / "fleet_outcome_manifest.json": (
@@ -170,7 +187,7 @@ class Reconciler:
                 raise ReconcileError(
                     f"files[{index}].destination_root is not governed"
                 )
-            source = self.source_root / source_rel
+            source = self._source_base(entry, index=index) / source_rel
             target = root / destination_rel
             if target in targets:
                 raise ReconcileError(f"duplicate manifest destination: {target}")
@@ -186,7 +203,7 @@ class Reconciler:
     def validate_sources(self) -> None:
         expected_by_source: dict[Path, str] = {}
         for index, entry in enumerate(self.manifest["files"]):
-            source = self.source_root / self._plain_relative(
+            source = self._source_base(entry, index=index) / self._plain_relative(
                 entry.get("source"), field=f"files[{index}].source"
             )
             if not source.is_file() or source.is_symlink():
@@ -613,6 +630,16 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--hermes-home", type=Path)
     parser.add_argument("--launch-agents-dir", type=Path)
     parser.add_argument("--state-dir", type=Path)
+    parser.add_argument(
+        "--repo-root",
+        type=Path,
+        default=None,
+        help=(
+            "Repo checkout root for files whose manifest entry sets "
+            "source_root=repo (e.g. scripts/clickup_poll_gate.py). "
+            "Defaults to --source-root when omitted."
+        ),
+    )
     parser.add_argument("--reload", action="store_true")
     return parser
 
@@ -627,6 +654,7 @@ def main() -> int:
             hermes_home=args.hermes_home,
             launch_agents_dir=args.launch_agents_dir,
             state_dir=args.state_dir,
+            repo_root=args.repo_root,
         )
         if args.action == "install":
             receipt = reconciler.install(reload=args.reload)

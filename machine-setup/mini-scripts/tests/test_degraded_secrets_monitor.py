@@ -160,10 +160,10 @@ class DegradedSecretsMonitorCredentialPoolTests(unittest.TestCase):
         self.assertEqual(
             result["hits"],
             [
-                {"provider": "codex", "id": "c", "status": "exhausted"},
-                {"provider": "nous", "id": "n", "status": "error"},
-                {"provider": "openrouter", "id": "o", "status": "dead"},
-                {"provider": "xai", "id": "x", "status": "invalid"},
+                {"provider": "codex", "id": "c", "status": "exhausted_cap", "retry_at": "2099-01-01T00:00:00+00:00"},
+                {"provider": "nous", "id": "n", "status": "missing_credential", "retry_at": None},
+                {"provider": "openrouter", "id": "o", "status": "missing_credential", "retry_at": None},
+                {"provider": "xai", "id": "x", "status": "missing_credential", "retry_at": None},
             ],
         )
 
@@ -201,7 +201,7 @@ class DegradedSecretsMonitorCredentialPoolTests(unittest.TestCase):
                     "unavailable_slots": [
                         {
                             "id": "primary",
-                            "status": "exhausted",
+                            "status": "exhausted_session",
                             "retry_at": "2026-07-27T01:00:00+00:00",
                         }
                     ],
@@ -275,8 +275,8 @@ class DegradedSecretsMonitorCredentialPoolTests(unittest.TestCase):
         self.assertEqual(
             result["hits"],
             [
-                {"provider": "openai-codex", "id": "refresh-only", "status": "missing_credential"},
-                {"provider": "openrouter", "id": "wrong-field", "status": "missing_credential"},
+                {"provider": "openai-codex", "id": "refresh-only", "status": "missing_credential", "retry_at": None},
+                {"provider": "openrouter", "id": "wrong-field", "status": "missing_credential", "retry_at": None},
             ],
         )
         self.assertNotIn("secret", repr(result))
@@ -342,7 +342,7 @@ class DegradedSecretsMonitorCredentialPoolTests(unittest.TestCase):
         self.assertTrue(result["triggered"])
         self.assertEqual(
             result["hits"],
-            [{"provider": "anthropic", "id": "unseeded", "status": "missing_credential"}],
+            [{"provider": "anthropic", "id": "unseeded", "status": "missing_credential", "retry_at": None}],
         )
 
     def test_non_env_sourced_entry_with_fingerprint_only_is_still_missing_credential(self):
@@ -370,7 +370,7 @@ class DegradedSecretsMonitorCredentialPoolTests(unittest.TestCase):
         self.assertTrue(result["triggered"])
         self.assertEqual(
             result["hits"],
-            [{"provider": "openrouter", "id": "manual-no-token", "status": "missing_credential"}],
+            [{"provider": "openrouter", "id": "manual-no-token", "status": "missing_credential", "retry_at": None}],
         )
 
     def test_nous_agent_key_requires_runtime_usable_inference_jwt(self):
@@ -397,22 +397,39 @@ class DegradedSecretsMonitorCredentialPoolTests(unittest.TestCase):
         self.assertNotIn(valid_jwt, repr(result))
         self.assertNotIn(invalid_jwt, repr(result))
 
-    def test_empty_provider_is_unavailable_but_absent_pool_is_not(self):
+    def test_empty_provider_is_unconfigured_notice_not_a_page(self):
+        """ClickUp 86e2mdfhx regression: copilot/gemini stale EMPTY-list keys
+
+        left behind by a credential-hygiene sweep must classify as
+        unconfigured_provider and NEVER page — nothing routes to a provider
+        with zero configured entries. Distinct from an absent pool key
+        entirely (no change there).
+        """
         now = datetime.fromisoformat(self.NOW)
 
         empty = monitor.classify_credential_pool(
-            {"credential_pool": {"openai-codex": []}},
+            {"credential_pool": {"openai-codex": [], "copilot": [], "gemini": []}},
             now,
         )
         absent = monitor.classify_credential_pool({}, now)
 
-        self.assertTrue(empty["triggered"])
+        self.assertFalse(empty["triggered"])
+        self.assertEqual(empty["hits"], [])
         self.assertEqual(
-            empty["hits"],
-            [{"provider": "openai-codex", "id": "pool", "status": "empty"}],
+            empty["credential_pool_notices"],
+            [
+                {"provider": "copilot", "id": "pool", "status": "unconfigured_provider", "retry_at": None},
+                {"provider": "gemini", "id": "pool", "status": "unconfigured_provider", "retry_at": None},
+                {"provider": "openai-codex", "id": "pool", "status": "unconfigured_provider", "retry_at": None},
+            ],
         )
         self.assertFalse(absent["triggered"])
         self.assertEqual(absent["status"], "absent")
+
+    # Comprehensive per-class page/no-page coverage (including the live
+    # regression cases this classification change fixes) lives in
+    # tests/machine_setup/test_degraded_secrets_monitor_taxonomy.py — the
+    # main CI lane. This file is NOT wired into any CI workflow.
 
     def test_supported_shapes_match_runtime_has_available(self):
         from agent.credential_pool import CredentialPool, PooledCredential
@@ -513,9 +530,9 @@ class DegradedSecretsMonitorCredentialPoolTests(unittest.TestCase):
         self.assertEqual(
             result["hits"],
             [
-                {"provider": "codex", "id": "index:1", "status": "malformed"},
-                {"provider": "codex", "id": "missing", "status": "missing_credential"},
-                {"provider": "malformed-provider", "id": "index:0", "status": "malformed"},
+                {"provider": "codex", "id": "index:1", "status": "malformed", "retry_at": None},
+                {"provider": "codex", "id": "missing", "status": "missing_credential", "retry_at": None},
+                {"provider": "malformed-provider", "id": "index:0", "status": "malformed", "retry_at": None},
             ],
         )
 
@@ -537,7 +554,7 @@ class DegradedSecretsMonitorCredentialPoolTests(unittest.TestCase):
         self.assertTrue(result["triggered"])
         self.assertEqual(
             result["hits"],
-            [{"provider": "outage", "id": "bad", "status": "error"}],
+            [{"provider": "outage", "id": "bad", "status": "missing_credential", "retry_at": None}],
         )
         self.assertEqual(
             [item["provider"] for item in result["credential_pool_diagnostics"]],
@@ -629,7 +646,7 @@ class DegradedSecretsMonitorCredentialPoolTests(unittest.TestCase):
         self.assertTrue(payload["degraded"])
         self.assertEqual(
             payload["credential_pool"]["hits"],
-            [{"provider": "nous", "id": "pool-1", "status": "error"}],
+            [{"provider": "nous", "id": "pool-1", "status": "missing_credential", "retry_at": None}],
         )
 
     def test_mixed_pool_json_is_healthy_and_alert_transports_stay_silent(self):
@@ -680,7 +697,7 @@ class DegradedSecretsMonitorCredentialPoolTests(unittest.TestCase):
         self.assertNotIn("credential_pool_diagnostics", payload["credential_pool"])
         self.assertEqual(
             payload["credential_pool_diagnostics"][0]["unavailable_slots"],
-            [{"id": "primary", "status": "dead", "retry_at": None}],
+            [{"id": "primary", "status": "missing_credential", "retry_at": None}],
         )
         self.assertNotIn("DRY_RUN slack", result.stdout)
         self.assertNotIn("DRY_RUN clickup", result.stdout)
@@ -721,7 +738,7 @@ class DegradedSecretsMonitorCredentialPoolTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertIn("[degraded-secrets-monitor] healthy", result.stdout)
         self.assertIn(
-            "credential pool reduced redundancy: provider=codex usable=1/2 unavailable=primary:invalid",
+            "credential pool reduced redundancy: provider=codex usable=1/2 unavailable=primary:missing_credential",
             result.stdout,
         )
 
@@ -776,7 +793,7 @@ class DegradedSecretsMonitorCredentialPoolTests(unittest.TestCase):
             result.stdout,
         )
         self.assertIn(
-            "Credential pool degraded: provider 'codex' entry 'pool-1' last_status=exhausted",
+            "Credential pool degraded: provider 'codex' entry 'pool-1' status=exhausted_cap",
             result.stdout,
         )
         self.assertIn("[degraded-secrets-monitor] alerted (slack=True clickup=True)", result.stdout)

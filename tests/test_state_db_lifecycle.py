@@ -316,7 +316,7 @@ def test_root_budget_counts_session_databases_not_the_whole_hermes_home(tmp_path
     db.close()
 
 
-def test_default_profile_is_not_held_to_the_narrower_profile_budget(tmp_path: Path) -> None:
+def test_default_profile_reports_its_own_size_budget_breach(tmp_path: Path) -> None:
     path, db = _db_with_sessions(tmp_path)
     config = _config()
     config["profile"]["max_bytes"] = 1
@@ -324,7 +324,8 @@ def test_default_profile_is_not_held_to_the_narrower_profile_budget(tmp_path: Pa
     report = run_lifecycle(path, config=config)
 
     assert report["scope"] == "root"
-    assert report["budget_status"]["profile_over_bytes"] is False
+    assert report["metrics"]["profile_bytes"] > report["budgets"]["profile_max_bytes"]
+    assert report["budget_status"]["profile_over_bytes"] is True
     db.close()
 
 
@@ -350,11 +351,26 @@ def test_policy_with_prune_horizon_larger_than_size_budget_is_rejected(tmp_path:
         run_lifecycle(tmp_path / "state.db", config=config)
 
 
+def test_policy_rejects_profile_budget_below_retained_growth_horizon(tmp_path: Path) -> None:
+    config = _config()
+    config["root"]["max_bytes"] = 64 * 1024 * 1024
+    config["profile"]["max_bytes"] = 1 * 1024 * 1024
+    config["profile"]["prune_after_days"] = 30
+    config["growth"] = {"expected_bytes_per_day": 1 * 1024 * 1024}
+
+    with pytest.raises(LifecycleSafetyError, match="profile.max_bytes"):
+        run_lifecycle(tmp_path / "state.db", config=config)
+
+
 def test_shipped_production_policy_is_self_consistent() -> None:
     policy = lifecycle.load_retention_config()
 
     horizon = policy["growth"]["expected_bytes_per_day"] * policy["profile"]["prune_after_days"]
     assert horizon <= policy["root"]["max_bytes"]
+    # The default profile may hold the fleet's entire observed growth. Its
+    # budget therefore must not alarm before its retained horizon is eligible
+    # for pruning.
+    assert horizon <= policy["profile"]["max_bytes"]
     assert policy["profile"]["stale_session_after_hours"] > 0
 
 
@@ -543,6 +559,25 @@ def test_dry_run_reports_budget_forecast_and_vacuum_payoff(tmp_path: Path) -> No
     assert report["metrics"]["vacuum_reclaimable_bytes"] >= 0
     assert report["metrics"]["active_session_count"] == 1
     db.close()
+
+
+def test_budget_forecast_is_unsatisfiable_when_profile_horizon_breaches_only_profile() -> None:
+    forecast = lifecycle._budget_forecast(
+        root_bytes=100,
+        profile_bytes=75,
+        growth_bytes_per_day=20,
+        root_max_bytes=1000,
+        profile_max_bytes=100,
+        prune_after_days=6,
+        expected_bytes_per_day=None,
+    )
+
+    assert forecast["retention_horizon_bytes"] == 120
+    assert forecast["root_policy_satisfiable"] is True
+    assert forecast["profile_policy_satisfiable"] is False
+    assert forecast["policy_satisfiable"] is False
+    assert forecast["days_until_root_budget"] == 45.0
+    assert forecast["days_until_profile_budget"] == 1.25
 
 
 def test_cli_dry_run_flag_is_explicit_and_mutually_exclusive_with_apply(
