@@ -51,6 +51,11 @@ Safety / idempotency:
     the `needs-validation` tag is out of scope here (the PR-workflow skill's retry path owns
     tagging at the point of failure); this script only reads that tag for cross-referencing.
   - Re-running after a PR now exists for a branch is a silent no-op for that branch (idempotent).
+  - Before opening anything, inventories all open PRs by ClickUp task id. A retry branch for a
+    task with an open PR reuses that PR identity (no second create); duplicate branches discovered
+    in one sweep reserve the task after the first create. GitHub inventory failure fails closed.
+    Superseded worktrees/branches remain owned by the existing worktree sweep -- this script does
+    not add a parallel cleanup or delete remote branches.
   - Every ClickUp/gh call is wrapped best-effort: a single branch's failure (rate limit,
     transient network error, malformed remote metadata) is logged and skipped, never fatal
     to the whole sweep.
@@ -72,16 +77,39 @@ Env:
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
+import fcntl
 import json
+import math
 import os
+import re
 import subprocess
 import sys
+import time
+from typing import NamedTuple
 import urllib.request
 
 DEFAULT_PREFIXES = ("agent/", "hermes/")
 NEEDS_VALIDATION_TAG = "needs-validation"
 CLICKUP_TEAM_ID = "9017245888"  # same team id as scripts/clickup_poll_gate.py
 DEFAULT_BARE_ROOT = os.path.join(os.path.expanduser("~"), ".hermes", "bare")
+TASK_ID_RE = re.compile(r"\b(86e[0-9a-z]{5,8})\b", re.IGNORECASE)
+TASK_MARKER_RE = re.compile(
+    r"<!--\s*clickup-task-id:\s*(86e[0-9a-z]{5,8})\s*-->", re.IGNORECASE
+)
+DEFAULT_LOCK_ROOT = os.path.join("/tmp", "hermes-orphan-pr-sweep-locks")
+RESERVATION_TTL_SECONDS = 300
+MAX_CLOCK_SKEW_SECONDS = 30
+
+
+class TaskIdentity(NamedTuple):
+    status: str  # unique | absent | ambiguous
+    task_id: str | None = None
+
+
+class PrLookup(NamedTuple):
+    status: str  # found | absent | unknown
+    number: int | None = None
 
 
 def _run(cmd, **kwargs):
@@ -142,8 +170,7 @@ def _gh(args, gh_repo=None):
 
 
 def _existing_pr(branch, gh_repo=None):
-    """Return the PR number for `branch` (open OR closed/merged — any of those means
-    "not orphaned"), or None if no PR references it at all."""
+    """Tri-state branch PR lookup; API/shape failures are unknown, never absent."""
     proc = _run(
         _gh(
             [
@@ -161,47 +188,299 @@ def _existing_pr(branch, gh_repo=None):
             f"[orphan-sweep] gh pr list failed for {branch}: {proc.stderr.strip()}",
             file=sys.stderr,
         )
-        return None  # unknown — treated as "no PR found" below, sweep will try to create;
-                     # `gh pr create` itself is idempotent-safe (errors if one already exists)
+        return PrLookup("unknown")
     try:
         rows = json.loads(proc.stdout or "[]")
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, TypeError):
+        return PrLookup("unknown")
+    if not isinstance(rows, list):
+        return PrLookup("unknown")
+    if not rows:
+        return PrLookup("absent")
+    if (
+        not isinstance(rows[0], dict)
+        or not isinstance(rows[0].get("number"), int)
+        or not isinstance(rows[0].get("state"), str)
+    ):
+        return PrLookup("unknown")
+    return PrLookup("found", rows[0]["number"])
+
+
+def _task_identity(*texts):
+    """Resolve task identity with canonical marker precedence and tri-state output."""
+    structured = {
+        match.lower()
+        for text in texts
+        for match in TASK_MARKER_RE.findall(str(text or ""))
+    }
+    if len(structured) == 1:
+        return TaskIdentity("unique", next(iter(structured)))
+    if len(structured) > 1:
+        return TaskIdentity("ambiguous")
+    matches = {
+        match.lower()
+        for text in texts
+        for match in TASK_ID_RE.findall(str(text or ""))
+    }
+    if len(matches) == 1:
+        return TaskIdentity("unique", next(iter(matches)))
+    return TaskIdentity("ambiguous" if matches else "absent")
+
+
+def _task_id(*texts):
+    """Compatibility helper: return the id only when identity is unique."""
+    identity = _task_identity(*texts)
+    return identity.task_id if identity.status == "unique" else None
+
+
+def _is_bot_author(author):
+    login = str((author or {}).get("login") or "").lower()
+    return login == "app/hermes-dev-assistant" or login in {
+        "hermes-dev-assistant",
+        "hermes-dev-assistant[bot]",
+    }
+
+
+def _open_prs_by_task(gh_repo=None, prefixes=DEFAULT_PREFIXES):
+    """Index open PRs by ClickUp task, or return None when GitHub is unreadable.
+
+    This is the task-level idempotency seam.  Branch-level ``_existing_pr`` is
+    insufficient because every executor retry has a fresh branch name.
+    """
+    repo = gh_repo or "{owner}/{repo}"
+    proc = _run([
+        "gh", "api", "--paginate", "--slurp",
+        f"repos/{repo}/pulls?state=open&per_page=100",
+    ])
+    if proc.returncode != 0:
+        print(
+            f"[orphan-sweep] gh open-PR inventory failed: {proc.stderr.strip()} — "
+            "refusing PR creation because task-level uniqueness cannot be proven",
+            file=sys.stderr,
+        )
         return None
-    return rows[0]["number"] if rows else None
+    try:
+        pages = json.loads(proc.stdout or "[]")
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(pages, list) or any(not isinstance(page, list) for page in pages):
+        return None
+    indexed = {}
+    for page in pages:
+        for row in page:
+            if (
+                not isinstance(row, dict)
+                or not isinstance(row.get("number"), int)
+                or not isinstance(row.get("head"), dict)
+                or not isinstance(row["head"].get("ref"), str)
+                or not isinstance(row.get("user"), dict)
+                or not isinstance(row["user"].get("login"), str)
+            ):
+                return None
+            identity = _task_identity(row["head"]["ref"], row.get("title"), row.get("body"))
+            is_bot = _is_bot_author(row.get("user"))
+            if (
+                identity.status != "unique"
+                and row["head"]["ref"].startswith(tuple(prefixes))
+                and is_bot
+            ):
+                print(
+                    f"[orphan-sweep] open bot branch {row['head']['ref']} has "
+                    f"{identity.status} task identity — refusing incomplete inventory",
+                    file=sys.stderr,
+                )
+                return None
+            if identity.status == "unique":
+                indexed.setdefault(identity.task_id, []).append(
+                {
+                    "number": row.get("number"),
+                    "headRefName": row["head"]["ref"],
+                    "bot": is_bot,
+                }
+            )
+    return indexed
 
 
-def _last_commit_subject_body(ref):
-    proc = _run(["git", "log", "-1", "--pretty=%s%x00%b", ref])
+@contextmanager
+def _task_lease(task_id):
+    """Cross-process task-scoped mutex held across final inventory and PR creation."""
+    root = os.environ.get("HERMES_ORPHAN_PR_LOCK_ROOT", DEFAULT_LOCK_ROOT)
+    os.makedirs(root, mode=0o700, exist_ok=True)
+    path = os.path.join(root, f"{task_id}.lock")
+    with open(path, "a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield handle
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _clear_reservation(handle):
+    """Durably remove a reservation while its task lease is held."""
+    handle.seek(0)
+    handle.truncate()
+    handle.flush()
+    os.fsync(handle.fileno())
+
+
+def _fresh_reservation(handle):
+    """Return a valid recent reservation; durably clean unsafe/expired data.
+
+    A small future timestamp is tolerated for ordinary host clock skew, but a
+    reservation farther in the future is malformed rather than immortal.
+    """
+    try:
+        handle.seek(0)
+        raw = handle.read()
+        if not raw:
+            return None
+        reservation = json.loads(raw)
+        if not isinstance(reservation, dict):
+            raise ValueError("reservation is not an object")
+        created_value = reservation.get("created_at")
+        if isinstance(created_value, bool) or not isinstance(created_value, (int, float)):
+            raise ValueError("invalid timestamp")
+        created_at = float(created_value)
+        branch = reservation.get("branch")
+        state = reservation.get("state")
+        if (
+            not math.isfinite(created_at)
+            or not isinstance(branch, str)
+            or not branch
+            or state not in {"pending", "created"}
+        ):
+            raise ValueError("invalid reservation fields")
+    except (ValueError, TypeError, json.JSONDecodeError):
+        _clear_reservation(handle)
+        return None
+    now = time.time()
+    if created_at > now + MAX_CLOCK_SKEW_SECONDS:
+        _clear_reservation(handle)
+        return None
+    age = max(0.0, now - created_at)
+    if age > RESERVATION_TTL_SECONDS:
+        _clear_reservation(handle)
+        return None
+    return reservation
+
+
+def _record_reservation(handle, branch, *, state, output=None):
+    handle.seek(0)
+    handle.truncate()
+    reservation = {"state": state, "branch": branch, "created_at": time.time()}
+    if output is not None:
+        reservation["output"] = output
+    json.dump(reservation, handle)
+    handle.flush()
+    os.fsync(handle.fileno())
+
+
+def _last_commit_subject_body(ref, gitdir=None):
+    proc = (
+        _git(gitdir, "log", "-1", "--pretty=%s%x00%b", ref)
+        if gitdir
+        else _run(["git", "log", "-1", "--pretty=%s%x00%b", ref])
+    )
     if proc.returncode != 0 or "\x00" not in proc.stdout:
         return f"chore: recover orphaned branch {ref}", ""
     subject, _, body = proc.stdout.partition("\x00")
     return subject.strip() or f"chore: recover orphaned branch {ref}", body.strip()
 
 
-def _create_pr(branch, base, dry_run, remote="origin", gh_repo=None):
+def _create_pr(
+    branch, base, dry_run, remote="origin", gh_repo=None, open_prs_by_task=None,
+    prefixes=DEFAULT_PREFIXES,
+):
     title, body = _last_commit_subject_body(f"{remote}/{branch}")
+    identity = _task_identity(branch, title, body)
+    if identity.status != "unique":
+        print(
+            f"[orphan-sweep] {branch}: {identity.status} ClickUp task identity — "
+            "refusing bot PR creation",
+            file=sys.stderr,
+        )
+        return False
+    task_id = identity.task_id
+    if open_prs_by_task is None:
+        open_prs_by_task = _open_prs_by_task(gh_repo, prefixes=prefixes)
+        if open_prs_by_task is None:
+            return False
+    existing_for_task = open_prs_by_task.get(task_id, [])
+    if existing_for_task:
+        canonical = sorted(
+            existing_for_task,
+            key=lambda row: (row.get("number") is None, row.get("number") or 0),
+        )[0]
+        print(
+            f"[orphan-sweep] {branch}: reuse open PR #{canonical.get('number')} on "
+            f"{canonical.get('headRefName')} for ClickUp task {task_id}; no replacement PR created"
+        )
+        return True
     full_body = (
-        f"{body}\n\n" if body else ""
-    ) + (
-        "_Opened automatically by scripts/ops/orphan_pr_sweep.py — this branch was pushed "
-        "but never got a PR (see ClickUp 86e29q8pg: `gh pr create` had no retry/re-auth, so "
-        "a 401 silently stranded it)._"
+        f"<!-- clickup-task-id: {task_id} -->\n\n"
+        + (f"{body}\n\n" if body else "")
+        + "_Opened automatically by the orphan PR sweep after this pushed branch was found "
+          "without a PR._"
     )
     if dry_run:
         print(f"[orphan-sweep] DRY-RUN would create PR for {branch}: {title!r}")
         return True
-    proc = _run(
-        _gh(
-            [
-                "pr", "create",
-                "--head", branch,
-                "--base", base,
-                "--title", title,
-                "--body", full_body,
-            ],
-            gh_repo,
+    try:
+        with _task_lease(task_id) as lease_file:
+            # Refresh while holding the shared mutex: the pre-sweep inventory is
+            # only an optimization and cannot establish cross-process uniqueness.
+            reservation = _fresh_reservation(lease_file)
+            if reservation:
+                print(
+                    f"[orphan-sweep] {branch}: reuse recent {reservation.get('state')} task "
+                    f"reservation from {reservation.get('branch')} for ClickUp task {task_id}; "
+                    "no replacement PR created"
+                )
+                return True
+            refreshed = _open_prs_by_task(gh_repo, prefixes=prefixes)
+            if refreshed is None:
+                return False
+            existing_for_task = refreshed.get(task_id, [])
+            if existing_for_task:
+                canonical = sorted(
+                    existing_for_task,
+                    key=lambda row: (row.get("number") is None, row.get("number") or 0),
+                )[0]
+                print(
+                    f"[orphan-sweep] {branch}: reuse open PR #{canonical.get('number')} on "
+                    f"{canonical.get('headRefName')} for ClickUp task {task_id}; "
+                    "no replacement PR created"
+                )
+                return True
+            # Persist intent before the API call. A crash after GitHub creates
+            # the PR therefore leaves a fresh pending reservation that bridges
+            # read-after-write lag for the next process. Expiry plus the
+            # authoritative inventory refresh above provides bounded recovery.
+            _record_reservation(lease_file, branch, state="pending")
+            proc = _run(
+                _gh(
+                    [
+                        "pr", "create",
+                        "--head", branch,
+                        "--base", base,
+                        "--title", title,
+                        "--body", full_body,
+                    ],
+                    gh_repo,
+                )
+            )
+            # Keep the already-fsynced pending record untouched after success.
+            # Rewriting it would reintroduce a truncate/write crash window. The
+            # next process reconciles via inventory once this bounded reservation
+            # expires. A definite CLI failure can clear immediately for retry.
+            if proc.returncode != 0:
+                _clear_reservation(lease_file)
+    except OSError as exc:
+        print(
+            f"[orphan-sweep] task lease failed for {task_id}: {exc!r} — refusing PR creation",
+            file=sys.stderr,
         )
-    )
+        return False
     if proc.returncode != 0:
         print(
             f"[orphan-sweep] gh pr create failed for {branch}: {proc.stderr.strip()}",
@@ -348,6 +627,9 @@ def check_unpushed(base="main", prefixes=DEFAULT_PREFIXES, bare_root=None, push=
     derived from `gh_repo` when not passed explicitly, so cross-repo mirrors never false-positive.
     """
     bare_root = bare_root if bare_root is not None else DEFAULT_BARE_ROOT
+    open_prs_by_task = _open_prs_by_task(gh_repo, prefixes=prefixes) if push else {}
+    if open_prs_by_task is None:
+        return 1
     if repo_match is None and gh_repo and "/" in gh_repo:
         # Full owner__repo stem so colingreig__hermes-agent.git is matched but the
         # nousresearch__hermes-agent.git upstream mirror is NOT.
@@ -384,6 +666,29 @@ def check_unpushed(base="main", prefixes=DEFAULT_PREFIXES, bare_root=None, push=
         )
         if not push:
             continue
+        title, body = _last_commit_subject_body(branch, gitdir=gitdir)
+        identity = _task_identity(branch, title, body)
+        if identity.status != "unique":
+            print(
+                f"[orphan-sweep]   {branch}: {identity.status} ClickUp task identity — "
+                "refusing push/PR recovery",
+                file=sys.stderr,
+            )
+            continue
+        task_id = identity.task_id
+        existing_for_task = open_prs_by_task.get(task_id, [])
+        if existing_for_task:
+            canonical = sorted(
+                existing_for_task,
+                key=lambda row: (row.get("number") is None, row.get("number") or 0),
+            )[0]
+            print(
+                f"[orphan-sweep]   reuse open PR #{canonical.get('number')} on "
+                f"{canonical.get('headRefName')} for ClickUp task {task_id}; "
+                "replacement branch stays local for the existing worktree sweep"
+            )
+            handled += 1
+            continue
         if dry_run:
             print(f"[orphan-sweep]   DRY-RUN would push+PR {branch}")
             handled += 1
@@ -397,8 +702,19 @@ def check_unpushed(base="main", prefixes=DEFAULT_PREFIXES, bare_root=None, push=
             continue
         print(f"[orphan-sweep]   pushed {branch} to {remote}")
         # After push, <remote>/<branch> exists; reuse the standard PR-create path.
-        if _create_pr(branch, base, dry_run=False, remote=remote, gh_repo=gh_repo):
+        if _create_pr(
+            branch,
+            base,
+            dry_run=False,
+            remote=remote,
+            gh_repo=gh_repo,
+            open_prs_by_task=open_prs_by_task,
+            prefixes=prefixes,
+        ):
             handled += 1
+            open_prs_by_task.setdefault(task_id, []).append(
+                {"number": None, "headRefName": branch, "bot": True}
+            )
 
     if push and handled:
         print(f"[orphan-sweep] check-unpushed: pushed/PR'd {handled}/{len(stranded)} branch(es)")
@@ -411,6 +727,10 @@ def sweep(base="main", prefixes=DEFAULT_PREFIXES, dry_run=False, remote="origin"
     if not branches:
         print(f"[orphan-sweep] no agent/* or hermes/* branches on {remote} — nothing to do")
         return 0
+
+    open_prs_by_task = _open_prs_by_task(gh_repo, prefixes=prefixes)
+    if open_prs_by_task is None:
+        return 1
 
     needs_validation_tasks = _clickup_needs_validation_tasks()
     if needs_validation_tasks:
@@ -425,15 +745,62 @@ def sweep(base="main", prefixes=DEFAULT_PREFIXES, dry_run=False, remote="origin"
         if not _ahead_of_base(branch, base, remote):
             skipped += 1
             continue
-        pr_number = _existing_pr(branch, gh_repo)
-        if pr_number is not None:
+        pr_lookup = _existing_pr(branch, gh_repo)
+        if pr_lookup.status == "unknown":
+            print(
+                f"[orphan-sweep] {branch}: branch PR state unknown — refusing creation",
+                file=sys.stderr,
+            )
+            errors += 1
+            continue
+        if pr_lookup.status == "found":
+            skipped += 1
+            continue
+        title, body = _last_commit_subject_body(f"{remote}/{branch}")
+        identity = _task_identity(branch, title, body)
+        if identity.status != "unique":
+            print(
+                f"[orphan-sweep] {branch}: {identity.status} ClickUp task identity — "
+                "refusing bot PR creation",
+                file=sys.stderr,
+            )
+            errors += 1
+            continue
+        task_id = identity.task_id
+        existing_for_task = open_prs_by_task.get(task_id, [])
+        if existing_for_task:
+            canonical = sorted(
+                existing_for_task,
+                key=lambda row: (row.get("number") is None, row.get("number") or 0),
+            )[0]
+            kind = "open bot PR" if canonical.get("bot") else "open PR"
+            print(
+                f"[orphan-sweep] {branch}: ClickUp task {task_id} already has {kind} "
+                f"#{canonical.get('number')} on {canonical.get('headRefName')} — reuse open "
+                f"{'bot PR' if canonical.get('bot') else 'PR'} #{canonical.get('number')} "
+                "and add follow-up commits there; leave this branch to the existing worktree "
+                "sweep (no parallel cleanup)"
+            )
             skipped += 1
             continue
         print(f"[orphan-sweep] orphan candidate: {branch} (ahead of {base}, no PR)")
-        if not _create_pr(branch, base, dry_run, remote=remote, gh_repo=gh_repo):
+        if not _create_pr(
+            branch,
+            base,
+            dry_run,
+            remote=remote,
+            gh_repo=gh_repo,
+            open_prs_by_task=open_prs_by_task,
+            prefixes=prefixes,
+        ):
             errors += 1
             continue
         created += 1
+        # Keep the in-process reservation as an optimization; `_create_pr` also
+        # holds the shared task lease across its authoritative inventory refresh.
+        open_prs_by_task.setdefault(task_id, []).append(
+            {"number": None, "headRefName": branch, "bot": True}
+        )
 
     print(
         f"[orphan-sweep] done: {created} PR(s) created, {skipped} branch(es) already "
