@@ -992,6 +992,9 @@ the **sole writer** of these files. It:
 
 - verifies every source's sha256 against the manifest and **fails closed** on
   drift (never installs unverified bytes);
+- deploys the exact `self_report_manifest.json` used for the transaction to
+  `~/.hermes/scripts/`, so the runtime coverage contract is present alongside
+  the files it governs;
 - snapshots each existing destination into
   `~/.hermes/logs/self-report-installs/<UTC-ts>/` (plus a
   `<dest>.bak-self-report-install-<ts>` sibling) before writing;
@@ -1075,6 +1078,7 @@ This bundle closes that gap the same way `self_report_manifest.json` +
 exactly: sha-pinned, fails closed on any source hash drift, snapshots each
 existing destination into `~/.hermes/logs/spend-guard-installs/<UTC-ts>/`
 (plus a `<dest>.bak-spend-install-<ts>` sibling) before writing, installs
+the four files plus the exact `spend_manifest.json` transaction contract
 atomically and re-verifies the deployed bytes (restoring the snapshot on any
 mismatch), writes a durable `install-receipt.json`, and refuses any
 destination outside `~/.hermes/` or named `claim_store.py` /
