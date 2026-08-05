@@ -1,18 +1,43 @@
 {
-  "version": 1,
-  "notes": "This file is the single source of truth for every label/tag used across ClickUp and GitHub. Adding, renaming, or removing a label is a PR to this file, never an ad-hoc tag typed into the ClickUp or GitHub UI. Anything applied to a task or PR that is not defined here is sprawl and gets flagged by migrate_clickup_labels.py --audit.",
+  "version": 2,
+  "notes": "This file is the single source of truth for every label/tag used across ClickUp and GitHub. Adding, renaming, or removing a label is a PR to this file, never an ad-hoc tag typed into the ClickUp or GitHub UI. Anything applied to a task or PR that is not defined here is sprawl and gets flagged by migrate_clickup_labels.py --audit. v2 (2026-08-05): Colin's 'less is more' call -- consolidated from 35 labels/6 namespaces down to 18 labels/5 namespaces. The src: namespace is deleted entirely (provenance is already recorded by the issue author / task creator, so a label for it is redundant). flow: is trimmed from 9 values to 4 -- needs-prep and needs-validation are removed because their absence (no flow:prepped label) or the board's own status (In Review) already carries that signal; superseded and duplicate are removed because they are closure reasons that belong in the close action, not a label; prep-blocked folds into blocked (one blocked signal, not two). lane:design folds into lane:content. model:human folds into flow:needs-human (it was the same signal expressed twice). area: sheds pr-pipeline and validator (both fold into infra) and billing (renamed cost); data, reporting, seo, ux, and content are dropped outright. See rules.retired for the full list of label strings this registry deliberately killed.",
   "rules": {
     "form": "namespace:value, lowercase, ascii, hyphen-separated values only",
-    "closed_namespaces": ["lane", "model", "risk", "flow", "src"],
+    "closed_namespaces": ["lane", "model", "risk", "flow"],
     "open_namespaces": ["area"],
-    "max_labels_per_task_guidance": "one lane, one model, one risk, zero-or-more flow, zero-or-more area, one src",
+    "max_labels_per_task_guidance": "one lane, one model, one risk, zero-or-more flow, zero-or-more area",
+    "open_namespace_bar": "area is the only open namespace, and the bar for adding a new value to it is now explicit: a new area value requires a PR and a stated reason none of the existing four (infra, security, observability, cost) cover it.",
     "forbidden_patterns": [
       "\\s",
       "^-",
       "^(blocked-operator|attempt-cap-exceeded)-\\d{10}$",
       "^(superseded-by|duplicate-of)-[a-z0-9]+$",
-      "^(code|content|design|ops|haiku|sonnet|opus|fable|human|low|medium|high|hermes|audit)$"
-    ]
+      "^(code|content|ops|haiku|sonnet|opus|fable|low|medium|high|prepped|blocked|needs-human|validate-failed|infra|security|observability|cost)$"
+    ],
+    "retired": {
+      "note": "Label strings that existed in the v1 (35-label) registry and were deliberately removed in the v2 consolidation. Kept here so a future audit recognises these as intentional kills, not new sprawl re-forming under an old name.",
+      "labels": [
+        "model:human",
+        "flow:needs-prep",
+        "flow:prep-blocked",
+        "flow:needs-validation",
+        "flow:superseded",
+        "flow:duplicate",
+        "lane:design",
+        "src:hermes",
+        "src:human",
+        "src:audit",
+        "area:pr-pipeline",
+        "area:validator",
+        "area:billing",
+        "area:data",
+        "area:reporting",
+        "area:seo",
+        "area:ux",
+        "area:content"
+      ],
+      "retired_namespaces": ["src"]
+    }
   },
   "namespaces": {
     "lane": {
@@ -22,8 +47,7 @@
       "color": "#0388d1",
       "values": {
         "code": {"desc": "Software engineering work: repos, scripts, infrastructure-as-code.", "color": "#01579b"},
-        "content": {"desc": "Written content work: copy, blog posts, marketing collateral.", "color": "#0388d1"},
-        "design": {"desc": "Visual/UX design work: mockups, brand assets, layouts.", "color": "#29b6f6"},
+        "content": {"desc": "Written or visual content work: copy, blog posts, marketing collateral, mockups, brand assets, layouts.", "color": "#0388d1"},
         "ops": {"desc": "Operational work: deploys, monitors, credentials, fleet upkeep.", "color": "#80d8ff"}
       }
     },
@@ -36,8 +60,7 @@
         "haiku": {"desc": "Mechanical, low-judgment work safe for the cheapest tier.", "color": "#b39ddb"},
         "sonnet": {"desc": "Default working tier for most agent-executable tasks.", "color": "#7e57c2"},
         "opus": {"desc": "Requires stronger reasoning: ambiguous scope, multi-step judgment.", "color": "#5e35b1"},
-        "fable": {"desc": "Requires orchestration-grade judgment across a large or costly task.", "color": "#4527a0"},
-        "human": {"desc": "Not agent-executable at any model tier; requires a person.", "color": "#311b92"}
+        "fable": {"desc": "Requires orchestration-grade judgment across a large or costly task.", "color": "#4527a0"}
       }
     },
     "risk": {
@@ -57,45 +80,22 @@
       "cardinality": "zero-or-more",
       "color": "#ffa727",
       "values": {
-        "needs-prep": {"desc": "Not yet groomed; blocking questions or scope gaps remain.", "color": "#ffe0b2"},
         "prepped": {"desc": "Groomed and ready for an executor to claim.", "color": "#ffcc80"},
-        "prep-blocked": {"desc": "Grooming stalled on a dependency outside the task itself.", "color": "#ffb74d"},
-        "needs-human": {"desc": "Requires a person's judgment or approval before it can proceed.", "color": "#ffa726"},
-        "needs-validation": {"desc": "Work is done and awaiting the validator's QA pass.", "color": "#fb8c00"},
-        "validate-failed": {"desc": "The validator rejected the work; sent back for rework.", "color": "#f57c00"},
-        "blocked": {"desc": "Stalled on an external dependency, credential, or decision.", "color": "#ef6c00"},
-        "superseded": {"desc": "Replaced by newer work; kept for history, not actionable.", "color": "#e65100"},
-        "duplicate": {"desc": "Duplicates another tracked task; not independently actionable.", "color": "#bf5000"}
-      }
-    },
-    "src": {
-      "purpose": "Provenance of the task: who or what filed it.",
-      "closed": true,
-      "cardinality": "zero-or-one",
-      "color": "#009688",
-      "values": {
-        "hermes": {"desc": "Filed autonomously by the Hermes agent.", "color": "#004d40"},
-        "human": {"desc": "Filed by a person.", "color": "#00897b"},
-        "audit": {"desc": "Filed by an audit or monitor run.", "color": "#4db6ac"}
+        "blocked": {"desc": "Stalled: on grooming, an external dependency, a credential, or a decision.", "color": "#ef6c00"},
+        "needs-human": {"desc": "Requires a person's judgment or approval before it can proceed; not agent-executable at any model tier.", "color": "#ffa726"},
+        "validate-failed": {"desc": "The validator rejected the work; sent back for rework.", "color": "#f57c00"}
       }
     },
     "area": {
-      "purpose": "Subject matter of the work. The only namespace allowed to grow, and only via a PR to this file.",
+      "purpose": "Subject matter of the work. The only open namespace, and only via a PR to this file with a stated reason the existing four values don't cover it.",
       "closed": false,
       "cardinality": "zero-or-more",
       "color": "#607d8b",
       "values": {
-        "infra": {"desc": "Core infrastructure: deploy pipelines, servers, fleet config.", "color": "#263238"},
-        "observability": {"desc": "Monitoring, logging, alerting, dashboards.", "color": "#37474f"},
+        "infra": {"desc": "Core infrastructure: deploy pipelines, PR/merge automation, the validator, servers, fleet config.", "color": "#263238"},
         "security": {"desc": "Credentials, access control, vulnerabilities, hardening.", "color": "#455a64"},
-        "content": {"desc": "Editorial or marketing content subject matter.", "color": "#546e7a"},
-        "seo": {"desc": "Search visibility, keywords, technical SEO.", "color": "#607d8b"},
-        "reporting": {"desc": "Recurring reports, digests, status emails.", "color": "#78909c"},
-        "data": {"desc": "Data pipelines, schemas, storage, migrations.", "color": "#90a4ae"},
-        "ux": {"desc": "User experience and interface design.", "color": "#a7bcc4"},
-        "billing": {"desc": "Spend, invoicing, cost tracking.", "color": "#b0bec5"},
-        "pr-pipeline": {"desc": "Pull-request creation, review, and merge automation.", "color": "#cfd8dc"},
-        "validator": {"desc": "The QA/validation gate itself.", "color": "#eceff1"}
+        "observability": {"desc": "Monitoring, logging, alerting, dashboards.", "color": "#37474f"},
+        "cost": {"desc": "Spend, invoicing, billing, cost tracking.", "color": "#78909c"}
       }
     }
   }
