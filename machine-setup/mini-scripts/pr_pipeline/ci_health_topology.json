@@ -34,12 +34,12 @@
       "listener_command": ["/home/colingreig/actions-runner/topdynamicspartners/bin/Runner.Listener", "run"]
     },
     {
-      "repo": "colingreig/elevatoruptime.com",
+      "repo": "ignitemarketing/elevatoruptime.com",
       "name": "hermes-elevatoruptime.com",
       "listener_command": ["/home/colingreig/actions-runner/elevatoruptime.com/bin/Runner.Listener", "run"]
     },
     {
-      "repo": "colingreig/thermal",
+      "repo": "ignitemarketing/thermal",
       "name": "hermes-thermal",
       "listener_command": ["/home/colingreig/actions-runner/thermal/bin/Runner.Listener", "run"]
     }
@@ -52,7 +52,7 @@
       "max_reruns": 1
     },
     {
-      "repo": "colingreig/thermal",
+      "repo": "ignitemarketing/thermal",
       "workflow": "E2E Functional",
       "event": "schedule",
       "job": "e2e functional suite (advisory)",

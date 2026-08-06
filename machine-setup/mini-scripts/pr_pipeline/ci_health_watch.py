@@ -44,14 +44,14 @@ GATING_EVENTS = {"push", "merge_group", "pull_request"}
 STATE_SCHEMA_VERSION = 2
 LIFECYCLE_SCHEMA_VERSION = 1
 EXPECTED_RUNNERS = {
-    ("colingreig/elevatoruptime.com", "hermes-elevatoruptime.com"),
+    ("ignitemarketing/elevatoruptime.com", "hermes-elevatoruptime.com"),
     ("colingreig/jdmbuysell-v4", "hermes-jdmbuysell-v4"),
-    ("colingreig/thermal", "hermes-thermal"),
+    ("ignitemarketing/thermal", "hermes-thermal"),
     ("colingreig/topdynamicspartners", "hermes-topdynamicspartners"),
 }
 EXPECTED_RECOVERY_IDENTITIES = {
     ("colingreig/jdmbuysell-v4", "Dead-image monitor", "schedule"),
-    ("colingreig/thermal", "E2E Functional", "schedule"),
+    ("ignitemarketing/thermal", "E2E Functional", "schedule"),
 }
 
 
@@ -405,7 +405,7 @@ def _load_topology(path: Path = TOPOLOGY_PATH) -> dict[str, Any]:
             raise MonitorError("recovery allowlist contains an unknown workflow identity")
         if item.get("event") != "schedule" or item.get("max_reruns") != 1:
             raise MonitorError("recovery allowlist entries must be scheduled and capped at one rerun")
-        if item.get("repo") == "colingreig/thermal":
+        if item.get("repo") == "ignitemarketing/thermal":
             if item.get("job") != "e2e functional suite (advisory)" or item.get("expected_runner") != "hermes-thermal":
                 raise MonitorError("Thermal recovery must declare the exact E2E job and runner")
             if item.get("mode") != "job-interruption":

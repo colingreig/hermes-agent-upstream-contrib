@@ -41,8 +41,8 @@ class FakeRunner:
         self.runner_statuses = {
             "colingreig/jdmbuysell-v4": "online",
             "colingreig/topdynamicspartners": "online",
-            "colingreig/elevatoruptime.com": "online",
-            "colingreig/thermal": "online",
+            "ignitemarketing/elevatoruptime.com": "online",
+            "ignitemarketing/thermal": "online",
         }
         self.runs: list[dict[str, object]] = []
         self.runs_by_repo: dict[str, list[dict[str, object]]] = {}
@@ -58,8 +58,8 @@ class FakeRunner:
         self.listener_commands = {
             "colingreig/jdmbuysell-v4": "/home/colingreig/actions-runner/jdmbuysell-v4/bin/Runner.Listener run",
             "colingreig/topdynamicspartners": "/home/colingreig/actions-runner/topdynamicspartners/bin/Runner.Listener run",
-            "colingreig/elevatoruptime.com": "/home/colingreig/actions-runner/elevatoruptime.com/bin/Runner.Listener run",
-            "colingreig/thermal": "/home/colingreig/actions-runner/thermal/bin/Runner.Listener run",
+            "ignitemarketing/elevatoruptime.com": "/home/colingreig/actions-runner/elevatoruptime.com/bin/Runner.Listener run",
+            "ignitemarketing/thermal": "/home/colingreig/actions-runner/thermal/bin/Runner.Listener run",
         }
 
     def __call__(self, cmd, **_kwargs):
@@ -99,11 +99,11 @@ class FakeRunner:
         if cmd[:3] == ["gh", "api", "repos/colingreig/topdynamicspartners/actions/runners"]:
             payload = {"runners": [{"name": "hermes-topdynamicspartners", "status": self.runner_statuses["colingreig/topdynamicspartners"], "busy": False}]}
             return subprocess.CompletedProcess(cmd, 0, json.dumps(payload), "")
-        if cmd[:3] == ["gh", "api", "repos/colingreig/elevatoruptime.com/actions/runners"]:
-            payload = {"runners": [{"name": "hermes-elevatoruptime.com", "status": self.runner_statuses["colingreig/elevatoruptime.com"], "busy": False}]}
+        if cmd[:3] == ["gh", "api", "repos/ignitemarketing/elevatoruptime.com/actions/runners"]:
+            payload = {"runners": [{"name": "hermes-elevatoruptime.com", "status": self.runner_statuses["ignitemarketing/elevatoruptime.com"], "busy": False}]}
             return subprocess.CompletedProcess(cmd, 0, json.dumps(payload), "")
-        if cmd[:3] == ["gh", "api", "repos/colingreig/thermal/actions/runners"]:
-            payload = {"runners": [{"name": "hermes-thermal", "status": self.runner_statuses["colingreig/thermal"], "busy": False}]}
+        if cmd[:3] == ["gh", "api", "repos/ignitemarketing/thermal/actions/runners"]:
+            payload = {"runners": [{"name": "hermes-thermal", "status": self.runner_statuses["ignitemarketing/thermal"], "busy": False}]}
             return subprocess.CompletedProcess(cmd, 0, json.dumps(payload), "")
         if cmd[:2] == ["gh", "api"] and "/actions/runs/" in cmd[2] and cmd[2].endswith("/jobs?filter=latest"):
             run_id = int(cmd[2].split("/actions/runs/", 1)[1].split("/", 1)[0])
@@ -165,8 +165,8 @@ class CiHealthWatchTests(unittest.TestCase):
             {
                 ("colingreig/jdmbuysell-v4", "hermes-jdmbuysell-v4"),
                 ("colingreig/topdynamicspartners", "hermes-topdynamicspartners"),
-                ("colingreig/elevatoruptime.com", "hermes-elevatoruptime.com"),
-                ("colingreig/thermal", "hermes-thermal"),
+                ("ignitemarketing/elevatoruptime.com", "hermes-elevatoruptime.com"),
+                ("ignitemarketing/thermal", "hermes-thermal"),
             },
         )
         self.assertEqual(
@@ -659,8 +659,8 @@ class CiHealthWatchTests(unittest.TestCase):
         state = json.loads(self.state_path.read_text(encoding="utf-8"))
         self.assertIn("colingreig/jdmbuysell-v4::hermes-jdmbuysell-v4=online", state["last_transition"]["runner_status"])
         self.assertIn("colingreig/topdynamicspartners::hermes-topdynamicspartners=online", state["last_transition"]["runner_status"])
-        self.assertIn("colingreig/elevatoruptime.com::hermes-elevatoruptime.com=online", state["last_transition"]["runner_status"])
-        self.assertIn("colingreig/thermal::hermes-thermal=online", state["last_transition"]["runner_status"])
+        self.assertIn("ignitemarketing/elevatoruptime.com::hermes-elevatoruptime.com=online", state["last_transition"]["runner_status"])
+        self.assertIn("ignitemarketing/thermal::hermes-thermal=online", state["last_transition"]["runner_status"])
 
     def test_local_runner_fallback_is_exact_and_fail_closed(self):
         self.runner.gh_runner_api_forbidden = True
@@ -1173,7 +1173,7 @@ class CiHealthWatchTests(unittest.TestCase):
                 "steps": [{"name": "Build web app", "status": "pending", "conclusion": None}],
             }
         ]
-        self.runner.runner_statuses["colingreig/thermal"] = "offline"
+        self.runner.runner_statuses["ignitemarketing/thermal"] = "offline"
 
         report = self._poll()
 
@@ -1260,7 +1260,7 @@ class CiHealthWatchTests(unittest.TestCase):
         self._poll()
         now = self.mod._now()
         older, newer = 8101, 8102
-        self.runner.runs_by_repo["colingreig/thermal"] = [
+        self.runner.runs_by_repo["ignitemarketing/thermal"] = [
             {
                 "databaseId": older, "workflowName": "E2E Functional", "conclusion": "failure",
                 "status": "completed", "createdAt": (now - timedelta(hours=2)).isoformat(),
@@ -1292,7 +1292,7 @@ class CiHealthWatchTests(unittest.TestCase):
             (8201, now - timedelta(hours=1), "b" * 40),
             (8202, now - timedelta(days=2), self.runner.default_sha),
         ):
-            self.runner.runs_by_repo["colingreig/thermal"] = [{
+            self.runner.runs_by_repo["ignitemarketing/thermal"] = [{
                 "databaseId": run_id, "workflowName": "E2E Functional", "conclusion": "failure",
                 "status": "completed", "createdAt": created.isoformat(), "updatedAt": now.isoformat(),
                 "event": "schedule", "headBranch": "main", "headSha": head_sha,
@@ -1347,7 +1347,7 @@ class CiHealthWatchTests(unittest.TestCase):
             "status": "completed", "createdAt": (now - timedelta(minutes=5)).isoformat(),
             "updatedAt": now.isoformat(), "event": "schedule", "headBranch": "main",
         }]
-        self.runner.runs_by_repo["colingreig/thermal"] = [{
+        self.runner.runs_by_repo["ignitemarketing/thermal"] = [{
             "databaseId": 8402, "workflowName": "E2E Functional", "conclusion": "failure",
             "status": "completed", "createdAt": (now - timedelta(minutes=4)).isoformat(),
             "updatedAt": now.isoformat(), "event": "schedule", "headBranch": "main",
@@ -1367,7 +1367,7 @@ class CiHealthWatchTests(unittest.TestCase):
     def test_eventual_job_rerun_conclusion_is_persisted(self):
         self._poll()
         run_id = 8501
-        self.runner.runs_by_repo["colingreig/thermal"] = [{
+        self.runner.runs_by_repo["ignitemarketing/thermal"] = [{
             "databaseId": run_id, "workflowName": "E2E Functional", "conclusion": "success",
             "status": "completed", "createdAt": self.mod._now_iso(), "updatedAt": self.mod._now_iso(),
             "event": "schedule", "headBranch": "main",
