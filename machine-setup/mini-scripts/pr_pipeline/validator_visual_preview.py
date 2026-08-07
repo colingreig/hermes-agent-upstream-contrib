@@ -25,7 +25,7 @@ from typing import Any
 from urllib.parse import quote, urlsplit, urlunsplit
 
 
-PILOT_REPO = "colingreig/jdmbuysell-v4"
+PILOT_REPO = "ignitemarketing/jdmbuysell-v4"
 DEFAULT_CONFIG = Path("~/.hermes/config.yaml").expanduser()
 GH_TIMEOUT = 60
 CHECK_NAME = "visual-preview"
