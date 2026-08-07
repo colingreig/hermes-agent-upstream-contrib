@@ -7,6 +7,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -710,7 +711,7 @@ with lock_path.open("a+", encoding="utf-8") as handle:
             commands,
         )
         installs = [command for command in commands if "runner-asset-install" in command]
-        self.assertEqual(len(installs), 5)
+        self.assertEqual(len(installs), 6)
         self.assertTrue(any("0600" in command and any(part.endswith("runner-config.json") for part in command) for command in installs))
         self.assertTrue(any("0644" in command and any(part.endswith("hermes-runner@.service") for part in command) for command in installs))
         self.assertTrue(all(payload for command, payload in calls if "runner-asset-install" in command))
@@ -942,6 +943,323 @@ with lock_path.open("a+", encoding="utf-8") as handle:
             (newest / "runner.env").read_text(encoding="utf-8"),
         )
         self.assertFalse(diag.exists())
+
+    def test_runner_registration_is_governed_and_present_on_disk(self):
+        manifest = json.loads((PIPELINE / "manifest.json").read_text(encoding="utf-8"))
+
+        self.assertIn("hermes-runner-registration.json", manifest["legacy_flat_entrypoints"])
+        destinations = {item["destination"] for item in manifest["runner_vm_assets"]}
+        self.assertEqual(destinations, self.mod.RUNNER_ASSET_DESTINATIONS)
+        self.assertIn(
+            "/home/colingreig/.hermes-ci/runner-registration.json",
+            self.mod.RUNNER_ASSET_DESTINATIONS,
+        )
+        # The old owners-only file must not linger anywhere in the governed set.
+        self.assertNotIn("hermes-runner-owners.json", manifest["legacy_flat_entrypoints"])
+        self.assertFalse((PIPELINE / "hermes-runner-owners.json").exists())
+
+        registration_source = PIPELINE / "hermes-runner-registration.json"
+        self.assertTrue(registration_source.is_file())
+        registration_data = json.loads(registration_source.read_text(encoding="utf-8"))
+        self.assertEqual(registration_data["schema_version"], 1)
+        self.assertIsInstance(registration_data.get("_note"), str)
+        self.assertTrue(registration_data["_note"])
+
+        # App identity: non-secret numeric identifiers only. The PEM stays off
+        # the manifest entirely (~/.hermes-ci/executor-app.pem on the VM).
+        self.assertIsInstance(registration_data.get("github_app_id"), int)
+        self.assertGreater(registration_data["github_app_id"], 0)
+        self.assertIsInstance(registration_data.get("github_app_installation_id"), int)
+        self.assertGreater(registration_data["github_app_installation_id"], 0)
+
+        self.assertTrue(registration_data["owners"])
+        for repo, owner in registration_data["owners"].items():
+            self.assertIsInstance(repo, str)
+            self.assertIsInstance(owner, str)
+            self.assertTrue(owner)
+
+    def test_runner_config_key_set_matches_ci_health_watch_expectation(self):
+        # ci_health_watch.py's VM status probe compares hermes-runner-config.json
+        # against a fixed expected_runner_config dict by *exact* equality; the
+        # App identity / owners map must never be folded into that file, or it
+        # trips a false runner-config:drift alarm. Pin the governed key set
+        # here as a regression guard.
+        runner_config = json.loads(
+            (PIPELINE / "hermes-runner-config.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            set(runner_config),
+            {
+                "schema_version",
+                "concurrency_slots",
+                "semaphore_timeout_seconds",
+                "diagnostic_retention_days",
+                "diagnostic_max_jobs_per_repo",
+            },
+        )
+        self.assertNotIn("owners", runner_config)
+        self.assertNotIn("github_app_id", runner_config)
+        self.assertNotIn("github_app_installation_id", runner_config)
+
+    def test_runner_loop_config_reads_are_backed_by_governed_sources(self):
+        # Contract test: every `jq -er '.<key>' "$VAR"` read in
+        # hermes-runner-loop.sh must resolve, via the deployed-file variable
+        # and the manifest's runner_vm_assets mapping, to a governed source
+        # JSON that actually provides that key. This is the exact shape of
+        # the defect this test suite is guarding against: the script used to
+        # read .github_app_id / .github_app_installation_id from $CONFIG
+        # (runner-config.json), whose governed source only ever declared the
+        # five operational keys -- every deploy would have crash-looped the
+        # runner service.
+        loop_script = (PIPELINE / "hermes-runner-loop.sh").read_text(encoding="utf-8")
+        manifest = json.loads((PIPELINE / "manifest.json").read_text(encoding="utf-8"))
+
+        var_to_deployed_name = dict(
+            re.findall(r'^([A-Z_]+)="\$HERMES_CI/([\w.\-]+)"$', loop_script, re.MULTILINE)
+        )
+        self.assertIn("CONFIG", var_to_deployed_name)
+        self.assertIn("REGISTRATION", var_to_deployed_name)
+
+        deployed_to_source = {
+            Path(item["destination"]).name: item["source"]
+            for item in manifest["runner_vm_assets"]
+            if item["destination"].startswith("/home/colingreig/.hermes-ci/")
+        }
+
+        source_cache: dict[str, dict] = {}
+        checked = 0
+        for line in loop_script.splitlines():
+            if "jq -er" not in line:
+                continue
+            key_match = re.search(r"jq -er\b.*?'\.([A-Za-z0-9_]+)", line)
+            if not key_match:
+                continue
+            file_vars = re.findall(r'"\$([A-Z_]+)"', line)
+            file_var = next((v for v in reversed(file_vars) if v in var_to_deployed_name), None)
+            if file_var is None:
+                continue
+            deployed_name = var_to_deployed_name[file_var]
+            source_name = deployed_to_source.get(deployed_name)
+            self.assertIsNotNone(
+                source_name,
+                f"deployed file {deployed_name!r} (read via ${file_var}) has no "
+                "governed source in manifest runner_vm_assets",
+            )
+            if source_name not in source_cache:
+                source_cache[source_name] = json.loads(
+                    (PIPELINE / source_name).read_text(encoding="utf-8")
+                )
+            key = key_match.group(1)
+            self.assertIn(
+                key,
+                source_cache[source_name],
+                f"hermes-runner-loop.sh reads '.{key}' from ${file_var} "
+                f"({deployed_name}), but governed source {source_name} does "
+                "not provide that key",
+            )
+            checked += 1
+
+        # Sanity: the script reads 5 distinct keys this way (owners,
+        # github_app_id, github_app_installation_id, diagnostic_retention_days,
+        # diagnostic_max_jobs_per_repo). If this drops to 0 the test is
+        # silently checking nothing.
+        self.assertGreaterEqual(checked, 5)
+
+    def test_registration_owners_cover_every_topology_runner(self):
+        registration = json.loads(
+            (PIPELINE / "hermes-runner-registration.json").read_text(encoding="utf-8")
+        )
+        topology = json.loads((PIPELINE / "ci_health_topology.json").read_text(encoding="utf-8"))
+        owners = registration["owners"]
+        self.assertTrue(topology["expected_runners"])
+        for entry in topology["expected_runners"]:
+            owner, _, repo_name = entry["repo"].partition("/")
+            self.assertIn(
+                repo_name, owners, f"{entry['repo']} has no hermes-runner-registration.json owners entry"
+            )
+            self.assertEqual(
+                owners[repo_name],
+                owner,
+                f"{entry['repo']} owner in ci_health_topology.json disagrees with hermes-runner-registration.json",
+            )
+
+    def test_resolve_runner_owner_uses_verified_map(self):
+        root, _home, _runner_dir, env = self._runner_test_tree()
+        env.pop("HERMES_RUNNER_OWNER", None)
+        (root / "runner-registration.json").write_text(
+            json.dumps({"schema_version": 1, "owners": {"thermal": "ignitemarketing"}}),
+            encoding="utf-8",
+        )
+        env["HERMES_RUNNER_TEST_ACTION"] = "resolve-owner"
+
+        result = subprocess.run(
+            [str(PIPELINE / "hermes-runner-loop.sh"), "thermal"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "ignitemarketing")
+
+    def test_resolve_runner_owner_env_override_wins_over_map(self):
+        root, _home, _runner_dir, env = self._runner_test_tree()
+        (root / "runner-registration.json").write_text(
+            json.dumps({"schema_version": 1, "owners": {"thermal": "ignitemarketing"}}),
+            encoding="utf-8",
+        )
+        env["HERMES_RUNNER_OWNER"] = "override-owner"
+        env["HERMES_RUNNER_TEST_ACTION"] = "resolve-owner"
+
+        result = subprocess.run(
+            [str(PIPELINE / "hermes-runner-loop.sh"), "thermal"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "override-owner")
+
+    def test_resolve_runner_owner_unmapped_repo_fails_closed(self):
+        root, home, _runner_dir, env = self._runner_test_tree()
+        env.pop("HERMES_RUNNER_OWNER", None)
+        (home / "actions-runner" / "ghost-repo").mkdir(parents=True, exist_ok=True)
+        (root / "runner-registration.json").write_text(
+            json.dumps({"schema_version": 1, "owners": {"thermal": "ignitemarketing"}}),
+            encoding="utf-8",
+        )
+        env["HERMES_RUNNER_TEST_ACTION"] = "resolve-owner"
+
+        result = subprocess.run(
+            [str(PIPELINE / "hermes-runner-loop.sh"), "ghost-repo"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("ghost-repo", result.stderr)
+        self.assertIn("runner-registration.json", result.stderr)
+        self.assertNotIn("ignitemarketing", result.stdout)
+
+    def test_resolve_runner_owner_missing_map_and_no_override_fails_closed(self):
+        root, _home, _runner_dir, env = self._runner_test_tree()
+        env.pop("HERMES_RUNNER_OWNER", None)
+        self.assertFalse((root / "runner-registration.json").exists())
+        env["HERMES_RUNNER_TEST_ACTION"] = "resolve-owner"
+
+        result = subprocess.run(
+            [str(PIPELINE / "hermes-runner-loop.sh"), "thermal"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("thermal", result.stderr)
+        self.assertIn("HERMES_RUNNER_OWNER", result.stderr)
+
+    def test_resolve_runner_registration_reads_app_identity(self):
+        root, _home, _runner_dir, env = self._runner_test_tree()
+        (root / "runner-registration.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "github_app_id": 4491727,
+                    "github_app_installation_id": 151353292,
+                    "owners": {"thermal": "ignitemarketing"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        env["HERMES_RUNNER_TEST_ACTION"] = "resolve-registration"
+
+        result = subprocess.run(
+            [str(PIPELINE / "hermes-runner-loop.sh"), "thermal"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "4491727 151353292")
+
+    def test_resolve_runner_registration_missing_app_id_fails_closed(self):
+        root, _home, _runner_dir, env = self._runner_test_tree()
+        (root / "runner-registration.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "github_app_installation_id": 151353292,
+                    "owners": {"thermal": "ignitemarketing"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        env["HERMES_RUNNER_TEST_ACTION"] = "resolve-registration"
+
+        result = subprocess.run(
+            [str(PIPELINE / "hermes-runner-loop.sh"), "thermal"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("github_app_id", result.stderr)
+        self.assertIn("runner-registration.json", result.stderr)
+        self.assertEqual(result.stdout.strip(), "")
+
+    def test_resolve_runner_registration_missing_installation_id_fails_closed(self):
+        root, _home, _runner_dir, env = self._runner_test_tree()
+        (root / "runner-registration.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "github_app_id": 4491727,
+                    "owners": {"thermal": "ignitemarketing"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        env["HERMES_RUNNER_TEST_ACTION"] = "resolve-registration"
+
+        result = subprocess.run(
+            [str(PIPELINE / "hermes-runner-loop.sh"), "thermal"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("github_app_installation_id", result.stderr)
+        self.assertIn("runner-registration.json", result.stderr)
+        self.assertEqual(result.stdout.strip(), "")
+
+    def test_resolve_runner_registration_missing_file_fails_closed(self):
+        root, _home, _runner_dir, env = self._runner_test_tree()
+        self.assertFalse((root / "runner-registration.json").exists())
+        env["HERMES_RUNNER_TEST_ACTION"] = "resolve-registration"
+
+        result = subprocess.run(
+            [str(PIPELINE / "hermes-runner-loop.sh"), "thermal"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("runner-registration.json", result.stderr)
+        self.assertEqual(result.stdout.strip(), "")
 
     def test_installed_merge_surface_loads_as_a_standalone_entrypoint(self):
         self._install()

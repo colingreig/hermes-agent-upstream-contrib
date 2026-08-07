@@ -23,6 +23,7 @@
     "hermes-runner-acquire.sh",
     "hermes-runner-config.json",
     "hermes-runner-loop.sh",
+    "hermes-runner-registration.json",
     "hermes-runner-release.sh",
     "hermes-runner@.service",
     "hermes_validate_ops.py",
@@ -97,6 +98,13 @@
       "mode": "0600",
       "owner": "colingreig",
       "source": "hermes-runner-config.json"
+    },
+    {
+      "destination": "/home/colingreig/.hermes-ci/runner-registration.json",
+      "group": "colingreig",
+      "mode": "0644",
+      "owner": "colingreig",
+      "source": "hermes-runner-registration.json"
     }
   ]
 }

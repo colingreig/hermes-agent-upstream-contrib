@@ -69,6 +69,7 @@ RUNNER_ASSET_DESTINATIONS = {
     "/home/colingreig/.hermes-ci/hooks/release.sh",
     "/home/colingreig/.hermes-ci/run-runner-loop.sh",
     "/home/colingreig/.hermes-ci/runner-config.json",
+    "/home/colingreig/.hermes-ci/runner-registration.json",
 }
 RUNNER_ASSET_OWNERS = {"root", "colingreig"}
 

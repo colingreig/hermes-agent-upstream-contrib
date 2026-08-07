@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "_note": "Single source of truth for hermes-runner-loop.sh's runner REGISTRATION identity: which GitHub App mints the installation token (github_app_id/github_app_installation_id) and which owner each repo belongs to (owners). These are non-secret numeric/string identifiers only -- the App PRIVATE KEY stays at ~/.hermes-ci/executor-app.pem on the VM, outside this manifest, and is never written here. Deliberately NOT merged into hermes-runner-config.json: ci_health_watch.py's VM status probe compares that file against a fixed expected_runner_config dict by exact equality (schema_version/concurrency_slots/semaphore_timeout_seconds/diagnostic_retention_days/diagnostic_max_jobs_per_repo only), so any extra key there would trip a false runner-config:drift alarm. hermes-runner-loop.sh only ever uses an owner it finds in `owners`, or an explicit HERMES_RUNNER_OWNER override -- it never guesses or falls back to a default owner string, and it fails closed if github_app_id/github_app_installation_id are missing here. Verified 2026-08-07: github_app_id 4491727 and github_app_installation_id 151353292 are the live hermes-executor App and its installation on org ignitemarketing (checked via `gh api /app` with the App's own JWT and `gh api /app/installations`); owners verified via `gh api repos/<owner>/<repo> --jq .full_name` after the colingreig -> ignitemarketing org transfer (2026-08-06).",
+  "github_app_id": 4491727,
+  "github_app_installation_id": 151353292,
+  "owners": {
+    "elevatoruptime.com": "ignitemarketing",
+    "jdmbuysell-v4": "ignitemarketing",
+    "thermal": "ignitemarketing",
+    "topdynamicspartners": "ignitemarketing"
+  }
+}

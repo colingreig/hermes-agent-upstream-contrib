@@ -27,6 +27,11 @@ class ThermalGithubAppProbeTests(unittest.TestCase):
     def setUp(self):
         self.mod = _load_module()
 
+    def test_default_owner_is_the_verified_post_transfer_owner(self):
+        # thermal moved colingreig -> ignitemarketing in the 2026-08-06 org
+        # transfer; a stale default here silently probes the wrong repo.
+        self.assertEqual(self.mod.DEFAULT_OWNER, "ignitemarketing")
+
     def test_success_emits_status_codes_only(self):
         calls: list[tuple[str, str]] = []
 

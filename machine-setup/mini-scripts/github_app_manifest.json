@@ -30,8 +30,8 @@
       "src_rel": "thermal_github_app_probe.py",
       "src_base": "mirror",
       "dest_abs": "~/.hermes/scripts/thermal_github_app_probe.py",
-      "sha256": "4fbb71bc6ac052e7a4b42393f8b3952d9affd207b7b69171e032fcfa11cfce18",
-      "role": "body-suppressed GET/POST probes against colingreig/thermal runner registration endpoints; emits JSON status codes only, never logs registration tokens or response bodies",
+      "sha256": "f51e38e436f14cf11633d092f6724978b236af87df2148739995a2bd40535a0d",
+      "role": "body-suppressed GET/POST probes against the thermal repo's runner registration endpoints (owner ignitemarketing post-2026-08-06 transfer, verified against pr_pipeline/hermes-runner-registration.json); emits JSON status codes only, never logs registration tokens or response bodies",
       "deploy_mode": "script"
     }
   ]
