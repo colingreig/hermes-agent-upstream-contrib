@@ -13,6 +13,10 @@ else
   HERMES_CI="$BASE/.hermes-ci"
 fi
 DIR="$BASE/actions-runner/$REPO"
+# Governed repos were transferred colingreig -> ignitemarketing; the
+# registration-token mint and config.sh --url below used to hardcode
+# colingreig and 404 for every transferred repo (migration-learnings #18).
+OWNER="${HERMES_RUNNER_OWNER:-ignitemarketing}"
 PATFILE="$HERMES_CI/reg-pat"
 CONFIG="$HERMES_CI/runner-config.json"
 SLOTS_DIR="$HERMES_CI/sem/slots"
@@ -164,7 +168,7 @@ PAT="$(cat "$PATFILE")"
 REG_TOKEN="$(curl -fsS -X POST \
   -H "Authorization: token $PAT" \
   -H "Accept: application/vnd.github+json" \
-  "https://api.github.com/repos/colingreig/$REPO/actions/runners/registration-token" \
+  "https://api.github.com/repos/$OWNER/$REPO/actions/runners/registration-token" \
   | jq -r .token)"
 if [ -z "$REG_TOKEN" ] || [ "$REG_TOKEN" = "null" ]; then
   echo "registration-token mint failed for $REPO"
@@ -172,7 +176,7 @@ if [ -z "$REG_TOKEN" ] || [ "$REG_TOKEN" = "null" ]; then
 fi
 
 ./config.sh \
-  --url "https://github.com/colingreig/$REPO" \
+  --url "https://github.com/$OWNER/$REPO" \
   --token "$REG_TOKEN" \
   --labels self-hosted,linux,hermes-mini \
   --ephemeral --unattended --replace \

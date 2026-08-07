@@ -196,15 +196,25 @@ python3 machine-setup/mini-scripts/reconcile_pr_pipeline.py verify  --host mini 
 
 The topology is deliberately declarative and fail-closed. It declares the VM
 probe commands, managed start/stop/restart commands, the exact four-runner
-fleet (including `colingreig/thermal` / `hermes-thermal`), the no-agent cadence
+fleet (including `ignitemarketing/thermal` / `hermes-thermal`), the no-agent cadence
 (`300` seconds), and desired resources: 4 CPU, 6144 MiB, and one shared job
 slot. Duplicate, missing, or unknown runners are rejected.
 
+**When a governed repo is transferred to another owner**, three things must be
+updated together or the runner goes silently offline: `expected_runners[].repo`
+here, `EXPECTED_RUNNERS` / `EXPECTED_RECOVERY_IDENTITIES` in `ci_health_watch.py`
+(they are compared for exact equality, so a one-sided edit fails the monitor
+closed), and the VM-side registration path — `hermes-runner-loop.sh` hardcodes
+`colingreig/$REPO` for both the registration-token mint and `config.sh --url`,
+and `~/.hermes-ci/reg-pat` is a fine-grained PAT scoped to `colingreig` only.
+The VM side is still open: `thermal` has been unable to register since
+2026-07-29 and `elevatoruptime.com` since its 2026-08-06 transfer.
+
 Two scheduled recoveries are governed and capped at one rerun:
 
-- `colingreig/jdmbuysell-v4` / `Dead-image monitor` retains managed-restart
+- `ignitemarketing/jdmbuysell-v4` / `Dead-image monitor` retains managed-restart
   overlap recovery.
-- `colingreig/thermal` / `E2E Functional` inspects the exact `e2e functional
+- `ignitemarketing/thermal` / `E2E Functional` inspects the exact `e2e functional
   suite (advisory)` job, even when job-level `continue-on-error` made the
   workflow look green. It reruns only a completed failed job on
   `hermes-thermal` when every completed step is `success` or `skipped` and at
@@ -905,7 +915,7 @@ hash mismatch, recorded-commit mismatch, or unmanifested pipeline extra.
 ### Deployed-preview visual validation pilot
 
 `pr_pipeline/validator_visual_preview.py` is a source-gated pilot for
-`colingreig/jdmbuysell-v4`. It is disabled by default and is a no-op for every
+`ignitemarketing/jdmbuysell-v4`. It is disabled by default and is a no-op for every
 other repository. Enable the behavioral switch in `~/.hermes/config.yaml`:
 
 ```yaml
