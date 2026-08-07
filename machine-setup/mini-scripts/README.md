@@ -212,7 +212,7 @@ The VM side is still open: `thermal` has been unable to register since
 
 Two scheduled recoveries are governed and capped at one rerun:
 
-- `colingreig/jdmbuysell-v4` / `Dead-image monitor` retains managed-restart
+- `ignitemarketing/jdmbuysell-v4` / `Dead-image monitor` retains managed-restart
   overlap recovery.
 - `ignitemarketing/thermal` / `E2E Functional` inspects the exact `e2e functional
   suite (advisory)` job, even when job-level `continue-on-error` made the
@@ -915,7 +915,7 @@ hash mismatch, recorded-commit mismatch, or unmanifested pipeline extra.
 ### Deployed-preview visual validation pilot
 
 `pr_pipeline/validator_visual_preview.py` is a source-gated pilot for
-`colingreig/jdmbuysell-v4`. It is disabled by default and is a no-op for every
+`ignitemarketing/jdmbuysell-v4`. It is disabled by default and is a no-op for every
 other repository. Enable the behavioral switch in `~/.hermes/config.yaml`:
 
 ```yaml

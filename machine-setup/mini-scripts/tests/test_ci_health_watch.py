@@ -39,8 +39,8 @@ class FakeRunner:
         self.cpu_limit = 4
         self.memory_limit_mib = 6144
         self.runner_statuses = {
-            "colingreig/jdmbuysell-v4": "online",
-            "colingreig/topdynamicspartners": "online",
+            "ignitemarketing/jdmbuysell-v4": "online",
+            "ignitemarketing/topdynamicspartners": "online",
             "ignitemarketing/elevatoruptime.com": "online",
             "ignitemarketing/thermal": "online",
         }
@@ -56,8 +56,8 @@ class FakeRunner:
         self.boot_rc = 0
         self.gh_runner_api_forbidden = False
         self.listener_commands = {
-            "colingreig/jdmbuysell-v4": "/home/colingreig/actions-runner/jdmbuysell-v4/bin/Runner.Listener run",
-            "colingreig/topdynamicspartners": "/home/colingreig/actions-runner/topdynamicspartners/bin/Runner.Listener run",
+            "ignitemarketing/jdmbuysell-v4": "/home/colingreig/actions-runner/jdmbuysell-v4/bin/Runner.Listener run",
+            "ignitemarketing/topdynamicspartners": "/home/colingreig/actions-runner/topdynamicspartners/bin/Runner.Listener run",
             "ignitemarketing/elevatoruptime.com": "/home/colingreig/actions-runner/elevatoruptime.com/bin/Runner.Listener run",
             "ignitemarketing/thermal": "/home/colingreig/actions-runner/thermal/bin/Runner.Listener run",
         }
@@ -93,11 +93,11 @@ class FakeRunner:
             return subprocess.CompletedProcess(cmd, 0, stdout, "")
         if self.gh_runner_api_forbidden and cmd[:2] == ["gh", "api"]:
             return subprocess.CompletedProcess(cmd, 403, "", "HTTP 403: Resource not accessible by integration")
-        if cmd[:3] == ["gh", "api", "repos/colingreig/jdmbuysell-v4/actions/runners"]:
-            payload = {"runners": [{"name": "hermes-jdmbuysell-v4", "status": self.runner_statuses["colingreig/jdmbuysell-v4"], "busy": False}]}
+        if cmd[:3] == ["gh", "api", "repos/ignitemarketing/jdmbuysell-v4/actions/runners"]:
+            payload = {"runners": [{"name": "hermes-jdmbuysell-v4", "status": self.runner_statuses["ignitemarketing/jdmbuysell-v4"], "busy": False}]}
             return subprocess.CompletedProcess(cmd, 0, json.dumps(payload), "")
-        if cmd[:3] == ["gh", "api", "repos/colingreig/topdynamicspartners/actions/runners"]:
-            payload = {"runners": [{"name": "hermes-topdynamicspartners", "status": self.runner_statuses["colingreig/topdynamicspartners"], "busy": False}]}
+        if cmd[:3] == ["gh", "api", "repos/ignitemarketing/topdynamicspartners/actions/runners"]:
+            payload = {"runners": [{"name": "hermes-topdynamicspartners", "status": self.runner_statuses["ignitemarketing/topdynamicspartners"], "busy": False}]}
             return subprocess.CompletedProcess(cmd, 0, json.dumps(payload), "")
         if cmd[:3] == ["gh", "api", "repos/ignitemarketing/elevatoruptime.com/actions/runners"]:
             payload = {"runners": [{"name": "hermes-elevatoruptime.com", "status": self.runner_statuses["ignitemarketing/elevatoruptime.com"], "busy": False}]}
@@ -163,8 +163,8 @@ class CiHealthWatchTests(unittest.TestCase):
         self.assertEqual(
             {(item["repo"], item["name"]) for item in topology["expected_runners"]},
             {
-                ("colingreig/jdmbuysell-v4", "hermes-jdmbuysell-v4"),
-                ("colingreig/topdynamicspartners", "hermes-topdynamicspartners"),
+                ("ignitemarketing/jdmbuysell-v4", "hermes-jdmbuysell-v4"),
+                ("ignitemarketing/topdynamicspartners", "hermes-topdynamicspartners"),
                 ("ignitemarketing/elevatoruptime.com", "hermes-elevatoruptime.com"),
                 ("ignitemarketing/thermal", "hermes-thermal"),
             },
@@ -173,7 +173,7 @@ class CiHealthWatchTests(unittest.TestCase):
             topology["expected_runners"][0]["listener_command"],
             ["/home/colingreig/actions-runner/jdmbuysell-v4/bin/Runner.Listener", "run"],
         )
-        self.assertEqual(topology["recovery_allowlist"][0]["repo"], "colingreig/jdmbuysell-v4")
+        self.assertEqual(topology["recovery_allowlist"][0]["repo"], "ignitemarketing/jdmbuysell-v4")
         self.assertEqual(topology["recovery_allowlist"][0]["workflow"], "Dead-image monitor")
         self.assertEqual(topology["desired_resources"]["cpu_limit"], 4)
         self.assertEqual(topology["desired_resources"]["memory_limit_mib"], 6144)
@@ -433,7 +433,7 @@ class CiHealthWatchTests(unittest.TestCase):
         self.assertEqual(records[-1]["prior_boot_id"], BOOT_A)
         self.assertEqual(records[-1]["current_boot_id"], BOOT_B)
         self.assertEqual(records[-1]["host_uptime_seconds"], 120)
-        self.assertIn("colingreig/jdmbuysell-v4::hermes-jdmbuysell-v4=online", records[-1]["runner_status"])
+        self.assertIn("ignitemarketing/jdmbuysell-v4::hermes-jdmbuysell-v4=online", records[-1]["runner_status"])
         self.assertIn("orbstack_evidence", records[-1])
         self.assertEqual(records[-1]["initiator"], "unknown")
 
@@ -566,7 +566,7 @@ class CiHealthWatchTests(unittest.TestCase):
 
     def test_offline_debounce_dedup_and_recovery_alert(self):
         self._poll()
-        self.runner.runner_statuses["colingreig/jdmbuysell-v4"] = "offline"
+        self.runner.runner_statuses["ignitemarketing/jdmbuysell-v4"] = "offline"
 
         first = self._poll()
         second = self._poll()
@@ -577,7 +577,7 @@ class CiHealthWatchTests(unittest.TestCase):
         self.assertEqual(third["runner_alerted"], 0)
         self.assertEqual(len([msg for msg in self.runner.sent if "runner offline" in msg]), 1)
 
-        self.runner.runner_statuses["colingreig/jdmbuysell-v4"] = "online"
+        self.runner.runner_statuses["ignitemarketing/jdmbuysell-v4"] = "online"
         recovered = self._poll()
         self.assertEqual(recovered["runner_recovered"], 1)
         self.assertEqual(len([msg for msg in self.runner.sent if "runner recovered" in msg]), 1)
@@ -657,25 +657,25 @@ class CiHealthWatchTests(unittest.TestCase):
         self._poll()
 
         state = json.loads(self.state_path.read_text(encoding="utf-8"))
-        self.assertIn("colingreig/jdmbuysell-v4::hermes-jdmbuysell-v4=online", state["last_transition"]["runner_status"])
-        self.assertIn("colingreig/topdynamicspartners::hermes-topdynamicspartners=online", state["last_transition"]["runner_status"])
+        self.assertIn("ignitemarketing/jdmbuysell-v4::hermes-jdmbuysell-v4=online", state["last_transition"]["runner_status"])
+        self.assertIn("ignitemarketing/topdynamicspartners::hermes-topdynamicspartners=online", state["last_transition"]["runner_status"])
         self.assertIn("ignitemarketing/elevatoruptime.com::hermes-elevatoruptime.com=online", state["last_transition"]["runner_status"])
         self.assertIn("ignitemarketing/thermal::hermes-thermal=online", state["last_transition"]["runner_status"])
 
     def test_local_runner_fallback_is_exact_and_fail_closed(self):
         self.runner.gh_runner_api_forbidden = True
-        self.runner.listener_commands["colingreig/jdmbuysell-v4"] = "/bin/sh -c /home/colingreig/actions-runner/jdmbuysell-v4/bin/Runner.Listener run"
+        self.runner.listener_commands["ignitemarketing/jdmbuysell-v4"] = "/bin/sh -c /home/colingreig/actions-runner/jdmbuysell-v4/bin/Runner.Listener run"
 
         self._poll()
 
         record = self._evidence()[-1]
-        self.assertIn("colingreig/jdmbuysell-v4::hermes-jdmbuysell-v4=missing", record["runner_status"])
-        self.assertIn("colingreig/topdynamicspartners::hermes-topdynamicspartners=online", record["runner_status"])
+        self.assertIn("ignitemarketing/jdmbuysell-v4::hermes-jdmbuysell-v4=missing", record["runner_status"])
+        self.assertIn("ignitemarketing/topdynamicspartners::hermes-topdynamicspartners=online", record["runner_status"])
 
     def test_local_runner_fallback_refuses_ambiguous_exact_listener(self):
         self.runner.gh_runner_api_forbidden = True
-        command = self.runner.listener_commands["colingreig/jdmbuysell-v4"]
-        self.runner.listener_commands["colingreig/jdmbuysell-v4"] = f"{command}\n{command}"
+        command = self.runner.listener_commands["ignitemarketing/jdmbuysell-v4"]
+        self.runner.listener_commands["ignitemarketing/jdmbuysell-v4"] = f"{command}\n{command}"
 
         self._poll()
 
@@ -867,7 +867,7 @@ class CiHealthWatchTests(unittest.TestCase):
             runner=self.runner, topology_path=TOPOLOGY, state_path=self.state_path,
         )
         now = self.mod._now()
-        self.runner.runs_by_repo["colingreig/jdmbuysell-v4"] = [{
+        self.runner.runs_by_repo["ignitemarketing/jdmbuysell-v4"] = [{
             "databaseId": 1199, "workflowName": "Dead-image monitor", "conclusion": "failure",
             "status": "completed", "createdAt": (now - timedelta(minutes=5)).isoformat(),
             "updatedAt": now.isoformat(), "event": "schedule", "headBranch": "main",
@@ -976,7 +976,7 @@ class CiHealthWatchTests(unittest.TestCase):
             }
         ]
         self.runner.boot_id = BOOT_B
-        self.runner.runner_statuses["colingreig/topdynamicspartners"] = "offline"
+        self.runner.runner_statuses["ignitemarketing/topdynamicspartners"] = "offline"
 
         report = self._poll()
 
@@ -1342,7 +1342,7 @@ class CiHealthWatchTests(unittest.TestCase):
             runner=self.runner, topology_path=TOPOLOGY, state_path=self.state_path,
         )
         now = self.mod._now()
-        self.runner.runs_by_repo["colingreig/jdmbuysell-v4"] = [{
+        self.runner.runs_by_repo["ignitemarketing/jdmbuysell-v4"] = [{
             "databaseId": 8401, "workflowName": "Dead-image monitor", "conclusion": "failure",
             "status": "completed", "createdAt": (now - timedelta(minutes=5)).isoformat(),
             "updatedAt": now.isoformat(), "event": "schedule", "headBranch": "main",

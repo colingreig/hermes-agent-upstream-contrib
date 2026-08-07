@@ -24,12 +24,12 @@
   },
   "expected_runners": [
     {
-      "repo": "colingreig/jdmbuysell-v4",
+      "repo": "ignitemarketing/jdmbuysell-v4",
       "name": "hermes-jdmbuysell-v4",
       "listener_command": ["/home/colingreig/actions-runner/jdmbuysell-v4/bin/Runner.Listener", "run"]
     },
     {
-      "repo": "colingreig/topdynamicspartners",
+      "repo": "ignitemarketing/topdynamicspartners",
       "name": "hermes-topdynamicspartners",
       "listener_command": ["/home/colingreig/actions-runner/topdynamicspartners/bin/Runner.Listener", "run"]
     },
@@ -46,7 +46,7 @@
   ],
   "recovery_allowlist": [
     {
-      "repo": "colingreig/jdmbuysell-v4",
+      "repo": "ignitemarketing/jdmbuysell-v4",
       "workflow": "Dead-image monitor",
       "event": "schedule",
       "max_reruns": 1

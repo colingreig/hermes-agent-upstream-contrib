@@ -45,12 +45,12 @@ STATE_SCHEMA_VERSION = 2
 LIFECYCLE_SCHEMA_VERSION = 1
 EXPECTED_RUNNERS = {
     ("ignitemarketing/elevatoruptime.com", "hermes-elevatoruptime.com"),
-    ("colingreig/jdmbuysell-v4", "hermes-jdmbuysell-v4"),
+    ("ignitemarketing/jdmbuysell-v4", "hermes-jdmbuysell-v4"),
     ("ignitemarketing/thermal", "hermes-thermal"),
-    ("colingreig/topdynamicspartners", "hermes-topdynamicspartners"),
+    ("ignitemarketing/topdynamicspartners", "hermes-topdynamicspartners"),
 }
 EXPECTED_RECOVERY_IDENTITIES = {
-    ("colingreig/jdmbuysell-v4", "Dead-image monitor", "schedule"),
+    ("ignitemarketing/jdmbuysell-v4", "Dead-image monitor", "schedule"),
     ("ignitemarketing/thermal", "E2E Functional", "schedule"),
 }
 

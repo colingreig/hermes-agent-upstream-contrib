@@ -80,7 +80,7 @@ class RuntimeWiringTests(unittest.TestCase):
             "validator_visual_preview.py",
             manifest["legacy_flat_entrypoints"],
         )
-        self.assertEqual(validator_visual_preview.PILOT_REPO, "colingreig/jdmbuysell-v4")
+        self.assertEqual(validator_visual_preview.PILOT_REPO, "ignitemarketing/jdmbuysell-v4")
 
         source = inspect.getsource(validate_pr.validate)
         self.assertLess(source.index("head = vc.pr_head_sha"), source.index("visual = vvp.run"))
