@@ -23,7 +23,14 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-DEFAULT_OWNER = "colingreig"
+# Verified 2026-08-07 (colingreig -> ignitemarketing org transfer, 2026-08-06)
+# via `gh api repos/ignitemarketing/thermal --jq .full_name`. Kept as a plain
+# constant, not the fail-closed owners-map lookup hermes-runner-loop.sh uses,
+# because this probe only ever targets one fixed repo; THERMAL_PROBE_OWNER
+# below remains the escape hatch if that repo ever moves again. See
+# pr_pipeline/hermes-runner-registration.json for the multi-repo map and its
+# fail-closed contract.
+DEFAULT_OWNER = "ignitemarketing"
 DEFAULT_REPO = "thermal"
 EXPECTED_GET = 200
 EXPECTED_POST = 201
