@@ -16,11 +16,7 @@ DIR="$BASE/actions-runner/$REPO"
 # Governed repos were transferred colingreig -> ignitemarketing; the
 # registration-token mint and config.sh --url below used to hardcode
 # colingreig and 404 for every transferred repo (migration-learnings #18).
-# Default to the org, but keep an exception for repos not yet transferred.
 OWNER="${HERMES_RUNNER_OWNER:-ignitemarketing}"
-case "$REPO" in
-  jdmbuysell-v4) OWNER="${HERMES_RUNNER_OWNER:-colingreig}" ;;
-esac
 PATFILE="$HERMES_CI/reg-pat"
 CONFIG="$HERMES_CI/runner-config.json"
 SLOTS_DIR="$HERMES_CI/sem/slots"
